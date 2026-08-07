@@ -8,8 +8,8 @@ use k8s_openapi::{
             SecurityContext, TCPSocketAction, Volume, VolumeMount,
         },
         networking::v1::{
-            NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
-            NetworkPolicySpec,
+            NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
+            NetworkPolicyPort, NetworkPolicySpec,
         },
     },
     apimachinery::pkg::{
@@ -19,7 +19,7 @@ use k8s_openapi::{
 };
 use kube::{
     Api,
-    api::{DeleteParams, ListParams, PostParams},
+    api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
 };
 
 use super::paths;
@@ -479,7 +479,12 @@ fn build_network_policy(
     name: &str,
     execution_hash: &ExecutionHash,
     job_namespace: &str,
+    egress: Option<Vec<NetworkPolicyEgressRule>>,
 ) -> NetworkPolicy {
+    let mut policy_types = vec!["Ingress".into()];
+    if egress.is_some() {
+        policy_types.push("Egress".into());
+    }
     NetworkPolicy {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
@@ -491,13 +496,19 @@ fn build_network_policy(
         },
         spec: Some(NetworkPolicySpec {
             pod_selector: Some(LabelSelector {
-                match_labels: Some(BTreeMap::from([(
-                    labels::PLAYBOOKPLAN_HASH.to_string(),
-                    execution_hash.to_string(),
-                )])),
+                match_labels: Some(BTreeMap::from([
+                    (
+                        labels::PLAYBOOKPLAN_HASH.to_string(),
+                        execution_hash.to_string(),
+                    ),
+                    (
+                        labels::COMPONENT.to_string(),
+                        labels::MANAGED_SSH_PROXY_COMPONENT.to_string(),
+                    ),
+                ])),
                 ..Default::default()
             }),
-            policy_types: Some(vec!["Ingress".into()]),
+            policy_types: Some(policy_types),
             ingress: Some(vec![NetworkPolicyIngressRule {
                 from: Some(vec![NetworkPolicyPeer {
                     namespace_selector: Some(LabelSelector {
@@ -508,10 +519,16 @@ fn build_network_policy(
                         ..Default::default()
                     }),
                     pod_selector: Some(LabelSelector {
-                        match_labels: Some(BTreeMap::from([(
-                            labels::PLAYBOOKPLAN_HASH.to_string(),
-                            execution_hash.to_string(),
-                        )])),
+                        match_labels: Some(BTreeMap::from([
+                            (
+                                labels::PLAYBOOKPLAN_HASH.to_string(),
+                                execution_hash.to_string(),
+                            ),
+                            (
+                                labels::COMPONENT.to_string(),
+                                labels::PLAYBOOK_COMPONENT.to_string(),
+                            ),
+                        ])),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -522,7 +539,7 @@ fn build_network_policy(
                     ..Default::default()
                 }]),
             }]),
-            ..Default::default()
+            egress,
         }),
     }
 }
@@ -610,7 +627,7 @@ async fn ensure_client_cert(
 
 /// Ensures a proxy pod (+ its Secret + the run's NetworkPolicy) exists and is Ready for every
 /// host in `hosts`. Safe to call every reconcile tick — only missing pieces are created.
-// Each argument is a distinct, unrelated input (two namespaces, run identity, hosts, CA, image,
+// Each argument is a distinct, unrelated input (two namespaces, hash, hosts, CA, image, policy,
 // owner); bundling them into a struct would only move the noise, so keep them explicit.
 #[allow(clippy::too_many_arguments)]
 pub async fn ensure_proxy_infra(
@@ -623,6 +640,7 @@ pub async fn ensure_proxy_infra(
     grace_policy: &ProxyGracePolicy,
     ca: &CertificateAuthority,
     proxy_image: &str,
+    network_policy_egress: Option<Vec<NetworkPolicyEgressRule>>,
     plan_owner: &OwnerReference,
 ) -> Result<ProxyReadiness, ReconcileError> {
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), operator_namespace);
@@ -641,10 +659,19 @@ pub async fn ensure_proxy_infra(
             execution_hash.to_string().hash(&mut hasher);
             hasher.finish()
         });
-        if netpol_api.get_opt(&netpol_name).await?.is_none() {
-            let netpol = build_network_policy(&netpol_name, execution_hash, job_namespace);
-            netpol_api.create(&PostParams::default(), &netpol).await?;
-        }
+        let netpol = build_network_policy(
+            &netpol_name,
+            execution_hash,
+            job_namespace,
+            network_policy_egress,
+        );
+        netpol_api
+            .patch(
+                &netpol_name,
+                &PatchParams::apply("ansible-operator").force(),
+                &Patch::Apply(&netpol),
+            )
+            .await?;
 
         ensure_client_cert(&job_secrets_api, execution_hash, ca, plan_owner).await?;
     }
@@ -734,11 +761,13 @@ pub async fn cleanup_proxy_infra(
     operator_namespace: &str,
     job_namespace: &str,
     execution_hash: &ExecutionHash,
+    playbookplan_name: &str,
 ) -> Result<(), ReconcileError> {
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), operator_namespace);
     let secrets_api: Api<Secret> = Api::namespaced(client.clone(), operator_namespace);
     let netpol_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), operator_namespace);
     let job_secrets_api: Api<Secret> = Api::namespaced(client.clone(), job_namespace);
+    let job_netpol_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), job_namespace);
 
     let dp = DeleteParams::default();
     let hash_selector = format!("{}={execution_hash}", labels::PLAYBOOKPLAN_HASH);
@@ -752,6 +781,12 @@ pub async fn cleanup_proxy_infra(
     let _ = pods_api.delete_collection(&dp, &pods_lp).await;
     let _ = secrets_api.delete_collection(&dp, &rest_lp).await;
     let _ = netpol_api.delete_collection(&dp, &rest_lp).await;
+    let _ = job_netpol_api
+        .delete(
+            &super::job_builder::job_network_policy_name(playbookplan_name, execution_hash),
+            &dp,
+        )
+        .await;
     // Plan-namespace client-cert Secret: by name, never by label (would catch the Job/pod). See doc.
     let _ = job_secrets_api
         .delete(&client_cert_secret_name(execution_hash), &dp)
@@ -783,6 +818,28 @@ mod tests {
             a1,
             format!("ansible-sshd-worker-1-{}", utils::generate_id(*hash_a))
         );
+    }
+
+    #[test]
+    fn proxy_network_policy_adds_egress_only_when_configured() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+
+        let hash = calculate_execution_hash("playbook", std::iter::empty());
+        let ingress_only = build_network_policy("proxy", &hash, "plans", None);
+        assert_eq!(
+            ingress_only.spec.unwrap().policy_types.unwrap(),
+            vec!["Ingress"]
+        );
+
+        let with_egress = build_network_policy(
+            "proxy",
+            &hash,
+            "plans",
+            Some(vec![NetworkPolicyEgressRule::default()]),
+        );
+        let spec = with_egress.spec.unwrap();
+        assert_eq!(spec.policy_types.unwrap(), vec!["Ingress", "Egress"]);
+        assert_eq!(spec.egress.unwrap().len(), 1);
     }
 
     #[test]

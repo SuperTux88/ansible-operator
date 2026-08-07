@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash as _, Hasher as _};
 
 use k8s_openapi::{
     api::{
@@ -7,10 +8,21 @@ use k8s_openapi::{
             self as kcore,
             v1::{EmptyDirVolumeSource, EnvVar, KeyToPath, SecretVolumeSource, Volume},
         },
+        networking::v1::{
+            NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyPeer, NetworkPolicyPort,
+            NetworkPolicySpec,
+        },
     },
-    apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference},
+    apimachinery::pkg::{
+        apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference},
+        util::intstr::IntOrString,
+    },
 };
-use kube::runtime::reflector::Lookup as _;
+use kube::{
+    Api,
+    api::{Patch, PatchParams},
+    runtime::reflector::Lookup as _,
+};
 
 /// Name of the Job pod's main container — the one running `ansible-playbook`, and the one whose
 /// `/dev/termination-log` carries the recap the reconciler reads back (see `advance_applying_run`).
@@ -105,6 +117,7 @@ pub fn create_job_for_run(
     let job_labels: BTreeMap<String, String> = BTreeMap::from([
         (labels::PLAYBOOKPLAN_NAME.into(), pb_name.to_string()),
         (labels::PLAYBOOKPLAN_HASH.into(), hash.to_string()),
+        (labels::COMPONENT.into(), labels::PLAYBOOK_COMPONENT.into()),
     ]);
     job.metadata.labels = Some(job_labels.clone());
 
@@ -119,6 +132,126 @@ pub fn create_job_for_run(
     }
 
     Ok(job)
+}
+
+pub async fn ensure_job_network_policy(
+    client: kube::Client,
+    operator_namespace: &str,
+    hash: &ExecutionHash,
+    target_groups: &[ResolvedInventoryGroup],
+    plan: &PlaybookPlan,
+    mut egress: Vec<NetworkPolicyEgressRule>,
+) -> Result<(), ReconcileError> {
+    let namespace = plan.namespace().ok_or(ReconcileError::PreconditionFailed(
+        "expected .metadata.namespace in PlaybookPlan",
+    ))?;
+    let name = plan.name().ok_or(ReconcileError::PreconditionFailed(
+        "expected .metadata.name in PlaybookPlan",
+    ))?;
+    let uid = plan.uid().ok_or(ReconcileError::PreconditionFailed(
+        "expected .metadata.uid in PlaybookPlan",
+    ))?;
+
+    if has_managed_ssh_group(target_groups) {
+        egress.push(NetworkPolicyEgressRule {
+            to: Some(vec![NetworkPolicyPeer {
+                namespace_selector: Some(LabelSelector {
+                    match_labels: Some(BTreeMap::from([(
+                        "kubernetes.io/metadata.name".into(),
+                        operator_namespace.into(),
+                    )])),
+                    ..Default::default()
+                }),
+                pod_selector: Some(LabelSelector {
+                    match_labels: Some(BTreeMap::from([
+                        (labels::PLAYBOOKPLAN_HASH.into(), hash.to_string()),
+                        (
+                            labels::COMPONENT.into(),
+                            labels::MANAGED_SSH_PROXY_COMPONENT.into(),
+                        ),
+                    ])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ports: Some(vec![NetworkPolicyPort {
+                port: Some(IntOrString::Int(managed_ssh::PROXY_SSH_PORT)),
+                protocol: Some("TCP".into()),
+                ..Default::default()
+            }]),
+        });
+    }
+
+    let np_name = job_network_policy_name(&name, hash);
+    let policy = NetworkPolicy {
+        metadata: ObjectMeta {
+            name: Some(np_name.clone()),
+            namespace: Some(namespace.to_string()),
+            owner_references: Some(vec![OwnerReference {
+                api_version: PlaybookPlan::api_version(&()).into(),
+                kind: PlaybookPlan::kind(&()).into(),
+                name: name.to_string(),
+                uid: uid.to_string(),
+                controller: Some(true),
+                block_owner_deletion: None,
+            }]),
+            labels: Some(BTreeMap::from([
+                (labels::PLAYBOOKPLAN_NAME.into(), name.to_string()),
+                (labels::PLAYBOOKPLAN_HASH.into(), hash.to_string()),
+                (labels::COMPONENT.into(), labels::PLAYBOOK_COMPONENT.into()),
+            ])),
+            ..Default::default()
+        },
+        spec: Some(NetworkPolicySpec {
+            pod_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([
+                    (labels::PLAYBOOKPLAN_NAME.into(), name.to_string()),
+                    (labels::PLAYBOOKPLAN_HASH.into(), hash.to_string()),
+                    (labels::COMPONENT.into(), labels::PLAYBOOK_COMPONENT.into()),
+                ])),
+                ..Default::default()
+            }),
+            policy_types: Some(vec!["Egress".into()]),
+            egress: Some(egress),
+            ..Default::default()
+        }),
+    };
+
+    Api::<NetworkPolicy>::namespaced(client, &namespace)
+        .patch(
+            &np_name,
+            &PatchParams::apply("ansible-operator").force(),
+            &Patch::Apply(&policy),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Name of a run's egress `NetworkPolicy` in the plan's namespace.
+///
+/// The plan name is both truncated (for readability) *and* hashed to reduce collision risk.
+/// Truncation alone is not enough: object names are capped at 63 characters, so two plans in one
+/// namespace sharing a long common prefix and the same execution hash — identical playbook and
+/// Secrets, which is plausible for templated or copy-pasted plans — would collapse onto the same
+/// policy name. The write is a forced server-side apply, so that collision would be silent and
+/// destructive: the second plan takes over the `controller: true` owner reference, and the first
+/// plan's cleanup (a delete by this same name) then removes the second plan's policy mid-run.
+/// Including the full name in the hash substantially reduces collision risk from shared prefixes.
+pub(super) fn job_network_policy_name(plan_name: &str, hash: &ExecutionHash) -> String {
+    let mut hasher = twox_hash::XxHash3_64::new();
+    plan_name.hash(&mut hasher);
+    let suffix = format!(
+        "-{}-{}-egress",
+        utils::generate_id(hasher.finish()),
+        utils::generate_id(**hash)
+    );
+    let prefix = "playbook-";
+    let max_name_len = 63 - prefix.len() - suffix.len();
+    let truncated_plan_name: String = plan_name.chars().take(max_name_len).collect();
+    format!(
+        "{prefix}{}{suffix}",
+        truncated_plan_name.trim_end_matches('-')
+    )
 }
 
 /// Creates a Kubernetes Job with everything needed for basic Ansible execution, without any
@@ -922,8 +1055,8 @@ spec:
 
     #[test]
     fn plan_security_context_is_applied_to_both_job_containers() {
-        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
         use crate::v1beta1::PlaybookSecurityContext;
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
 
         let mut pp = minimal_plan();
         pp.spec.template.requirements = Some("collections: []".into());
@@ -957,5 +1090,30 @@ spec:
                 .allow_privilege_escalation,
             Some(false)
         );
+    }
+
+    #[test]
+    fn job_network_policy_name_is_stable_and_dns_length_safe() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+
+        let hash = calculate_execution_hash("playbook", std::iter::empty());
+        let name = super::job_network_policy_name(&"a".repeat(100), &hash);
+        assert!(name.len() <= 63);
+    }
+
+    #[test]
+    fn job_network_policy_name_does_not_collide_on_a_shared_long_prefix() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+
+        // Same execution hash (identical playbook + Secrets) and a common prefix far longer than
+        // what fits in a 63-character object name: truncation alone would fuse these two plans onto
+        // one NetworkPolicy, letting the second silently steal ownership from the first.
+        let hash = calculate_execution_hash("playbook", std::iter::empty());
+        let long_prefix = "a".repeat(60);
+        let first = super::job_network_policy_name(&format!("{long_prefix}-one"), &hash);
+        let second = super::job_network_policy_name(&format!("{long_prefix}-two"), &hash);
+
+        assert_ne!(first, second);
+        assert!(first.len() <= 63 && second.len() <= 63);
     }
 }

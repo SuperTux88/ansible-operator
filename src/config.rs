@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 
+use k8s_openapi::api::networking::v1::NetworkPolicyEgressRule;
 use serde::Deserialize;
 
 /// Where the chart mounts the rendered config. Overridable via the `--config <path>` CLI flag for
@@ -54,6 +55,41 @@ pub struct OperatorConfig {
     /// Helm chart from `managedSsh.readiness` into the `[managed_ssh]` table; absent ⇒ all defaults.
     #[serde(default)]
     pub managed_ssh: ManagedSshConfig,
+
+    /// Egress rules applied to generated Ansible Job pods.
+    #[serde(default, deserialize_with = "deserialize_network_policy_egress")]
+    pub playbook_network_policy_egress: Option<Vec<NetworkPolicyEgressRule>>,
+
+    /// Egress rules applied to managed-ssh proxy pods.
+    #[serde(default, deserialize_with = "deserialize_network_policy_egress")]
+    pub managed_ssh_network_policy_egress: Option<Vec<NetworkPolicyEgressRule>>,
+}
+
+fn deserialize_network_policy_egress<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<NetworkPolicyEgressRule>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value {
+        Some(value) => {
+            let mut json = serde_json::Deserializer::from_str(&value);
+            let mut ignored = None;
+            let parsed = serde_ignored::deserialize(&mut json, |path| {
+                ignored.get_or_insert_with(|| path.to_string());
+            })
+            .map_err(serde::de::Error::custom)?;
+            json.end().map_err(serde::de::Error::custom)?;
+            if let Some(path) = ignored {
+                return Err(serde::de::Error::custom(format_args!(
+                    "configuration contains unknown or unsupported field `{path}`"
+                )));
+            }
+            Ok(Some(parsed))
+        }
+        None => Ok(None),
+    }
 }
 
 /// The `[managed_ssh]` config table: tunables for the adaptive readiness gate. The base wait is
@@ -125,6 +161,7 @@ impl OperatorConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
     #[test]
     fn missing_file_yields_empty_config_so_only_the_operator_namespace_is_enrolled() {
@@ -204,6 +241,52 @@ mod tests {
         assert!(
             toml::from_str::<OperatorConfig>("[managed_ssh]\nthreshold_days = [1, 2]\n").is_err(),
             "threshold_days of the wrong length must be rejected"
+        );
+    }
+
+    #[test]
+    fn workload_settings_parse_from_chart_rendered_json_strings() {
+        let config: OperatorConfig = toml::from_str(
+            r#"
+playbook_network_policy_egress = "[{}]"
+managed_ssh_network_policy_egress = "[]"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.playbook_network_policy_egress.unwrap().len(), 1);
+        assert!(config.managed_ssh_network_policy_egress.unwrap().is_empty());
+    }
+
+    #[test]
+    fn workload_settings_accept_int_or_string_ports() {
+        let config: OperatorConfig = toml::from_str(
+            r#"playbook_network_policy_egress = "[{\"ports\":[{\"port\":8022},{\"port\":\"8022\"}]}]""#,
+        )
+        .unwrap();
+
+        let ports = config.playbook_network_policy_egress.unwrap()[0]
+            .ports
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(ports[0].port, Some(IntOrString::Int(8022)));
+        assert_eq!(ports[1].port, Some(IntOrString::String("8022".to_string())));
+    }
+
+    #[test]
+    fn workload_settings_reject_unknown_fields() {
+        assert!(
+            toml::from_str::<OperatorConfig>(
+                r#"playbook_network_policy_egress = "[{\"too\":[]}]""#
+            )
+            .is_err()
+        );
+        assert!(
+            toml::from_str::<OperatorConfig>(
+                r#"playbook_network_policy_egress = "[{\"ports\":[{\"nope\":80}]}]""#
+            )
+            .is_err()
         );
     }
 

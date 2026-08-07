@@ -31,6 +31,12 @@ watch_namespaces = [
 # the release workflow keeps this line pinned to the current signed image.
 proxy_image = "ghcr.io/webd97/ansible-operator-sshd@sha256:bd32bc1aaf89d110a5e5098977c5b41018c9134eef57d9ec14c42ac3fb959f38"
 
+# Optional JSON-encoded NetworkPolicy egress rule arrays. Omit either setting to avoid creating an
+# egress policy for that workload. `[{}]` creates a policy while preserving unrestricted egress;
+# replace it with environment-specific rules to enforce an allowlist.
+# playbook_network_policy_egress = "[{}]"
+# managed_ssh_network_policy_egress = "[]"
+
 # How long the operator waits for a NotReady node's managed-ssh proxy pod to become Ready before it
 # gives up on that node for the run (Ansible then reports the node unreachable, and it is retried on
 # the next run). The wait applies only to a pod stuck before Running; a pod that has reached Running
