@@ -56,6 +56,7 @@ Cross-run isolation is enforced at the **certificate** layer, not merely by netw
 Proxy pods take the **minimum** that makes `nsenter`-to-host work: `hostPID: true`, a host `/proc`
 bind-mount, `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE`, and (on SELinux nodes) the `spc_t` label. They do
 **not** set `privileged: true`, `hostNetwork`, or `hostIPC`. Each is pinned to exactly one Node. The
+proxy does not mount a ServiceAccount token. The
 image they run is the node-root supply-chain surface you must own — the default is the first-party
 image published with the operator; in production pin it to a trusted digest (see
 [Deployment → the proxy image](./deployment.md#the-managed-ssh-proxy-image)).

@@ -56,7 +56,9 @@ watchNamespaces: []
 
 serviceAccount:
   create: true
-  automount: true
+  # Disable implicit token mounts on the ServiceAccount. The operator Deployment requests its API
+  # token explicitly, so this does not change the operator's runtime access.
+  automount: false
   annotations: {}
   name: ""
 

@@ -119,6 +119,13 @@ chart renders into a mounted ConfigMap. For local development you can point the 
 file directly with `run --config <path>` and set `POD_NAMESPACE` (the operator's own namespace, always
 enrolled).
 
+## ServiceAccount tokens
+
+The operator ServiceAccount disables implicit token mounting, while the operator Deployment
+explicitly requests the token it needs for Kubernetes API access. Managed-SSH proxy pods do not
+mount a ServiceAccount token. An Ansible Job receives a token only when its `PlaybookPlan` sets
+`serviceAccountName`.
+
 ## Custom Resource Definitions
 
 The chart bundles the four CRDs (`PlaybookPlan`, `ClusterInventory`, `StaticInventory`,

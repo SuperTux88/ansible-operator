@@ -448,6 +448,7 @@ fn build_pod(
         },
         spec: Some(PodSpec {
             containers: vec![container],
+            automount_service_account_token: Some(false),
             volumes: Some(vec![secret_volume, host_proc_volume]),
             restart_policy: Some("Never".into()),
             // Required: unlike the other host namespaces, PID can't be joined per-session via
