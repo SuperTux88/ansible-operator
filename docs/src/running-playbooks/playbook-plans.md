@@ -10,6 +10,7 @@ the CRD schema (`ansible-operator crds`) and the generated API reference.
 | Field | Required | Meaning |
 |---|---|---|
 | `image` | yes | An OCI image that has `ansible-playbook` and every collection your playbook uses. The Job runs this image. |
+| `securityContext` | no | Container security context applied to the playbook and collection-installer containers. |
 | `serviceAccountName` | no | ServiceAccount the run's pod uses, so tasks can reach the Kubernetes API. Unset means no API token is mounted — see [Managing Kubernetes resources](#managing-kubernetes-resources). |
 | `inventoryRefs` | yes | Which inventories to target — one entry per referenced `ClusterInventory` or `StaticInventory`. |
 | `template.playbook` | yes | The playbook text itself (see below). |
@@ -44,6 +45,24 @@ template:
 
 Baking collections into the image is faster and more reproducible than installing them on every run;
 use `requirements` for collections you cannot or do not want to pre-bake.
+
+The execution image also determines which container security settings it supports. Configure them
+on the plan so they stay coupled to that image:
+
+```yaml
+spec:
+  image: docker.io/serversideup/ansible-core:2.18
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+    seccompProfile:
+      type: RuntimeDefault
+```
+
+The context is applied to both the `ansible-playbook` container and the optional
+`download-collections` init container. Changing the security context affects future Jobs but does
+not itself cause hosts that already succeeded to run again.
 
 ## The playbook
 

@@ -134,6 +134,10 @@ as privilege escalation. The proxy receives only the capabilities and SELinux ty
 node access. Admission policies should scope any required exception to pods labelled
 `ansible.cloudbending.dev/component=managed-ssh-proxy` instead of excluding the whole namespace.
 
+Generated Ansible Jobs use the optional `securityContext` from their `PlaybookPlan`. Keeping this
+next to the plan's image allows each execution image to declare compatible settings while admission
+policies enforce the cluster's required baseline.
+
 ## Custom Resource Definitions
 
 The chart bundles the four CRDs (`PlaybookPlan`, `ClusterInventory`, `StaticInventory`,

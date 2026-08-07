@@ -229,6 +229,7 @@ fn create_job_skeleton(
                 "-r".into(),
                 "requirements.yml".into(),
             ]),
+            security_context: plan.spec.security_context.as_ref().map(Into::into),
             ..Default::default()
         };
 
@@ -246,6 +247,7 @@ fn create_job_skeleton(
         // explicitly so the dependency is legible and can't be silently mutated away.
         termination_message_path: Some("/dev/termination-log".into()),
         termination_message_policy: Some("File".into()),
+        security_context: plan.spec.security_context.as_ref().map(Into::into),
         ..Default::default()
     };
 
@@ -916,5 +918,44 @@ spec:
 
         assert_eq!(pod_spec.service_account_name, Some("playbook-sa".into()));
         assert_eq!(pod_spec.automount_service_account_token, Some(true));
+    }
+
+    #[test]
+    fn plan_security_context_is_applied_to_both_job_containers() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+        use crate::v1beta1::PlaybookSecurityContext;
+
+        let mut pp = minimal_plan();
+        pp.spec.template.requirements = Some("collections: []".into());
+        pp.spec.security_context = Some(PlaybookSecurityContext {
+            allow_privilege_escalation: Some(false),
+            ..Default::default()
+        });
+        let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
+
+        let pod_spec = super::create_job_for_run(&hash, 1, &[], &pp)
+            .unwrap()
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+
+        assert_eq!(
+            pod_spec.containers[0]
+                .security_context
+                .as_ref()
+                .unwrap()
+                .allow_privilege_escalation,
+            Some(false)
+        );
+        assert_eq!(
+            pod_spec.init_containers.unwrap()[0]
+                .security_context
+                .as_ref()
+                .unwrap()
+                .allow_privilege_escalation,
+            Some(false)
+        );
     }
 }
