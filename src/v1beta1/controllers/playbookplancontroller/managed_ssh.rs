@@ -243,6 +243,10 @@ fn run_labels(execution_hash: &ExecutionHash, host: &str) -> BTreeMap<String, St
             execution_hash.to_string(),
         ),
         (labels::PLAYBOOKPLAN_HOST.to_string(), host.to_string()),
+        (
+            labels::COMPONENT.to_string(),
+            labels::MANAGED_SSH_PROXY_COMPONENT.to_string(),
+        ),
     ])
 }
 

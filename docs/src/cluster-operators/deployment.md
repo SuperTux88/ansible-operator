@@ -126,6 +126,14 @@ explicitly requests the token it needs for Kubernetes API access. Managed-SSH pr
 mount a ServiceAccount token. An Ansible Job receives a token only when its `PlaybookPlan` sets
 `serviceAccountName`.
 
+## Workload security contexts
+
+The chart sets `allowPrivilegeEscalation: false` on the operator container. Managed-SSH proxy
+containers cannot use that setting because Kubernetes treats their required `SYS_ADMIN` capability
+as privilege escalation. The proxy receives only the capabilities and SELinux type required for
+node access. Admission policies should scope any required exception to pods labelled
+`ansible.cloudbending.dev/component=managed-ssh-proxy` instead of excluding the whole namespace.
+
 ## Custom Resource Definitions
 
 The chart bundles the four CRDs (`PlaybookPlan`, `ClusterInventory`, `StaticInventory`,
