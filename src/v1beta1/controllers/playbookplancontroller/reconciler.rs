@@ -4,6 +4,7 @@ use k8s_openapi::api::{
     batch::v1::Job,
     coordination::v1::Lease,
     core::v1::{Pod, Secret},
+    networking::v1::NetworkPolicyEgressRule,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::{
@@ -48,6 +49,11 @@ use crate::{
 /// does not set `spec.startingDeadlineSeconds`. See that field's docs.
 const DEFAULT_STARTING_DEADLINE_SECONDS: u32 = 30;
 
+pub struct WorkloadEgressPolicies {
+    pub playbook: Option<Vec<NetworkPolicyEgressRule>>,
+    pub managed_ssh: Option<Vec<NetworkPolicyEgressRule>>,
+}
+
 struct ReconciliationContext {
     client: kube::Client,
     /// Namespace the operator itself runs in — where per-run Leases and managed-ssh proxy pods
@@ -75,6 +81,7 @@ struct ReconciliationContext {
     /// How long to wait for a `NotReady` node's proxy pod to become Ready before treating the node as
     /// unreachable, scaled by the node's heartbeat age. From the chart's `managedSsh.readiness`.
     proxy_grace: managed_ssh::ProxyGracePolicy,
+    workload_egress_policies: WorkloadEgressPolicies,
 }
 
 /// Per-tick identifiers shared by `try_start_run` and `advance_applying_run`: the resource's
@@ -100,6 +107,7 @@ pub fn new(
     ca: Arc<CertificateAuthority>,
     proxy_image: String,
     proxy_grace: managed_ssh::ProxyGracePolicy,
+    workload_egress_policies: WorkloadEgressPolicies,
 ) -> impl Stream<
     Item = Result<
         (ObjectRef<v1beta1::PlaybookPlan>, Action),
@@ -168,6 +176,7 @@ pub fn new(
         node_access_policies: Arc::clone(&node_access_policy_reflector_reader),
         proxy_image,
         proxy_grace,
+        workload_egress_policies,
     });
 
     let mut controller = Controller::new(playbookplans_api, watcher::Config::default()).watches(
@@ -485,6 +494,7 @@ async fn try_start_run(
         &context.proxy_grace,
         &context.ca,
         &context.proxy_image,
+        context.workload_egress_policies.managed_ssh.clone(),
         &plan_owner,
     )
     .await?;
@@ -547,6 +557,18 @@ async fn try_start_run(
         )
         .await?;
         resource_status.last_rendered_generation = object.metadata.generation;
+    }
+
+    if let Some(network_policy_egress) = context.workload_egress_policies.playbook.clone() {
+        job_builder::ensure_job_network_policy(
+            context.client.clone(),
+            &context.operator_namespace,
+            &run.execution_hash,
+            run_groups,
+            object,
+            network_policy_egress,
+        )
+        .await?;
     }
 
     spawn_ansible_job(
@@ -680,6 +702,7 @@ async fn advance_applying_run(
         &context.operator_namespace,
         run.namespace,
         &run.execution_hash,
+        run.name,
     )
     .await?;
     locking::release_locks(&leases_api, run.hosts_to_trigger, run.holder_identity).await?;

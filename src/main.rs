@@ -135,6 +135,10 @@ async fn run(args: RunArgs) {
         ca,
         proxy_image,
         proxy_grace,
+        v1beta1::playbookplancontroller::reconciler::WorkloadEgressPolicies {
+            playbook: operator_config.playbook_network_policy_egress,
+            managed_ssh: operator_config.managed_ssh_network_policy_egress,
+        },
     )
     .for_each(|res| async move {
         match res {

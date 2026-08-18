@@ -4,8 +4,9 @@ Namespaced permissions, rendered once per ENROLLED namespace = the operator's ow
 enforcement boundary: the operator can read/write Secrets and create Jobs ONLY in these namespaces.
 
 Every enrolled namespace gets the "plan-serving" rules (Secret/Job/Pod access for a run). The
-operator's OWN namespace additionally gets the managed-ssh infra rules (Leases, proxy pods,
-NetworkPolicies, and cleanup of per-run cert Secrets) — those resources only ever exist there.
+operator's OWN namespace additionally gets the managed-ssh infra rules (Leases, proxy pods, proxy
+NetworkPolicies, and cleanup of per-run cert Secrets) — those resources only ever exist there. Per-run
+playbook NetworkPolicies are created in the plan namespace when enabled.
 */ -}}
 {{- $namespaces := concat (.Values.watchNamespaces | default list) (list .Release.Namespace) | uniq }}
 {{- range $ns := $namespaces }}
@@ -43,19 +44,32 @@ rules:
   - apiGroups: ["ansible.cloudbending.dev"]
     resources: ["plays/status"]
     verbs: ["get", "update", "patch"]
+  # `delete` remains available even when optional egress policies are disabled so policies from a
+  # previous enabled configuration can still be cleaned up safely.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs:
+      - delete
+      {{- if or $.Values.networkPolicy.enabled (eq $ns $.Release.Namespace) }}
+      - create
+      - patch
+      {{- end }}
+      {{- if eq $ns $.Release.Namespace }}
+      - list
+      - watch
+      - deletecollection
+      {{- end }}
   {{- if eq $ns $.Release.Namespace }}
   # Operator-namespace-only infra. Leases, managed-ssh proxy pods, their NetworkPolicies, and
   # cleanup (delete/deletecollection) of per-run cert Secrets only ever exist in the operator's own
-  # namespace, so these are NOT granted in tenant namespaces.
+  # namespace, so these are NOT granted in tenant namespaces. Playbook NetworkPolicies use the
+  # plan-namespace rule above.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["create", "delete", "deletecollection"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["networkpolicies"]
-    verbs: ["get", "list", "watch", "create", "delete", "deletecollection"]
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["delete", "deletecollection"]

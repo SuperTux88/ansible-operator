@@ -56,7 +56,9 @@ watchNamespaces: []
 
 serviceAccount:
   create: true
-  automount: true
+  # Disable implicit token mounts on the ServiceAccount. The operator Deployment requests its API
+  # token explicitly, so this does not change the operator's runtime access.
+  automount: false
   annotations: {}
   name: ""
 
@@ -65,9 +67,31 @@ podLabels: {}
 
 podSecurityContext: {}
 
-securityContext: {}
+securityContext:
   # The operator's own pod needs no special privilege — it never touches node filesystems
   # itself, only the ephemeral managed-ssh proxy pods it creates do.
+  allowPrivilegeEscalation: false
+
+# Optional egress NetworkPolicies. Rules use the native networking.k8s.io/v1 NetworkPolicy egress
+# schema. Disabled by default so an upgrade never broadens or changes existing network controls.
+#
+# CAUTION: these are raw NetworkPolicy egress rule arrays, so empty-vs-unrestricted follows
+# NetworkPolicy semantics, not Helm's:
+#   - `[{}]` (the operator and playbook defaults below) — policy present, egress unrestricted. Safe
+#     to enable as-is; it changes nothing about connectivity and gives you an object to add rules to.
+#   - `[]`   — policy present with NO rules, which in NetworkPolicy semantics is DENY ALL egress.
+#     This is the managed-ssh default because the proxy only needs inbound SSH; for the operator it
+#     would block the API server and DNS, and for playbook Jobs it would block their targets. Set it
+#     deliberately for those workloads.
+# Replace the defaults with an explicit allowlist to actually restrict egress.
+networkPolicy:
+  enabled: false
+  operator:
+    egress: [{}]
+  playbook:
+    egress: [{}]
+  managedSsh:
+    egress: []
 
 resources: {}
   # We usually recommend not to specify default resources and to leave this as a conscious
