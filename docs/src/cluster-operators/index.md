@@ -10,6 +10,8 @@ node access.
 
 - **Install** the Helm chart into a dedicated, `privileged`-labelled namespace, and pin the
   managed-SSH proxy image. → [Deployment](./deployment.md)
+- **Configure your admission policies** for the exceptions the operator needs, and only those. →
+  [Admission policies](./admission-policies.md)
 - **Enroll** the tenant namespaces that are allowed to run playbooks (fail-closed: a plan in an
   un-enrolled namespace is refused). → [Deployment → enrolled namespaces](./deployment.md#enrolled-namespaces)
 - **Grant node access** with `NodeAccessPolicy` resources (fail-closed: no policy means a namespace
@@ -27,5 +29,6 @@ documentation bug.
 ## In this chapter
 
 - [Deployment](./deployment.md) — install, namespaces, Pod Security Admission, SELinux, the proxy image, config
+- [Admission policies](./admission-policies.md) — the policy exceptions to grant, and the ones not to grant
 - [Security model](./security.md) — node-root, the ephemeral CA, per-run isolation, and the blast radius you accept
 - [Node access policies](./node-access-policies.md) — capping which Nodes a namespace may reach
