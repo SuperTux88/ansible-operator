@@ -100,11 +100,19 @@ More examples live under [`examples/v1beta1/`](examples/v1beta1/).
 
 ## Installation
 
-The operator ships as a Helm chart under [`chart/`](chart/). It must be installed into its own
-dedicated namespace, which also needs the `privileged` Pod Security Admission label because the
-managed-SSH proxy pods use `hostPID` and elevated capabilities. See
-[`chart/README.md`](chart/README.md) for install instructions, the Pod Security Admission and
-SELinux notes, and how to regenerate the bundled CRDs.
+The operator ships as a Helm chart under [`chart/`](chart/) and release charts are published to
+GHCR:
+
+```sh
+helm install --create-namespace -n ansible-system ansible-operator \
+  oci://ghcr.io/webd97/charts/ansible-operator \
+  --version <version>
+```
+
+It must be installed into its own dedicated namespace, which also needs the `privileged` Pod
+Security Admission label because the managed-SSH proxy pods use `hostPID` and elevated
+capabilities. See [`chart/README.md`](chart/README.md) for install instructions, the Pod Security
+Admission and SELinux notes, and how to regenerate the bundled CRDs.
 
 ## Example use cases
 

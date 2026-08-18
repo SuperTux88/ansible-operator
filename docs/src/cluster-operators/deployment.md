@@ -9,8 +9,12 @@ namespace enrollment and node access — you have to open deliberately.
 Install into its **own dedicated namespace**:
 
 ```sh
-helm install --create-namespace -n ansible-system ansible-operator ./chart
+helm install --create-namespace -n ansible-system ansible-operator \
+  oci://ghcr.io/webd97/charts/ansible-operator \
+  --version <version>
 ```
+
+For development from a checkout, replace the OCI URL and version with `./chart`.
 
 Do **not** create `PlaybookPlan`s or inventories in the operator's own namespace — those belong in
 tenant namespaces. The operator namespace is where its runtime machinery lives: per-run Leases and

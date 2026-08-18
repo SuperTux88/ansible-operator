@@ -246,7 +246,7 @@ eyeball new cross-page links (or run the `mdbook-linkcheck` backend if installed
 - The chart renders `managedSsh.proxyImage` and `watchNamespaces` into the operator ConfigMap;
   `helm template ./chart -s templates/configmap.yaml` (and `templates/role.yaml`) is the quick
   way to sanity-check chart wiring.
-- CI (`.github/workflows/container.yml`): `cargo test` + `cargo build --release`, then a
+- CI (`.github/workflows/build-test-push.yml`): `cargo test` + `cargo build --release`, then a
   Containerfile distroless image (binary copied in, no cargo build inside the image).
 - `.agents/skills/` is a vendored skill pack (rust-skills), unrelated to this project's domain —
   not something to modify as part of feature work.

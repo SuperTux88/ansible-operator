@@ -2,6 +2,16 @@
 
 ## Install
 
+Install a released chart from GHCR:
+
+```sh
+helm install --create-namespace -n ansible-system ansible-operator \
+  oci://ghcr.io/webd97/charts/ansible-operator \
+  --version <version>
+```
+
+For development from a checkout:
+
 ```sh
 helm install --create-namespace -n ansible-system ansible-operator ./chart
 ```
