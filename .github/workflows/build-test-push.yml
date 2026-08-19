@@ -20,6 +20,20 @@ permissions:
   contents: read
 
 jobs:
+  chart:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: Validate Helm chart
+        run: |
+          helm lint --strict chart
+          helm template ansible-operator chart --namespace ansible-system > /dev/null
+
   # Sole validation for ordinary commits (PRs, main pushes): compiles the crate once, in
   # the test profile, and runs the tests.
   test:
@@ -41,7 +55,7 @@ jobs:
   # binary's glibc matches the distroless/cc-debian12 runtime it is COPY'd into.
   compile:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    needs: [test]
+    needs: [test, chart]
     runs-on: ubuntu-latest
 
     container:
@@ -120,6 +134,10 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=ref,event=branch
+            type=ref,event=pr
 
       # Build and push Docker image with Buildx
       # https://github.com/docker/build-push-action
@@ -146,4 +164,63 @@ jobs:
           DIGEST: ${{ steps.build-and-push.outputs.digest }}
         # This step uses the identity token to provision an ephemeral certificate
         # against the sigstore community Fulcio instance.
-        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+        run: echo "${TAGS}" | xargs -I {} cosign sign --yes "{}@${DIGEST}"
+
+  # Publish the chart only after the matching operator image is available. Helm uses
+  # appVersion as the default image tag, so publishing them independently would create
+  # chart versions that cannot be installed with their defaults.
+  publish-chart:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, chart]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: Verify release version
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          release_version="${RELEASE_VERSION#v}"
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f 2)"
+          chart_version="$(grep -m1 '^version:' chart/Chart.yaml | cut -d ' ' -f 2)"
+          chart_app_version="$(grep -m1 '^appVersion:' chart/Chart.yaml | cut -d ' ' -f 2 | tr -d '"')"
+
+          if [[ "$cargo_version" != "$release_version" || \
+                "$chart_version" != "$release_version" || \
+                "$chart_app_version" != "$release_version" ]]; then
+            echo "Release tag, Cargo package and Helm chart versions must match" >&2
+            echo "tag=$release_version cargo=$cargo_version chart=$chart_version appVersion=$chart_app_version" >&2
+            exit 1
+          fi
+
+      - name: Log into GHCR for Helm
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | helm registry login ghcr.io \
+            --username "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Package and publish Helm chart
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          release_version="${RELEASE_VERSION#v}"
+          repository_owner="${REPOSITORY_OWNER,,}"
+
+          mkdir -p dist
+          helm package chart \
+            --version "$release_version" \
+            --app-version "$release_version" \
+            --destination dist
+          helm push "dist/ansible-operator-${release_version}.tgz" \
+            "oci://ghcr.io/${repository_owner}/charts"
