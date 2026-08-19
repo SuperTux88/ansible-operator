@@ -136,7 +136,8 @@ The chart sets `allowPrivilegeEscalation: false` on the operator container. Mana
 containers cannot use that setting because Kubernetes treats their required `SYS_ADMIN` capability
 as privilege escalation. The proxy receives only the capabilities and SELinux type required for
 node access. Admission policies should scope any required exception to pods labelled
-`ansible.cloudbending.dev/component=managed-ssh-proxy` instead of excluding the whole namespace.
+`ansible.cloudbending.dev/component=managed-ssh-proxy` instead of excluding the whole namespace. The
+full list of exceptions to configure is [Admission policies](./admission-policies.md).
 
 Generated Ansible Jobs use the optional `securityContext` from their `PlaybookPlan`. Keeping this
 next to the plan's image allows each execution image to declare compatible settings while admission
