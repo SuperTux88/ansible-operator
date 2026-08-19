@@ -123,6 +123,60 @@ chart renders into a mounted ConfigMap. For local development you can point the 
 file directly with `run --config <path>` and set `POD_NAMESPACE` (the operator's own namespace, always
 enrolled).
 
+## ServiceAccount tokens
+
+The operator ServiceAccount disables implicit token mounting, while the operator Deployment
+explicitly requests the token it needs for Kubernetes API access. Managed-SSH proxy pods do not
+mount a ServiceAccount token. An Ansible Job receives a token only when its `PlaybookPlan` sets
+`serviceAccountName`.
+
+## Workload security contexts
+
+The chart sets `allowPrivilegeEscalation: false` on the operator container. Managed-SSH proxy
+containers cannot use that setting because Kubernetes treats their required `SYS_ADMIN` capability
+as privilege escalation. The proxy receives only the capabilities and SELinux type required for
+node access. Admission policies should scope any required exception to pods labelled
+`ansible.cloudbending.dev/component=managed-ssh-proxy` instead of excluding the whole namespace. The
+full list of exceptions to configure is [Admission policies](./admission-policies.md).
+
+Generated Ansible Jobs use the optional `securityContext` from their `PlaybookPlan`. Keeping this
+next to the plan's image allows each execution image to declare compatible settings while admission
+policies enforce the cluster's required baseline.
+
+## Network policies
+
+The per-run managed-SSH ingress policy is created when a run uses managed SSH. Optional egress
+NetworkPolicies can be enabled for the operator Deployment, Ansible Jobs, and managed-SSH proxy pods.
+They are disabled by default so an upgrade never changes or broadens existing network controls.
+
+These values are raw NetworkPolicy egress rule arrays, so they follow NetworkPolicy semantics rather
+than Helm's: `[{}]` — the shipped operator and playbook default — means "policy present, egress
+unrestricted", while `[]` means a policy with no rules at all, which **denies all egress**. The
+managed-SSH default is `[]` because the proxy only needs inbound SSH. Do not use `[]` for the operator
+or playbook unless deliberately blocking the API server, DNS, and their other outbound connections.
+Configure the rule arrays before enabling them:
+
+```yaml
+networkPolicy:
+  enabled: true
+  operator:
+    egress:
+      - to:
+          - ipBlock:
+              cidr: 10.0.0.1/32
+        ports:
+          - protocol: TCP
+            port: 6443
+  playbook:
+    egress: [{}] # Narrow this to DNS, package sources, direct SSH and other destinations used by playbooks.
+  managedSsh:
+    egress: [] # The proxy only needs inbound SSH; commands run after nsenter use the node network namespace.
+```
+
+When managed SSH is used, the operator adds the narrow Ansible-Job-to-proxy TCP/22 rule to the
+playbook egress policy. API server and DNS addresses vary across clusters and CNIs, so the chart
+cannot derive portable restrictive defaults.
+
 ## Custom Resource Definitions
 
 The chart bundles the four CRDs (`PlaybookPlan`, `ClusterInventory`, `StaticInventory`,

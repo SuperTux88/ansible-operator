@@ -52,6 +52,11 @@ pub struct PlaybookPlanSpec {
     /// An OCI image with Ansible and all required collections
     pub image: String,
 
+    /// Container security context applied to both the Ansible playbook container and the optional
+    /// collection-installer init container. Optional for compatibility with arbitrary execution
+    /// images; cluster admission policies may require particular fields.
+    pub security_context: Option<PlaybookSecurityContext>,
+
     /// ServiceAccount the playbook pod runs as, letting tasks reach the Kubernetes API with that
     /// identity's RBAC. When set, the SA's token is auto-mounted (Ansible's `kubernetes.core`
     /// modules pick it up via in-cluster config). When unset, the pod runs with no API token at
@@ -121,6 +126,106 @@ pub struct InventoryRef {
     pub cluster_inventory: Option<String>,
     /// Name of the StaticInventory resource being referenced
     pub static_inventory: Option<String>,
+}
+
+/// Kubernetes container security settings for the playbook execution image.
+#[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybookSecurityContext {
+    pub allow_privilege_escalation: Option<bool>,
+    pub app_armor_profile: Option<SecurityProfile>,
+    pub capabilities: Option<ContainerCapabilities>,
+    pub privileged: Option<bool>,
+    pub proc_mount: Option<String>,
+    pub read_only_root_filesystem: Option<bool>,
+    pub run_as_group: Option<i64>,
+    pub run_as_non_root: Option<bool>,
+    pub run_as_user: Option<i64>,
+    pub se_linux_options: Option<ContainerSeLinuxOptions>,
+    pub seccomp_profile: Option<SecurityProfile>,
+    pub windows_options: Option<ContainerWindowsOptions>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerCapabilities {
+    pub add: Option<Vec<String>>,
+    pub drop: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityProfile {
+    pub localhost_profile: Option<String>,
+    #[serde(rename = "type")]
+    pub type_: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerSeLinuxOptions {
+    pub level: Option<String>,
+    pub role: Option<String>,
+    #[serde(rename = "type")]
+    pub type_: Option<String>,
+    pub user: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerWindowsOptions {
+    pub gmsa_credential_spec: Option<String>,
+    pub gmsa_credential_spec_name: Option<String>,
+    pub host_process: Option<bool>,
+    pub run_as_user_name: Option<String>,
+}
+
+impl From<&PlaybookSecurityContext> for k8s_openapi::api::core::v1::SecurityContext {
+    fn from(value: &PlaybookSecurityContext) -> Self {
+        Self {
+            allow_privilege_escalation: value.allow_privilege_escalation,
+            app_armor_profile: value.app_armor_profile.as_ref().map(|profile| {
+                k8s_openapi::api::core::v1::AppArmorProfile {
+                    localhost_profile: profile.localhost_profile.clone(),
+                    type_: profile.type_.clone(),
+                }
+            }),
+            capabilities: value.capabilities.as_ref().map(|capabilities| {
+                k8s_openapi::api::core::v1::Capabilities {
+                    add: capabilities.add.clone(),
+                    drop: capabilities.drop.clone(),
+                }
+            }),
+            privileged: value.privileged,
+            proc_mount: value.proc_mount.clone(),
+            read_only_root_filesystem: value.read_only_root_filesystem,
+            run_as_group: value.run_as_group,
+            run_as_non_root: value.run_as_non_root,
+            run_as_user: value.run_as_user,
+            se_linux_options: value.se_linux_options.as_ref().map(|options| {
+                k8s_openapi::api::core::v1::SELinuxOptions {
+                    level: options.level.clone(),
+                    role: options.role.clone(),
+                    type_: options.type_.clone(),
+                    user: options.user.clone(),
+                }
+            }),
+            seccomp_profile: value.seccomp_profile.as_ref().map(|profile| {
+                k8s_openapi::api::core::v1::SeccompProfile {
+                    localhost_profile: profile.localhost_profile.clone(),
+                    type_: profile.type_.clone(),
+                }
+            }),
+            windows_options: value.windows_options.as_ref().map(|options| {
+                k8s_openapi::api::core::v1::WindowsSecurityContextOptions {
+                    gmsa_credential_spec: options.gmsa_credential_spec.clone(),
+                    gmsa_credential_spec_name: options.gmsa_credential_spec_name.clone(),
+                    host_process: options.host_process,
+                    run_as_user_name: options.run_as_user_name.clone(),
+                }
+            }),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -314,6 +419,7 @@ mod tests {
             "blubb",
             PlaybookPlanSpec {
                 image: "registry.tld/ansible:1.0.0".to_string(),
+                security_context: None,
                 service_account_name: None,
                 verbosity: None,
                 mode: ExecutionMode::Recurring,

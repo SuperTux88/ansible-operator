@@ -88,6 +88,105 @@ spec:
                 description: 5-part cron expression that tells at which time the playbook may execute
                 nullable: true
                 type: string
+              securityContext:
+                description: |-
+                  Container security context applied to both the Ansible playbook container and the optional
+                  collection-installer init container. Optional for compatibility with arbitrary execution
+                  images; cluster admission policies may require particular fields.
+                nullable: true
+                properties:
+                  allowPrivilegeEscalation:
+                    nullable: true
+                    type: boolean
+                  appArmorProfile:
+                    nullable: true
+                    properties:
+                      localhostProfile:
+                        nullable: true
+                        type: string
+                      type:
+                        type: string
+                    required:
+                    - type
+                    type: object
+                  capabilities:
+                    nullable: true
+                    properties:
+                      add:
+                        items:
+                          type: string
+                        nullable: true
+                        type: array
+                      drop:
+                        items:
+                          type: string
+                        nullable: true
+                        type: array
+                    type: object
+                  privileged:
+                    nullable: true
+                    type: boolean
+                  procMount:
+                    nullable: true
+                    type: string
+                  readOnlyRootFilesystem:
+                    nullable: true
+                    type: boolean
+                  runAsGroup:
+                    format: int64
+                    nullable: true
+                    type: integer
+                  runAsNonRoot:
+                    nullable: true
+                    type: boolean
+                  runAsUser:
+                    format: int64
+                    nullable: true
+                    type: integer
+                  seLinuxOptions:
+                    nullable: true
+                    properties:
+                      level:
+                        nullable: true
+                        type: string
+                      role:
+                        nullable: true
+                        type: string
+                      type:
+                        nullable: true
+                        type: string
+                      user:
+                        nullable: true
+                        type: string
+                    type: object
+                  seccompProfile:
+                    nullable: true
+                    properties:
+                      localhostProfile:
+                        nullable: true
+                        type: string
+                      type:
+                        type: string
+                    required:
+                    - type
+                    type: object
+                  windowsOptions:
+                    nullable: true
+                    properties:
+                      gmsaCredentialSpec:
+                        nullable: true
+                        type: string
+                      gmsaCredentialSpecName:
+                        nullable: true
+                        type: string
+                      hostProcess:
+                        nullable: true
+                        type: boolean
+                      runAsUserName:
+                        nullable: true
+                        type: string
+                    type: object
+                type: object
               serviceAccountName:
                 description: |-
                   ServiceAccount the playbook pod runs as, letting tasks reach the Kubernetes API with that

@@ -16,5 +16,6 @@
 
 - [Overview](./cluster-operators/index.md)
 - [Deployment](./cluster-operators/deployment.md)
+- [Admission policies](./cluster-operators/admission-policies.md)
 - [Security model](./cluster-operators/security.md)
 - [Node access policies](./cluster-operators/node-access-policies.md)

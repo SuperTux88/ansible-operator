@@ -18,6 +18,10 @@ data:
       {{ . | quote }},
     {{- end }}
     ]
+    {{- if .Values.networkPolicy.enabled }}
+    playbook_network_policy_egress = {{ .Values.networkPolicy.playbook.egress | toJson | quote }}
+    managed_ssh_network_policy_egress = {{ .Values.networkPolicy.managedSsh.egress | toJson | quote }}
+    {{- end }}
     {{- with .Values.managedSsh }}{{ with .proxyImage }}{{ if .repository }}
     # Image for the node-root managed-ssh proxy pods (THREAT_MODEL T-ESC-5). The sshd image is released
     # on its own `sshd-v*` cadence, so pin it explicitly: a `tag`, or a `@sha256:` digest in

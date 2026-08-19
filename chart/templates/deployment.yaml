@@ -30,6 +30,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "chart.serviceAccountName" . }}
+      # The ServiceAccount disables implicit mounts; the operator itself explicitly needs a token
+      # for its Kubernetes API watches and reconciliation calls.
+      automountServiceAccountToken: true
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}

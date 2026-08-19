@@ -20,6 +20,12 @@ The operator must be installed into its own dedicated namespace — see the comm
 `serviceAccount` in `values.yaml` for why. Don't create PlaybookPlans/ClusterInventories/
 StaticInventories in that same namespace; those belong in your own tenant namespaces.
 
+Optional egress NetworkPolicies are configurable through `networkPolicy` in `values.yaml`. Operator
+and playbook policies default to `[{}]` ("policy present, egress unrestricted"); the managed-SSH
+proxy policy defaults to an empty array (`[]`), NetworkPolicy's deny-all-egress, because the proxy
+only needs inbound SSH. Do not use `[]` for the operator or playbook unless deliberately blocking
+their outbound connections.
+
 ### Pod Security Admission
 
 Managed-ssh proxy pods (created dynamically by the operator at runtime, not by this chart) run

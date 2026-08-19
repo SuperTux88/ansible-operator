@@ -314,8 +314,9 @@ StaticInventory targets arbitrary hostnames/IPs with a BYO SSH key and is explic
 - *Residual:* a tenant can point a StaticInventory at a node's real sshd IP with a key
   they possess — but that is ordinary SSH the tenant could do anyway; it does **not** grant
   the node-root proxy primitive. Still, it is an unclamped egress/lateral-movement channel
-  (playbook connects to arbitrary in-cluster or external IPs from the Job pod). NetworkPolicy
-  on Job pods is not applied by this operator.
+  (playbook connects to arbitrary in-cluster or external IPs from the Job pod). The operator can
+  optionally apply an egress NetworkPolicy to Job pods, but it is disabled by default and does not
+  inherently restrict StaticInventory targets.
 - *Severity:* Medium (egress/SSRF-style), by design outside NAP.
 
 **T-ESC-3 — Node/Namespace label forgery to widen the ceiling.**
