@@ -5,10 +5,8 @@ metadata:
 spec:
   group: ansible.cloudbending.dev
   names:
-    categories: []
     kind: ClusterInventory
     plural: clusterinventories
-    shortNames: []
     singular: clusterinventory
   scope: Namespaced
   versions:

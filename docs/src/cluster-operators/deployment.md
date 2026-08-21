@@ -179,16 +179,20 @@ cannot derive portable restrictive defaults.
 
 ## Custom Resource Definitions
 
-The chart bundles the four CRDs (`PlaybookPlan`, `ClusterInventory`, `StaticInventory`,
-`NodeAccessPolicy`) under `crds/`. Following Helm's convention, `crds/` is install-only and is
-**not** upgraded by `helm upgrade`; when the CRDs change between versions, apply them manually:
+The chart bundles the five CRDs (`PlaybookPlan`, `Play`, `ClusterInventory`, `StaticInventory`,
+`NodeAccessPolicy`) in a built-in `crds` subchart. `crds.install` defaults to `true` because the
+operator requires these definitions. They are normal Helm templates, so Helm upgrades reconcile
+CRD changes together with the operator chart:
 
-```sh
-kubectl apply -f chart/crds/
+```yaml
+crds:
+  install: true
 ```
 
-The bundled manifests are a static snapshot generated from the binary itself
-(`ansible-operator crds`); the regeneration procedure lives in `chart/README.md`.
+Set `crds.install: false` only when another release owns the same cluster-scoped CRDs. The
+manifests are generated from the operator binary itself (`ansible-operator crds`) and stored under
+the subchart's `templates/` directory.
+The regeneration procedure lives in `chart/README.md`.
 
 ## Grant node access
 

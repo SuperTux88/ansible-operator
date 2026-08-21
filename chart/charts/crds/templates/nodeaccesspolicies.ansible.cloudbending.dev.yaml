@@ -5,10 +5,8 @@ metadata:
 spec:
   group: ansible.cloudbending.dev
   names:
-    categories: []
     kind: NodeAccessPolicy
     plural: nodeaccesspolicies
-    shortNames: []
     singular: nodeaccesspolicy
   scope: Cluster
   versions:

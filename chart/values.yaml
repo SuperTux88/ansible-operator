@@ -1,5 +1,8 @@
 # Default values for the ansible-operator chart.
 
+crds:
+  install: true
+
 replicaCount: 1
 
 image:

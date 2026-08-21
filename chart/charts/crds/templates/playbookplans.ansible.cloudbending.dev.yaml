@@ -5,10 +5,8 @@ metadata:
 spec:
   group: ansible.cloudbending.dev
   names:
-    categories: []
     kind: PlaybookPlan
     plural: playbookplans
-    shortNames: []
     singular: playbookplan
   scope: Namespaced
   versions:

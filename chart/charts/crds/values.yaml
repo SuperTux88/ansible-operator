@@ -1,0 +1,1 @@
+# CRDs are required by the operator and are enabled by the parent chart by default.

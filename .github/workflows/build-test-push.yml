@@ -33,6 +33,16 @@ jobs:
         run: |
           helm lint --strict chart
           helm template ansible-operator chart --namespace ansible-system > /dev/null
+          parent_version="$(grep -m1 '^version:' chart/Chart.yaml | awk '{print $2}')"
+          dependency_version="$(grep -m1 '^    version:' chart/Chart.yaml | awk '{print $2}')"
+          crds_version="$(grep -m1 '^version:' chart/charts/crds/Chart.yaml | awk '{print $2}')"
+          test "$parent_version" = "$dependency_version"
+          test "$parent_version" = "$crds_version"
+
+      - name: Verify CRD installation toggle
+        run: |
+          test "$(helm template ansible-operator chart --namespace ansible-system | grep -c '^kind: CustomResourceDefinition$')" -eq 5
+          test "$(helm template ansible-operator chart --namespace ansible-system --set crds.install=false | grep -c '^kind: CustomResourceDefinition$')" -eq 0
 
   # Sole validation for ordinary commits (PRs, main pushes): compiles the crate once, in
   # the test profile, and runs the tests.

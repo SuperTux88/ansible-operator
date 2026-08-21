@@ -5,10 +5,8 @@ metadata:
 spec:
   group: ansible.cloudbending.dev
   names:
-    categories: []
     kind: Play
     plural: plays
-    shortNames: []
     singular: play
   scope: Namespaced
   versions:

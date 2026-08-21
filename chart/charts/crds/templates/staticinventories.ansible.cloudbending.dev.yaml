@@ -5,15 +5,12 @@ metadata:
 spec:
   group: ansible.cloudbending.dev
   names:
-    categories: []
     kind: StaticInventory
     plural: staticinventories
-    shortNames: []
     singular: staticinventory
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
-    name: v1beta1
+  - name: v1beta1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for StaticInventorySpec via `CustomResource`
