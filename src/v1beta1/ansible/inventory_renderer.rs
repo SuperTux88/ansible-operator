@@ -23,6 +23,7 @@ pub const RESERVED_HOST_VARS: &[&str] = &[
     "ansible_ssh_private_key_file",
     "ansible_ssh_common_args",
     "ansible_ssh_use_tty",
+    "ansible_connection",
 ];
 
 /// Returns the first [`RESERVED_HOST_VARS`] key present in an author's group `variables`, if any.
@@ -131,6 +132,10 @@ fn render_managed_ssh_host_vars(hostname: &str, ctx: &RenderContext) -> Mapping 
     vars.insert(
         Value::String("ansible_ssh_private_key_file".into()),
         Value::String(ctx.managed_ssh_client_key_path.to_string()),
+    );
+    vars.insert(
+        Value::String("ansible_connection".into()),
+        Value::String("ssh".into()),
     );
     // ansible_host is the proxy pod's IP, but the host cert's principal (and the wildcard
     // @cert-authority known_hosts line) is the node's name — without HostKeyAlias, the SSH
@@ -417,6 +422,7 @@ mod tests {
 
         let rendered = render_inventory(&[group], &ctx).unwrap();
 
+        assert!(rendered.contains("ansible_connection: ssh"));
         assert!(rendered.contains("ansible_ssh_use_tty: false"));
         assert!(rendered.contains("-o RequestTTY=no"));
     }
