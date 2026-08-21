@@ -63,3 +63,33 @@ generate-crds:
         sed -i "/^metadata:$/r $tmp_dir/annotation" "$file"
         cp "$file" "chart/charts/crds/templates/${name}.yaml"
     done
+
+# Set the release version in Cargo and both chart metadata files, commit it and tag it.
+# Nothing is pushed — review, then `git push --follow-tags`.
+# The tag is what the release workflow builds from.
+release $version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+        echo "expected a semver version without the leading v, e.g. 1.2.3 — got '$version'" >&2
+        exit 1
+    fi
+    if ! git diff --quiet HEAD; then
+        echo "working tree has uncommitted changes; commit or stash them first" >&2
+        exit 1
+    fi
+    if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
+        echo "tag v$version already exists" >&2
+        exit 1
+    fi
+    sed -i -E "0,/^version = .*/s//version = \"$version\"/" Cargo.toml
+    # Keeps Cargo.lock in step so a --locked build of the tag does not fail.
+    cargo update --workspace --offline
+    sed -i -E "s/^version: .* # VERSION$/version: $version # VERSION/" chart/Chart.yaml
+    sed -i -E "s/^appVersion: .*/appVersion: \"$version\"/" chart/Chart.yaml
+    sed -i -E "s/^    version: .* # VERSION$/    version: $version # VERSION/" chart/Chart.yaml
+    sed -i -E "s/^version: .* # VERSION$/version: $version # VERSION/" chart/charts/crds/Chart.yaml
+    git add Cargo.toml Cargo.lock chart/Chart.yaml chart/charts/crds/Chart.yaml
+    git commit -m "chore(release): v$version"
+    git tag -a "v$version" -m "v$version"
+    echo "committed and tagged v$version — push with: git push --follow-tags"

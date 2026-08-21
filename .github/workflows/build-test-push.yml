@@ -228,9 +228,6 @@ jobs:
           repository_owner="${REPOSITORY_OWNER,,}"
 
           mkdir -p dist
-          helm package chart \
-            --version "$release_version" \
-            --app-version "$release_version" \
-            --destination dist
+          helm package chart --destination dist
           helm push "dist/ansible-operator-${release_version}.tgz" \
             "oci://ghcr.io/${repository_owner}/charts"
