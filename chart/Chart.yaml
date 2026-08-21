@@ -2,9 +2,9 @@ apiVersion: v2
 name: ansible-operator
 description: An opinionated runner for Ansible on Kubernetes
 type: application
-version: 0.0.6 # VERSION
-appVersion: "0.0.6"
+version: 0.0.7 # VERSION
+appVersion: "0.0.7"
 dependencies:
   - name: crds
-    version: 0.0.6 # VERSION
+    version: 0.0.7 # VERSION
     condition: crds.install
