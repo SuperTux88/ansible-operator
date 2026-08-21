@@ -2,4 +2,4 @@ apiVersion: v2
 name: crds
 description: Custom resource definitions for the Ansible Operator
 type: application
-version: 0.0.5 # VERSION
+version: 0.0.6 # VERSION
