@@ -53,28 +53,34 @@ permissions or capabilities. `spc_t` is the same label `privileged: true` pods a
 node-debugging tools (e.g. `oc debug node/...`) get, and is what actually allows nsenter'd
 processes to touch the host filesystem. This is a no-op on non-SELinux nodes.
 
-## Regenerating the bundled CRDs
+## Custom resource definitions
 
-The CRD manifests under `crds/` are **not templated** — they're a static snapshot generated from
-the operator binary itself, matching Helm's convention that `crds/` is install-only (not
-upgraded automatically on `helm upgrade`; see the [Helm docs on CRDs](https://helm.sh/docs/chart_best_practices/custom_resource_definitions/)).
+The chart contains a built-in `crds` subchart. Its `crds.install` value defaults to `true` because
+the operator cannot work without these definitions. Unlike files in Helm's special `crds/`
+directory, these manifests are normal subchart templates and are reconciled on chart upgrades.
+
+Disable them only when another release manages the same cluster-scoped CRDs:
+
+```yaml
+crds:
+  install: false
+```
+
+Because these are release resources rather than files in Helm's `crds/` directory, they would be
+deleted by `helm uninstall` — and deleting a CRD deletes every custom resource of that kind in the
+cluster. `crds.keep` therefore defaults to `true`, which annotates them with
+`helm.sh/resource-policy: keep`, so an uninstall leaves the definitions and your resources behind
+(delete them by hand if you really want them gone):
+
+```yaml
+crds:
+  keep: false
+```
+
+The `crds` subchart is built into this chart and is not published separately.
 
 After changing any `#[derive(CustomResource)]` type in the Rust source, regenerate them:
 
 ```sh
-cargo build --release
-./target/release/ansible-operator crds > /tmp/all-crds.yaml
-csplit -z -f /tmp/crd- /tmp/all-crds.yaml '/^---$/' '{*}'
-for f in /tmp/crd-*; do
-  name=$(grep -m1 "^  name:" "$f" | awk '{print $2}')
-  sed -i '/^---$/d' "$f"
-  cp "$f" "chart/crds/${name}.yaml"
-done
-rm -f /tmp/crd-* /tmp/all-crds.yaml
-```
-
-Since `crds/` isn't updated by `helm upgrade`, apply regenerated CRDs manually when they change:
-
-```sh
-kubectl apply -f chart/crds/
+just generate-crds
 ```

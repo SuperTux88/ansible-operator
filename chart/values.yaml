@@ -1,5 +1,14 @@
 # Default values for the ansible-operator chart.
 
+crds:
+  install: true
+  # Unlike Helm's install-only crds/ directory, subchart templates are release resources and are
+  # deleted on `helm uninstall` — which would cascade to every PlaybookPlan, Play, ClusterInventory,
+  # StaticInventory and NodeAccessPolicy in the cluster. `keep` annotates them with
+  # helm.sh/resource-policy: keep so an uninstall leaves both the definitions and the resources
+  # alone; they then have to be deleted manually. Upgrades reconcile schema changes either way.
+  keep: true
+
 replicaCount: 1
 
 image:

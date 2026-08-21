@@ -1,14 +1,16 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
+  {{- if .Values.keep }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
   name: nodeaccesspolicies.ansible.cloudbending.dev
 spec:
   group: ansible.cloudbending.dev
   names:
-    categories: []
     kind: NodeAccessPolicy
     plural: nodeaccesspolicies
-    shortNames: []
     singular: nodeaccesspolicy
   scope: Cluster
   versions:

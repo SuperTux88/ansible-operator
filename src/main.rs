@@ -65,8 +65,8 @@ async fn main() {
     }
 }
 
-/// Renders all CRDs as a single multi-document YAML string (for `kubectl apply` / Helm chart
-/// generation). See `chart/README.md` for how the bundled `crds/` snapshot is regenerated.
+/// Renders all CRDs as a single multi-document YAML string for chart generation and `kubectl apply`.
+/// See `chart/README.md` for how the bundled snapshot is regenerated.
 fn render_crds() -> String {
     let playbookplan = v1beta1::PlaybookPlan::crd();
     let play = v1beta1::Play::crd();

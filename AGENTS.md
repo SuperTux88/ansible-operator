@@ -241,7 +241,7 @@ eyeball new cross-page links (or run the `mdbook-linkcheck` backend if installed
   exception). Run `cargo build` + `cargo test` + `cargo clippy` before proposing changes — and
   the guide build (`just docs`) if you touched `docs/` or user-facing behaviour/CRDs/chart.
   `just check` runs everything (build + test + clippy + guide + apidoc); see the `Justfile` for recipes.
-- `./ansible-operator crds` dumps all **four** CRDs (PlaybookPlan, ClusterInventory,
+- `./ansible-operator crds` dumps all **five** CRDs (PlaybookPlan, Play, ClusterInventory,
   StaticInventory, NodeAccessPolicy) — check this path after changing any `CustomResource` type.
 - The chart renders `managedSsh.proxyImage` and `watchNamespaces` into the operator ConfigMap;
   `helm template ./chart -s templates/configmap.yaml` (and `templates/role.yaml`) is the quick
