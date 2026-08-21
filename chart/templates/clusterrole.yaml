@@ -16,12 +16,12 @@ rules:
   - apiGroups: ["ansible.cloudbending.dev"]
     resources: ["playbookplans", "clusterinventories", "staticinventories"]
     verbs: ["get", "list", "watch"]
-  # Only PlaybookPlan and ClusterInventory have controllers writing status (StaticInventory has no
-  # controller of its own today). Cluster-wide so status (incl. UnauthorizedNamespace) can be written
-  # on plans in non-enrolled namespaces too.
+  # PlaybookPlan, ClusterInventory, and NodeAccessPolicy controllers write status (StaticInventory
+  # has no controller of its own today). Cluster-wide so status (incl. UnauthorizedNamespace) can be
+  # written on plans in non-enrolled namespaces too.
   - apiGroups: ["ansible.cloudbending.dev"]
     resources: ["playbookplans/status", "clusterinventories/status", "nodeaccesspolicies/status"]
-    verbs: ["get", "update"]
+    verbs: ["get", "update", "patch"]
   # ClusterInventory resolves node label selectors against real Nodes (cluster-scoped resource).
   - apiGroups: [""]
     resources: ["nodes"]
