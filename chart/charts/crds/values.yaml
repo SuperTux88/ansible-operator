@@ -1,1 +1,6 @@
 # CRDs are required by the operator and are enabled by the parent chart by default.
+
+# Annotate the definitions with helm.sh/resource-policy: keep so `helm uninstall` leaves them (and
+# therefore every custom resource in the cluster) in place. Overridden through `crds.keep` in the
+# parent chart.
+keep: true

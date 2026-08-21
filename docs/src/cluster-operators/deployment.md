@@ -194,6 +194,12 @@ manifests are generated from the operator binary itself (`ansible-operator crds`
 the subchart's `templates/` directory.
 The regeneration procedure lives in `chart/README.md`.
 
+Being ordinary release resources also means Helm would delete them on `helm uninstall`, and
+deleting a CRD deletes every custom resource of that kind cluster-wide. `crds.keep` defaults to
+`true` and annotates the definitions with `helm.sh/resource-policy: keep`, so uninstalling the
+chart leaves both the definitions and your `PlaybookPlan`s in place; set it to `false` if you
+would rather have an uninstall clean everything up.
+
 ## Grant node access
 
 Installing the operator and enrolling a namespace is **not** enough for cluster-node playbooks: node

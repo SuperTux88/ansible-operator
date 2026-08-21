@@ -66,18 +66,21 @@ crds:
   install: false
 ```
 
+Because these are release resources rather than files in Helm's `crds/` directory, they would be
+deleted by `helm uninstall` — and deleting a CRD deletes every custom resource of that kind in the
+cluster. `crds.keep` therefore defaults to `true`, which annotates them with
+`helm.sh/resource-policy: keep`, so an uninstall leaves the definitions and your resources behind
+(delete them by hand if you really want them gone):
+
+```yaml
+crds:
+  keep: false
+```
+
 The `crds` subchart is built into this chart and is not published separately.
 
 After changing any `#[derive(CustomResource)]` type in the Rust source, regenerate them:
 
 ```sh
-cargo build --release
-./target/release/ansible-operator crds > /tmp/all-crds.yaml
-csplit -z -f /tmp/crd- /tmp/all-crds.yaml '/^---$/' '{*}'
-for f in /tmp/crd-*; do
-  name=$(grep -m1 "^  name:" "$f" | awk '{print $2}')
-  sed -i '/^---$/d' "$f"
-  cp "$f" "chart/charts/crds/templates/${name}.yaml"
-done
-rm -f /tmp/crd-* /tmp/all-crds.yaml
+just generate-crds
 ```
