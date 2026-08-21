@@ -22,6 +22,7 @@ pub const RESERVED_HOST_VARS: &[&str] = &[
     "ansible_user",
     "ansible_ssh_private_key_file",
     "ansible_ssh_common_args",
+    "ansible_ssh_use_tty",
 ];
 
 /// Returns the first [`RESERVED_HOST_VARS`] key present in an author's group `variables`, if any.
@@ -139,9 +140,13 @@ fn render_managed_ssh_host_vars(hostname: &str, ctx: &RenderContext) -> Mapping 
     vars.insert(
         Value::String("ansible_ssh_common_args".into()),
         Value::String(format!(
-            "-o UserKnownHostsFile={} -o HostKeyAlias={hostname}",
+            "-o UserKnownHostsFile={} -o HostKeyAlias={hostname} -o RequestTTY=no",
             ctx.managed_ssh_known_hosts_path
         )),
+    );
+    vars.insert(
+        Value::String("ansible_ssh_use_tty".into()),
+        Value::Bool(false),
     );
 
     vars
@@ -381,6 +386,39 @@ mod tests {
         // The author's variable lands under the group's `vars:`, not under a host.
         assert!(rendered.contains("vars:"));
         assert!(rendered.contains("ansible_python_interpreter: /usr/bin/python3.11"));
+    }
+
+    #[test]
+    fn disables_tty_allocation_for_managed_ssh_hosts() {
+        let group = ResolvedInventoryGroup::ManagedSsh {
+            hosts: ResolvedHosts {
+                name: "controlplanes".into(),
+                hosts: vec!["worker-1".into()],
+            },
+            tolerations: None,
+            variables: None,
+        };
+        let mut managed_ssh_hosts = BTreeMap::new();
+        managed_ssh_hosts.insert(
+            "worker-1".to_string(),
+            ManagedSshHostInfo {
+                pod_ip: "10.0.0.5".into(),
+                port: 22,
+                unreachable: false,
+            },
+        );
+        let ssh_paths = BTreeMap::new();
+        let ctx = RenderContext {
+            managed_ssh_hosts: &managed_ssh_hosts,
+            managed_ssh_client_key_path: "/run/ansible-operator/managed-ssh/client_key",
+            managed_ssh_known_hosts_path: "/run/ansible-operator/managed-ssh/known_hosts",
+            ssh_paths_by_static_inventory: &ssh_paths,
+        };
+
+        let rendered = render_inventory(&[group], &ctx).unwrap();
+
+        assert!(rendered.contains("ansible_ssh_use_tty: false"));
+        assert!(rendered.contains("-o RequestTTY=no"));
     }
 
     #[test]
