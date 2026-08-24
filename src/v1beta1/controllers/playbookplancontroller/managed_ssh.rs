@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
 
 use k8s_openapi::{
     api::{
@@ -23,17 +22,14 @@ use kube::{
 };
 
 use super::paths;
-use crate::{
-    utils,
-    v1beta1::{
-        ca::CertificateAuthority,
-        controllers::{
-            playbookplancontroller::execution_evaluator::ExecutionHash,
-            reconcile_error::ReconcileError,
-        },
-        labels,
-        resources::Toleration,
+use crate::v1beta1::{
+    ca::CertificateAuthority,
+    controllers::{
+        playbookplancontroller::execution_evaluator::ExecutionHash,
+        reconcile_error::{ReconcileError, is_not_found},
     },
+    labels,
+    resources::Toleration,
 };
 
 pub const PROXY_SSH_PORT: i32 = 22;
@@ -44,9 +40,9 @@ const HOST_CERT_FILENAME: &str = "ssh_host_ed25519_key-cert.pub";
 const CA_PUB_FILENAME: &str = "ca.pub";
 const ENTER_HOST_SCRIPT_FILENAME: &str = "enter-host.sh";
 
-/// Per-run principals file for sshd's `AuthorizedPrincipalsFile`. It contains **only this run's
-/// execution hash** (see `build_secret`) — never `root`. That scopes the proxy to certs carrying
-/// that run's hash principal, so a leaked/strayed client cert from another run is rejected at the
+/// Per-attempt principals file for sshd's `AuthorizedPrincipalsFile`. It contains **only this run's
+/// run ID** (see `build_secret`) — never `root`. That scopes the proxy to certs carrying
+/// that attempt's principal, so a leaked/strayed client cert from another run is rejected at the
 /// sshd cert-principal layer, not just by the per-run NetworkPolicy (THREAT_MODEL R3 / T-INFO-3).
 const AUTHORIZED_PRINCIPALS_FILENAME: &str = "authorized_principals";
 
@@ -120,25 +116,103 @@ pub enum ProxyReadiness {
         ready: Vec<ProxyPodInfo>,
         unreachable: Vec<String>,
     },
-    /// At least one proxy pod is still `Running`-not-yet-Ready or within its pre-`Running` grace
-    /// window; `waiting` names them so the caller can report them on the plan.
+    /// At least one proxy pod is still `Running`-not-yet-Ready or within its startup/termination
+    /// grace window; `waiting` names them so the caller can report them on the plan.
     Pending { waiting: Vec<String> },
 }
 
+/// Discards the half-built proxy infrastructure of a run that is being resumed after the CA rotated,
+/// so `ensure_proxy_infra` rebuilds it against the current CA instead of adopting credentials nobody
+/// can authenticate against any more. The CA is in-memory (INV-6), so every operator restart rotates
+/// it — which is exactly when a run gets resumed.
+///
+/// Scoped entirely to this attempt: every name derives from `run_id`, so it can never touch another
+/// run's resources.
+///
+/// **Two things here are load-bearing and must not be "tidied":**
+///
+/// 1. *The client-cert Secret is the gate, and is deleted last.* Its presence-and-staleness is the
+///    only signal that a reset is owed, so it has to outlive every delete that can fail. An
+///    interrupted reset therefore leaves the gate open and the next tick re-enters and finishes the
+///    job. Deleting it first (or folding it into the loop) would make an interrupted reset look
+///    complete, leaving stale per-host Secrets that `ensure_proxy_infra` happily adopts — the run
+///    then wedges with old-CA host certificates and a new-CA client certificate.
+/// 2. *Returning early when the Secret already trusts the current CA.* That is what makes this
+///    idempotent and free on the overwhelmingly common path (a resume within one operator lifetime).
+///
+/// Deleting a pod only *starts* its termination; see `proxy_pod_readiness`, which refuses to adopt a
+/// pod still carrying a deletion timestamp, so the rebuild waits for the old pod to actually go away.
+pub async fn reset_incomplete_run(
+    client: &kube::Client,
+    operator_namespace: &str,
+    job_namespace: &str,
+    run_id: &str,
+    hosts: &[String],
+    ca: &CertificateAuthority,
+) -> Result<(), ReconcileError> {
+    let job_secrets_api = Api::<Secret>::namespaced(client.clone(), job_namespace);
+    let client_secret_name = client_cert_secret_name(run_id);
+    let Some(client_secret) = job_secrets_api.get_opt(&client_secret_name).await? else {
+        return Ok(());
+    };
+    let current_ca = ca.public_key_openssh()?;
+    let trusts_current_ca = client_secret
+        .data
+        .as_ref()
+        .and_then(|data| data.get(paths::MANAGED_SSH_KNOWN_HOSTS_FILENAME))
+        .and_then(|value| std::str::from_utf8(&value.0).ok())
+        .is_some_and(|known_hosts| known_hosts.contains(&current_ca));
+    if trusts_current_ca {
+        return Ok(());
+    }
+
+    let pods_api = Api::<Pod>::namespaced(client.clone(), operator_namespace);
+    let secrets_api = Api::<Secret>::namespaced(client.clone(), operator_namespace);
+    for host in hosts {
+        let name = resource_name(host, run_id);
+        delete_if_exists(&pods_api, &name, &DeleteParams::default()).await?;
+        delete_if_exists(&secrets_api, &name, &DeleteParams::default()).await?;
+    }
+    // Last, deliberately: this Secret is the gate that brought us here, so it must outlive every
+    // delete above for an interrupted reset to be retried rather than looking finished. See the
+    // doc comment.
+    delete_if_exists(
+        &job_secrets_api,
+        &client_secret_name,
+        &DeleteParams::default(),
+    )
+    .await
+}
+
 /// A proxy pod's k8s state as far as the readiness gate cares: Ready (with its pod IP), still
-/// `Running` (waited on indefinitely), or stuck before `Running` (subject to the grace window).
+/// `Running` (waited on indefinitely), stuck before `Running` (subject to the grace window), or
+/// `Terminating` (a deleted pod that has not disappeared yet, also subject to the grace window).
 #[derive(Debug, PartialEq)]
 enum PodReadyState {
     ReadyWithIp(String),
     Running,
     PreRunning,
+    Terminating,
 }
 
-/// Pure classification of a proxy pod. Ready-condition `True` + a pod IP ⇒ `ReadyWithIp`; else a pod
-/// that has reached `Running` ⇒ `Running` (sshd still coming up — waited on with no timeout, as
-/// before); anything earlier (`Pending`/`Unknown`/absent phase) ⇒ `PreRunning`, the only state the
-/// grace window applies to.
+/// Pure classification of a proxy pod. A pod carrying a `deletionTimestamp` ⇒ `Terminating`, checked
+/// *first* and deliberately ahead of the Ready condition: pod deletion is graceful and asynchronous,
+/// so a doomed pod keeps `phase: Running`, `Ready=True` and a live pod IP for its whole termination
+/// grace period. `reset_incomplete_run` deletes this run's pods and immediately re-enters
+/// `ensure_proxy_infra` in the same tick, so without this check the run would adopt a corpse still
+/// serving the *previous* CA's host certificate — and, because it looks Ready, sail straight through
+/// the readiness gate and launch the Job against it (every session then failing
+/// `Permission denied (publickey)`). Treating it as not-yet-ready instead makes the tick wait until
+/// the object is really gone, at which point the pod is recreated against the current CA.
+///
+/// Otherwise: Ready-condition `True` + a pod IP ⇒ `ReadyWithIp`; else a pod that has reached
+/// `Running` ⇒ `Running` (sshd still coming up — waited on with no timeout, as before); anything
+/// earlier (`Pending`/`Unknown`/absent phase) ⇒ `PreRunning`.
 fn proxy_pod_readiness(pod: &Pod) -> PodReadyState {
+    if pod.metadata.deletion_timestamp.is_some() {
+        return PodReadyState::Terminating;
+    }
+
     let status = pod.status.as_ref();
     let ready = status
         .and_then(|s| s.conditions.as_ref())
@@ -175,10 +249,10 @@ fn node_ready_heartbeat_age_secs(node: &Node, now_epoch_secs: i64) -> Option<i64
     Some(now_epoch_secs - last.0.as_second())
 }
 
-/// The effective grace for a pre-`Running` pod: `grace_seconds / aggressiveness^k` for the first tier
-/// `k` whose boundary the heartbeat age falls within, `0` past the last boundary. An unknown age ⇒
-/// full grace (never shorten on missing data). A healthy node's heartbeat is always recent, so it
-/// always lands in tier 0.
+/// The effective grace for a pre-`Running` or terminating pod: `grace_seconds / aggressiveness^k`
+/// for the first tier `k` whose boundary the heartbeat age falls within, `0` past the last boundary.
+/// An unknown age means full grace (never shorten on missing data). A healthy node's heartbeat is
+/// always recent, so it always lands in tier 0.
 fn effective_grace_secs(heartbeat_age_secs: Option<i64>, policy: &ProxyGracePolicy) -> i64 {
     let Some(age) = heartbeat_age_secs else {
         return policy.grace_seconds;
@@ -190,6 +264,15 @@ fn effective_grace_secs(heartbeat_age_secs: Option<i64>, policy: &ProxyGracePoli
         }
     }
     0
+}
+
+fn proxy_wait_age_secs(pod: &Pod, state: &PodReadyState, now_epoch_secs: i64) -> Option<i64> {
+    let started = match state {
+        PodReadyState::Terminating => pod.metadata.deletion_timestamp.as_ref(),
+        PodReadyState::PreRunning => pod.metadata.creation_timestamp.as_ref(),
+        PodReadyState::ReadyWithIp(_) | PodReadyState::Running => None,
+    }?;
+    Some(now_epoch_secs - started.0.as_second())
 }
 
 /// Node taints Kubernetes auto-applies to a `NotReady` node tolerated by every proxy pod, merged with
@@ -220,28 +303,37 @@ fn merge_default_tolerations(
     merged
 }
 
-/// Deterministic, human-readable resource name for a (host, run) pair. The host is used verbatim
+/// Deterministic, human-readable resource name for a (host, attempt) pair. The host is used verbatim
 /// (not hashed) since managed-ssh only targets `ClusterInventory` hosts, i.e. real Node names,
-/// which are already valid Kubernetes object name components. The run uses `utils::generate_id`'s
-/// short-id, matching `job_builder::create_job_for_run`'s Job naming.
-fn resource_name(host: &str, execution_hash: &ExecutionHash) -> String {
-    format!(
-        "ansible-sshd-{host}-{}",
-        utils::generate_id(**execution_hash)
-    )
+/// which are already valid Kubernetes object name components. The attempt is identified by its run
+/// ID, so a delayed cleanup can never reach a retry's pods.
+///
+/// Length budget, since nothing truncates here: the result names a Pod and a Secret, so it is bounded
+/// by `utils::MAX_DNS_SUBDOMAIN_LEN`. The host is separately bounded to `utils::MAX_DNS_LABEL_LEN`
+/// because it is also written as the `PLAYBOOKPLAN_HOST` **label value** (`run_labels`) — so the
+/// worst case is 13 + 63 + 1 + `reconciler::RUN_ID_LENGTH`, leaving well over 150 characters of
+/// headroom. A test pins that, so growing the run ID (or ever sourcing the host from something
+/// unlabelled) fails there rather than at the apiserver.
+fn resource_name(host: &str, run_id: &str) -> String {
+    format!("ansible-sshd-{host}-{run_id}")
 }
 
 /// Name of this run's client-cert Secret, shared by `job_builder`'s mount and `ensure_client_cert`.
-pub fn client_cert_secret_name(execution_hash: &ExecutionHash) -> String {
-    format!("managed-ssh-client-{execution_hash}")
+pub fn client_cert_secret_name(run_id: &str) -> String {
+    format!("managed-ssh-client-{run_id}")
 }
 
-fn run_labels(execution_hash: &ExecutionHash, host: &str) -> BTreeMap<String, String> {
+fn run_labels(
+    execution_hash: &ExecutionHash,
+    run_id: &str,
+    host: &str,
+) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
             labels::PLAYBOOKPLAN_HASH.to_string(),
             execution_hash.to_string(),
         ),
+        (labels::RUN_ID.to_string(), run_id.to_string()),
         (labels::PLAYBOOKPLAN_HOST.to_string(), host.to_string()),
         (
             labels::COMPONENT.to_string(),
@@ -262,7 +354,7 @@ fn run_labels(execution_hash: &ExecutionHash, host: &str) -> BTreeMap<String, St
 /// `secure_filename` refuses under the default `StrictModes yes`. sshd then silently *discards* the
 /// principals file, so no cert principal ever matches and every login fails with
 /// `Permission denied (publickey)`. Disabling StrictModes does not weaken isolation: the per-run
-/// `<hash>` principal check still runs (INV-4 / T-INFO-3); only the file-permission gate is skipped,
+/// run-ID principal check still runs (INV-4 / T-INFO-3); only the file-permission gate is skipped,
 /// and every file in the mount is operator-rendered and read-only.
 fn render_sshd_config() -> String {
     format!(
@@ -323,6 +415,7 @@ fn render_enter_host_script() -> String {
 fn build_secret(
     name: &str,
     execution_hash: &ExecutionHash,
+    run_id: &str,
     host: &str,
     ca: &CertificateAuthority,
 ) -> Result<Secret, ReconcileError> {
@@ -339,13 +432,13 @@ fn build_secret(
     string_data.insert(HOST_KEY_FILENAME.to_string(), host_key_openssh);
     string_data.insert(HOST_CERT_FILENAME.to_string(), host_cert);
     string_data.insert(CA_PUB_FILENAME.to_string(), ca_pub);
-    // ONLY this run's hash — never "root". This is the sole principal sshd's
-    // `AuthorizedPrincipalsFile` will accept, so a client cert from any other run (whose hash
-    // differs) is rejected even if it can reach this pod. Must match the client cert's hash
-    // principal minted in `ensure_client_cert`.
+    // ONLY this attempt's run ID — never "root". This is the sole principal sshd's
+    // `AuthorizedPrincipalsFile` will accept, so a client cert from any other attempt (whose run ID
+    // differs, even for a retry of the same execution hash) is rejected even if it can reach this
+    // pod. Must match the run-ID principal minted in `ensure_client_cert`.
     string_data.insert(
         AUTHORIZED_PRINCIPALS_FILENAME.to_string(),
-        format!("{execution_hash}\n"),
+        format!("{run_id}\n"),
     );
     string_data.insert("sshd_config".to_string(), render_sshd_config());
     string_data.insert(
@@ -356,7 +449,7 @@ fn build_secret(
     Ok(Secret {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
-            labels: Some(run_labels(execution_hash, host)),
+            labels: Some(run_labels(execution_hash, run_id, host)),
             ..Default::default()
         },
         string_data: Some(string_data),
@@ -368,6 +461,7 @@ fn build_pod(
     name: &str,
     secret_name: &str,
     execution_hash: &ExecutionHash,
+    run_id: &str,
     host: &str,
     tolerations: Option<&[Toleration]>,
     proxy_image: &str,
@@ -447,7 +541,7 @@ fn build_pod(
     Pod {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
-            labels: Some(run_labels(execution_hash, host)),
+            labels: Some(run_labels(execution_hash, run_id, host)),
             ..Default::default()
         },
         spec: Some(PodSpec {
@@ -478,6 +572,7 @@ fn build_pod(
 fn build_network_policy(
     name: &str,
     execution_hash: &ExecutionHash,
+    run_id: &str,
     job_namespace: &str,
     egress: Option<Vec<NetworkPolicyEgressRule>>,
 ) -> NetworkPolicy {
@@ -488,10 +583,13 @@ fn build_network_policy(
     NetworkPolicy {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
-            labels: Some(BTreeMap::from([(
-                labels::PLAYBOOKPLAN_HASH.to_string(),
-                execution_hash.to_string(),
-            )])),
+            labels: Some(BTreeMap::from([
+                (
+                    labels::PLAYBOOKPLAN_HASH.to_string(),
+                    execution_hash.to_string(),
+                ),
+                (labels::RUN_ID.to_string(), run_id.to_string()),
+            ])),
             ..Default::default()
         },
         spec: Some(NetworkPolicySpec {
@@ -505,6 +603,7 @@ fn build_network_policy(
                         labels::COMPONENT.to_string(),
                         labels::MANAGED_SSH_PROXY_COMPONENT.to_string(),
                     ),
+                    (labels::RUN_ID.to_string(), run_id.to_string()),
                 ])),
                 ..Default::default()
             }),
@@ -528,6 +627,7 @@ fn build_network_policy(
                                 labels::COMPONENT.to_string(),
                                 labels::PLAYBOOK_COMPONENT.to_string(),
                             ),
+                            (labels::RUN_ID.to_string(), run_id.to_string()),
                         ])),
                         ..Default::default()
                     }),
@@ -544,22 +644,21 @@ fn build_network_policy(
     }
 }
 
-/// Renders this run's client-cert files — private key, a cert signed for `["root", <hash>]`, and
+/// Renders this run's client-cert files — private key, a cert signed for `["root", <run-id>]`, and
 /// the `@cert-authority` known_hosts line — as a `filename -> contents` map. Split out from
 /// `ensure_client_cert` (which just wraps this in a Secret) so tests can exercise the exact client
 /// material the Job pod mounts against a real sshd, rather than re-deriving it.
 ///
-/// The run hash is the *enforced* principal: each proxy pod's `AuthorizedPrincipalsFile` lists only
-/// its own run's hash, so this cert authenticates only to this run's proxies. "root" is kept as a
+/// The per-attempt run ID is the *enforced* principal: each proxy's principals file lists only
+/// its own run ID, so this cert authenticates only to this attempt's proxies. "root" is kept as a
 /// harmless second principal (belt-and-suspenders for sshd's default username check on builds/configs
 /// where `AuthorizedPrincipalsFile` isn't in force); `PermitRootLogin yes` authorizes the root login.
 fn render_client_cert_files(
     ca: &CertificateAuthority,
-    execution_hash: &ExecutionHash,
+    run_id: &str,
 ) -> Result<BTreeMap<String, String>, ReconcileError> {
     let client_key = crate::v1beta1::ca::generate_ephemeral_keypair()?;
-    let principal = execution_hash.to_string();
-    let client_cert = ca.sign_client_cert(client_key.public_key(), &["root", &principal])?;
+    let client_cert = ca.sign_client_cert(client_key.public_key(), &["root", run_id])?;
     let ca_pub = ca.public_key_openssh()?;
 
     let client_key_openssh = client_key
@@ -595,24 +694,28 @@ fn render_client_cert_files(
 async fn ensure_client_cert(
     secrets_api: &Api<Secret>,
     execution_hash: &ExecutionHash,
+    run_id: &str,
     ca: &CertificateAuthority,
     plan_owner: &OwnerReference,
 ) -> Result<(), ReconcileError> {
-    let name = client_cert_secret_name(execution_hash);
+    let name = client_cert_secret_name(run_id);
 
     if secrets_api.get_opt(&name).await?.is_some() {
         return Ok(());
     }
 
-    let string_data = render_client_cert_files(ca, execution_hash)?;
+    let string_data = render_client_cert_files(ca, run_id)?;
 
     let secret = Secret {
         metadata: ObjectMeta {
             name: Some(name),
-            labels: Some(BTreeMap::from([(
-                labels::PLAYBOOKPLAN_HASH.to_string(),
-                execution_hash.to_string(),
-            )])),
+            labels: Some(BTreeMap::from([
+                (
+                    labels::PLAYBOOKPLAN_HASH.to_string(),
+                    execution_hash.to_string(),
+                ),
+                (labels::RUN_ID.to_string(), run_id.to_string()),
+            ])),
             owner_references: Some(vec![plan_owner.clone()]),
             ..Default::default()
         },
@@ -635,6 +738,7 @@ pub async fn ensure_proxy_infra(
     operator_namespace: &str,
     job_namespace: &str,
     execution_hash: &ExecutionHash,
+    run_id: &str,
     hosts: &[String],
     tolerations: Option<&[Toleration]>,
     grace_policy: &ProxyGracePolicy,
@@ -654,14 +758,11 @@ pub async fn ensure_proxy_infra(
     let job_secrets_api: Api<Secret> = Api::namespaced(client.clone(), job_namespace);
 
     if !hosts.is_empty() {
-        let netpol_name = format!("managed-ssh-{:x}", {
-            let mut hasher = twox_hash::XxHash3_64::new();
-            execution_hash.to_string().hash(&mut hasher);
-            hasher.finish()
-        });
+        let netpol_name = format!("managed-ssh-{run_id}");
         let netpol = build_network_policy(
             &netpol_name,
             execution_hash,
+            run_id,
             job_namespace,
             network_policy_egress,
         );
@@ -673,7 +774,7 @@ pub async fn ensure_proxy_infra(
             )
             .await?;
 
-        ensure_client_cert(&job_secrets_api, execution_hash, ca, plan_owner).await?;
+        ensure_client_cert(&job_secrets_api, execution_hash, run_id, ca, plan_owner).await?;
     }
 
     let now = chrono::Utc::now().timestamp();
@@ -683,10 +784,10 @@ pub async fn ensure_proxy_infra(
     let mut waiting = Vec::new();
 
     for host in hosts {
-        let name = resource_name(host, execution_hash);
+        let name = resource_name(host, run_id);
 
         if secrets_api.get_opt(&name).await?.is_none() {
-            let secret = build_secret(&name, execution_hash, host, ca)?;
+            let secret = build_secret(&name, execution_hash, run_id, host, ca)?;
             secrets_api.create(&PostParams::default(), &secret).await?;
         }
 
@@ -694,7 +795,15 @@ pub async fn ensure_proxy_infra(
         let pod = match pods_api.get_opt(&name).await? {
             Some(pod) => pod,
             None => {
-                let pod = build_pod(&name, &name, execution_hash, host, tolerations, proxy_image);
+                let pod = build_pod(
+                    &name,
+                    &name,
+                    execution_hash,
+                    run_id,
+                    host,
+                    tolerations,
+                    proxy_image,
+                );
                 pods_api.create(&PostParams::default(), &pod).await?
             }
         };
@@ -707,20 +816,17 @@ pub async fn ensure_proxy_infra(
             }),
             // Reached Running — sshd is coming up; wait indefinitely, exactly as before (no timeout).
             PodReadyState::Running => waiting.push(host.clone()),
-            // Stuck before Running: give it a heartbeat-scaled grace window, then give up. Fetch the
-            // Node only here, so healthy runs incur no extra reads once pods are Running.
-            PodReadyState::PreRunning => {
+            // A pod stuck before Running or terminating after a reset gets the same
+            // heartbeat-scaled deadline. Until then a terminating pod is never adopted; after the
+            // deadline the host is rendered unreachable so a dead kubelet cannot wedge this run and
+            // its Leases forever.
+            state @ (PodReadyState::PreRunning | PodReadyState::Terminating) => {
                 let heartbeat_age = match nodes_api.get_opt(host).await? {
                     Some(node) => node_ready_heartbeat_age_secs(&node, now),
                     None => None,
                 };
                 let grace = effective_grace_secs(heartbeat_age, grace_policy);
-                let pod_age = pod
-                    .metadata
-                    .creation_timestamp
-                    .as_ref()
-                    .map(|t| now - t.0.as_second());
-                match pod_age {
+                match proxy_wait_age_secs(&pod, &state, now) {
                     Some(age) if age >= grace => unreachable.push(host.clone()),
                     _ => waiting.push(host.clone()),
                 }
@@ -738,29 +844,37 @@ pub async fn ensure_proxy_infra(
 /// Deletes every resource belonging to this run: the operator-namespace proxy pods, their per-host
 /// Secrets and the run's NetworkPolicy via label-scoped `delete_collection`, plus the plan-namespace
 /// client-cert Secret by exact name. The operator-ns sweep is by-label so the host list isn't needed
-/// — GC-by-label catches everything tagged with the run's hash regardless of how the inventory
+/// — GC-by-label catches everything tagged with the attempt's run ID regardless of how the inventory
 /// drifted since the run started. (The CA is in-memory only, not a Secret, so nothing CA-related is
 /// in scope here.) The operator-ns resources can't use ownerReferences, since Kubernetes GC ignores
 /// references that cross namespaces (they live in the operator namespace, the Job/PlaybookPlan in the
-/// plan namespace). Best-effort: delete errors are ignored, the next run's cleanup retries.
+/// plan namespace).
+///
+/// **Not** best-effort: every delete is propagated, and the caller must not treat a run as released
+/// until this returns `Ok`. These are node-root pods and the credentials that reach them, so a
+/// partial sweep has to be retried rather than forgotten — the run's `Play` deliberately outlives
+/// cleanup so the next reconcile can re-enter here, and every delete is idempotent. The deletes run
+/// in sequence and short-circuit on the first error, so a stuck cleanup should be diagnosed from the
+/// *first* failing resource, not the last.
 ///
 /// The client-cert Secret is deleted **by name**, not by the hash label: it lives in the plan
 /// namespace where the ansible Job and its pod carry that same `PLAYBOOKPLAN_HASH` label, so a
 /// label-scoped `delete_collection` there would also sweep them. Its ownerReference on the
 /// PlaybookPlan is the backstop if this explicit delete never runs (operator crash / plan deleted
-/// mid-run). Deleting it is not the revocation mechanism — that is the deletion of the proxy pods
-/// below, after which the cert authenticates to nothing (INV-4 / T-INFO-3).
+/// mid-run). Deleting it is not the revocation mechanism — that is the deletion of the proxy pods,
+/// which happens first and after which the cert authenticates to nothing (INV-4 / T-INFO-3).
 ///
 /// Pods use a tighter selector than the operator-ns Secrets/NetworkPolicy: the ansible Job pod
-/// carries the same `PLAYBOOKPLAN_HASH` label (the run's NetworkPolicy targets it by that label) but
-/// is NOT proxy infra — it must be reaped by its own Job's `ttlSecondsAfterFinished`, never here.
-/// That only collides when the operator and the plan share a namespace, but requiring the per-host
-/// `PLAYBOOKPLAN_HOST` label (which only proxy pods carry) excludes the ansible pod cleanly.
+/// carries the same `PLAYBOOKPLAN_HASH` and `RUN_ID` labels but is NOT proxy infra — it must be
+/// reaped by its own Job's `ttlSecondsAfterFinished`, never here. That only collides when the
+/// operator and the plan share a namespace, but requiring the per-host `PLAYBOOKPLAN_HOST` label
+/// (which only proxy pods carry) excludes the ansible pod cleanly.
 pub async fn cleanup_proxy_infra(
     client: &kube::Client,
     operator_namespace: &str,
     job_namespace: &str,
     execution_hash: &ExecutionHash,
+    run_id: &str,
     playbookplan_name: &str,
 ) -> Result<(), ReconcileError> {
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), operator_namespace);
@@ -770,54 +884,198 @@ pub async fn cleanup_proxy_infra(
     let job_netpol_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), job_namespace);
 
     let dp = DeleteParams::default();
-    let hash_selector = format!("{}={execution_hash}", labels::PLAYBOOKPLAN_HASH);
+    let run_selector = format!(
+        "{}={execution_hash},{}={run_id}",
+        labels::PLAYBOOKPLAN_HASH,
+        labels::RUN_ID
+    );
 
     // Existence of PLAYBOOKPLAN_HOST spares the ansible Job pod (which lacks it) — see the doc.
     let pods_lp =
-        ListParams::default().labels(&format!("{hash_selector},{}", labels::PLAYBOOKPLAN_HOST));
-    // Bare hash selector: no other operator-managed Secret/NetworkPolicy carries the hash label.
-    let rest_lp = ListParams::default().labels(&hash_selector);
+        ListParams::default().labels(&format!("{run_selector},{}", labels::PLAYBOOKPLAN_HOST));
+    // Hash + run ID selector: no other attempt shares this cleanup identity.
+    let rest_lp = ListParams::default().labels(&run_selector);
 
-    let _ = pods_api.delete_collection(&dp, &pods_lp).await;
-    let _ = secrets_api.delete_collection(&dp, &rest_lp).await;
-    let _ = netpol_api.delete_collection(&dp, &rest_lp).await;
-    let _ = job_netpol_api
-        .delete(
-            &super::job_builder::job_network_policy_name(playbookplan_name, execution_hash),
-            &dp,
-        )
-        .await;
+    pods_api.delete_collection(&dp, &pods_lp).await?;
+    secrets_api.delete_collection(&dp, &rest_lp).await?;
+    netpol_api.delete_collection(&dp, &rest_lp).await?;
+    delete_if_exists(
+        &job_netpol_api,
+        &super::job_builder::job_network_policy_name(playbookplan_name, run_id),
+        &dp,
+    )
+    .await?;
     // Plan-namespace client-cert Secret: by name, never by label (would catch the Job/pod). See doc.
-    let _ = job_secrets_api
-        .delete(&client_cert_secret_name(execution_hash), &dp)
-        .await;
+    delete_if_exists(&job_secrets_api, &client_cert_secret_name(run_id), &dp).await?;
 
     Ok(())
+}
+
+async fn delete_if_exists<K>(
+    api: &Api<K>,
+    name: &str,
+    params: &DeleteParams,
+) -> Result<(), ReconcileError>
+where
+    K: kube::Resource<DynamicType = ()> + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+{
+    match api.delete(name, params).await {
+        Ok(_) => Ok(()),
+        Err(error) if is_not_found(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Pins the wire format of the per-attempt resource names, and the length budget behind
+    /// `resource_name` — see its doc comment for why nothing truncates there.
     #[test]
-    fn resource_name_is_deterministic_per_host_and_run() {
+    fn attempt_scoped_resource_names_keep_their_shape_and_fit() {
+        use crate::utils::{MAX_DNS_LABEL_LEN, MAX_DNS_SUBDOMAIN_LEN, generate_id_with_length};
+        use crate::v1beta1::controllers::playbookplancontroller::reconciler::RUN_ID_LENGTH;
+
+        assert_eq!(
+            resource_name("worker-1", "run-a"),
+            "ansible-sshd-worker-1-run-a"
+        );
+        assert_eq!(client_cert_secret_name("run-a"), "managed-ssh-client-run-a");
+
+        // The host is bounded by the label cap (it is also a label value), the whole name by the
+        // subdomain cap (it names a Pod and a Secret).
+        let run_id = generate_id_with_length(u64::MAX, RUN_ID_LENGTH);
+        let name = resource_name(&"n".repeat(MAX_DNS_LABEL_LEN), &run_id);
+        assert!(
+            name.len() <= MAX_DNS_SUBDOMAIN_LEN,
+            "worst-case proxy resource name is {} characters",
+            name.len()
+        );
+    }
+
+    /// These labels are the cleanup selector's whole contract: `PLAYBOOKPLAN_HOST` is what tells a
+    /// proxy pod apart from the ansible Job pod, and `RUN_ID` is what keeps one attempt's sweep off
+    /// another's resources.
+    #[test]
+    fn run_labels_carry_the_hash_run_id_host_and_component() {
         use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
 
-        let hash_a = calculate_execution_hash("playbook-a", std::iter::empty());
-        let hash_b = calculate_execution_hash("playbook-b", std::iter::empty());
+        let hash = calculate_execution_hash("playbook", std::iter::empty());
+        let labels = run_labels(&hash, "run-1", "worker-1");
 
-        let a1 = resource_name("worker-1", &hash_a);
-        let a2 = resource_name("worker-1", &hash_a);
-        let b = resource_name("worker-1", &hash_b);
-        let other_host = resource_name("worker-2", &hash_a);
-
-        assert_eq!(a1, a2);
-        assert_ne!(a1, b, "same host, different run must differ");
-        assert_ne!(a1, other_host, "different host, same run must differ");
+        assert_eq!(labels[labels::PLAYBOOKPLAN_HASH], hash.to_string());
+        assert_eq!(labels[labels::RUN_ID], "run-1");
+        assert_eq!(labels[labels::PLAYBOOKPLAN_HOST], "worker-1");
         assert_eq!(
-            a1,
-            format!("ansible-sshd-worker-1-{}", utils::generate_id(*hash_a))
+            labels[labels::COMPONENT],
+            labels::MANAGED_SSH_PROXY_COMPONENT
         );
+    }
+
+    /// INV-7. The pod sweep and the ansible Job pod both carry `PLAYBOOKPLAN_HASH` *and* `RUN_ID`,
+    /// so requiring `PLAYBOOKPLAN_HOST` — which only proxy pods have — is the single thing standing
+    /// between `cleanup_proxy_infra`'s `delete_collection` and the Job pod running the playbook.
+    /// Deleting that pod mid-run would kill the run it is cleaning up after.
+    #[test]
+    fn the_proxy_pod_sweep_selector_cannot_match_the_ansible_job_pod() {
+        use crate::v1beta1::controllers::playbookplancontroller::{
+            execution_evaluator::calculate_execution_hash, job_builder,
+        };
+
+        let hash = calculate_execution_hash("playbook", std::iter::empty());
+        let run_id = "run-1";
+
+        let mut plan =
+            crate::v1beta1::PlaybookPlan::new("web", crate::v1beta1::PlaybookPlanSpec::default());
+        plan.metadata.namespace = Some("team".into());
+        plan.metadata.uid = Some("plan-uid".into());
+        let job = job_builder::create_job_blueprint(&hash, 1, run_id, &[], &plan).unwrap();
+        let job_pod_labels = job
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .metadata
+            .as_ref()
+            .unwrap()
+            .labels
+            .clone()
+            .unwrap();
+
+        // The Job pod does match the hash+run-id part of the selector — that is the whole risk.
+        assert_eq!(job_pod_labels[labels::PLAYBOOKPLAN_HASH], hash.to_string());
+        assert_eq!(job_pod_labels[labels::RUN_ID], run_id);
+
+        // ...and is spared only because it carries no target-host label.
+        assert!(
+            !job_pod_labels.contains_key(labels::PLAYBOOKPLAN_HOST),
+            "the ansible Job pod must never carry {}, or cleanup would sweep it",
+            labels::PLAYBOOKPLAN_HOST
+        );
+
+        // A proxy pod, by contrast, is matched by every part of the selector.
+        let proxy = build_pod(
+            "ansible-sshd-worker-1-run-1",
+            "ansible-sshd-worker-1-run-1",
+            &hash,
+            run_id,
+            "worker-1",
+            None,
+            "proxy:latest",
+        );
+        let proxy_labels = proxy.metadata.labels.as_ref().unwrap();
+        for key in [
+            labels::PLAYBOOKPLAN_HASH,
+            labels::RUN_ID,
+            labels::PLAYBOOKPLAN_HOST,
+        ] {
+            assert!(proxy_labels.contains_key(key), "proxy pod must carry {key}");
+        }
+    }
+
+    /// The proxy pod is the node-root primitive, so the privileges it does *and does not* ask for are
+    /// part of the threat model rather than an implementation detail (THREAT_MODEL §T-ESC-1).
+    #[test]
+    fn build_pod_pins_the_node_root_privileges_and_targets_its_own_node() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+
+        let hash = calculate_execution_hash("playbook", std::iter::empty());
+        let pod = build_pod(
+            "ansible-sshd-worker-1-run-1",
+            "ansible-sshd-worker-1-run-1",
+            &hash,
+            "run-1",
+            "worker-1",
+            None,
+            "proxy:latest",
+        );
+        let spec = pod.spec.as_ref().unwrap();
+
+        // Scheduled onto the exact node it proxies — the pod IS the node's access path. Pinned by
+        // `nodeSelector` rather than `nodeName` so normal scheduling (taints, tolerations) still
+        // applies; see `merge_default_tolerations`.
+        assert_eq!(
+            spec.node_selector.as_ref().unwrap()["kubernetes.io/hostname"],
+            "worker-1"
+        );
+
+        // hostPID is required (nsenter needs a host process to enter); the rest must stay off.
+        assert_eq!(spec.host_pid, Some(true));
+        assert_ne!(spec.host_network, Some(true));
+        assert_ne!(spec.host_ipc, Some(true));
+
+        let container = &spec.containers[0];
+        assert_eq!(container.image.as_deref(), Some("proxy:latest"));
+        let security = container.security_context.as_ref().unwrap();
+        assert_ne!(
+            security.privileged,
+            Some(true),
+            "capabilities are granted explicitly, never via blanket privileged"
+        );
+        let added = security.capabilities.as_ref().unwrap().add.clone().unwrap();
+        assert!(added.contains(&"SYS_ADMIN".to_string()));
+        assert!(added.contains(&"SYS_PTRACE".to_string()));
     }
 
     #[test]
@@ -825,7 +1083,7 @@ mod tests {
         use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
 
         let hash = calculate_execution_hash("playbook", std::iter::empty());
-        let ingress_only = build_network_policy("proxy", &hash, "plans", None);
+        let ingress_only = build_network_policy("proxy", &hash, "run-1", "plans", None);
         assert_eq!(
             ingress_only.spec.unwrap().policy_types.unwrap(),
             vec!["Ingress"]
@@ -834,6 +1092,7 @@ mod tests {
         let with_egress = build_network_policy(
             "proxy",
             &hash,
+            "run-1",
             "plans",
             Some(vec![NetworkPolicyEgressRule::default()]),
         );
@@ -843,23 +1102,24 @@ mod tests {
     }
 
     #[test]
-    fn build_secret_writes_the_run_hash_as_the_sole_authorized_principal() {
+    fn build_secret_writes_the_run_id_as_the_sole_authorized_principal() {
         use crate::v1beta1::ca::CertificateAuthority;
         use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
 
         let ca = CertificateAuthority::generate().unwrap();
         let hash = calculate_execution_hash("playbook-a", std::iter::empty());
 
-        let secret = build_secret("ansible-sshd-worker-1-abc", &hash, "worker-1", &ca).unwrap();
+        let secret =
+            build_secret("ansible-sshd-worker-1-abc", &hash, "run-1", "worker-1", &ca).unwrap();
         let principals = secret
             .string_data
             .as_ref()
             .and_then(|d| d.get(AUTHORIZED_PRINCIPALS_FILENAME))
             .expect("proxy secret must carry an authorized_principals file");
 
-        // The file must name exactly this run's hash and nothing else — in particular not "root",
+        // The file must name exactly this attempt's run ID and nothing else — in particular not "root",
         // which would make every run's client cert authenticate to every proxy (R3 / T-INFO-3).
-        assert_eq!(principals.trim(), hash.to_string());
+        assert_eq!(principals.trim(), "run-1");
         assert!(
             !principals.contains("root"),
             "authorized_principals must not contain 'root', or cross-run isolation is void"
@@ -1042,6 +1302,42 @@ mod tests {
         assert_eq!(
             proxy_pod_readiness(&pod_with(None, false, None, Some(0))),
             PodReadyState::PreRunning
+        );
+    }
+
+    /// A pod deleted by `reset_incomplete_run` keeps `Running`/`Ready=True`/a pod IP for its whole
+    /// termination grace period. Adopting it would hand the run a proxy still serving the previous
+    /// CA's host certificate — and, because it looks Ready, would let the Job launch against it.
+    #[test]
+    fn a_terminating_proxy_pod_is_never_adopted_even_while_it_still_looks_ready() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        use k8s_openapi::jiff::Timestamp;
+
+        let mut pod = pod_with(Some("Running"), true, Some("10.0.0.5"), Some(0));
+        pod.metadata.deletion_timestamp = Some(Time(Timestamp::from_second(0).unwrap()));
+
+        assert_eq!(proxy_pod_readiness(&pod), PodReadyState::Terminating);
+    }
+
+    #[test]
+    fn terminating_pod_wait_age_starts_at_deletion_not_creation() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        use k8s_openapi::jiff::Timestamp;
+
+        let mut pod = pod_with(Some("Running"), true, Some("10.0.0.5"), Some(100));
+        pod.metadata.deletion_timestamp = Some(Time(Timestamp::from_second(900).unwrap()));
+
+        assert_eq!(
+            proxy_wait_age_secs(&pod, &PodReadyState::Terminating, 1_000),
+            Some(100)
+        );
+        assert_eq!(
+            proxy_wait_age_secs(&pod, &PodReadyState::PreRunning, 1_000),
+            Some(900)
+        );
+        assert_eq!(
+            proxy_wait_age_secs(&pod, &PodReadyState::Running, 1_000),
+            None
         );
     }
 
@@ -1235,11 +1531,10 @@ mod container_tests {
     async fn proxy_rejects_other_runs_cert_and_accepts_its_own() {
         let ca = CertificateAuthority::generate().unwrap();
         let run_b = calculate_execution_hash("plan-b", std::iter::empty());
-        let run_a = calculate_execution_hash("plan-a", std::iter::empty());
 
         // Server: proxy config for run B — host cert principal = HOST_NAME, and the
-        // AuthorizedPrincipalsFile carries only run B's hash.
-        let server_files = build_secret("proxy-b", &run_b, HOST_NAME, &ca)
+        // AuthorizedPrincipalsFile carries only run B's run ID.
+        let server_files = build_secret("proxy-b", &run_b, "run-b", HOST_NAME, &ca)
             .unwrap()
             .string_data
             .expect("proxy secret must carry string_data");
@@ -1250,11 +1545,11 @@ mod container_tests {
         let client_a = tempfile::tempdir().unwrap();
         write_client_files(
             client_b.path(),
-            &render_client_cert_files(&ca, &run_b).unwrap(),
+            &render_client_cert_files(&ca, "run-b").unwrap(),
         );
         write_client_files(
             client_a.path(),
-            &render_client_cert_files(&ca, &run_a).unwrap(),
+            &render_client_cert_files(&ca, "run-a").unwrap(),
         );
 
         // Boot the real proxy image with our rendered config injected into its own fs layer. The
@@ -1296,7 +1591,7 @@ mod container_tests {
             "run B's cert did not reach the ForceCommand — host-cert or auth failed:\n{accepted_err}"
         );
 
-        // Foreign cert (run A's hash): sshd must refuse it at the AuthorizedPrincipalsFile check.
+        // Foreign cert (run A's run ID): sshd must refuse it at the AuthorizedPrincipalsFile check.
         let rejected = ssh_attempt(port, client_a.path());
         let rejected_err = String::from_utf8_lossy(&rejected.stderr);
         assert!(

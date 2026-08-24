@@ -71,8 +71,9 @@ the operator (via a `checksum/config` annotation) rather than hot-reloading.
 
 When a `ClusterInventory` targets a `NotReady` Node, the operator still schedules its proxy pod and
 waits for the pod to become Ready. If it does not become Ready in time, the run proceeds without that
-Node — Ansible reports it unreachable, and it is retried on the next run. The wait applies only to a
-pod that has not yet started; a pod that has reached `Running` is waited on until Ready as usual.
+Node — Ansible reports it unreachable, and it is retried on the next run. The same bound applies to
+an old-credential pod still terminating after a reset; it is never reused. A pod that has reached
+`Running` normally is waited on until Ready as usual.
 
 The wait scales with how long the Node has been silent (its last `Ready` heartbeat): a Node that only
 just went `NotReady` is given the full wait, one silent for longer is given up on sooner. Tune it via
@@ -122,6 +123,48 @@ Under the hood this is driven by a small TOML config (`watch_namespaces`, `proxy
 chart renders into a mounted ConfigMap. For local development you can point the binary at a config
 file directly with `run --config <path>` and set `POD_NAMESPACE` (the operator's own namespace, always
 enrolled).
+
+### Protect operator-created Jobs
+
+The chart's `Role` grants the operator ServiceAccount permission to create Jobs in each enrolled
+namespace. Kubernetes RBAC is additive: this does **not** stop another `Role`, `ClusterRole`, or
+binding from granting the same permission to a user or another ServiceAccount. Keep enrolled
+namespaces dedicated to Ansible operations and do not grant untrusted principals `create` on
+`batch/jobs` there.
+
+This matters for more than ordinary workload separation. The operator records a run before creating
+its Job and later checks the Job's owner reference and run labels to identify it. A principal that can
+create Jobs in an enrolled namespace can occupy an expected Job name, or copy the operator's identity
+metadata onto a different pod template. The reconciler refuses an ordinary foreign Job and waits for
+it, but object metadata alone cannot prove which principal created a Job that carries all the expected
+fields.
+
+Check the effective permission for the operator and for every other principal that may act in an
+enrolled namespace. Replace the ServiceAccount names with the ones used by your installation:
+
+```sh
+ENROLLED_NAMESPACE=team-a
+OPERATOR_NAMESPACE=ansible-system
+OPERATOR_SERVICE_ACCOUNT=ansible-operator
+
+kubectl auth can-i create jobs -n "$ENROLLED_NAMESPACE" \
+  --as="system:serviceaccount:$OPERATOR_NAMESPACE:$OPERATOR_SERVICE_ACCOUNT"
+# expected: yes
+
+kubectl auth can-i create jobs -n "$ENROLLED_NAMESPACE" \
+  --as="system:serviceaccount:$ENROLLED_NAMESPACE:default"
+# expected for an untrusted tenant ServiceAccount: no
+```
+
+Review namespaced `RoleBinding`s and cluster-wide `ClusterRoleBinding`s as well; a cluster-wide grant
+can bypass the namespace's intended local policy. If an enrolled namespace must also host unrelated
+Job workloads, use an admission policy to reserve the operator's Job identity instead: allow only the
+operator ServiceAccount to create Jobs with the operator's reserved component/plan/run labels and
+with names matching the operator's `apply-...` convention. Do not solve this by allowing every Job in
+the namespace to bypass admission.
+
+See [Security model → the Job trust boundary](./security.md#the-job-trust-boundary) for why this
+restriction is required even though the operator validates Job identity during recovery.
 
 ## ServiceAccount tokens
 
@@ -193,6 +236,21 @@ Set `crds.install: false` only when another release owns the same cluster-scoped
 manifests are generated from the operator binary itself (`ansible-operator crds`) and stored under
 the subchart's `templates/` directory.
 The regeneration procedure lives in `chart/README.md`.
+
+The chart declares `kubeVersion: ">=1.25.0-0"` because two CRDs use **CRD validation rules**
+(`x-kubernetes-validations`):
+
+- The `Play` CRD freezes a run record's spec for its lifetime, one of the controls that keeps a
+  committed run from being steered by anyone with write access to `plays` (see
+  [Security](./security.md) and `T-ESC-8`).
+- The `PlaybookPlan` CRD caps a plan's name at 63 characters, because that name is written as a
+  label value onto every object a run creates.
+
+Kubernetes only evaluates such rules from 1.25 onwards, and an older or non-conformant API server
+would **ignore them silently** rather than reject them — so if you bypass the version constraint,
+confirm they are actually in force rather than assuming it. The operator re-checks the plan-name cap
+itself and refuses an over-long plan with a clear message on the resource, so only the `Play` rule
+depends on the API server alone.
 
 Being ordinary release resources also means Helm would delete them on `helm uninstall`, and
 deleting a CRD deletes every custom resource of that kind cluster-wide. `crds.keep` defaults to

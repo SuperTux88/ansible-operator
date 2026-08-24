@@ -14,7 +14,7 @@ controllers running concurrently in `main.rs` via `tokio::join!`
 
 ## Security invariants — do NOT regress without an explicit instruction
 
-These are `THREAT_MODEL.md` §7 (INV-1…INV-7), enforced by unit tests. They are the
+These are the numbered invariants in `THREAT_MODEL.md` §7, enforced by unit tests. They are the
 whole point of the design. If a change would weaken one, stop and surface it; do not
 "simplify" or "clean up" past them unless the user explicitly asks.
 
@@ -27,9 +27,13 @@ whole point of the design. If a change would weaken one, stop and surface it; do
 - **INV-3 — Enforcement runs before proxy infra.** NAP clamping happens at inventory
   resolve time (reconcile "step 0b"), on **every** reconcile, before any proxy pod/Secret/
   NetworkPolicy is created.
+- **INV-3b — Every attempt re-authorizes before proxy creation.** Fresh and resumed absent-Job
+  attempts share `ensure_infra_and_launch`, which derives the node set from the groups it is about
+  to render and re-authorizes *that* set live before `ensure_proxy_infra`, never a set read back
+  from the record.
 - **INV-4 — Cross-run isolation is at the cert layer.** Each proxy pod's
-  `AuthorizedPrincipalsFile` lists **only its own run's execution hash** (`build_secret`) —
-  never `root`, never a wildcard. The client cert carries that hash as a principal. The
+  `AuthorizedPrincipalsFile` lists **only its own per-attempt run ID** (`build_secret`) —
+  never `root`, never a wildcard. The client cert carries that run ID as a principal. The
   per-run `NetworkPolicy` is defense-in-depth on top, not the primary control.
 - **INV-5 — Node set is authoritative & live.** The allow-set is a **live** Node read in
   `enforce`, never a cached one.
@@ -74,20 +78,21 @@ src/v1beta1/
   controllers/playbookplancontroller/
     reconciler.rs                    the reconcile pipeline (below); patch_status via JSON merge patch
     node_access.rs                   NodeAccessPolicy enforcement: fail-closed intersection clamp (INV-2/3/5)
-    managed_ssh.rs                   proxy pods (hostPID + nsenter = NODE ROOT), per-run sshd config/certs/principals, NetworkPolicy, cleanup (INV-4/7)
+    managed_ssh.rs                   proxy pods (hostPID + nsenter = NODE ROOT), per-attempt sshd config/certs/principals, NetworkPolicy, cleanup (INV-4/7)
     locking.rs                       per-host Leases (operator ns) for run mutual-exclusion
+    play_history.rs                  writes/prunes the immutable Play run records; its module doc is the authoritative PlayPhase state machine
     job_builder.rs                   builds the one Job per run (volumes, client-cert mount, callback env, node anti-affinity)
     workspace.rs                     renders the per-plan workspace Secret (playbook.yml/inventory.yml/recap plugin/vars), owner-ref'd to the plan
     execution_evaluator.rs           ExecutionHash over playbook + referenced Secrets (excludes the self-rendered workspace Secret)
     callback_output.rs               parses the recap the callback wrote to the pod termination message
     triggers.rs                      cron schedule eval (evaluate_schedule / forecast_next_run), timezone-aware
-    status.rs                        folds Job/host outcomes into PlaybookPlanStatus conditions
+    status.rs                        folds a terminal Play's per-host results into PlaybookPlanStatus conditions (the only place run outcomes reach the plan)
     paths.rs                         shared mount-path conventions between workspace/inventory_renderer/job_builder
   ansible/
     playbook_renderer.rs             round-trips spec.template.playbook YAML (validation)
     inventory_renderer.rs            ResolvedInventoryGroup → Ansible YAML inventory (managed-ssh: proxy IP + HostKeyAlias; ssh: BYO key)
     ansible_operator_recap.py        Ansible callback plugin: writes per-host recap to /dev/termination-log
-  labels.rs                          PLAYBOOKPLAN_NAME / _HASH / _HOST label keys
+  labels.rs                          PLAYBOOKPLAN_NAME / _HASH / _HOST / RUN_ID label keys, plus PLAY_UID_ANNOTATION (an annotation, never selectable)
 ```
 
 ## Core reconcile flow (playbookplancontroller/reconciler.rs)
@@ -101,29 +106,58 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    (`config.rs`: operator ns ∪ `watch_namespaces`), refuse with `Phase::UnauthorizedNamespace`
    and `await_change` — before any Secret/Job call (the operator holds no Secret/Job RBAC
    outside the enrolled set).
-2. **Step 0 — resolve inventory.** `resolve_inventory` → `Vec<ResolvedInventoryGroup>`
-   (`ClusterInventory` ⇒ `ManagedSsh`, `StaticInventory` ⇒ `Ssh`), preserving which resource
-   each group came from.
-3. **Step 0b — NodeAccessPolicy enforcement (INV-2/3/5).** `node_access::enforce` clamps
-   managed-ssh nodes to the fail-closed intersection of the plan namespace's allowed nodes;
-   `warn!`s excluded nodes; sets `status.eligible_hosts`.
+   A **name guard** follows in the same shape (`plan_name_within_label_limit`): a plan name over
+   `MAX_PLAN_NAME_LEN` (63, the *label value* cap — the name is written as a label onto the `Play`,
+   the Job, its pod template and the run's NetworkPolicy) is refused with `Phase::Failed` and
+   `await_change`. The CRD rejects it at admission too; the reconciler re-checks it for clusters
+   that don't evaluate validation rules.
+2. **Step 0a — `recover_active_run`.** Runs *first*, before inventory is even resolved: lists
+   this plan's `Play`s, keeps the ones it owns (`spec.playbookPlan` + `spec.playbookPlanUid`,
+   not the label), deletes any statusless record (it never crossed the operator-owned status
+   boundary, so nothing may be derived from it), and dispatches on `PlayPhase` —
+   `Prepared`/`Starting`/`Launching` ⇒ **deferred** to after inventory resolution (deciding
+   whether they may still be resumed needs the resolved, policy-clamped groups the fingerprint
+   covers), `Running` ⇒ carry on, `Aborted` ⇒ `abandon_run`, terminal-but-unacknowledged ⇒
+   apply its result to the plan.
+   A recovery failure is reported on the plan (`summary`) *before* the tick aborts.
+3. **Steps 0 + 0b — resolve inventory, then clamp it (INV-2/3/5).**
+   `resolve_authorized_inventory` runs `resolve_inventory` → `Vec<ResolvedInventoryGroup>`
+   (`ClusterInventory` ⇒ `ManagedSsh`, `StaticInventory` ⇒ `Ssh`, preserving which resource each
+   group came from) and then `node_access::enforce`, which clamps managed-ssh nodes to the
+   fail-closed intersection of the plan namespace's allowed nodes. One step on purpose: nothing may
+   observe the unclamped result. `warn!`s excluded nodes; sets `status.eligible_hosts`.
 4. **Execution hash.** `ExecutionHash` over the playbook text + contents of every referenced
    Secret (variables + files), order-insensitive; deliberately **excludes** the workspace
    Secret (its content — proxy IPs — legitimately changes each run). Hash change ⇒
-   `Phase::Pending`, reset `retry_count`, clear `last_triggered_run`.
+   `retry_count` reset to 0, `last_triggered_run` cleared (so an edit can start inside the
+   window its predecessor used, and a revert is just another change), and `Phase::Pending`
+   **only when there is no `active_run`** — an in-flight run keeps `Applying` and its own hash
+   (which lives in its `Play`), and the new revision waits for it.
 5. **Step 1 — schedule + outdated hosts.** `triggers::evaluate_schedule` in the plan's
    timezone within a 15s window; `hosts_to_trigger` = outdated hosts (`OneShot`) or all hosts
    (`Recurring`).
-6. **`try_start_run` (steps 2–5)** when eligible: acquire per-host **Leases** (`locking.rs`),
-   ensure **managed-ssh proxy infra** is Ready (`managed_ssh::ensure_proxy_infra`: proxy
-   pods + per-host Secrets + NetworkPolicy in the operator ns, client-cert Secret in the plan
-   ns), render/refresh the **workspace Secret** with the live proxy pod IPs, then ensure the
-   **one Job** exists (`spawn_ansible_job`: list by hash label, adopt an active Job or create
-   the next `retry_count`-numbered one).
-7. **`advance_applying_run` (steps 6–7)** once the Job is terminal: parse the per-host recap
+6. **`try_start_run` (steps 2–5)** when eligible and nothing is active: `select_job` numbers
+   the attempt one past everything still claiming a name (Jobs *and* retained `Play`s — it
+   never adopts a running Job, see below), `play_history::record_prepared` writes the
+   immutable record, then acquire per-host **Leases** (`locking.rs`) and `commit_starting`.
+   From there `ensure_infra_and_launch` does the rest: re-authorize the nodes (INV-3b),
+   `reset_incomplete_run` (drops half-built infra the current CA can't authenticate against),
+   ensure **managed-ssh proxy infra** is Ready (`managed_ssh::ensure_proxy_infra`: proxy pods
+   + per-host Secrets + NetworkPolicy in the operator ns, client-cert Secret in the plan ns),
+   render the **workspace Secret** with the live proxy pod IPs, `commit_launching`, create the
+   **one Job** and `record_running`. A resumed `Prepared`/`Starting` attempt re-enters
+   `try_start_run` with its recorded identity. A `Launching` attempt first checks whether the Job
+   already exists; an absent Job re-enters `ensure_infra_and_launch`, while an existing one is
+   adopted without depending on the newly desired inventory.
+7. **`advance_active_run`** once the Job is terminal: parse the per-host recap
    from the pod's **termination message** (`callback_output.rs`, written by the callback
-   plugin — not from logs, no `pods/log` access), record host outcomes, `cleanup_proxy_infra`,
-   release Leases, set the terminal `Phase` (or reschedule for `Recurring`).
+   plugin — not from logs, no `pods/log` access), `cleanup_proxy_infra`, release Leases,
+   `record_finished` on the `Play`, fold it into the plan via
+   `status::apply_terminal_play_status`, then `finalize_finished_run` (persist, acknowledge,
+   prune) and set the terminal `Phase` (or reschedule for `Recurring`).
+   This is also where a run whose `Play` is gone is `finalize_lost_run`'d (infra released, hosts
+   `Unknown`) — not in step 0a: recovery has no record left to dispatch on, so it is the *mirror*
+   in `status.activeRun` that brings the run here to be released.
 8. **`patch_status`** — JSON **merge patch** (not `replace_status`); many async steps pass
    between read and write, so a version-checked PUT would routinely 409.
 
@@ -136,8 +170,8 @@ A `ClusterInventory` host is reached by scheduling an ephemeral **proxy pod onto
 (`hostPID: true`, host `/proc` bind-mount, `CAP_SYS_ADMIN`+`CAP_SYS_PTRACE`, SELinux `spc_t`);
 every SSH session is wrapped in `nsenter` into the host namespaces (`enter-host.sh`). So a
 managed-ssh session is **root on the node** — that is the feature, and the reason
-`NodeAccessPolicy` exists. Certs are minted per run from the in-memory CA; cross-run isolation
-is the per-run `AuthorizedPrincipalsFile` hash principal (INV-4). See `managed_ssh.rs` doc
+`NodeAccessPolicy` exists. Certs are minted per attempt from the in-memory CA; cross-run isolation
+is the per-attempt `AuthorizedPrincipalsFile` run-ID principal (INV-4). See `managed_ssh.rs` doc
 comments (they encode hard-won runtime facts: BusyBox `nsenter` short-option quirks, the sftp
 `ForceCommand` trick, `StrictModes no`, why `hostPID` can't be joined per-session).
 
@@ -148,14 +182,84 @@ comments (they encode hard-won runtime facts: BusyBox `nsenter` short-option qui
 - `Recurring`: *all* hosts run every schedule tick; reschedules via `forecast_next_run` back to
   `Phase::Scheduled`.
 
+### Run records and recovery (`Play`)
+
+Every attempt is written down **before** anything is created for it, as a `Play` in the plan's
+namespace whose spec is immutable (a CEL `self == oldSelf` rule). **The authoritative descriptions
+live in the code**: `play_history.rs`'s module doc for the `PlayPhase` protocol, `play.rs` for the
+spec and why every field is typed, `reconciler.rs`'s `resume_launching_run` for the Job-existence
+boundary. Keep those correct rather than restating them here. What belongs at this level is the
+handful of decisions that are easy to undo by accident:
+
+- **Do not reintroduce snapshots of the plan spec, resolved connection config or the Job blueprint**
+  "so a run can finish what it started". They are pure functions of the live plan and the live
+  resolved groups, which is exactly what `preparationFingerprint` covers; `create_job_blueprint` is
+  deterministic, so a resumed rebuild is byte-identical. An unlaunched run whose inputs changed is
+  deliberately *not* finished.
+- **Only `Prepared` is gated on the schedule window** and the rest of `has_work_to_start`.
+  `Starting`/`Launching` wait on proxy pods, which routinely outlasts `startingDeadlineSeconds`;
+  gating them would leave a scheduled plan unable to launch.
+- **`spec.suspend` is decided before the inventory is read** (`resolve_unlaunched_before_inputs`),
+  for every phase — dropping an unlaunched attempt needs no inventory, and deferring it would leave a
+  suspended plan sitting on its host Leases behind a read that may never succeed. That is why
+  `has_work_to_start` excludes it and `decide_unlaunched_action` may assume it is not set; folding it
+  back in there looks like a simplification and is a second, later decision.
+- **The result reaches the plan first and the `Play` second** (`finalize_finished_run`), so a crash
+  between them replays idempotently. `plays_to_prune` therefore never prunes an unacknowledged
+  terminal record, nor an `Aborted` one.
+- **`recover_active_run` enforces one-run-at-a-time rather than assuming it.** More than one *in
+  flight* record fails the tick loudly (`sole_active_record`) instead of orphaning the loser's
+  node-root proxy pods — after `renew_contested_locks` has kept every candidate's hosts protected. It
+  deliberately does *not* second-guess a `Running` record's Job: only `advance_active_run` can tell an
+  unfinished foreign Job (wait) from a finished one (finalize with no recap), and deciding it in
+  recovery wedged the plan forever.
+- **`PlaybookPlanStatus.activeRun` is a thin mirror** of what *finishing* a run needs, so a run whose
+  `Play` was deleted can still be released (`finalize_lost_run`) instead of wedging in `Applying`. It
+  is read from the reflector cache, which lags this controller's own writes, so `finalize_lost_run`
+  re-reads the plan from the apiserver first and adopts a disagreeing live status wholesale
+  (`ActiveRunProgress::AlreadyFinalized`).
+- **Do not make the run ID a function of (plan, hash, attempt)** to save recording it. An aborted
+  attempt frees its number again, so a derived ID would hand the retry that attempt's
+  still-terminating proxy pods — see `reconciler::run_id`.
+- **A contended lock is not automatically a lost one.** `locking::renew_locks` separates an observed
+  takeover (`Lost`) from a write race (`Unconfirmed`); only the first may abandon an attempt
+  (`resolve_contended_locks`). Collapsing them would let a transient 409 tear down node-root infra.
+
 ### Job naming and idempotency
 
-Job name is `apply-{plan}-{shortid}-{retry_count}` where `shortid = generate_id(execution_hash)`.
-`retry_count` is in the name because the hash alone is unchanged between retries of an identical
-spec. Dedup is a fresh `list()` by the run's `PLAYBOOKPLAN_HASH` label plus adopt-newest-active
-(`newest_active_job`), not an owner-based get — the reflector-cached `phase` lags this
-controller's own writes, so a cache read can't prevent duplicate creates. Per-node **Leases**
-give run mutual exclusion.
+Job name is `apply-{plan}-{shortid}-{attempt}` (`job_builder::job_name`, which also names the
+`Play`), where `shortid` is **ten symbols of a hash over the plan's UID *and* the execution hash**
+(`run_short_id`) and `{plan}` is **truncated** to whatever `utils::MAX_DNS_LABEL_LEN` leaves after
+the rest — 44 characters at a single-digit attempt, one fewer per further digit. A Job name has to be
+a DNS *label* (it becomes the `job-name` label value on its pods) while a plan may carry a full
+subdomain, and the record is written under this name *before* the Job, so an unbounded name would be
+accepted for the `Play` and then refused for the Job. Keying the short id on the plan UID is what
+makes the lossy readable half safe. Both numbers are pinned by
+`the_plan_name_half_is_truncated_from_45_characters` — they are quoted to the user in
+`scheduling-and-modes.md`, so change them there too or not at all.
+
+The attempt number is in the name because the hash alone is unchanged between retries of an identical
+spec. `select_job` numbers a new attempt one past everything still claiming a name — *all* of this
+plan's Jobs *and* all of its retained `Play`s (including statusless ones, which occupy their name
+until recovery deletes them), across every revision and not just the one being named. That last part
+is load-bearing: `shortid` truncates a 64-bit hash to ten symbols, so two revisions *of one plan*
+(same UID) can still produce the same name, and per-hash numbering would let one claim a name a
+retained record of the other still holds — `record_prepared` then rejects it as another run's on
+every tick until pruning removes it.
+The number, not the hash, is what makes the name unique; a new revision therefore does not restart at
+1. It **never adopts an already-running Job**: every Job the operator creates has
+a `Play` recorded before it, so an active Job that `recover_active_run` didn't account for isn't this
+run's, and adopting it would pair it with a freshly minted `run_id` its own record contradicts.
+Resuming a genuinely in-flight run is recovery's job; same-run idempotency within a tick is
+`spawn_ansible_job`'s (`get_opt` + 409-tolerant create, both validated by `validate_selected_job`).
+
+`validate_selected_job` matches on **identity, not content**: the attempt's `Play` UID on both the Job
+and its pod template, the plan owner reference, the hash, the run ID and the attempt number. A Job's
+pod template is immutable once created, so identity already implies the blueprint — while a
+field-by-field comparison would have to model every server-side default and mutating webhook, and each
+field it mispredicted would disown a healthy run — the operator would sit out the whole run holding
+its host Leases, then write it off as `Unknown`.
+Per-node **Leases** give run mutual exclusion.
 
 ### Secret / Node change triggers
 

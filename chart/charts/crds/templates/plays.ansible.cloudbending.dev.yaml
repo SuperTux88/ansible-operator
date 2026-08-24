@@ -62,20 +62,19 @@ spec:
         properties:
           spec:
             description: |-
-              A single Ansible execution — one attempt of a `PlaybookPlan` run, backed 1:1 by one Job in the
-              plan's namespace. Purely a durable *history record*: the operator writes it, nothing reconciles
-              it into further cluster state. It exists so a run's Ansible recap survives the backing Job/pod's
-              short `ttlSecondsAfterFinished`, and so `kubectl get plays` gives an at-a-glance run history with
-              the recap tallies as columns.
+              An immutable per-attempt recovery and history record. It is written before Job creation, advances
+              from preparation through execution, and retains the terminal recap after the Job is reaped.
 
               Owned (ownerReference) by its `PlaybookPlan`, so deleting the plan cascades to all its Plays;
               retention beyond that is bounded per-plan by `successfulPlaysHistoryLimit`/
-              `failedPlaysHistoryLimit`. Correlated to its Job by the shared execution hash plus `attempt`.
+              `failedPlaysHistoryLimit`. The Job and pod template carry this Play's UID for correlation.
             properties:
               attempt:
                 description: |-
-                  Retry number within this hash: 1 for the first attempt, incrementing per retry. Mirrors the
-                  backing Job's numbered name (`apply-{plan}-{shortid}-{attempt}`).
+                  Attempt number reserved across all revisions of this plan: 1 for the first attempt, then one
+                  past every Job and retained `Play` record still claiming a number. It may therefore continue
+                  across plan edits and skip numbers. Mirrors the backing Job's numbered name
+                  (`apply-{plan}-{shortid}-{attempt}`).
                 minimum: 0.0
                 type: integer
               executionHash:
@@ -102,12 +101,47 @@ spec:
               playbookPlan:
                 description: The `PlaybookPlan` this run belongs to (also this Play's ownerReference).
                 type: string
+              playbookPlanUid:
+                description: |-
+                  UID of the owning `PlaybookPlan`. Unlike an ownerReference, this is part of the immutable run
+                  record and prevents a plan recreated with the same name from adopting an older run.
+                type: string
+              preparationFingerprint:
+                description: |-
+                  Fingerprint of all plan and resolved-inventory inputs used while preparing this attempt.
+
+                  This is the run's change detector, and it is why the record carries no copy of the plan spec,
+                  resolved connection configuration or the Job. Everything an unlaunched attempt needs to be
+                  resumed is a pure function of the live plan spec and the freshly resolved groups, so while
+                  the fingerprint still matches those the inputs can simply be re-derived; once it stops
+                  matching there is nothing worth resuming and the attempt is aborted in favour of the new
+                  revision. Reducing them to one *typed* field is also what lets the spec's `self == oldSelf`
+                  rule cover the whole record: CEL cannot see into a schemaless field, and there is none here.
+                type: string
+              runId:
+                description: |-
+                  Stable identifier for this attempt, used to isolate resource names, labels, and cleanup from
+                  other attempts that share the same execution hash.
+                type: string
+              triggeredSlot:
+                description: |-
+                  Start of the schedule slot consumed by this run. Unscheduled runs leave this absent. Keeping
+                  it in the immutable run record lets restart recovery distinguish this run's slot from a later
+                  slot that becomes due while the operator is unavailable.
+                nullable: true
+                type: string
             required:
             - attempt
             - executionHash
             - inventory
             - playbookPlan
+            - playbookPlanUid
+            - preparationFingerprint
+            - runId
             type: object
+            x-kubernetes-validations:
+            - message: Play spec is immutable
+              rule: self == oldSelf
           status:
             nullable: true
             properties:
@@ -118,14 +152,16 @@ spec:
               finishedAt:
                 description: |-
                   When the backing Job reached a terminal state. The run's *start* is the Play's own
-                  `metadata.creationTimestamp` (the Play is created when the run's Job is), so it isn't
-                  duplicated here. See the `#[serde(default, ...)]` timestamp note on
+                  `metadata.creationTimestamp` (the Play is created immediately before the run's Job), so it
+                  isn't duplicated here. See the `#[serde(default, ...)]` timestamp note on
                   `PlaybookPlanStatus::next_run`: merge patches drop `null` keys, so this is genuinely absent
                   when `None`.
                 nullable: true
                 type: string
               hostCount:
-                description: Number of hosts this run targeted (mirrors `spec.hosts.len()`, surfaced as a column).
+                description: |-
+                  Number of distinct hosts this run targeted (the total across `spec.inventory`, surfaced as
+                  a column).
                 minimum: 0.0
                 type: integer
               hosts:
@@ -188,11 +224,21 @@ spec:
                 type: string
               phase:
                 enum:
+                - Prepared
+                - Starting
+                - Launching
                 - Running
                 - Succeeded
                 - Failed
                 - Unknown
+                - Aborted
                 type: string
+              planStatusRecorded:
+                default: false
+                description: |-
+                  Whether this terminal result has been applied to the owning `PlaybookPlan` status. Kept on
+                  the status subresource so acknowledgement uses the operator's existing `plays/status` RBAC.
+                type: boolean
               recap:
                 description: The Ansible recap, summed across every targeted host — the recap columns read from here.
                 properties:

@@ -5,7 +5,7 @@ use std::{
 
 use k8s_openapi::ByteString;
 
-use crate::v1beta1::{self, controllers::reconcile_error::ReconcileError};
+use crate::v1beta1;
 
 #[derive(PartialEq, Debug, Copy, Clone)]
 pub struct ExecutionHash(u64);
@@ -25,6 +25,12 @@ impl std::ops::Deref for ExecutionHash {
 }
 
 impl ExecutionHash {
+    /// Reconstructs a persisted execution hash. Hashes are serialized as lowercase hexadecimal
+    /// strings by `Display`, so this accepts the status representation used by `ActiveRun`.
+    pub fn from_hex(value: &str) -> Option<Self> {
+        u64::from_str_radix(value, 16).ok().map(Self)
+    }
+
     /// Folds inventory-author group variables into an existing hash. Kept separate from
     /// [`calculate_execution_hash`] so the many call sites that hash only playbook + secrets stay
     /// unchanged — the reconciler chains this on with the run's resolved groups.
@@ -60,7 +66,7 @@ impl ExecutionHash {
 pub fn find_outdated_hosts(
     status: &v1beta1::PlaybookPlanStatus,
     execution_hash: &ExecutionHash,
-) -> Result<Vec<String>, ReconcileError> {
+) -> Vec<String> {
     let hosts: Vec<_> = status
         .eligible_hosts
         .iter()
@@ -69,7 +75,7 @@ pub fn find_outdated_hosts(
 
     // If we don't have any hosts_status yet, simply return all hosts for execution
     let Some(hosts_status) = &status.hosts_status else {
-        return Ok(hosts);
+        return hosts;
     };
 
     // For each host, check if it already has the current execution hash in the PlaybookPlan's status
@@ -87,7 +93,7 @@ pub fn find_outdated_hosts(
         host_status.last_applied_hash != *execution_hash.to_string()
     });
 
-    Ok(outdated_hosts.cloned().collect())
+    outdated_hosts.cloned().collect()
 }
 
 pub fn find_all_hosts(status: &v1beta1::PlaybookPlanStatus) -> Vec<String> {
@@ -146,7 +152,7 @@ mod tests {
         let to_execute = find_outdated_hosts(&status, &ExecutionHash(1));
 
         // Then
-        assert_eq!(to_execute.unwrap().len(), 0);
+        assert_eq!(to_execute.len(), 0);
     }
 
     #[test]
@@ -171,7 +177,7 @@ mod tests {
             "host-3".to_owned(),
         ];
         let expected: Vec<String> = expected_hostnames.to_vec();
-        let actual: Vec<String> = to_execute.unwrap();
+        let actual: Vec<String> = to_execute;
 
         assert!(expected.eq(&actual));
     }
@@ -216,7 +222,7 @@ mod tests {
         // Then
         let expected_hostnames = ["host-1".to_owned(), "host-3".to_owned()];
         let expected: Vec<String> = expected_hostnames.to_vec();
-        let actual: Vec<String> = to_execute.unwrap();
+        let actual: Vec<String> = to_execute;
 
         assert_eq!(expected, actual);
     }

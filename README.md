@@ -18,9 +18,11 @@ You create three kinds of custom resource:
   credentials used to reach them.
 
 For each run the operator renders a workspace (playbook, inventory, variables, recap callback) into
-a Secret, ensures the hosts are reachable, and launches a single Job that applies the playbook to
-every targeted host. When the Job finishes it parses a compact per-host recap and updates the
-`PlaybookPlan` status.
+a Secret, records the attempt as a `Play`, ensures the hosts are reachable, and launches a single Job
+that applies the playbook to every targeted host. The `Play` is a write-ahead recovery record, so an
+attempt survives operator restarts without being confused with a newer plan revision. When the Job
+finishes the operator parses a compact per-host recap, updates the `PlaybookPlan` status, and retains
+the `Play` as bounded run history.
 
 ## Features
 
@@ -50,6 +52,8 @@ every targeted host. When the Job finishes it parses a compact per-host recap an
   (Succeeded / Failed / NotReached / Unknown), `Ready`/`Running` conditions, and a summary. The
   recap travels via the Job container's termination message, so the operator never needs to scrape
   pod logs.
+- [x] **Crash-safe run recovery** — immutable `Play` records preserve per-attempt identity across
+  operator restarts, while edits supersede only attempts whose Job has not been created yet.
 - [x] **Scheduling-aware placement** — the ansible Job pod softly prefers *not* to be scheduled onto
   a node the run targets, so a disruptive playbook is less likely to kill its own controller pod
   mid-run (never blocks scheduling, even when a run targets every node).

@@ -1,22 +1,19 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, FixedOffset};
-use kube::CustomResource;
+use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::v1beta1::{HostOutcome, ResolvedHosts, UnsignedInt};
 
-/// A single Ansible execution — one attempt of a `PlaybookPlan` run, backed 1:1 by one Job in the
-/// plan's namespace. Purely a durable *history record*: the operator writes it, nothing reconciles
-/// it into further cluster state. It exists so a run's Ansible recap survives the backing Job/pod's
-/// short `ttlSecondsAfterFinished`, and so `kubectl get plays` gives an at-a-glance run history with
-/// the recap tallies as columns.
+/// An immutable per-attempt recovery and history record. It is written before Job creation, advances
+/// from preparation through execution, and retains the terminal recap after the Job is reaped.
 ///
 /// Owned (ownerReference) by its `PlaybookPlan`, so deleting the plan cascades to all its Plays;
 /// retention beyond that is bounded per-plan by `successfulPlaysHistoryLimit`/
-/// `failedPlaysHistoryLimit`. Correlated to its Job by the shared execution hash plus `attempt`.
-#[derive(CustomResource, Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
+/// `failedPlaysHistoryLimit`. The Job and pod template carry this Play's UID for correlation.
+#[derive(CustomResource, Debug, Serialize, Deserialize, Default, Clone, KubeSchema)]
 #[kube(
     group = "ansible.cloudbending.dev",
     version = "v1beta1",
@@ -36,16 +33,44 @@ use crate::v1beta1::{HostOutcome, ResolvedHosts, UnsignedInt};
     printcolumn = r#"{"name":"Status","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
+// Freezes the whole spec. CEL is blind inside `x-kubernetes-preserve-unknown-fields`, so the rule is
+// only worth its name because every field below is *typed* — which is possible because the inputs an
+// attempt may be resumed against are reduced to the `preparationFingerprint` hash rather than stored
+// verbatim. `crd_makes_the_play_spec_immutable` fails if a schemaless field is ever reintroduced.
+// Not the only control: the nodes a resumed run is about to reach are re-authorized against live
+// policy before any of them get a proxy pod. See THREAT_MODEL §T-ESC-8.
+#[x_kube(validation = Rule::new("self == oldSelf").message("Play spec is immutable"))]
 #[serde(rename_all = "camelCase")]
 pub struct PlaySpec {
     /// The `PlaybookPlan` this run belongs to (also this Play's ownerReference).
     pub playbook_plan: String,
 
+    /// UID of the owning `PlaybookPlan`. Unlike an ownerReference, this is part of the immutable run
+    /// record and prevents a plan recreated with the same name from adopting an older run.
+    pub playbook_plan_uid: String,
+
     /// The execution hash the run applied — matches the backing Job's hash label.
     pub execution_hash: String,
 
-    /// Retry number within this hash: 1 for the first attempt, incrementing per retry. Mirrors the
-    /// backing Job's numbered name (`apply-{plan}-{shortid}-{attempt}`).
+    /// Stable identifier for this attempt, used to isolate resource names, labels, and cleanup from
+    /// other attempts that share the same execution hash.
+    pub run_id: String,
+
+    /// Fingerprint of all plan and resolved-inventory inputs used while preparing this attempt.
+    ///
+    /// This is the run's change detector, and it is why the record carries no copy of the plan spec,
+    /// resolved connection configuration or the Job. Everything an unlaunched attempt needs to be
+    /// resumed is a pure function of the live plan spec and the freshly resolved groups, so while
+    /// the fingerprint still matches those the inputs can simply be re-derived; once it stops
+    /// matching there is nothing worth resuming and the attempt is aborted in favour of the new
+    /// revision. Reducing them to one *typed* field is also what lets the spec's `self == oldSelf`
+    /// rule cover the whole record: CEL cannot see into a schemaless field, and there is none here.
+    pub preparation_fingerprint: String,
+
+    /// Attempt number reserved across all revisions of this plan: 1 for the first attempt, then one
+    /// past every Job and retained `Play` record still claiming a number. It may therefore continue
+    /// across plan edits and skip numbers. Mirrors the backing Job's numbered name
+    /// (`apply-{plan}-{shortid}-{attempt}`).
     #[schemars(with = "UnsignedInt")]
     pub attempt: u32,
 
@@ -53,6 +78,13 @@ pub struct PlaySpec {
     /// and its hosts) rather than a flat host list. Same shape as the plan's `.status.eligibleHosts`,
     /// filtered to the hosts this attempt actually ran.
     pub inventory: Vec<ResolvedHosts>,
+
+    /// Start of the schedule slot consumed by this run. Unscheduled runs leave this absent. Keeping
+    /// it in the immutable run record lets restart recovery distinguish this run's slot from a later
+    /// slot that becomes due while the operator is unavailable.
+    #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
+    #[schemars(with = "Option<String>")]
+    pub triggered_slot: Option<DateTime<FixedOffset>>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -60,20 +92,26 @@ pub struct PlaySpec {
 pub struct PlayStatus {
     pub phase: PlayPhase,
 
+    /// Whether this terminal result has been applied to the owning `PlaybookPlan` status. Kept on
+    /// the status subresource so acknowledgement uses the operator's existing `plays/status` RBAC.
+    #[serde(default)]
+    pub plan_status_recorded: bool,
+
     /// Name of the backing Job in the plan's namespace. The Job/pod may already have been reaped by
     /// Kubernetes' TTL controller; this Play outlives them.
     pub job_name: Option<String>,
 
     /// When the backing Job reached a terminal state. The run's *start* is the Play's own
-    /// `metadata.creationTimestamp` (the Play is created when the run's Job is), so it isn't
-    /// duplicated here. See the `#[serde(default, ...)]` timestamp note on
+    /// `metadata.creationTimestamp` (the Play is created immediately before the run's Job), so it
+    /// isn't duplicated here. See the `#[serde(default, ...)]` timestamp note on
     /// `PlaybookPlanStatus::next_run`: merge patches drop `null` keys, so this is genuinely absent
     /// when `None`.
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub finished_at: Option<DateTime<FixedOffset>>,
 
-    /// Number of hosts this run targeted (mirrors `spec.hosts.len()`, surfaced as a column).
+    /// Number of distinct hosts this run targeted (the total across `spec.inventory`, surfaced as
+    /// a column).
     #[schemars(with = "UnsignedInt")]
     pub host_count: u32,
 
@@ -119,8 +157,19 @@ pub struct PlayHostResult {
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
 pub enum PlayPhase {
-    /// The backing Job has been created and hasn't reached a terminal state yet.
+    /// The immutable run record exists, but Job creation has not yet been committed.
     #[default]
+    Prepared,
+    /// The run holds its host locks and its privileged infrastructure is being created. Recovery
+    /// resumes that setup while the plan's inputs are unchanged; the attempt is abandoned if its
+    /// nodes lost their authorization or if the desired revision moved on.
+    Starting,
+    /// Setup is complete and final live authorization has passed, so Job creation is committed.
+    /// Recovery re-derives the blueprint from the plan and creates it. If the desired revision moved
+    /// on first, recovery adopts the Job when it already exists — a started run is always allowed to
+    /// finish — and otherwise abandons the attempt rather than launching a superseded one.
+    Launching,
+    /// The backing Job has been confirmed and hasn't reached a terminal state yet.
     Running,
     /// The Job finished and no targeted host was `Failed`/`Unreachable`.
     Succeeded,
@@ -129,11 +178,15 @@ pub enum PlayPhase {
     /// The Job finished but its recap couldn't be read — reaped before the operator saw it, or a
     /// hard crash (OOM/SIGKILL) before the stats hook wrote `/dev/termination-log`.
     Unknown,
+    /// The run was superseded before Job creation committed. Cleanup is pending; this phase is
+    /// transient and the Play is deleted after cleanup.
+    Aborted,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kube::CustomResourceExt as _;
 
     #[test]
     fn play_status_serializes_recap_camel_case_for_columns() {
@@ -174,6 +227,51 @@ mod tests {
         let back: PlayStatus = serde_json::from_value(json).unwrap();
         assert_eq!(back.recap, status.recap);
         assert_eq!(back.hosts["node-1"].outcome, HostOutcome::Succeeded);
+    }
+
+    #[test]
+    fn crd_makes_the_play_spec_immutable() {
+        let crd = serde_json::to_value(Play::crd()).unwrap();
+        let spec_schema =
+            &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        let validations = &spec_schema["x-kubernetes-validations"];
+
+        assert!(validations.as_array().unwrap().iter().any(|validation| {
+            validation["rule"] == "self == oldSelf"
+                && validation["message"] == "Play spec is immutable"
+        }));
+
+        // The rule is only worth the name if CEL can actually see everything it claims to freeze.
+        // CEL is blind inside `x-kubernetes-preserve-unknown-fields`, so a single schemaless field
+        // anywhere under the spec would silently carve a hole in the immutability guarantee — and
+        // the hole would be invisible in the rule itself. Keeping every input reduced to a typed
+        // field (`preparationFingerprint` rather than a verbatim inventory snapshot) is what makes
+        // this hold; a new field that reintroduces one has to fail here rather than in production.
+        fn schemaless_field(schema: &serde_json::Value, path: &str) -> Option<String> {
+            if schema["x-kubernetes-preserve-unknown-fields"] == serde_json::json!(true) {
+                return Some(path.to_string());
+            }
+            let mut nested: Vec<(String, &serde_json::Value)> = Vec::new();
+            if let Some(properties) = schema["properties"].as_object() {
+                nested.extend(
+                    properties
+                        .iter()
+                        .map(|(key, value)| (format!("{path}.{key}"), value)),
+                );
+            }
+            if schema["items"].is_object() {
+                nested.push((format!("{path}[]"), &schema["items"]));
+            }
+            nested
+                .into_iter()
+                .find_map(|(path, schema)| schemaless_field(schema, &path))
+        }
+
+        assert_eq!(
+            schemaless_field(spec_schema, "spec"),
+            None,
+            "a schemaless field under the Play spec is invisible to the immutability rule"
+        );
     }
 
     /// An absent optional timestamp must deserialize (merge patches store it as genuinely missing,
