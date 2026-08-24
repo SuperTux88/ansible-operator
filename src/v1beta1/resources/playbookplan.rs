@@ -28,6 +28,16 @@ impl JsonSchema for GenericMap {
     }
 }
 
+/// Cap on a plan's own object name, enforced at admission by the CRD rule below and re-checked by
+/// the reconciler for clusters that do not evaluate such rules.
+///
+/// Kubernetes would allow the full DNS *subdomain* length here, but the plan's name is written as a
+/// **label value** onto every object a run creates — its `Play`, its Job, that Job's pod template and
+/// the run's egress NetworkPolicy — and label values stop at 63 characters. Without this cap a longer
+/// name is accepted happily and then fails at the first of those creates, with an error naming a
+/// label the user never wrote. See `reconciler::plan_name_within_label_limit`.
+pub const MAX_PLAN_NAME_LEN: usize = 63;
+
 #[derive(CustomResource, Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
 #[kube(
     group = "ansible.cloudbending.dev",
@@ -35,6 +45,13 @@ impl JsonSchema for GenericMap {
     kind = "PlaybookPlan",
     namespaced,
     status = "PlaybookPlanStatus",
+    // Root-level rule: `self` is the whole object, and `metadata.name` is one of the few metadata
+    // fields CEL can always reach from here. See `MAX_PLAN_NAME_LEN` for why the cap exists, and
+    // `deployment.md` for the same caveat the `Play` rule carries — an API server that does not
+    // evaluate validation rules ignores this silently rather than rejecting it, which is why the
+    // reconciler checks it too.
+    validation = Rule::new("!has(self.metadata.name) || self.metadata.name.size() <= 63")
+        .message("PlaybookPlan name must be at most 63 characters: it is used as a label value on the objects each run creates"),
     printcolumn = r#"{"name":"Mode","type":"string","jsonPath":".spec.mode"}"#,
     printcolumn = r#"{"name":"Schedule","type":"string","jsonPath":".spec.schedule"}"#,
     printcolumn = r#"{"name":"Suspended","type":"boolean","jsonPath":".spec.suspend"}"#,
@@ -106,12 +123,15 @@ pub struct PlaybookPlanSpec {
     pub ttl_seconds_after_finished: Option<i32>,
 
     /// How many successful `Play` history records to keep for this plan before the oldest are
-    /// pruned. Unlike the Job's short TTL, Plays are the durable run history. Defaults to 3.
+    /// pruned. Unlike the Job's short TTL, Plays are the durable run history. A terminal result is
+    /// temporarily exempt until it reaches the plan status. Defaults to 3.
     #[schemars(with = "Option<UnsignedInt>")]
     pub successful_plays_history_limit: Option<u32>,
 
     /// How many failed (or outcome-unknown) `Play` history records to keep for this plan. Kept
-    /// larger than the successful limit so failures stay visible longer. Defaults to 10.
+    /// larger than the successful limit so failures stay visible longer. A terminal result is
+    /// temporarily exempt until it reaches the plan status; an aborted attempt is deleted only
+    /// after its resources are cleaned up. Defaults to 10.
     #[schemars(with = "Option<UnsignedInt>")]
     pub failed_plays_history_limit: Option<u32>,
 
@@ -313,7 +333,21 @@ pub enum Phase {
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybookPlanStatus {
+    /// The run that is currently being applied, independent of the newly desired execution hash.
+    /// This remains stable while a spec change queues a replacement run, so the old Job, locks, and
+    /// managed-ssh resources continue to be reconciled until the run finishes.
+    ///
+    /// Only what finishing that run needs: everything else about it lives in its immutable `Play`,
+    /// which is the record recovery reads. This copy is what lets the operator still release a run
+    /// whose `Play` was deleted out from under it.
+    pub active_run: Option<ActiveRun>,
     pub eligible_hosts: Vec<ResolvedHosts>,
+    /// The plan generation the workspace Secret was last rendered from — informational only.
+    ///
+    /// It is deliberately *not* a "needs re-render" gate: the workspace embeds the live proxy pod
+    /// IPs, which are fresh every time a run's infrastructure is built, so it is rewritten whenever
+    /// a run reaches that point regardless of whether the spec changed. Reintroducing a gate here
+    /// would let a run mount an inventory pointing at a previous run's pods.
     pub last_rendered_generation: Option<i64>,
     pub conditions: Vec<PlaybookPlanCondition>,
     pub hosts_status: Option<BTreeMap<String, HostStatus>>,
@@ -327,8 +361,8 @@ pub struct PlaybookPlanStatus {
     /// The start of the schedule slot (`Timing::Now`'s window start) that a run was last started
     /// for. The trigger gate compares the current slot against this so a run that completes inside
     /// its grace window isn't immediately re-triggered by the next reconcile within that same
-    /// window. Reset whenever `current_hash` changes; `None` for unscheduled plans (no slot to
-    /// dedupe against).
+    /// window. Cleared whenever `currentHash` changes, so an edit takes effect inside the window it
+    /// was made in; `None` for unscheduled plans (no slot to dedupe against).
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub last_triggered_run: Option<DateTime<FixedOffset>>,
@@ -339,11 +373,38 @@ pub struct PlaybookPlanStatus {
     /// than the `PLAYBOOKPLAN_HASH` label alone, since that label is stable across every retry
     /// of an unchanged spec and could match an older, already-finished retry's Job.
     pub current_job_name: Option<String>,
-    /// How many Jobs have been created for `current_hash` so far, including the current one —
-    /// distinguishes retries in the Job name (`apply-{plan}-{shortid}-{n}`). Reset to 0 whenever
-    /// `current_hash` changes; incremented once per Job actually created, in `spawn_ansible_job`.
+    /// The attempt number of the current run, which is what distinguishes retries in the Job name
+    /// (`apply-{plan}-{shortid}-{n}`). Reset to 0 whenever `currentHash` changes, but that reset
+    /// only ever lowers the *starting point*: a new attempt is numbered past every attempt still
+    /// claiming a name — all of this plan's Jobs and all of its retained `Play` records, whatever
+    /// revision they belong to — so it can advance by more than one, and a new revision does not
+    /// restart at 1 while earlier runs are still retained. Names are reserved plan-wide rather than
+    /// per revision because the short id truncates a hash over the plan and the revision, so two
+    /// revisions of one plan can share one; see `reconciler::select_job`.
     #[schemars(with = "UnsignedInt")]
     pub retry_count: u32,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveRun {
+    /// The execution hash used to create this run's Job and infrastructure.
+    pub execution_hash: String,
+    /// Stable per-attempt resource/cleanup identity, distinct even across same-hash retries.
+    pub run_id: String,
+    /// The Job backing this run, which is also the name of its `Play`.
+    pub job_name: String,
+    /// UID of the immutable `Play` recovery record correlated with the Job and its pod template.
+    pub play_uid: String,
+    /// Hosts targeted by this run, preserved even if the desired inventory changes while it runs.
+    pub hosts: Vec<String>,
+    /// Attempt number represented by `jobName`.
+    #[schemars(with = "UnsignedInt")]
+    pub attempt: u32,
+    /// Start of the schedule slot consumed by this run, if it is scheduled.
+    #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
+    #[schemars(with = "Option<String>")]
+    pub triggered_slot: Option<DateTime<FixedOffset>>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -397,6 +458,18 @@ impl Condition for PlaybookPlanCondition {
     fn reason(&self) -> Option<&str> {
         self.reason.as_deref()
     }
+
+    fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+
+    fn last_transition_time(&self) -> Option<DateTime<FixedOffset>> {
+        self.last_transition_time
+    }
+
+    fn set_last_transition_time(&mut self, value: Option<DateTime<FixedOffset>>) {
+        self.last_transition_time = value;
+    }
 }
 
 impl PlaybookPlan {
@@ -412,6 +485,40 @@ impl PlaybookPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The plan-name cap has to reach the API server as a rule on the *root* of the object: only
+    /// there can CEL see `metadata.name`, and the spec is where a rule would otherwise land. The
+    /// reconciler enforces the same bound for clusters that ignore validation rules, so this pins
+    /// the admission-time half — the one that gives the user the error at `kubectl apply`.
+    #[test]
+    fn crd_caps_the_plan_name_at_the_label_value_limit() {
+        use kube::CustomResourceExt as _;
+
+        let crd = serde_json::to_value(PlaybookPlan::crd()).unwrap();
+        let root = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
+        let validations = root["x-kubernetes-validations"].as_array().unwrap();
+
+        let rule = validations
+            .iter()
+            .find(|validation| {
+                validation["rule"]
+                    .as_str()
+                    .is_some_and(|rule| rule.contains("metadata.name"))
+            })
+            .expect("the plan-name rule is on the root schema, not the spec");
+
+        assert_eq!(
+            rule["rule"],
+            format!("!has(self.metadata.name) || self.metadata.name.size() <= {MAX_PLAN_NAME_LEN}"),
+            "the rule must state the same bound the reconciler enforces"
+        );
+        assert!(
+            rule["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("label value")),
+            "the message has to say why, or the cap reads as arbitrary"
+        );
+    }
 
     #[test]
     fn test_serialization() {

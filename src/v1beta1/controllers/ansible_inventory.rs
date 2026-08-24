@@ -7,7 +7,7 @@ pub trait AnsibleInventory {
     fn get_hosts(&self) -> Vec<ResolvedHosts>;
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedHosts {
     pub name: String,
@@ -19,7 +19,11 @@ pub struct ResolvedHosts {
 /// managed-ssh, `StaticInventory`-sourced groups always use their own embedded SSH key. Kept as
 /// a distinct per-group type, not flattened, since each resource's own config (tolerations /
 /// SshConfig) has to travel with its hosts downstream.
-#[derive(Clone, Debug)]
+///
+/// `Serialize` is not for persistence — no `Play` or status stores these — but for
+/// `reconciler::preparation_fingerprint`, which hashes the serialized form to detect that the
+/// resolved inventory an attempt was prepared against has moved on.
+#[derive(Clone, Debug, Serialize)]
 pub enum ResolvedInventoryGroup {
     ManagedSsh {
         hosts: ResolvedHosts,
