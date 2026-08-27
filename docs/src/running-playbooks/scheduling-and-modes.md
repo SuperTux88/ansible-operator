@@ -90,9 +90,10 @@ or a one-time migration and confirm every host got it.
 ### `Recurring`
 
 Re-apply on **every** schedule tick. *All* hosts run each time, regardless of whether they ran
-successfully last time, and the plan reschedules itself back to `Scheduled` for the next tick. Good
-for periodic enforcement or inherently repeating work: nightly package upgrades, drift correction,
-health tasks. A `Recurring` plan needs a `schedule`.
+successfully last time. Between ticks the phase keeps the latest run's `Succeeded` or `Failed`
+result, while `.status.nextRun` names the next tick. Good for periodic enforcement or inherently
+repeating work: nightly package upgrades, drift correction, health tasks. A `Recurring` plan needs a
+`schedule`.
 
 ## Drift detection
 

@@ -288,7 +288,7 @@ async fn reconcile(
     // after inventory resolution rather than here, because deciding whether it may still be resumed
     // needs the resolved, policy-clamped groups its fingerprint covers.
     let mut unlaunched_run: Option<UnlaunchedRun> = None;
-    let mut finished_active_run: Option<RecordedRun> = None;
+    let mut finished_active_run: Option<FinishedRun> = None;
     // Recovery drives the privileged parts of a run (Job creation, proxy infra, locks), so a failure
     // here aborts the tick before the final `patch_status`. Report it on the plan first, otherwise a
     // run that can't be recovered — a rejected Job, a revoked node grant — is only ever visible in
@@ -382,7 +382,10 @@ async fn reconcile(
                     }
                 }
                 finalized_run = true;
-                finished_active_run = Some(finished);
+                finished_active_run = Some(FinishedRun {
+                    outcome: status.phase,
+                    run: finished,
+                });
                 surviving_run = surviving;
             }
         }
@@ -448,6 +451,7 @@ async fn reconcile(
             }
             ActiveRunProgress::Finished {
                 run: finished,
+                outcome,
                 record,
             } => {
                 resource_status.summary =
@@ -475,7 +479,10 @@ async fn reconcile(
                     }
                 }
                 finalized_run = true;
-                finished_active_run = Some(finished);
+                finished_active_run = Some(FinishedRun {
+                    run: finished,
+                    outcome,
+                });
                 // This *was* the run a drained result was still waiting behind, and it has now
                 // finished too, so the plan may be classified on its own terms after all.
                 surviving_run = None;
@@ -569,7 +576,7 @@ async fn reconcile(
         sync_desired_hash_after_finished_run(
             &mut resource_status,
             &execution_hash,
-            finished,
+            &finished.run,
             surviving_run.as_deref(),
         );
     } else {
@@ -729,14 +736,14 @@ async fn reconcile(
     } else if let Some(finished) = &finished_active_run {
         if surviving_run.is_some() {
             // A terminal result is drained ahead of anything live (`recover_active_run`), so this
-            // tick applied one run's recap while another run is still going. Classifying the
-            // plan as `Succeeded`/`Scheduled` here would publish a verdict for a run that has not
-            // finished; the next tick recovers that run and reports it properly.
+            // tick applied one run's recap while another run is still going. Reporting the drained
+            // run's `Succeeded`/`Failed` here would publish a verdict over a plan that is still
+            // applying; the next tick recovers that run and reports it properly.
             resource_status.phase = Phase::Applying;
             resource_status.summary =
                 Some("recorded a finished run; another run is still in flight".to_string());
             requeue_after = std::time::Duration::from_secs(1);
-        } else if finished.execution_hash != execution_hash {
+        } else if finished.run.execution_hash != execution_hash {
             resource_status.phase = Phase::Pending;
             resource_status.next_run = None;
             resource_status.summary =
@@ -745,25 +752,27 @@ async fn reconcile(
         } else if matches!(
             timing,
             Timing::Now(Some(start))
-                if Some(start.fixed_offset()) != finished.mirror.triggered_slot
+                if Some(start.fixed_offset()) != finished.run.mirror.triggered_slot
                     && matches!(object.spec.mode, ExecutionMode::Recurring)
         ) {
-            resource_status.phase = Phase::Scheduled;
+            // The result stands even though the next run is already due: it is what the plan last
+            // did, and `nextRun` is what says another one is coming.
+            resource_status.phase = phase_for_finished_run(&finished.outcome);
             resource_status.next_run = match timing {
                 Timing::Now(start) => start.map(|start| start.fixed_offset()),
                 Timing::Delayed(_) => unreachable!("the guard only accepts Timing::Now"),
             };
             // The recovery path reaches here without having passed the `advance_active_run` branch
             // that reports a finished run, so this states it rather than leaving whatever the last
-            // tick said standing over a `Scheduled` plan.
+            // tick said standing over a plan whose next run is already due.
             resource_status.summary =
                 Some("previous run finished; the next scheduled run is already due".to_string());
             requeue_after = std::time::Duration::from_secs(1);
         } else {
             let total_count = distinct_host_count(&resource_status.eligible_hosts);
             // Reaching here without a schedule means it was removed mid-run: the eligibility gate
-            // normally stops such a plan from ever starting one. Log the anomaly — `decide_terminal`
-            // deliberately leaves the plan in `Applying` for this case.
+            // normally stops such a plan from ever starting one. Log the anomaly — the run still
+            // gets its verdict, it simply has no next slot to advertise.
             if matches!(object.spec.mode, ExecutionMode::Recurring)
                 && object.spec.schedule.is_none()
             {
@@ -772,6 +781,7 @@ async fn reconcile(
             let outcome = decide_terminal(
                 &object.spec.mode,
                 object.spec.schedule.as_deref(),
+                &finished.outcome,
                 outdated_hosts.len(),
                 total_count,
                 now(),
@@ -1673,6 +1683,10 @@ enum ActiveRunProgress {
     Running(std::time::Duration),
     Finished {
         run: RecordedRun,
+        /// The verdict the run's record carried, which is what the plan's own phase is decided
+        /// from. A run finalized without its record reads `Unknown` here, and that is a failure
+        /// like any other: nothing proves its hosts were reached.
+        outcome: v1beta1::PlayPhase,
         record: TerminalRecord,
     },
     /// The cached plan status named a run that the apiserver's copy no longer has — an earlier tick
@@ -1893,19 +1907,19 @@ async fn advance_active_run(
         parsed.as_ref(),
     )
     .await?;
-    status::apply_terminal_play_status(
-        &run.execution_hash,
+    let finished_status =
         finished_play
             .status
             .as_ref()
             .ok_or(ReconcileError::PreconditionFailed(
                 "finished Play has no status",
-            ))?,
-        resource_status,
-    );
+            ))?;
+    let outcome = finished_status.phase.clone();
+    status::apply_terminal_play_status(&run.execution_hash, finished_status, resource_status);
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
+        outcome,
         record: TerminalRecord::Present,
     })
 }
@@ -1952,14 +1966,13 @@ async fn finalize_lost_run(
 
     release_run_infrastructure(context, object, run).await?;
 
-    status::apply_terminal_play_status(
-        &run.execution_hash,
-        &play_history::lost_run_status(&run.mirror.job_name, &run.mirror.hosts),
-        resource_status,
-    );
+    let lost_status = play_history::lost_run_status(&run.mirror.job_name, &run.mirror.hosts);
+    let outcome = lost_status.phase.clone();
+    status::apply_terminal_play_status(&run.execution_hash, &lost_status, resource_status);
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
+        outcome,
         record: TerminalRecord::Lost,
     })
 }
@@ -3090,6 +3103,17 @@ impl RecordedRun {
     }
 }
 
+/// A run whose terminal result this tick applied, and the verdict its record carried.
+///
+/// The two travel together because both halves are needed to classify the plan afterwards: the run
+/// says which revision and which schedule window the result belongs to, while the verdict says what
+/// the result *was*. Recovering the verdict later from the plan's own state is not possible — a
+/// failed `Recurring` run leaves no drift behind to read it back out of.
+struct FinishedRun {
+    run: RecordedRun,
+    outcome: v1beta1::PlayPhase,
+}
+
 /// Persists a run's terminal result and hands its record back to history. Returns whether the
 /// closing retention pass failed and should be retried with a shortened requeue — see
 /// [`prune_history`] for why that is a return value rather than an error.
@@ -3705,11 +3729,13 @@ fn run_number_from_job_name(job_name: &str) -> Option<u32> {
 /// and the caller's requeue duration become once this run's Job has reached a terminal state. Pure
 /// (every wall-clock/inventory input is passed in) so the per-mode matrix is unit-testable without a
 /// kube client:
-///   - OneShot resolves to `Succeeded`/`Failed` solely by whether any host is still outdated and
-///     never reschedules.
-///   - Recurring with a schedule reschedules to the next slot and requeues until then.
-///   - Recurring *without* a schedule is the dead-end the eligibility gate normally prevents (the
-///     caller logs it): nothing to reschedule against, so the plan stays `Applying`.
+///   - Every finished run resolves to `Succeeded`/`Failed`, in either mode, from *that run's* own
+///     verdict — see [`phase_for_finished_run`].
+///   - OneShot never reschedules.
+///   - Recurring with a schedule keeps the verdict and advertises the next slot through `next_run`,
+///     requeueing until then.
+///   - Recurring *without* a schedule is the dead-end the start gate normally prevents (the caller
+///     logs it): the verdict still stands, there is simply no next slot to name.
 struct TerminalOutcome {
     phase: Phase,
     next_run: Option<DateTime<FixedOffset>>,
@@ -3720,6 +3746,7 @@ struct TerminalOutcome {
 fn decide_terminal<Tz: TimeZone>(
     mode: &ExecutionMode,
     schedule: Option<&str>,
+    outcome: &v1beta1::PlayPhase,
     outdated_count: usize,
     total_count: usize,
     now: DateTime<Tz>,
@@ -3728,14 +3755,11 @@ fn decide_terminal<Tz: TimeZone>(
         0 => format!("{total_count}/{total_count} up-to-date"),
         n => format!("{n}/{total_count} outdated"),
     };
+    let phase = phase_for_finished_run(outcome);
 
     match mode {
         ExecutionMode::OneShot => TerminalOutcome {
-            phase: if outdated_count == 0 {
-                Phase::Succeeded
-            } else {
-                Phase::Failed
-            },
+            phase,
             next_run: None,
             summary,
             requeue: None,
@@ -3746,20 +3770,38 @@ fn decide_terminal<Tz: TimeZone>(
                     forecast_next_run(schedule, now.clone(), Some(chrono::Duration::seconds(-5)));
                 let requeue = (next.clone() - now).to_std().ok();
                 TerminalOutcome {
-                    phase: Phase::Scheduled,
+                    phase,
                     next_run: Some(next.fixed_offset()),
                     summary,
                     requeue,
                 }
             }
-            // Any prior forecast is now unreachable, so clear `next_run` and hold at `Applying`.
+            // Any prior forecast is now unreachable, so clear `next_run`. The verdict is kept: it
+            // describes a run that did happen, and removing the schedule does not undo it.
             None => TerminalOutcome {
-                phase: Phase::Applying,
+                phase,
                 next_run: None,
                 summary,
                 requeue: None,
             },
         },
+    }
+}
+
+/// The plan phase a finished run resolves to, in either mode.
+///
+/// Read from the run's own record rather than from the plan's drift state, because the two can
+/// legitimately disagree: a `Recurring` run that fails leaves every host still carrying the
+/// `lastAppliedHash` an earlier run gave it, so nothing is outdated and a drift-based verdict would
+/// report the failed run as a success. Anything short of `Succeeded` is a failure, `Unknown`
+/// included — a recap that could not be read is not evidence that the hosts were reached.
+///
+/// The non-terminal phases cannot arrive here: `apply_terminal_play_status` refuses them, and both
+/// paths that produce an outcome have already been through it.
+fn phase_for_finished_run(outcome: &v1beta1::PlayPhase) -> Phase {
+    match outcome {
+        v1beta1::PlayPhase::Succeeded => Phase::Succeeded,
+        _ => Phase::Failed,
     }
 }
 
@@ -6712,7 +6754,14 @@ spec:
     #[test]
     fn decide_terminal_oneshot_all_current_succeeds() {
         let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let outcome = decide_terminal(&ExecutionMode::OneShot, None, 0, 3, now);
+        let outcome = decide_terminal(
+            &ExecutionMode::OneShot,
+            None,
+            &v1beta1::PlayPhase::Succeeded,
+            0,
+            3,
+            now,
+        );
 
         assert_eq!(outcome.phase, Phase::Succeeded);
         assert_eq!(outcome.next_run, None);
@@ -6721,11 +6770,18 @@ spec:
     }
 
     #[test]
-    fn decide_terminal_oneshot_with_outdated_fails_and_never_reschedules() {
+    fn decide_terminal_oneshot_failed_run_fails_and_never_reschedules() {
         let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
         // A schedule is irrelevant in OneShot — even with one set it must resolve terminally and
         // never reschedule.
-        let outcome = decide_terminal(&ExecutionMode::OneShot, Some("0 3 * * *"), 1, 3, now);
+        let outcome = decide_terminal(
+            &ExecutionMode::OneShot,
+            Some("0 3 * * *"),
+            &v1beta1::PlayPhase::Failed,
+            1,
+            3,
+            now,
+        );
 
         assert_eq!(outcome.phase, Phase::Failed);
         assert_eq!(outcome.next_run, None);
@@ -6734,32 +6790,98 @@ spec:
     }
 
     #[test]
-    fn decide_terminal_recurring_with_schedule_reschedules_to_next_slot() {
+    fn decide_terminal_recurring_keeps_the_verdict_and_names_the_next_slot() {
         let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let outcome = decide_terminal(&ExecutionMode::Recurring, Some("0 3 * * *"), 0, 2, now);
-
-        assert_eq!(outcome.phase, Phase::Scheduled);
-        assert_eq!(
-            outcome.next_run,
-            Some(
-                "2025-08-13T03:00:00Z"
-                    .parse::<DateTime<FixedOffset>>()
-                    .unwrap()
-            )
+        let next_slot = Some(
+            "2025-08-13T03:00:00Z"
+                .parse::<DateTime<FixedOffset>>()
+                .unwrap(),
         );
-        // Overrides the caller's default requeue so the plan wakes up at the next slot.
-        assert!(outcome.requeue.is_some());
+
+        for (outcome, expected) in [
+            (v1beta1::PlayPhase::Succeeded, Phase::Succeeded),
+            (v1beta1::PlayPhase::Failed, Phase::Failed),
+        ] {
+            let terminal = decide_terminal(
+                &ExecutionMode::Recurring,
+                Some("0 3 * * *"),
+                &outcome,
+                0,
+                2,
+                now,
+            );
+
+            // The result of the run that just finished stands between slots; `next_run` is what
+            // says another one is coming.
+            assert_eq!(terminal.phase, expected);
+            assert_eq!(terminal.next_run, next_slot);
+            // Overrides the caller's default requeue so the plan wakes up at the next slot.
+            assert!(terminal.requeue.is_some());
+        }
+    }
+
+    /// A `Recurring` run that fails leaves every host on the `lastAppliedHash` an earlier run gave
+    /// it, so nothing is outdated — the verdict has to come from the run, not from the drift.
+    #[test]
+    fn decide_terminal_reports_a_failed_run_that_left_no_drift_behind() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let outcome = decide_terminal(
+            &ExecutionMode::Recurring,
+            Some("0 3 * * *"),
+            &v1beta1::PlayPhase::Failed,
+            0,
+            2,
+            now,
+        );
+
+        assert_eq!(outcome.phase, Phase::Failed);
+        assert_eq!(outcome.summary, "2/2 up-to-date");
+        assert!(outcome.next_run.is_some());
+    }
+
+    /// A recap that could not be read is not evidence that the hosts were reached.
+    #[test]
+    fn decide_terminal_reports_an_unreadable_recap_as_failed() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let outcome = decide_terminal(
+            &ExecutionMode::OneShot,
+            None,
+            &v1beta1::PlayPhase::Unknown,
+            0,
+            2,
+            now,
+        );
+
+        assert_eq!(outcome.phase, Phase::Failed);
     }
 
     #[test]
-    fn decide_terminal_recurring_without_schedule_is_a_dead_end() {
+    fn decide_terminal_recurring_without_schedule_keeps_the_verdict() {
         let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let outcome = decide_terminal(&ExecutionMode::Recurring, None, 0, 2, now);
+        let succeeded = decide_terminal(
+            &ExecutionMode::Recurring,
+            None,
+            &v1beta1::PlayPhase::Succeeded,
+            0,
+            2,
+            now,
+        );
+        let failed = decide_terminal(
+            &ExecutionMode::Recurring,
+            None,
+            &v1beta1::PlayPhase::Failed,
+            0,
+            2,
+            now,
+        );
 
-        // Nothing to reschedule against, so the plan holds at Applying (the eligibility gate
-        // normally prevents a schedule-less Recurring plan from ever starting a run).
-        assert_eq!(outcome.phase, Phase::Applying);
-        assert_eq!(outcome.next_run, None);
-        assert_eq!(outcome.requeue, None);
+        // Nothing to reschedule against (the start gate normally prevents a schedule-less Recurring
+        // plan from ever starting a run), but the run that did happen keeps its verdict.
+        assert_eq!(succeeded.phase, Phase::Succeeded);
+        assert_eq!(succeeded.next_run, None);
+        assert_eq!(succeeded.requeue, None);
+        assert_eq!(failed.phase, Phase::Failed);
+        assert_eq!(failed.next_run, None);
+        assert_eq!(failed.requeue, None);
     }
 }

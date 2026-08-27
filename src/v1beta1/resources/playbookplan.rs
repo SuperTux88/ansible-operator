@@ -319,10 +319,13 @@ pub enum Phase {
     /// Playbook is scheduled for reexecution.
     Scheduled,
 
-    /// Some or all jobs failed (for OneShot mode only)
+    /// The latest run did not succeed on every host it targeted, or its recap could not be read.
+    /// A `Recurring` plan keeps this result between schedule ticks, with `nextRun` naming the next
+    /// one. Also set when the plan is refused outright, e.g. for a name that is too long.
     Failed,
 
-    /// Jobs for all hosts ran successfully (for OneShot mode only)
+    /// Every host the latest run targeted succeeded. A `Recurring` plan keeps this result between
+    /// schedule ticks, with `nextRun` naming the next one.
     Succeeded,
 
     /// The PlaybookPlan's namespace is not enrolled for the operator (not in the chart's
