@@ -211,6 +211,22 @@ pub fn set_job_identity_mismatch_condition(status: &mut PlaybookPlanStatus, job_
         },
     );
 }
+
+/// Marks the plan as not ready because one of its desired inputs could not be read. The message is
+/// the same diagnostic shown in the plan summary.
+pub fn set_inputs_unavailable_condition(status: &mut PlaybookPlanStatus, message: &str) {
+    upsert_condition(
+        &mut status.conditions,
+        PlaybookPlanCondition {
+            type_: "Ready".into(),
+            status: "False".into(),
+            reason: Some("InputsUnavailable".into()),
+            message: Some(message.into()),
+            last_transition_time: Some(chrono::Local::now().fixed_offset()),
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +447,59 @@ mod tests {
                 .message
                 .as_deref()
                 .is_some_and(|message| message.contains("plan-abc123-1"))
+        );
+    }
+
+    /// A second, *different* outage under the same reason has to replace the message. The summary is
+    /// written from the same diagnostic, so a condition that kept the first one would sit next to a
+    /// summary naming a different failure — and the reader has no way to tell which is current.
+    /// `lastTransitionTime` must not move for it: the status never changed, and it is what a reader
+    /// ages a stuck condition by.
+    #[test]
+    fn a_persisting_input_outage_reports_the_current_read_failure() {
+        let mut status = PlaybookPlanStatus::default();
+
+        set_inputs_unavailable_condition(
+            &mut status,
+            "cannot resolve the plan's inventories: Referenced ClusterInventory \"nodes\" does not exist",
+        );
+        let first = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Ready")
+            .unwrap()
+            .clone();
+
+        set_inputs_unavailable_condition(
+            &mut status,
+            "cannot read referenced Secrets: Referenced Secret \"vars\" does not exist",
+        );
+        let second = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Ready")
+            .unwrap();
+
+        assert_eq!(
+            status
+                .conditions
+                .iter()
+                .filter(|condition| condition.type_ == "Ready")
+                .count(),
+            1,
+            "the condition is replaced in place, never appended twice"
+        );
+        assert!(
+            second
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("vars")),
+            "the message must name the read that is failing now, not the first one: {:?}",
+            second.message
+        );
+        assert_eq!(
+            second.last_transition_time, first.last_transition_time,
+            "the status did not change, so this is not a transition"
         );
     }
 }

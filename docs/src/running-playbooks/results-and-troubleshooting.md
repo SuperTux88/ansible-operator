@@ -23,7 +23,7 @@ per-host status, and the summary line.
 
 | Phase | Meaning |
 |---|---|
-| `Pending` | Triggers not yet evaluated — the resting state right after creation or after the inputs changed. |
+| `Pending` | Triggers not yet evaluated — the resting state right after creation, after the inputs changed, or while an input [cannot be read](#the-plans-inputs-cannot-be-read). |
 | `Delayed` | Execution was deferred (e.g. waiting on proxy readiness). Transient. |
 | `Applying` | An attempt is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the Job itself is active. |
 | `Scheduled` | (`Recurring`) The run finished and the plan is waiting for the next schedule tick. |
@@ -175,6 +175,32 @@ The name is used as a label value on every object a run creates, and Kubernetes 
 63 characters. An object's name cannot be changed, so recreate the plan under a shorter one — a
 `kubectl edit` will not clear this.
 
+### The plan's inputs cannot be read
+
+Two summaries report that the operator could not read what the plan says it should be running, and
+so could not decide anything this tick:
+
+- **"cannot resolve the plan's inventories: …"** — a referenced `ClusterInventory` or
+  `StaticInventory` could not be read. `Referenced ClusterInventory "…" does not exist` means the
+  reference is wrong or the inventory was deleted; anything else is an API error to retry.
+- **"cannot read referenced Secrets: …"** — a Secret named by `spec.template.variables` or
+  `spec.template.files` could not be read. `Referenced Secret "…" does not exist` means the reference
+  is wrong or the Secret was deleted; anything else is an API error to retry.
+
+Both reads are treated the same way, including for a run that is already in flight: a missing
+resource is permanent and supersedes an attempt that has not launched, while anything else is
+transient and holds it.
+
+Neither starts a run and neither changes `.status.hostsStatus`, so the plan holds its previous
+per-host results until the read succeeds; the operator retries every tick. The phase does go back to
+`Pending` and `.status.nextRun` is cleared, so a plan in this state does not keep advertising the
+last run's verdict or a scheduled slot it will not be able to act on. If a run was already in flight
+when this happened it keeps its own phase, and it is *not* dropped for a transient error — see [The
+plan is stuck in `Applying`](#the-plan-is-stuck-in-applying). When the inputs become readable again,
+an idle `OneShot` plan whose hosts are still current restores `Succeeded` and its up-to-date summary;
+it does not need a spec or Secret change to recover its visible status. While the inputs are
+unavailable, `Ready=False` with reason `InputsUnavailable` makes that temporary uncertainty explicit.
+
 ### A plan is not starting and its `Blocked` condition is `True`
 
 Another run is holding a lock on a host this plan targets, so the plan is waiting its turn — host
@@ -254,6 +280,22 @@ keeps failing and retrying) can keep an overlapping plan waiting for a long time
   own once the underlying problem does. Until then the run's proxy pods may still be up — worth
   looking at if the message persists, since these are node-root pods. The run's `Play` is deliberately
   kept meanwhile: it is the handle the retry works from, so do not delete it to unstick the plan.
+- **"run recovery paused: …"** — the operator needs something it cannot currently read to decide
+  what to do with the run: an inventory, `NodeAccessPolicy` or referenced Secret lookup that is
+  failing for a reason that may clear on its own, such as an API error or a lost connection. The
+  attempt is deliberately *held*, not dropped: its host locks keep being renewed so no other plan can
+  start on those hosts while the question is open, and the operator retries every tick. Unlike the
+  messages above, this one can persist indefinitely if the underlying read never succeeds — the rest
+  of the message is the error to fix. A read that fails because the resource is simply *gone* is not
+  this case; see the next message.
+- **"aborted the run because its desired inputs cannot be resolved: …"** — the same lookup failed in
+  a way that cannot be transient: a referenced `ClusterInventory`/`StaticInventory` or a referenced
+  variables/files `Secret` no longer exists, or an inventory group sets a variable the operator
+  manages. There is no executable desired state left, so the attempt was released and deleted; fix
+  the reference and a fresh attempt starts. Giving the attempt up rather than holding it also frees
+  its host locks — an attempt held indefinitely blocks every other plan targeting those hosts, not
+  just this one. If its Job had already been created it is adopted and allowed to finish instead,
+  reported as **"adopted the started run; the desired inputs cannot be resolved: …"**.
 - **"aborted the run: host '…' is now locked by …"** — while the attempt was still being set up,
   another run was *observed* holding one of its host locks (its own lease lapsed during an operator
   outage and the other run took it over). Rather than run two playbooks against the same host, it was

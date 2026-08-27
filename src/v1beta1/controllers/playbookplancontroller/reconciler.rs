@@ -378,10 +378,22 @@ async fn reconcile(
             &unlaunched,
             &mut resource_status,
         )
-        .await?
+        .await
         {
-            true => Some(unlaunched),
-            false => None,
+            Ok(true) => Some(unlaunched),
+            Ok(false) => None,
+            Err(error) => {
+                preserve_unlaunched_run_after_error(
+                    &context,
+                    &object,
+                    &api,
+                    &unlaunched,
+                    &mut resource_status,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
         }
     } else {
         None
@@ -453,20 +465,35 @@ async fn reconcile(
         }
     }
 
-    // Step 0: resolve inventory (kept separate per-resource, not flattened — connection
-    // mechanism is implicit by which resource produced a group).
-    let mut target_groups = resolve_inventory(&context, &object).await?;
-
-    // Step 0b: NodeAccessPolicy enforcement — clamp managed-ssh (ClusterInventory) nodes to what
-    // this namespace is permitted to target, before eligible_hosts and any proxy infra derive from
-    // them. Fail-closed: an ungoverned namespace resolves to zero managed-ssh nodes.
-    let excluded_nodes = node_access::enforce(
-        &context.client,
-        &context.node_access_policies,
-        namespace,
-        &mut target_groups,
-    )
-    .await?;
+    // Steps 0 and 0b: resolve the plan's inventories and clamp them to what NodeAccessPolicy grants
+    // this namespace. One fallible step with one error site, because they fail the same way — the
+    // desired inputs could not be read — and a recovered attempt's fate depends on which kind of
+    // failure it was, not on which of the two calls produced it.
+    let (target_groups, excluded_nodes) =
+        match resolve_authorized_inventory(&context, &object).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let summary = format!("cannot resolve the plan's inventories: {error}");
+                if let Some(unlaunched) = unlaunched_run.as_ref() {
+                    handle_unlaunched_input_error(
+                        &context,
+                        &object,
+                        &api,
+                        unlaunched,
+                        &mut resource_status,
+                        &error,
+                        &summary,
+                    )
+                    .await?;
+                } else {
+                    // Nothing in flight to hold open, but the plan still has to say why it is not
+                    // running: a deleted inventory would otherwise leave the last successful run's
+                    // summary standing while every tick fails in the log only.
+                    report_input_failure(&api, &object, &mut resource_status, summary).await;
+                }
+                return Err(error);
+            }
+        };
     if !excluded_nodes.is_empty() {
         warn!(
             "NodeAccessPolicy excluded nodes {excluded_nodes:?} from {namespace}/{name} \
@@ -489,13 +516,39 @@ async fn reconcile(
         .collect();
 
     let related_secrets = get_related_secrets(&object);
-    let execution_hash = hash_playbook_inputs(
+    let execution_hash = match hash_playbook_inputs(
         &object.spec.template.playbook,
         &related_secrets,
         &secrets_api,
         &inventory_variables,
     )
-    .await;
+    .await
+    {
+        Ok(hash) => hash,
+        Err(error) => {
+            let summary = format!("cannot read referenced Secrets: {error}");
+            if let Some(unlaunched) = unlaunched_run.as_ref() {
+                // Same decision as the inventory read above, through the same function: a Secret
+                // that is merely unreadable holds the attempt open, a Secret that is gone supersedes
+                // it. Holding is safe here — the inventory resolved, so this attempt's hosts are
+                // still known-authorized — but it is not free: the hold renews their Leases every
+                // tick, and an indefinite one starves every other plan targeting those hosts.
+                handle_unlaunched_input_error(
+                    &context,
+                    &object,
+                    &api,
+                    unlaunched,
+                    &mut resource_status,
+                    &error,
+                    &summary,
+                )
+                .await?;
+            } else {
+                report_input_failure(&api, &object, &mut resource_status, summary).await;
+            }
+            return Err(error);
+        }
+    };
 
     if resource_status.current_hash != execution_hash.to_string() {
         resource_status.phase = Phase::Pending;
@@ -1949,6 +2002,224 @@ async fn report_failed_finalization(
     error
 }
 
+/// Reports on the plan that its desired inputs could not be read, for a tick with no attempt in
+/// flight to hold open.
+///
+/// Both desired-input reads — the inventories and the referenced Secrets — come through here, so a
+/// plan that cannot resolve what it should be running says so on the resource rather than only in
+/// the operator's log. Without it the last successful run's summary keeps standing over a plan that
+/// has been failing every tick since, which reads as "nothing to do" rather than "broken".
+///
+/// The phase and `nextRun` are reset for the same reason the summary is written: they are the other
+/// two printer columns, and leaving a `Succeeded`/`Scheduled` phase over a plan that has not been
+/// able to read its own inputs since — pointing, in the `Scheduled` case, at a slot that will not
+/// fire — is exactly the "nothing to do" reading this exists to prevent. `hostsStatus` is left
+/// alone: the previous run's per-host results are still true, and nothing here re-ran anything.
+///
+/// A run still in flight keeps its phase, matching [`update_desired_hash`]'s guard. The read failure
+/// does not stop a Job that is already executing, and reporting `Pending` over one would contradict
+/// the `activeRun` standing right next to it.
+///
+/// Best effort, and deliberately so: the reconcile fails on the original error either way, and a
+/// failure to report must not replace the diagnosis it was trying to surface. Same shape as
+/// [`report_failed_abandon`] and the recovery failure path in [`reconcile`].
+async fn report_input_failure(
+    api: &Api<PlaybookPlan>,
+    object: &PlaybookPlan,
+    resource_status: &mut PlaybookPlanStatus,
+    summary: String,
+) {
+    record_input_failure(resource_status, summary);
+    if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
+        warn!(
+            "Could not report a desired-input read failure on {:?}/{:?}: {patch_error}",
+            object.metadata.namespace, object.metadata.name
+        );
+    }
+}
+
+/// The status half of [`report_input_failure`], split from the write so the guard is unit-testable
+/// without a kube client — see that function for why each field is (or is not) touched.
+fn record_input_failure(status: &mut PlaybookPlanStatus, summary: String) {
+    status::set_inputs_unavailable_condition(status, &summary);
+    status.summary = Some(summary);
+    if status.active_run.is_none() {
+        status.phase = Phase::Pending;
+        status.next_run = None;
+    }
+}
+
+/// Keeps a deferred unlaunched run safe when a prerequisite needed to decide its fate cannot be
+/// read. `Starting` and `Launching` may hold Leases; renewing them here prevents a transient or
+/// persistent inventory/policy error from letting another run acquire the same hosts while this
+/// attempt's proxy pods or Job still exist. `Prepared` has not acquired anything and must stay that
+/// way. Reporting is best effort because the original error remains the reconcile result.
+///
+/// The summary is only claimed if nothing better is already there. A step that fails *after*
+/// deciding the attempt's fate reports itself — `report_failed_abandon` names the run whose
+/// node-root proxy pods and host Leases could not be released, and tells the reader which manual
+/// cleanup applies. Writing "run recovery paused" over that would replace a specific, actionable
+/// diagnosis with a vague one, for the same error.
+async fn preserve_unlaunched_run_after_error(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    api: &Api<PlaybookPlan>,
+    unlaunched: &UnlaunchedRun,
+    resource_status: &mut PlaybookPlanStatus,
+    error: &ReconcileError,
+) {
+    let Ok((namespace, name)) = namespace_and_name(object) else {
+        return;
+    };
+
+    if unlaunched.phase != v1beta1::PlayPhase::Prepared {
+        let leases_api =
+            Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
+        if let Err(lock_error) = locking::renew_locks(
+            &leases_api,
+            &unlaunched.run.mirror.hosts,
+            &holder_identity(namespace, name, &unlaunched.run),
+        )
+        .await
+        {
+            warn!(
+                "Could not preserve host locks while recovery of {namespace}/{name} is paused: {lock_error}"
+            );
+        }
+    }
+
+    resource_status.summary = Some(format!("run recovery paused: {error}"));
+    if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
+        warn!("Could not report paused run recovery on {namespace}/{name}: {patch_error}");
+    }
+}
+
+/// Decides what a failed desired-input read means for an attempt whose Job does not exist yet, and
+/// reports the outage on the plan either way.
+///
+/// `summary` is the same diagnostic the no-attempt path ([`report_input_failure`]) would have
+/// written, and it is passed in rather than rebuilt here so both paths describe one outage in one
+/// wording. The readiness overlay is set before the branch because it is true of every outcome
+/// below: whether the attempt is held, adopted or given up, the plan cannot read what it should be
+/// running, and `Ready` is the column that says so. Leaving it to the *next* tick's no-attempt path
+/// would let the last run's verdict stand over an outage for as long as an attempt was being held —
+/// which, for a transient error, is exactly the case that can persist.
+///
+/// Reporting is not left to whatever the chosen outcome writes, because each of them can fail before
+/// writing anything: the transient branch ends in a status write of its own, and the superseding one
+/// publishes the outage up front. What follows may still replace the summary with something more
+/// specific — which run was aborted, or that a started Job was adopted instead — but it can no longer
+/// leave the plan showing only the previous run's verdict.
+///
+/// The phase is deliberately not touched here, unlike in [`record_input_failure`]: an attempt is in
+/// flight, and `Pending` would contradict the `activeRun` standing next to it.
+async fn handle_unlaunched_input_error(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    api: &Api<PlaybookPlan>,
+    unlaunched: &UnlaunchedRun,
+    resource_status: &mut PlaybookPlanStatus,
+    error: &ReconcileError,
+    summary: &str,
+) -> Result<(), ReconcileError> {
+    status::set_inputs_unavailable_condition(resource_status, summary);
+
+    if !input_error_supersedes_unlaunched(error) {
+        preserve_unlaunched_run_after_error(
+            context,
+            object,
+            api,
+            unlaunched,
+            resource_status,
+            error,
+        )
+        .await;
+        return Ok(());
+    }
+
+    let (namespace, name) = namespace_and_name(object)?;
+    info!(
+        "PlaybookPlan {namespace}/{name}: giving up on run {} because its desired inputs cannot be resolved: {error}",
+        unlaunched.run.mirror.job_name
+    );
+
+    // Persist the outage *before* the supersede below, which the transient branch above does not
+    // need because it always ends in a status write of its own. Every step from here can fail in a
+    // way that returns before anything reaches the apiserver — a Job read, a record transition, a
+    // cleanup — and the plan would then show neither the read that failed nor the run it is about to
+    // give up on, only the previous run's verdict. The outage is already decided and true at this
+    // point, so it is safe to publish ahead of what is done about it; the specific outcome replaces
+    // the summary below on success.
+    resource_status.summary = Some(summary.to_string());
+    if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
+        warn!("Could not report unreadable desired inputs on {namespace}/{name}: {patch_error}");
+    }
+
+    // A `Launching` attempt is never abandoned on the strength of the pre-input Job read alone:
+    // `resolve_inventory` has run since, and that is exactly the window in which a `create` whose
+    // response was lost becomes visible. Hand it to the one function that owns that boundary, with
+    // no inputs to converge against — this attempt may not launch, so all that is left for it is
+    // adopting an existing Job or abandoning an absent one.
+    if unlaunched.phase == v1beta1::PlayPhase::Launching {
+        let (action, _requeue) =
+            resume_launching_run(context, object, api, &unlaunched.run, None, resource_status)
+                .await?;
+        // Read off the action rather than inferred from the status: `Contested` also leaves the run
+        // mirrored, so "is there still an `activeRun`?" would report a contested name as an adoption.
+        match action {
+            JobPresenceAction::Adopt => {
+                resource_status.summary = Some(format!(
+                    "adopted the started run; the desired inputs cannot be resolved: {error}"
+                ));
+            }
+            JobPresenceAction::Abandon => {
+                resource_status.summary = Some(format!(
+                    "aborted the run because its desired inputs cannot be resolved: {error}"
+                ));
+            }
+            // `Contested` explained itself, and more usefully than this could. `Proceed` cannot
+            // happen: it needs inputs to converge against, and this attempt has none.
+            JobPresenceAction::Contested | JobPresenceAction::Proceed => {}
+        }
+        return patch_status(api, object, resource_status.clone()).await;
+    }
+
+    abandon_unlaunched_run(
+        context,
+        object,
+        api,
+        &unlaunched.run,
+        unlaunched.phase.clone(),
+        format!("aborted the run because its desired inputs cannot be resolved: {error}"),
+        resource_status,
+    )
+    .await
+}
+
+/// Whether failing to read the plan's desired inputs is a reason to give an unlaunched attempt up.
+///
+/// The line is whether the failure can plausibly clear on its own. A referenced resource that does
+/// not exist, or an inventory that names a variable the operator manages, leaves no executable
+/// desired state to resume the attempt against, so it is superseded and a fresh one starts once the
+/// input is fixed. Anything else — including a 404 that arrived as a bare `KubeError`, which no read
+/// site has classified — is treated as transient and holds the attempt open instead.
+///
+/// Both desired-input reads route through here, so the two cannot drift: a deleted `ClusterInventory`
+/// and a deleted variables Secret end the same way.
+fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
+    match error {
+        ReconcileError::ReservedInventoryVariable { .. }
+        | ReconcileError::InventoryNotFound { .. }
+        | ReconcileError::SecretNotFound { .. } => true,
+        ReconcileError::KubeError(_) => false,
+        ReconcileError::PreconditionFailed(_)
+        | ReconcileError::RenderError(_)
+        | ReconcileError::CaError(_)
+        | ReconcileError::JsonSerializationError(_)
+        | ReconcileError::YamlSerializationError(_) => false,
+    }
+}
+
 /// Gives back a run's proxy infrastructure and then its host Leases. Cleanup failures propagate so
 /// the caller retains the Play as its retry handle; `cleanup_proxy_infra` documents the resource
 /// ordering and revocation details.
@@ -2266,22 +2537,83 @@ async fn hash_playbook_inputs(
     secret_names: &[&String],
     secrets_api: &Api<Secret>,
     inventory_variables: &[(&str, &serde_json::Value)],
-) -> ExecutionHash {
-    let secrets = futures::future::join_all(
+) -> Result<ExecutionHash, ReconcileError> {
+    let secret_reads = futures::future::join_all(
         secret_names
             .iter()
-            .map(|secret_name| secrets_api.get(secret_name)),
+            .map(|name| async { ((*name).clone(), secrets_api.get(name).await) }),
     )
     .await;
+    let variables_secrets = collect_secret_data(secret_reads)?;
 
-    let variables_secrets: Vec<BTreeMap<_, _>> = secrets
-        .iter()
-        .filter_map(|result| result.as_ref().ok())
-        .filter_map(|secret| secret.data.clone())
-        .collect();
+    Ok(
+        execution_evaluator::calculate_execution_hash(playbook, variables_secrets.iter())
+            .fold_inventory_variables(inventory_variables.iter().copied()),
+    )
+}
 
-    execution_evaluator::calculate_execution_hash(playbook, variables_secrets.iter())
-        .fold_inventory_variables(inventory_variables.iter().copied())
+/// Collects the data of every referenced Secret, refusing the whole read if any of them failed —
+/// hashing a partial set would silently produce a revision nobody asked for.
+///
+/// A 404 is separated out as [`ReconcileError::SecretNotFound`] rather than left as a generic
+/// `KubeError`, so [`input_error_supersedes_unlaunched`] can tell "this Secret is gone" from "the
+/// apiserver is having a moment". The name has to be carried in alongside each result to say *which*
+/// Secret, which is why the caller pairs them.
+fn collect_secret_data(
+    reads: Vec<(String, Result<Secret, kube::Error>)>,
+) -> Result<Vec<BTreeMap<String, k8s_openapi::ByteString>>, ReconcileError> {
+    let mut data = Vec::new();
+    let mut missing = None;
+    let mut transient_error = None;
+    for (name, read) in reads {
+        match read {
+            Ok(secret) => data.extend(secret.data),
+            Err(error) if is_not_found(&error) => {
+                missing.get_or_insert(name);
+            }
+            Err(error) => {
+                transient_error.get_or_insert(error);
+            }
+        }
+    }
+
+    if let Some(name) = missing {
+        return Err(ReconcileError::SecretNotFound { name });
+    }
+    if let Some(error) = transient_error {
+        return Err(error.into());
+    }
+
+    Ok(data)
+}
+
+/// Steps 0 and 0b — the plan's desired host set, as the rest of the tick is allowed to see it:
+/// every referenced inventory resolved, then clamped by `NodeAccessPolicy` to the managed-ssh nodes
+/// this namespace may target (INV-2/3/5). Returns the groups plus the nodes enforcement removed.
+///
+/// The two are one step because nothing may ever observe the unclamped result: `eligible_hosts`, the
+/// execution hash, the run's groups and every proxy pod derive from what this returns. Fail-closed —
+/// an ungoverned namespace resolves to zero managed-ssh nodes.
+async fn resolve_authorized_inventory(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+) -> Result<(Vec<ResolvedInventoryGroup>, Vec<String>), ReconcileError> {
+    let namespace = object
+        .metadata
+        .namespace
+        .as_deref()
+        .ok_or(ReconcileError::PreconditionFailed("namespace not set"))?;
+
+    let mut groups = resolve_inventory(context, object).await?;
+    let excluded_nodes = node_access::enforce(
+        &context.client,
+        &context.node_access_policies,
+        namespace,
+        &mut groups,
+    )
+    .await?;
+
+    Ok((groups, excluded_nodes))
 }
 
 /// Resolves every inventory this PlaybookPlan references into `ResolvedInventoryGroup`s,
@@ -2307,43 +2639,63 @@ async fn resolve_inventory(
 
     let inventory_refs = &object.spec.inventory_refs;
 
-    let cluster_inventories = inventory_refs
+    let cluster_inventory_names: Vec<&String> = inventory_refs
         .iter()
         .filter_map(|inventory_ref| inventory_ref.cluster_inventory.as_ref())
-        .map(|name| cluster_inventory_api.get(name));
+        .collect();
+    let cluster_inventory_results = futures::future::join_all(
+        cluster_inventory_names
+            .iter()
+            .map(|name| async { ((*name).clone(), cluster_inventory_api.get(name).await) }),
+    )
+    .await;
+    let mut cluster_inventories = Vec::new();
+    for (name, result) in cluster_inventory_results {
+        match result {
+            Ok(inventory) => cluster_inventories.push(inventory),
+            Err(error) => {
+                return Err(if is_not_found(&error) {
+                    ReconcileError::InventoryNotFound {
+                        kind: "ClusterInventory",
+                        name,
+                    }
+                } else {
+                    ReconcileError::KubeError(error)
+                });
+            }
+        }
+    }
 
-    let (cluster_inventories, errors): (Vec<_>, Vec<_>) =
-        futures::future::join_all(cluster_inventories)
-            .await
-            .into_iter()
-            .partition(Result::is_ok);
-
-    let cluster_inventory_errors: Vec<_> = errors.into_iter().map(Result::unwrap_err).collect();
-
-    let static_inventories = inventory_refs
+    let static_inventory_names: Vec<&String> = inventory_refs
         .iter()
         .filter_map(|inventory_ref| inventory_ref.static_inventory.as_ref())
-        .map(|name| static_inventory_api.get(name));
-
-    let (static_inventories, errors): (Vec<_>, Vec<_>) =
-        futures::future::join_all(static_inventories)
-            .await
-            .into_iter()
-            .partition(Result::is_ok);
-
-    let static_inventory_errors: Vec<_> = errors.into_iter().map(Result::unwrap_err).collect();
-
-    let mut all_errors = cluster_inventory_errors
-        .into_iter()
-        .chain(static_inventory_errors);
-
-    if let Some(first) = all_errors.next() {
-        return Err(ReconcileError::KubeError(first));
+        .collect();
+    let static_inventory_results = futures::future::join_all(
+        static_inventory_names
+            .iter()
+            .map(|name| async { ((*name).clone(), static_inventory_api.get(name).await) }),
+    )
+    .await;
+    let mut static_inventories = Vec::new();
+    for (name, result) in static_inventory_results {
+        match result {
+            Ok(inventory) => static_inventories.push(inventory),
+            Err(error) => {
+                return Err(if is_not_found(&error) {
+                    ReconcileError::InventoryNotFound {
+                        kind: "StaticInventory",
+                        name,
+                    }
+                } else {
+                    ReconcileError::KubeError(error)
+                });
+            }
+        }
     }
 
     let mut groups = Vec::new();
 
-    for ci in cluster_inventories.into_iter().map(Result::unwrap) {
+    for ci in cluster_inventories {
         let tolerations = ci.spec.tolerations.clone();
         // Group variables live on the spec's InventoryHosts, but get_hosts() returns the resolved
         // node lists from status; re-join them by group name.
@@ -2367,7 +2719,7 @@ async fn resolve_inventory(
         }
     }
 
-    for si in static_inventories.into_iter().map(Result::unwrap) {
+    for si in static_inventories {
         let static_inventory_name = si.name_any();
         let config = si.spec.ssh.clone();
         for group in &si.spec.hosts {
@@ -4220,6 +4572,49 @@ spec:
     }
 
     #[test]
+    fn secret_read_errors_are_not_hashed_as_empty_data() {
+        let api_error = |code| {
+            kube::Error::Api(Box::new(kube::core::Status {
+                code,
+                ..Default::default()
+            }))
+        };
+
+        // A transient failure holds an unlaunched attempt open, so it must stay a plain KubeError.
+        assert!(matches!(
+            collect_secret_data(vec![("vars".into(), Err(api_error(500)))]),
+            Err(ReconcileError::KubeError(_))
+        ));
+
+        // A Secret that is gone supersedes the attempt, which needs the 404 named as such — and
+        // named after the Secret, since the message is what tells the user which one to recreate.
+        assert!(matches!(
+            collect_secret_data(vec![("vars".into(), Err(api_error(404)))]),
+            Err(ReconcileError::SecretNotFound { name }) if name == "vars"
+        ));
+
+        assert!(matches!(
+            collect_secret_data(vec![
+                ("unavailable".into(), Err(api_error(500))),
+                ("deleted".into(), Err(api_error(404))),
+            ]),
+            Err(ReconcileError::SecretNotFound { name }) if name == "deleted"
+        ));
+
+        let secret = Secret {
+            data: Some(BTreeMap::from([(
+                "variables.yaml".into(),
+                k8s_openapi::ByteString(b"key: value".to_vec()),
+            )])),
+            ..Default::default()
+        };
+        assert_eq!(
+            collect_secret_data(vec![("vars".into(), Ok(secret))]).unwrap()[0]["variables.yaml"].0,
+            b"key: value"
+        );
+    }
+
+    #[test]
     fn has_work_to_start_oneshot_gates_only_on_outdated_hosts() {
         // OneShot with work to do starts whether or not a schedule is set.
         assert!(has_work_to_start(&ExecutionMode::OneShot, false, true));
@@ -4400,6 +4795,109 @@ spec:
         );
     }
 
+    #[test]
+    fn permanent_input_errors_supersede_absent_job_attempts() {
+        let api_error = |code| {
+            ReconcileError::from(kube::Error::Api(Box::new(kube::core::Status {
+                code,
+                ..Default::default()
+            })))
+        };
+
+        // An unclassified 404 is not enough on its own — only a read site that knows *what* was
+        // missing may turn one into a supersede.
+        assert!(!input_error_supersedes_unlaunched(&api_error(404)));
+        assert!(!input_error_supersedes_unlaunched(&api_error(500)));
+        assert!(input_error_supersedes_unlaunched(
+            &ReconcileError::InventoryNotFound {
+                kind: "ClusterInventory",
+                name: "nodes".into(),
+            }
+        ));
+        // The Secret read reaches the same verdict as the inventory read; a plan whose variables
+        // Secret was deleted must not sit on its hosts' Leases forever waiting for it to return.
+        assert!(input_error_supersedes_unlaunched(
+            &ReconcileError::SecretNotFound {
+                name: "db-credentials".into(),
+            }
+        ));
+        assert!(input_error_supersedes_unlaunched(
+            &ReconcileError::ReservedInventoryVariable {
+                group: "workers".into(),
+                key: "ansible_host".into(),
+            }
+        ));
+    }
+
+    /// A plan that cannot read its own inputs must not keep advertising the last run's verdict. The
+    /// summary alone is not enough — `phase` and `nextRun` are the other two printer columns, and a
+    /// `Succeeded`/`Scheduled` plan pointing at a slot that will never fire reads as healthy.
+    ///
+    /// The exception is a run still in flight: the read failure did not stop its Job, so it keeps
+    /// its phase, exactly as `update_desired_hash` leaves an active run alone.
+    #[test]
+    fn an_unreadable_input_stops_the_plan_advertising_the_previous_verdict() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+
+        let mut idle = PlaybookPlanStatus {
+            phase: Phase::Succeeded,
+            next_run: Some(slot),
+            summary: Some("3/3 up-to-date".into()),
+            conditions: vec![v1beta1::PlaybookPlanCondition {
+                type_: "Ready".into(),
+                status: "True".into(),
+                reason: Some("AllHostsSucceeded".into()),
+                message: Some("3/3 hosts completed successfully".into()),
+                last_transition_time: None,
+            }],
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".to_string(),
+                v1beta1::HostStatus::default(),
+            )])),
+            ..Default::default()
+        };
+        record_input_failure(&mut idle, "cannot read referenced Secrets: nope".into());
+        assert_eq!(idle.phase, Phase::Pending);
+        assert_eq!(idle.next_run, None);
+        assert_eq!(
+            idle.summary.as_deref(),
+            Some("cannot read referenced Secrets: nope")
+        );
+        let ready = idle
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Ready")
+            .unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason.as_deref(), Some("InputsUnavailable"));
+        assert_eq!(
+            ready.message.as_deref(),
+            Some("cannot read referenced Secrets: nope")
+        );
+        // The previous run's per-host results are still true — nothing here re-ran anything.
+        assert!(idle.hosts_status.unwrap().contains_key("worker-1"));
+
+        let mut applying = PlaybookPlanStatus {
+            active_run: Some(ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-1".into(),
+                job_name: "apply-plan-1-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                attempt: 1,
+                triggered_slot: None,
+            }),
+            phase: Phase::Applying,
+            ..Default::default()
+        };
+        record_input_failure(
+            &mut applying,
+            "cannot resolve the plan's inventories: nope".into(),
+        );
+        assert_eq!(applying.phase, Phase::Applying);
+    }
 
     #[test]
     fn decide_terminal_oneshot_all_current_succeeds() {
