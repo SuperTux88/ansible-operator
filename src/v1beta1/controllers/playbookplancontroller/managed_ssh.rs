@@ -42,9 +42,9 @@ const HOST_CERT_FILENAME: &str = "ssh_host_ed25519_key-cert.pub";
 const CA_PUB_FILENAME: &str = "ca.pub";
 const ENTER_HOST_SCRIPT_FILENAME: &str = "enter-host.sh";
 
-/// Per-attempt principals file for sshd's `AuthorizedPrincipalsFile`. It contains **only this run's
+/// Per-run principals file for sshd's `AuthorizedPrincipalsFile`. It contains **only this run's
 /// run ID** (see `build_secret`) — never `root`. That scopes the proxy to certs carrying
-/// that attempt's principal, so a leaked/strayed client cert from another run is rejected at the
+/// that run's principal, so a leaked/strayed client cert from another run is rejected at the
 /// sshd cert-principal layer, not just by the per-run NetworkPolicy (THREAT_MODEL R3 / T-INFO-3).
 const AUTHORIZED_PRINCIPALS_FILENAME: &str = "authorized_principals";
 
@@ -128,7 +128,7 @@ pub enum ProxyReadiness {
 /// can authenticate against any more. The CA is in-memory (INV-6), so every operator restart rotates
 /// it — which is exactly when a run gets resumed.
 ///
-/// Scoped entirely to this attempt: every name derives from `run_id`, so it can never touch another
+/// Scoped entirely to this run: every name derives from `run_id`, so it can never touch another
 /// run's resources.
 ///
 /// **Two things here are load-bearing and must not be "tidied":**
@@ -305,7 +305,7 @@ fn merge_default_tolerations(
     merged
 }
 
-/// Deterministic, human-readable resource name for a (host, attempt) pair. The attempt is identified
+/// Deterministic, human-readable resource name for a (host, run) pair. The run is identified
 /// by its run ID, so a delayed cleanup can never reach a retry's pods.
 ///
 /// Length budget: the result names a Pod and a Secret, so it is bounded by
@@ -472,9 +472,9 @@ fn build_secret(
     string_data.insert(HOST_KEY_FILENAME.to_string(), host_key_openssh);
     string_data.insert(HOST_CERT_FILENAME.to_string(), host_cert);
     string_data.insert(CA_PUB_FILENAME.to_string(), ca_pub);
-    // ONLY this attempt's run ID — never "root". This is the sole principal sshd's
-    // `AuthorizedPrincipalsFile` will accept, so a client cert from any other attempt (whose run ID
-    // differs, even for a retry of the same execution hash) is rejected even if it can reach this
+    // ONLY this run's run ID — never "root". This is the sole principal sshd's
+    // `AuthorizedPrincipalsFile` will accept, so a client cert from any other run (whose run ID
+    // differs, even for another run of the same execution hash) is rejected even if it can reach this
     // pod. Must match the run-ID principal minted in `ensure_client_cert`.
     string_data.insert(
         AUTHORIZED_PRINCIPALS_FILENAME.to_string(),
@@ -691,8 +691,8 @@ fn build_network_policy(
 /// `ensure_client_cert` (which just wraps this in a Secret) so tests can exercise the exact client
 /// material the Job pod mounts against a real sshd, rather than re-deriving it.
 ///
-/// The per-attempt run ID is the *enforced* principal: each proxy's principals file lists only
-/// its own run ID, so this cert authenticates only to this attempt's proxies. "root" is kept as a
+/// The run ID is the *enforced* principal: each proxy's principals file lists only
+/// its own run ID, so this cert authenticates only to this run's proxies. "root" is kept as a
 /// harmless second principal (belt-and-suspenders for sshd's default username check on builds/configs
 /// where `AuthorizedPrincipalsFile` isn't in force); `PermitRootLogin yes` authorizes the root login.
 fn render_client_cert_files(
@@ -833,7 +833,7 @@ pub async fn ensure_proxy_infra(
             secrets_api.create(&PostParams::default(), &secret).await?;
         }
 
-        // Create the pod for EVERY host, including a NotReady one — we want to attempt scheduling it.
+        // Create the pod for EVERY host, including a NotReady one — we want to run scheduling it.
         let pod = match pods_api.get_opt(&name).await? {
             Some(pod) => pod,
             None => {
@@ -886,7 +886,7 @@ pub async fn ensure_proxy_infra(
 /// Deletes every resource belonging to this run: the operator-namespace proxy pods, their per-host
 /// Secrets and the run's NetworkPolicy via label-scoped `delete_collection`, plus the plan-namespace
 /// client-cert Secret by exact name. The operator-ns sweep is by-label so the host list isn't needed
-/// — GC-by-label catches everything tagged with the attempt's run ID regardless of how the inventory
+/// — GC-by-label catches everything tagged with the run's run ID regardless of how the inventory
 /// drifted since the run started. (The CA is in-memory only, not a Secret, so nothing CA-related is
 /// in scope here.) The operator-ns resources can't use ownerReferences, since Kubernetes GC ignores
 /// references that cross namespaces (they live in the operator namespace, the Job/PlaybookPlan in the
@@ -935,7 +935,7 @@ pub async fn cleanup_proxy_infra(
     // Existence of PLAYBOOKPLAN_HOST spares the ansible Job pod (which lacks it) — see the doc.
     let pods_lp =
         ListParams::default().labels(&format!("{run_selector},{}", labels::PLAYBOOKPLAN_HOST));
-    // Hash + run ID selector: no other attempt shares this cleanup identity.
+    // Hash + run ID selector: no other run shares this cleanup identity.
     let rest_lp = ListParams::default().labels(&run_selector);
 
     pods_api.delete_collection(&dp, &pods_lp).await?;
@@ -972,11 +972,11 @@ where
 mod tests {
     use super::*;
 
-    /// Pins the wire format of the per-attempt resource names, and the length budget behind
+    /// Pins the wire format of the per-run resource names, and the length budget behind
     /// `resource_name` — the worst case is a Node name that has to be truncated, so the bound is
     /// exercised through the longest name Kubernetes will accept rather than assumed.
     #[test]
-    fn attempt_scoped_resource_names_keep_their_shape_and_fit() {
+    fn run_scoped_resource_names_keep_their_shape_and_fit() {
         use crate::utils::{MAX_DNS_SUBDOMAIN_LEN, generate_id_with_length};
         use crate::v1beta1::controllers::playbookplancontroller::reconciler::RUN_ID_LENGTH;
 
@@ -1107,7 +1107,7 @@ mod tests {
     }
 
     /// These labels are the cleanup selector's whole contract: `PLAYBOOKPLAN_HOST` is what tells a
-    /// proxy pod apart from the ansible Job pod, and `RUN_ID` is what keeps one attempt's sweep off
+    /// proxy pod apart from the ansible Job pod, and `RUN_ID` is what keeps one run's sweep off
     /// another's resources.
     #[test]
     fn run_labels_carry_the_hash_run_id_host_and_component() {
@@ -1269,7 +1269,7 @@ mod tests {
             .and_then(|d| d.get(AUTHORIZED_PRINCIPALS_FILENAME))
             .expect("proxy secret must carry an authorized_principals file");
 
-        // The file must name exactly this attempt's run ID and nothing else — in particular not "root",
+        // The file must name exactly this run's run ID and nothing else — in particular not "root",
         // which would make every run's client cert authenticate to every proxy (R3 / T-INFO-3).
         assert_eq!(principals.trim(), "run-1");
         assert!(

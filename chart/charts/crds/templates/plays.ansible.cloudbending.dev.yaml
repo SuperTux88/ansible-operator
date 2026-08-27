@@ -18,8 +18,8 @@ spec:
     - jsonPath: .spec.playbookPlan
       name: Plan
       type: string
-    - jsonPath: .spec.attempt
-      name: Attempt
+    - jsonPath: .spec.runNumber
+      name: Run
       priority: 1
       type: integer
     - jsonPath: .status.hostCount
@@ -62,21 +62,13 @@ spec:
         properties:
           spec:
             description: |-
-              An immutable per-attempt recovery and history record. It is written before Job creation, advances
+              An immutable per-run recovery and history record. It is written before Job creation, advances
               from preparation through execution, and retains the terminal recap after the Job is reaped.
 
               Owned (ownerReference) by its `PlaybookPlan`, so deleting the plan cascades to all its Plays;
               retention beyond that is bounded per-plan by `successfulPlaysHistoryLimit`/
               `failedPlaysHistoryLimit`. The Job and pod template carry this Play's UID for correlation.
             properties:
-              attempt:
-                description: |-
-                  Attempt number reserved across all revisions of this plan: 1 for the first attempt, then one
-                  past every Job and retained `Play` record still claiming a number. It may therefore continue
-                  across plan edits and skip numbers. Mirrors the backing Job's numbered name
-                  (`apply-{plan}-{shortid}-{attempt}`).
-                minimum: 0.0
-                type: integer
               executionHash:
                 description: The execution hash the run applied — matches the backing Job's hash label.
                 type: string
@@ -84,7 +76,7 @@ spec:
                 description: |-
                   The inventory this run targeted, preserving the groups the user designed (each group's name
                   and its hosts) rather than a flat host list. Same shape as the plan's `.status.eligibleHosts`,
-                  filtered to the hosts this attempt actually ran.
+                  filtered to the hosts this run actually ran.
                 items:
                   properties:
                     hosts:
@@ -108,21 +100,33 @@ spec:
                 type: string
               preparationFingerprint:
                 description: |-
-                  Fingerprint of all plan and resolved-inventory inputs used while preparing this attempt.
+                  Fingerprint of all plan and resolved-inventory inputs used while preparing this run.
 
                   This is the run's change detector, and it is why the record carries no copy of the plan spec,
-                  resolved connection configuration or the Job. Everything an unlaunched attempt needs to be
+                  resolved connection configuration or the Job. Everything an unlaunched run needs to be
                   resumed is a pure function of the live plan spec and the freshly resolved groups, so while
                   the fingerprint still matches those the inputs can simply be re-derived; once it stops
-                  matching there is nothing worth resuming and the attempt is aborted in favour of the new
+                  matching there is nothing worth resuming and the run is aborted in favour of the new
                   revision. Reducing them to one *typed* field is also what lets the spec's `self == oldSelf`
                   rule cover the whole record: CEL cannot see into a schemaless field, and there is none here.
                 type: string
               runId:
                 description: |-
-                  Stable identifier for this attempt, used to isolate resource names, labels, and cleanup from
-                  other attempts that share the same execution hash.
+                  Stable identifier for this run, used to isolate resource names, labels, and cleanup from
+                  other runs that share the same execution hash.
                 type: string
+              runNumber:
+                description: |-
+                  Sequence number reserved across all revisions of this plan: 1 for the first run, then one
+                  past every Job and retained `Play` record still claiming a number. It therefore continues
+                  across plan edits rather than restarting at 1 for a new revision. Mirrors the backing Job's
+                  numbered name (`apply-{plan}-{shortid}-{runNumber}`).
+
+                  Not a dense count of this plan's runs: a run abandoned before its Job exists leaves its
+                  number unused whenever the plan's `lastRunNumber` already recorded it. Uniqueness of the
+                  name is the whole contract.
+                minimum: 0.0
+                type: integer
               triggeredSlot:
                 description: |-
                   Start of the schedule slot consumed by this run. Unscheduled runs leave this absent. Keeping
@@ -131,13 +135,13 @@ spec:
                 nullable: true
                 type: string
             required:
-            - attempt
             - executionHash
             - inventory
             - playbookPlan
             - playbookPlanUid
             - preparationFingerprint
             - runId
+            - runNumber
             type: object
             x-kubernetes-validations:
             - message: Play spec is immutable

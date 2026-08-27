@@ -89,12 +89,12 @@ use crate::{
 };
 
 /// Builds the run's Job exactly as it will be created, except for the correlation to its `Play` —
-/// that UID does not exist yet when the attempt is first prepared, so [`correlate_job_to_play`]
+/// that UID does not exist yet when the run is first prepared, so [`correlate_job_to_play`]
 /// stamps it on immediately before every `create`.
 ///
 /// **Must stay a pure function of its arguments.** The `Play` stores no copy of the result: a
-/// resumed attempt rebuilds it from the live plan and the groups it recorded, relying on the
-/// attempt's `preparationFingerprint` to establish that those are still the inputs it was prepared
+/// resumed run rebuilds it from the live plan and the groups it recorded, relying on the
+/// run's `preparationFingerprint` to establish that those are still the inputs it was prepared
 /// with. Anything time- or environment-dependent leaking in here would make a resumed run create a
 /// Job that differs from the one it committed to.
 ///
@@ -105,7 +105,7 @@ use crate::{
 /// `Blocked` while it holds its host Leases.
 pub fn create_job_blueprint(
     hash: &ExecutionHash,
-    retry_count: u32,
+    run_number: u32,
     run_id: &str,
     target_groups: &[ResolvedInventoryGroup],
     object: &PlaybookPlan,
@@ -146,10 +146,10 @@ pub fn create_job_blueprint(
 
     job.metadata.namespace = Some(pb_namespace.into());
 
-    // retry_count must be in the name — the hash alone is unchanged between retries of an
+    // The run number must be in the name — the hash alone is unchanged between retries of an
     // identical spec, so without it a new run's Job name would collide with a completed prior
     // run's and get silently skipped by the idempotency check.
-    job.metadata.name = Some(job_name(pb_name, pb_uid, hash, retry_count));
+    job.metadata.name = Some(job_name(pb_name, pb_uid, hash, run_number));
 
     let job_labels: BTreeMap<String, String> = BTreeMap::from([
         (labels::PLAYBOOKPLAN_NAME.into(), pb_name.to_string()),
@@ -172,13 +172,13 @@ pub fn create_job_blueprint(
     Ok(job)
 }
 
-/// Stamps the attempt's `Play` UID onto the Job and — crucially — onto its pod template, which is
+/// Stamps the run's `Play` UID onto the Job and — crucially — onto its pod template, which is
 /// what makes a run's identity checkable on the pod that actually carries out the run.
 ///
 /// Must be called **after** [`create_job_blueprint`] (which overwrites the pod template's metadata)
 /// and **before** the Job is created, since a Job's pod template is immutable once it exists. Every
 /// creation path re-stamps an identically rebuilt blueprint with the same UID, so a resumed run
-/// produces a byte-identical template to the one its first attempt would have.
+/// produces a byte-identical template to the one its first run would have.
 pub fn correlate_job_to_play(job: &mut Job, play_uid: &str) {
     job.metadata
         .annotations
@@ -195,16 +195,16 @@ pub fn correlate_job_to_play(job: &mut Job, play_uid: &str) {
         .insert(labels::PLAY_UID_ANNOTATION.into(), play_uid.to_string());
 }
 
-/// Names an attempt's Job — and, identically, its `Play` record.
+/// Names a run's Job — and, identically, its `Play` record.
 ///
 /// The plan name is truncated to fit [`utils::MAX_DNS_LABEL_LEN`]. That cap is the Job's, not the
 /// `Play`'s: a Job name becomes the `job-name` label value on its pods, so the apiserver validates it
 /// as a DNS *label* while a custom resource may use the far longer subdomain form. Since the write-
 /// ahead protocol records the `Play` before creating the Job, an unbounded name would be accepted
-/// for the record and then rejected for the Job — leaving the attempt stuck in `Launching`, retried
+/// for the record and then rejected for the Job — leaving the run stuck in `Launching`, retried
 /// every tick, renewing host Leases that block every other plan targeting those hosts. The readable
-/// half gets whatever the cap leaves after `apply-`, the ten-symbol short id and the attempt
-/// number — 44 characters while the attempt is a single digit, one fewer for every further digit —
+/// half gets whatever the cap leaves after `apply-`, the ten-symbol short id and the run
+/// number — 44 characters while the run is a single digit, one fewer for every further digit —
 /// so a plan named 45 characters or more already reaches that. The bound therefore belongs here,
 /// where the name is minted, rather than on the two objects that inherit it.
 /// `the_plan_name_half_is_truncated_from_45_characters` pins those numbers to the arithmetic.
@@ -214,8 +214,8 @@ pub fn correlate_job_to_play(job: &mut Job, play_uid: &str) {
 /// agree over the truncated prefix would otherwise be told apart only by a short id derived from
 /// inputs they may legitimately share — an identical playbook and Secrets. Colliding there is not
 /// merely untidy: the losing plan's `Play` can be pruned while its Job is still under TTL, leaving
-/// the other plan free to record an attempt at that name and then meet the foreign Job under it.
-/// Recovery refuses a Job that does not carry the attempt's identity
+/// the other plan free to record a run at that name and then meet the foreign Job under it.
+/// Recovery refuses a Job that does not carry the run's identity
 /// (`reconciler::resume_launching_run`), so the run is not finalized against a Job it never created —
 /// but while the operator keeps reconciling it, it renews its host Leases until the foreign Job is
 /// removed. A terminal foreign Job with a TTL may eventually be reaped automatically; otherwise an
@@ -223,16 +223,16 @@ pub fn correlate_job_to_play(job: &mut Job, play_uid: &str) {
 /// likely, while the identity check bounds what one still costs at every path that could meet one.
 ///
 /// Two *revisions of one plan* can still collide here — same UID, and the short id is ten symbols of
-/// a 64-bit hash — which is exactly why attempt numbers are reserved plan-wide rather than per hash;
+/// a 64-bit hash — which is exactly why run numbers are reserved plan-wide rather than per hash;
 /// see `reconciler::select_job`.
 pub(super) fn job_name(
     plan_name: &str,
     plan_uid: &str,
     hash: &ExecutionHash,
-    retry_count: u32,
+    run_number: u32,
 ) -> String {
     let prefix = "apply-";
-    let suffix = format!("-{}-{retry_count}", run_short_id(plan_uid, hash));
+    let suffix = format!("-{}-{run_number}", run_short_id(plan_uid, hash));
     let budget = utils::MAX_DNS_LABEL_LEN.saturating_sub(prefix.len() + suffix.len());
     format!(
         "{prefix}{}{suffix}",
@@ -249,8 +249,8 @@ pub(super) fn job_name(
 const RUN_SHORT_ID_LENGTH: usize = 10;
 
 /// The `{shortid}` segment of a run name: the plan's identity folded together with the revision the
-/// run applies. Deterministic, because a resumed attempt has to rebuild the exact name it committed
-/// to — and both inputs are fixed for the life of an attempt.
+/// run applies. Deterministic, because a resumed run has to rebuild the exact name it committed
+/// to — and both inputs are fixed for the life of a run.
 fn run_short_id(plan_uid: &str, hash: &ExecutionHash) -> String {
     let mut hasher = twox_hash::XxHash3_64::new();
     plan_uid.hash(&mut hasher);
@@ -357,7 +357,7 @@ pub async fn ensure_job_network_policy(
 
 /// Name of a run's egress `NetworkPolicy` in the plan's namespace.
 ///
-/// Uniqueness comes from the run ID, which `reconciler::run_id` mints per attempt from the plan's
+/// Uniqueness comes from the run ID, which `reconciler::run_id` mints per run from the plan's
 /// UID, so two plans can never name the same policy however alike they are. The truncated plan name
 /// is there to keep the object recognizable in `kubectl get netpol`, and the plan-name hash next to
 /// it keeps that readable half faithful: object names are capped at 63 characters, so two plans
@@ -1024,8 +1024,8 @@ spec:
         use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
 
         let hash = calculate_execution_hash("playbook", std::iter::empty());
-        let name_of = |length: usize, attempt: u32| {
-            super::job_name(&"n".repeat(length), "uid", &hash, attempt)
+        let name_of = |length: usize, run_number: u32| {
+            super::job_name(&"n".repeat(length), "uid", &hash, run_number)
         };
 
         assert!(
@@ -1040,11 +1040,11 @@ spec:
         assert_eq!(name_of(44, 1).len(), MAX_DNS_LABEL_LEN);
         assert_eq!(name_of(45, 1).len(), MAX_DNS_LABEL_LEN);
 
-        // Every further digit of the attempt number takes another character off that half.
+        // Every further digit of the run number takes another character off that half.
         assert!(!name_of(44, 10).contains(&"n".repeat(44)));
         assert!(name_of(43, 10).contains(&"n".repeat(43)));
 
-        // Whatever the plan name and attempt, the result stays inside the cap a Job is validated
+        // Whatever the plan name and run number, the result stays inside the cap a Job is validated
         // against — which is the property the truncation exists for.
         for length in [1, 44, 45, MAX_PLAN_NAME_LEN] {
             assert!(name_of(length, u32::MAX).len() <= MAX_DNS_LABEL_LEN);
@@ -1052,7 +1052,7 @@ spec:
     }
 
     #[test]
-    fn job_blueprint_names_by_retry_count_not_a_time_nonce() {
+    fn job_blueprint_names_by_run_number_not_a_time_nonce() {
         use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
         use kube::runtime::reflector::Lookup as _;
 
@@ -1075,21 +1075,21 @@ spec:
         let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
 
-        let attempt_1 = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp).unwrap();
-        let attempt_2 = super::create_job_blueprint(&hash, 2, "run-2", &[], &pp).unwrap();
-        let attempt_1_again = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp).unwrap();
+        let run_1 = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp).unwrap();
+        let run_2 = super::create_job_blueprint(&hash, 2, "run-2", &[], &pp).unwrap();
+        let run_1_again = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp).unwrap();
 
-        let name_1 = attempt_1.name().unwrap().to_string();
-        let name_2 = attempt_2.name().unwrap().to_string();
-        let name_1_again = attempt_1_again.name().unwrap().to_string();
+        let name_1 = run_1.name().unwrap().to_string();
+        let name_2 = run_2.name().unwrap().to_string();
+        let name_1_again = run_1_again.name().unwrap().to_string();
 
         assert_eq!(
             name_1, name_1_again,
-            "same hash + same retry_count must be deterministic"
+            "same hash + same run number must be deterministic"
         );
         assert_ne!(
             name_1, name_2,
-            "different retry_count for the same spec must produce a different name"
+            "a different run number for the same spec must produce a different name"
         );
         assert!(name_1.ends_with("-1"));
         assert!(name_2.ends_with("-2"));
@@ -1441,7 +1441,7 @@ spec:
     /// `RUN_ID_LENGTH` has to fail here rather than at the apiserver.
     ///
     /// The second half pins the readable half of the name. Two plans can no longer *collide* — the
-    /// run ID is minted per attempt from the plan's UID — but two names that truncate to the same
+    /// run ID is minted per run from the plan's UID — but two names that truncate to the same
     /// text still read as each other in `kubectl get netpol`, which the plan-name hash is what
     /// prevents.
     #[test]
@@ -1466,13 +1466,13 @@ spec:
     }
 
     /// A Job name becomes the `job-name` label value on its pods, so it is bounded by the DNS *label*
-    /// cap however long the plan's own (subdomain-length) name is. It has to hold for a large attempt
+    /// cap however long the plan's own (subdomain-length) name is. It has to hold for a large run
     /// number too: the number is reserved plan-wide and never restarts at 1, so it grows with the
     /// plan's history and eats into the same budget.
     ///
     /// This is not cosmetic. The `Play` is recorded under this name before the Job is created, and a
     /// custom resource accepts the longer subdomain form — so a name that only the Job rejects would
-    /// strand the attempt in `Launching`, holding its host Leases while it retried forever.
+    /// strand the run in `Launching`, holding its host Leases while it retried forever.
     #[test]
     fn job_name_fits_the_label_budget_a_job_is_actually_validated_against() {
         use crate::utils::{MAX_DNS_LABEL_LEN, MAX_DNS_SUBDOMAIN_LEN};
@@ -1480,15 +1480,15 @@ spec:
 
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
         for plan_name in ["web", &"a".repeat(MAX_DNS_SUBDOMAIN_LEN)] {
-            for attempt in [1, u32::MAX] {
-                let name = super::job_name(plan_name, "plan-uid", &hash, attempt);
+            for run_number in [1, u32::MAX] {
+                let name = super::job_name(plan_name, "plan-uid", &hash, run_number);
                 assert!(
                     name.len() <= MAX_DNS_LABEL_LEN,
                     "{name} ({} chars) exceeds the Job name cap",
                     name.len()
                 );
                 assert!(name.starts_with("apply-"));
-                assert!(name.ends_with(&format!("-{attempt}")));
+                assert!(name.ends_with(&format!("-{run_number}")));
             }
         }
 
@@ -1503,7 +1503,7 @@ spec:
     /// Truncation makes the readable half of the name lossy, so the short id is what has to keep two
     /// plans apart — including the case truncation creates: identical long names beyond the cut, and
     /// an identical playbook and Secrets, so the execution hash matches too. Without the plan's UID
-    /// in the short id these would be the same Job and `Play` name, and one plan's attempt could be
+    /// in the short id these would be the same Job and `Play` name, and one plan's run could be
     /// finalized against the other's Job.
     #[test]
     fn long_plan_names_sharing_a_truncated_prefix_still_name_distinct_runs() {
@@ -1524,7 +1524,7 @@ spec:
         assert!(second.len() <= MAX_DNS_LABEL_LEN);
 
         // The same plan, on the other hand, has to name the same run every time it is asked — a
-        // resumed attempt rebuilds the name it already committed to.
+        // resumed run rebuilds the name it already committed to.
         assert_eq!(
             first,
             super::job_name(&format!("{shared_prefix}-one"), "uid-one", &hash, 1)
@@ -1567,8 +1567,8 @@ spec:
                 continue;
             }
 
-            for attempt in [1, 42, u32::MAX] {
-                let name = super::job_name(plan_name, "plan-uid", &hash, attempt);
+            for run_number in [1, 42, u32::MAX] {
+                let name = super::job_name(plan_name, "plan-uid", &hash, run_number);
                 assert!(is_dns_label(&name), "job name {name:?} is not a DNS label");
             }
             let policy = super::job_network_policy_name(plan_name, run_id);
