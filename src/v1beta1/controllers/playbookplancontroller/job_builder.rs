@@ -28,6 +28,21 @@ use kube::{
 /// `/dev/termination-log` carries the recap the reconciler reads back (see `advance_active_run`).
 pub const ANSIBLE_CONTAINER_NAME: &str = "ansible-playbook";
 
+/// Name of the init container that waits for this run's managed-ssh proxies to answer before
+/// `ansible-playbook` starts (see `configure_job_for_managed_ssh_preflight`).
+const MANAGED_SSH_PREFLIGHT_CONTAINER_NAME: &str = "managed-ssh-preflight";
+
+/// How long the managed-ssh preflight gate waits for every proxy endpoint before starting Ansible
+/// anyway. Bounds the cost of a proxy that never becomes reachable; it is not a budget that a
+/// healthy run spends, since the gate exits the moment the last endpoint answers (observed: a few
+/// seconds while the CNI programs the proxies' ingress rule for the freshly created Job pod).
+const MANAGED_SSH_PREFLIGHT_TIMEOUT_SECONDS: u32 = 60;
+
+/// Name of the volume carrying the rendered workspace Secret (playbook.yml/inventory.yml/the recap
+/// callback/the preflight gate). Shared so the skeleton and the preflight init container cannot
+/// disagree about what to mount.
+const WORKSPACE_VOLUME_NAME: &str = "playbook";
+
 /// `ttlSecondsAfterFinished` for the ansible Job: reaping a *finished* run is left to Kubernetes'
 /// TTL controller, so finished runs stay around briefly for inspection and then get reaped instead
 /// of accumulating forever. The operator deletes a Job only to cancel one that is still running when
@@ -118,6 +133,7 @@ pub fn create_job_blueprint(
     if has_managed_ssh_group(target_groups) {
         let secret_name = managed_ssh::client_cert_secret_name(run_id);
         configure_job_for_managed_ssh_client_cert(&mut job, &secret_name);
+        configure_job_for_managed_ssh_preflight(&mut job, object);
     }
 
     let ssh_configs = distinct_static_inventory_ssh_configs(target_groups);
@@ -393,7 +409,7 @@ fn create_job_skeleton(
     let variable_secrets: Vec<&String> = extract_secret_names_for_variables(plan).collect();
 
     let mut volumes = vec![kcore::v1::Volume {
-        name: "playbook".into(),
+        name: WORKSPACE_VOLUME_NAME.into(),
         secret: Some(kcore::v1::SecretVolumeSource {
             secret_name: Some(pb_name.into()),
             ..Default::default()
@@ -402,7 +418,7 @@ fn create_job_skeleton(
     }];
 
     let mut volume_mounts = vec![kcore::v1::VolumeMount {
-        name: "playbook".into(),
+        name: WORKSPACE_VOLUME_NAME.into(),
         mount_path: paths::WORKSPACE_MOUNT_PATH.into(),
         ..Default::default()
     }];
@@ -669,6 +685,58 @@ fn configure_job_for_managed_ssh_client_cert(job: &mut Job, secret_name: &str) {
     });
 }
 
+/// Appends the init container that holds `ansible-playbook` back until every managed-ssh proxy of
+/// this run answers on its rendered pod IP.
+///
+/// kubelet's readiness probe on a proxy pod only proves sshd is up *from its own node*. The proxy
+/// pods' ingress NetworkPolicy selects this Job's pod by label, so the CNI cannot start programming
+/// that rule on the remote proxies' nodes until the pod exists — which is why a fresh multi-node run
+/// reliably reaches the proxy on its own node and gets `connection refused` from the others. Only a
+/// container in this pod shares the network namespace that has to work, so the gate cannot live in
+/// the operator.
+///
+/// Appended *after* the collections installer so it measures the freshest state and, when
+/// `requirements.yml` is present, usually finds the datapath already programmed by the time the
+/// Galaxy install has finished.
+///
+/// The endpoints come from the workspace Secret rather than from arguments here, because
+/// [`create_job_blueprint`] must stay pure — see `workspace::render_preflight_endpoints`. Only
+/// constants are baked into the spec.
+fn configure_job_for_managed_ssh_preflight(job: &mut Job, plan: &v1beta1::PlaybookPlan) {
+    job.spec.as_mut().and_then(|spec| {
+        spec.template.spec.as_mut().map(|pod_spec| {
+            pod_spec
+                .init_containers
+                .get_or_insert_default()
+                .push(kcore::v1::Container {
+                    name: MANAGED_SSH_PREFLIGHT_CONTAINER_NAME.into(),
+                    image: Some(plan.spec.image.clone()),
+                    working_dir: Some(paths::WORKSPACE_MOUNT_PATH.into()),
+                    // The plan's own image is the one container image guaranteed to be present on
+                    // this node and to hold a Python interpreter (ansible-core *is* Python), so the
+                    // gate needs no second image to mirror and no extra pull.
+                    command: Some(vec![
+                        "python3".into(),
+                        paths::managed_ssh_preflight_script_path(),
+                        paths::managed_ssh_preflight_endpoints_path(),
+                    ]),
+                    env: Some(vec![EnvVar {
+                        name: "ANSIBLE_OPERATOR_PREFLIGHT_TIMEOUT_SECONDS".into(),
+                        value: Some(MANAGED_SSH_PREFLIGHT_TIMEOUT_SECONDS.to_string()),
+                        ..Default::default()
+                    }]),
+                    volume_mounts: Some(vec![kcore::v1::VolumeMount {
+                        name: WORKSPACE_VOLUME_NAME.into(),
+                        mount_path: paths::WORKSPACE_MOUNT_PATH.into(),
+                        ..Default::default()
+                    }]),
+                    security_context: plan.spec.security_context.as_ref().map(Into::into),
+                    ..Default::default()
+                });
+        })
+    });
+}
+
 /// Sets the env vars that make Ansible load and use the operator's per-host-outcome recap
 /// callback (rendered into the workspace secret alongside playbook.yml/inventory.yml — see
 /// `workspace.rs`), without disabling the default human-readable stdout callback.
@@ -818,7 +886,7 @@ fn render_ansible_command(
 
 #[cfg(test)]
 mod tests {
-    use crate::v1beta1::{PlaybookPlan, labels};
+    use crate::v1beta1::{PlaybookPlan, controllers::playbookplancontroller::paths, labels};
 
     #[test]
     fn test_extract_file_volumes_generates_correct_volumes() {
@@ -1138,6 +1206,93 @@ spec:
         assert_eq!(
             req.values.as_ref().unwrap(),
             &vec!["node-a".to_string(), "node-b".to_string()]
+        );
+    }
+
+    /// The gate only earns its keep if it is the *last* thing before `ansible-playbook`: it has to
+    /// measure the datapath as Ansible will find it, and when a plan installs collections that
+    /// install is free propagation time it should not waste.
+    #[test]
+    fn a_managed_ssh_run_gates_ansible_behind_a_preflight_init_container() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+        use crate::v1beta1::{ResolvedHosts, ResolvedInventoryGroup};
+
+        let mut pp = minimal_plan();
+        pp.spec.template.requirements = Some("collections: []".into());
+        let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
+        let groups = vec![ResolvedInventoryGroup::ManagedSsh {
+            hosts: ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["node-a".into()],
+            },
+            tolerations: None,
+            variables: None,
+        }];
+
+        let job = super::create_job_blueprint(&hash, 1, "run-1", &groups, &pp).unwrap();
+        let pod_spec = job.spec.unwrap().template.spec.unwrap();
+        let init_containers = pod_spec.init_containers.unwrap();
+
+        assert_eq!(
+            init_containers
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "download-collections",
+                super::MANAGED_SSH_PREFLIGHT_CONTAINER_NAME
+            ],
+        );
+
+        let preflight = init_containers.last().unwrap();
+
+        // The plan's own image, so the gate needs no second image to be mirrored or pulled.
+        assert_eq!(preflight.image, pp.spec.image.clone().into());
+        assert_eq!(
+            preflight.command.as_ref().unwrap(),
+            &vec![
+                "python3".to_string(),
+                "/run/ansible-operator/ansible_operator_preflight".to_string(),
+                "/run/ansible-operator/managed_ssh_endpoints".to_string(),
+            ]
+        );
+
+        // The endpoints must reach it through the workspace Secret, never through the spec — see
+        // `a_rebuilt_blueprint_reproduces_the_one_prepared_for_the_same_run`.
+        let mounts = preflight.volume_mounts.as_ref().unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].name, super::WORKSPACE_VOLUME_NAME);
+        assert_eq!(mounts[0].mount_path, paths::WORKSPACE_MOUNT_PATH);
+
+        let env = preflight.env.as_ref().unwrap();
+        assert_eq!(env[0].name, "ANSIBLE_OPERATOR_PREFLIGHT_TIMEOUT_SECONDS");
+        assert_eq!(
+            env[0].value.as_deref(),
+            Some(
+                super::MANAGED_SSH_PREFLIGHT_TIMEOUT_SECONDS
+                    .to_string()
+                    .as_str()
+            )
+        );
+    }
+
+    /// A run with no managed-ssh targets has no proxy pods to wait for, so it must not pay for the
+    /// gate — static-inventory hosts are reachable independently of any of this.
+    #[test]
+    fn a_run_without_managed_ssh_targets_gets_no_preflight_init_container() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+
+        let pp = minimal_plan();
+        let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
+
+        let job = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp).unwrap();
+        let init_containers = job.spec.unwrap().template.spec.unwrap().init_containers;
+
+        assert!(
+            !init_containers
+                .unwrap_or_default()
+                .iter()
+                .any(|c| c.name == super::MANAGED_SSH_PREFLIGHT_CONTAINER_NAME)
         );
     }
 
