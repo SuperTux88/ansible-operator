@@ -224,6 +224,13 @@ fn merge_default_tolerations(
 /// (not hashed) since managed-ssh only targets `ClusterInventory` hosts, i.e. real Node names,
 /// which are already valid Kubernetes object name components. The run uses `utils::generate_id`'s
 /// short-id, matching `job_builder::create_job_for_run`'s Job naming.
+///
+/// Length budget, since nothing truncates here: the result names a Pod and a Secret, so it is bounded
+/// by `utils::MAX_DNS_SUBDOMAIN_LEN`. The host is separately bounded to `utils::MAX_DNS_LABEL_LEN`
+/// because it is also written as the `PLAYBOOKPLAN_HOST` **label value** (`run_labels`) — so the
+/// worst case is 13 + 63 + 1 + `reconciler::RUN_ID_LENGTH`, leaving well over 150 characters of
+/// headroom. A test pins that, so growing the run ID (or ever sourcing the host from something
+/// unlabelled) fails there rather than at the apiserver.
 fn resource_name(host: &str, execution_hash: &ExecutionHash) -> String {
     format!(
         "ansible-sshd-{host}-{}",

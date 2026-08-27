@@ -1238,7 +1238,7 @@ async fn spawn_ansible_job(
             resource_status.retry_count = retry_count;
 
             let job =
-                job_builder::create_job_for_run(&hash, retry_count, run_groups, playbookplan)?;
+                job_builder::create_job_blueprint(&hash, retry_count, run_groups, playbookplan)?;
             let job_name = job
                 .name()
                 .expect(".metadata.name must be set at this point")

@@ -150,7 +150,17 @@ comments (they encode hard-won runtime facts: BusyBox `nsenter` short-option qui
 
 ### Job naming and idempotency
 
-Job name is `apply-{plan}-{shortid}-{retry_count}` where `shortid = generate_id(execution_hash)`.
+Job name is `apply-{plan}-{shortid}-{attempt}` (`job_builder::job_name`, which also names the
+`Play`), where `shortid` is **ten symbols of a hash over the plan's UID *and* the execution hash**
+(`run_short_id`) and `{plan}` is **truncated** to whatever `utils::MAX_DNS_LABEL_LEN` leaves after
+the rest — 44 characters at a single-digit attempt, one fewer per further digit. A Job name has to be
+a DNS *label* (it becomes the `job-name` label value on its pods) while a plan may carry a full
+subdomain, and the record is written under this name *before* the Job, so an unbounded name would be
+accepted for the `Play` and then refused for the Job. Keying the short id on the plan UID is what
+makes the lossy readable half safe. Both numbers are pinned by
+`the_plan_name_half_is_truncated_from_45_characters` — they are quoted to the user in
+`scheduling-and-modes.md`, so change them there too or not at all.
+
 `retry_count` is in the name because the hash alone is unchanged between retries of an identical
 spec. Dedup is a fresh `list()` by the run's `PLAYBOOKPLAN_HASH` label plus adopt-newest-active
 (`newest_active_job`), not an owner-based get — the reflector-cached `phase` lags this

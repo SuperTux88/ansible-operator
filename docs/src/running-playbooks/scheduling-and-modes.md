@@ -93,6 +93,12 @@ Within a single hash, if a run's Job needs to be retried the operator numbers su
 so the hash alone cannot distinguish attempts. You generally do not interact with this; it is why you
 may see more than one Job object for the same run.
 
+A Job's name is capped at 63 characters by Kubernetes, so the plan-name portion is shortened to fit.
+The rest of the name — `apply-`, the id and the attempt number — takes 19 characters at a
+single-digit attempt, leaving 44: a plan named 45 characters or more is shortened, and one more
+character goes each time the attempt number gains a digit. The `Play` shares the shortened name, so
+the two always match.
+
 ## Host locks
 
 The operator applies at most one playbook to a given host at a time, across the whole cluster. Before
