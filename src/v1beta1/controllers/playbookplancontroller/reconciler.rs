@@ -2777,15 +2777,26 @@ fn run_pod_selector(run_id: &str) -> String {
     )
 }
 
-/// Whether a pod may still be running the playbook. A pod that has reached a terminal phase has
-/// stopped talking to its hosts even if its object survives the Job's cascade for a while, so
-/// waiting on it would hold the plan open for nothing.
+/// Whether a pod may still be running the playbook.
+///
+/// Only the two phases that positively say the pod has stopped release its hosts. Everything else —
+/// `Unknown`, a phase that has not been reported yet, a value this operator does not know — is the
+/// same fact: nobody can currently say what that pod is doing, which is not the same as it having
+/// stopped. `Unknown` in particular means the *runner's* node has gone unreachable, and the Job pod
+/// is scheduled away from the nodes the run targets (see `configure_job_for_node_affinity`), so the
+/// usual shape of it is a partitioned runner whose container is still SSHed into perfectly healthy
+/// hosts. Releasing their Leases on that evidence is what lets a second playbook onto them.
+///
+/// Waiting instead cannot hold a host forever: the Leases are only held while this operator keeps
+/// renewing them, so they expire and become takeable within `locking::LEASE_DURATION_SECONDS` of it
+/// stopping — and the plan waiting in `Terminating` is visible in the log, with a documented manual
+/// release for a node that never comes back.
 fn pod_may_be_executing(pod: &Pod) -> bool {
-    matches!(
+    !matches!(
         pod.status
             .as_ref()
             .and_then(|status| status.phase.as_deref()),
-        Some("Pending" | "Running") | None
+        Some("Succeeded" | "Failed")
     )
 }
 
@@ -5150,6 +5161,18 @@ mod tests {
             pod_may_be_executing(&pod(None)),
             "a pod whose phase has not been reported yet may still start"
         );
+        assert!(
+            pod_may_be_executing(&pod(Some("Unknown"))),
+            "`Unknown` is the node that runs the pod having gone unreachable, not the playbook \
+             having stopped — and the hosts it is applying to are usually on other nodes entirely"
+        );
+        assert!(
+            pod_may_be_executing(&pod(Some("SomePhaseFromALaterKubernetes"))),
+            "a phase this operator cannot interpret says as little about the pod as `Unknown` does"
+        );
+
+        // The whole list of phases that release a run's hosts: a pod has to positively say it has
+        // stopped, because everything else is only an absence of evidence.
         assert!(!pod_may_be_executing(&pod(Some("Succeeded"))));
         assert!(!pod_may_be_executing(&pod(Some("Failed"))));
     }
