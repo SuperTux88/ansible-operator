@@ -808,7 +808,7 @@ async fn reconcile(
         match timing {
             Timing::Delayed(until) => {
                 requeue_after = (until - now()).to_std().unwrap();
-                resource_status.phase = Phase::Scheduled;
+                resource_status.phase = phase_while_waiting_for_schedule(&resource_status.phase);
                 resource_status.next_run = Some(until.fixed_offset());
             }
             Timing::Now(start) => {
@@ -1012,6 +1012,25 @@ fn may_start_new_run(suspend: bool, has_work_to_start: bool) -> bool {
     !suspend && has_work_to_start
 }
 
+/// The phase of a plan whose next run is still ahead of it: `Delayed` until the current revision
+/// has a result, and that result from then on.
+///
+/// A schedule ahead of the plan is only a *lifecycle* state while nothing has been applied yet —
+/// that is the plan waiting, and `Delayed` says so. Once a run has finished, what the plan last did
+/// is the more useful thing to report, and the wait is fully described by `nextRun`; overwriting the
+/// verdict with a state meaning "waiting" would erase the only record of the last run's outcome on
+/// the plan itself.
+///
+/// A verdict is what marks the boundary because it is the one thing only a finished run writes, and
+/// it is cleared with the revision it belongs to (`update_desired_hash`): an edited plan is waiting
+/// for its first run again, whatever the previous revision achieved.
+fn phase_while_waiting_for_schedule(current: &Phase) -> Phase {
+    match current {
+        Phase::Succeeded | Phase::Failed => current.clone(),
+        _ => Phase::Delayed,
+    }
+}
+
 /// The other half of the suspension contract: while suspended, the plan advertises no next run. The
 /// start gate blocks the run itself, so a `nextRun` pointing at a slot that will not fire says the
 /// plan is about to do something it will not do — to an operator reading it, and to any client
@@ -1021,7 +1040,7 @@ fn may_start_new_run(suspend: bool, has_work_to_start: bool) -> bool {
 /// more than one way to write one and only one way to reach the end. A tick that finalizes a run, or
 /// that reports an unreadable inventory and gives up, writes the status too — and those writes were
 /// carrying whatever `nextRun` the plan already advertised straight back onto it, so a plan
-/// suspended while `Scheduled` could keep advertising its old slot until some later tick happened to
+/// suspended while waiting on its schedule could keep advertising its old slot until some later tick happened to
 /// run the whole pipeline through. Every write now settles it, so the first one after the suspend
 /// takes effect regardless of how the tick ends.
 ///
@@ -2282,9 +2301,9 @@ fn prune_retry_after(current: std::time::Duration) -> std::time::Duration {
 /// has been failing every tick since, which reads as "nothing to do" rather than "broken".
 ///
 /// The phase and `nextRun` are reset for the same reason the summary is written: they are the other
-/// two printer columns, and leaving a `Succeeded`/`Scheduled` phase over a plan that has not been
-/// able to read its own inputs since — pointing, in the `Scheduled` case, at a slot that will not
-/// fire — is exactly the "nothing to do" reading this exists to prevent. `hostsStatus` is left
+/// two printer columns, and leaving a `Succeeded`/`Delayed` phase over a plan that has not been
+/// able to read its own inputs since — pointing, in both cases, at a slot that will not fire — is
+/// exactly the "nothing to do" reading this exists to prevent. `hostsStatus` is left
 /// alone: the previous run's per-host results are still true, and nothing here re-ran anything.
 ///
 /// A run still in flight keeps its phase, matching [`update_desired_hash`]'s guard. The read failure
@@ -5655,6 +5674,30 @@ spec:
     }
 
     #[test]
+    fn a_plan_waiting_for_its_first_run_is_delayed_and_then_keeps_its_verdict() {
+        // Nothing has been applied under this revision yet — an untouched plan, one whose edit just
+        // reset it, and one whose run was given up before it launched all read the same way.
+        assert_eq!(
+            phase_while_waiting_for_schedule(&Phase::Pending),
+            Phase::Delayed
+        );
+        assert_eq!(
+            phase_while_waiting_for_schedule(&Phase::Delayed),
+            Phase::Delayed
+        );
+
+        // Once a run has finished, the wait is `nextRun`'s to describe and the verdict stands.
+        assert_eq!(
+            phase_while_waiting_for_schedule(&Phase::Succeeded),
+            Phase::Succeeded
+        );
+        assert_eq!(
+            phase_while_waiting_for_schedule(&Phase::Failed),
+            Phase::Failed
+        );
+    }
+
+    #[test]
     fn suspend_vetoes_starting_a_new_run_even_with_work_to_do() {
         assert!(!may_start_new_run(true, true));
         // The veto is suspend's alone: without it the work gate decides.
@@ -5664,11 +5707,11 @@ spec:
 
     /// The other half of the contract: a suspended plan never advertises a run it will not start.
     /// Asserted over a status that already carries a forecast, because that is the case the rule
-    /// exists for — a plan suspended while `Scheduled` has one standing on it.
+    /// exists for — a plan suspended while `Delayed` has one standing on it.
     #[test]
     fn a_suspended_plan_advertises_no_next_run() {
         let forecast = || PlaybookPlanStatus {
-            phase: Phase::Scheduled,
+            phase: Phase::Delayed,
             next_run: Some(
                 "2025-08-12T20:00:00Z"
                     .parse::<DateTime<FixedOffset>>()
@@ -5682,7 +5725,7 @@ spec:
         assert_eq!(suspended.next_run, None);
         // Only the forecast: the phase keeps saying what the plan's underlying state is, and the
         // `Suspended` printer column is what says it is paused.
-        assert_eq!(suspended.phase, Phase::Scheduled);
+        assert_eq!(suspended.phase, Phase::Delayed);
 
         let mut running = forecast();
         suspended_advertises_no_next_run(false, &mut running);
@@ -5979,7 +6022,7 @@ spec:
 
     /// A plan that cannot read its own inputs must not keep advertising the last run's verdict. The
     /// summary alone is not enough — `phase` and `nextRun` are the other two printer columns, and a
-    /// `Succeeded`/`Scheduled` plan pointing at a slot that will never fire reads as healthy.
+    /// `Succeeded`/`Delayed` plan pointing at a slot that will never fire reads as healthy.
     ///
     /// The exception is a run still in flight: the read failure did not stop its Job, so it keeps
     /// its phase, exactly as `update_desired_hash` leaves an active run alone.
