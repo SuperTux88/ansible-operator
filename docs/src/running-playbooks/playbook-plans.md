@@ -21,6 +21,7 @@ validation rules, the operator refuses the plan instead and says so in `.status.
 | `inventoryRefs` | yes | Which inventories to target — one entry per referenced `ClusterInventory` or `StaticInventory`. |
 | `template.playbook` | yes | The playbook text itself (see below). |
 | `mode` | no (`OneShot`) | `OneShot` or `Recurring` — see [Scheduling and execution modes](./scheduling-and-modes.md). |
+| `maxAttempts` | no (`3` / `1`) | How many times a failed run may be tried again, counting the first run. Defaults to `3` for `OneShot` and `1` for `Recurring` — see [Retries](./scheduling-and-modes.md#retries). |
 | `schedule` | no | A 5-field cron expression gating when the plan may run. Omit for "as soon as possible". |
 | `timeZone` | no (UTC) | IANA time zone the `schedule` is evaluated in, e.g. `Europe/Berlin`. |
 | `suspend` | no (`false`) | Pause switch, like a CronJob's `suspend`: while `true` the operator starts no new runs. See [Suspending a plan](./scheduling-and-modes.md#suspending-a-plan). |

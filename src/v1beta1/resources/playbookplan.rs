@@ -2,7 +2,7 @@ use std::{borrow::Cow, collections::BTreeMap};
 
 use crate::{
     utils::Condition,
-    v1beta1::{ResolvedHosts, UnsignedInt},
+    v1beta1::{PositiveInt, ResolvedHosts, UnsignedInt},
 };
 use chrono::{DateTime, FixedOffset};
 use chrono_tz::Tz;
@@ -89,6 +89,15 @@ pub struct PlaybookPlanSpec {
     /// Controls if a playbook is executed once or repeatedly
     #[schemars(default)]
     pub mode: ExecutionMode,
+
+    /// How many times a failed run may be tried again before the operator stops, counting the first
+    /// run — so `1` means no retry. Defaults to 3 for `OneShot` and 1 for `Recurring`.
+    ///
+    /// The budget covers one *execution*: for `OneShot` the current playbook and inputs, which an
+    /// edit resets; for `Recurring` one schedule tick, since the next tick is going to re-apply the
+    /// playbook anyway. Every try is a run of its own, with its own `Play` record and its own Job.
+    #[schemars(with = "Option<PositiveInt>")]
+    pub max_attempts: Option<u32>,
 
     /// When true, the operator stops starting new runs for this plan — the same idea as a
     /// CronJob's `.spec.suspend`. A run already in progress is left to finish; only the *starting*
@@ -387,6 +396,16 @@ pub struct PlaybookPlanStatus {
     /// deducted, so its number stays reserved for as long as this field outlives its `Play`.
     #[schemars(with = "UnsignedInt")]
     pub last_run_number: u32,
+    /// How many tries the current execution has spent of its `spec.maxAttempts` budget, the latest
+    /// run included. Unlike `lastRunNumber` this counts, and it counts within one execution only:
+    /// it restarts at 1 whenever `currentHash` changes and, for `Recurring` plans, whenever a new
+    /// schedule tick starts a run — the two events that begin a new execution.
+    ///
+    /// Written from the run's own `Play` record, so a status that lags a run in flight cannot hand
+    /// the budget back by forgetting a try that was already made.
+    #[serde(default)]
+    #[schemars(with = "UnsignedInt")]
+    pub retry_count: u32,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
@@ -405,6 +424,9 @@ pub struct ActiveRun {
     /// Run number represented by `jobName`.
     #[schemars(with = "UnsignedInt")]
     pub run_number: u32,
+    /// Which try of the current execution this run is — see `status.retryCount`.
+    #[schemars(with = "UnsignedInt")]
+    pub attempt: u32,
     /// Start of the schedule slot consumed by this run, if it is scheduled.
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
@@ -534,6 +556,7 @@ mod tests {
                 service_account_name: None,
                 verbosity: None,
                 mode: ExecutionMode::Recurring,
+                max_attempts: None,
                 suspend: false,
                 schedule: Some("0 1 * * *".into()),
                 time_zone: None,

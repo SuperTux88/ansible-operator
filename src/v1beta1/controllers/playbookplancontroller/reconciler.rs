@@ -48,6 +48,11 @@ use crate::{
 /// Default grace window after a scheduled tick during which a run may still start, when the plan
 /// does not set `spec.startingDeadlineSeconds`. See that field's docs.
 const DEFAULT_STARTING_DEADLINE_SECONDS: u32 = 30;
+/// Tries one `OneShot` execution gets when the plan does not set `spec.maxAttempts`. See
+/// [`max_attempts`] for why the two modes default differently.
+const DEFAULT_ONESHOT_ATTEMPTS: u32 = 3;
+/// Tries one `Recurring` schedule tick gets when the plan does not set `spec.maxAttempts`.
+const DEFAULT_RECURRING_ATTEMPTS: u32 = 1;
 
 pub struct WorkloadEgressPolicies {
     pub playbook: Option<Vec<NetworkPolicyEgressRule>>,
@@ -635,7 +640,12 @@ async fn reconcile(
         object.spec.schedule.is_some(),
         !hosts_to_trigger.is_empty(),
     );
-    let eligible_to_start = may_start_new_run(object.spec.suspend, has_work_to_start);
+    let max_attempts = max_attempts(&object.spec.mode, object.spec.max_attempts);
+    let eligible_to_start = may_start_new_run(
+        object.spec.suspend,
+        has_work_to_start,
+        attempt_budget_available(&object.spec.mode, resource_status.retry_count, max_attempts),
+    );
 
     // Whether a recorded run's preparation inputs are still the desired ones. While this holds,
     // the plan spec, resolved groups and Job blueprint are re-derivable from live state; once it
@@ -1008,8 +1018,66 @@ fn has_work_to_start(mode: &ExecutionMode, has_schedule: bool, has_hosts_to_trig
 /// The start gate: whether this tick may start a *new* run. [`has_work_to_start`] deliberately
 /// leaves `spec.suspend` out (see its doc), so this is the one place that folds it back in —
 /// pinned as its own function so `suspend` losing its veto breaks a test, not a cluster.
-fn may_start_new_run(suspend: bool, has_work_to_start: bool) -> bool {
-    !suspend && has_work_to_start
+fn may_start_new_run(suspend: bool, has_work_to_start: bool, budget_available: bool) -> bool {
+    !suspend && has_work_to_start && budget_available
+}
+
+/// How many tries one execution of this plan gets, `spec.maxAttempts` or the mode's default.
+///
+/// The defaults differ because the modes fail differently. A `OneShot` plan has nothing else coming:
+/// if its run fails, the plan is finished until somebody edits it, so a couple of retries are what
+/// stand between a transient failure — an unreachable host, a mirror that timed out — and a plan
+/// that silently stopped. A `Recurring` plan is going to re-apply the same playbook at the next
+/// tick anyway, so retrying inside the current one buys nothing by default and only makes a
+/// systematically failing playbook hammer its hosts.
+fn max_attempts(mode: &ExecutionMode, configured: Option<u32>) -> u32 {
+    configured
+        .unwrap_or(match mode {
+            ExecutionMode::OneShot => DEFAULT_ONESHOT_ATTEMPTS,
+            ExecutionMode::Recurring => DEFAULT_RECURRING_ATTEMPTS,
+        })
+        // The CRD refuses 0, but a cluster that does not evaluate validation rules would let one
+        // through as "never run", which is what `spec.suspend` is for.
+        .max(1)
+}
+
+/// Whether the plan's attempt budget allows starting a run *here*, at the gate that decides whether
+/// a new run may begin at all.
+///
+/// It is the whole answer for `OneShot`, whose budget spans the revision: once its tries are spent
+/// the plan is finished, and without this it would keep numbering a fresh Job every tick — its hosts
+/// stay outdated precisely *because* the runs failed, so the work gate never closes on its own.
+///
+/// For `Recurring` it is deliberately not asked here, and the answer is always yes. Its budget spans
+/// one schedule tick, and the gate that knows about ticks is the window gate below: a plan whose
+/// current tick is exhausted must still be free to start the next one, which is a run this gate
+/// cannot tell apart from a retry.
+fn attempt_budget_available(mode: &ExecutionMode, tries_spent: u32, max_attempts: u32) -> bool {
+    match mode {
+        ExecutionMode::OneShot => tries_spent < max_attempts,
+        ExecutionMode::Recurring => true,
+    }
+}
+
+/// Which try a run about to start is, from the budget the plan has already spent.
+///
+/// A `Recurring` run reaching a tick the plan has not run for starts a new execution and so a new
+/// budget; every other run continues the one in progress. `OneShot` has no ticks to divide its
+/// revision into, and gets a fresh budget only from an edit (`update_desired_hash`) — including when
+/// it has a schedule, since a schedule says when a `OneShot` plan may run, not how often it may fail.
+fn next_attempt(
+    mode: &ExecutionMode,
+    tries_spent: u32,
+    slot: Option<DateTime<FixedOffset>>,
+    last_triggered_run: Option<DateTime<FixedOffset>>,
+) -> u32 {
+    let new_execution = matches!(mode, ExecutionMode::Recurring)
+        && !slot_already_triggered(slot, last_triggered_run);
+    if new_execution {
+        1
+    } else {
+        tries_spent.saturating_add(1)
+    }
 }
 
 /// The phase of a plan whose next run is still ahead of it: `Delayed` until the current revision
@@ -1417,6 +1485,12 @@ async fn try_start_run(
             )
             .await?;
             let run_id = run_id(object, &run.execution_hash)?;
+            let attempt = next_attempt(
+                &object.spec.mode,
+                resource_status.retry_count,
+                run.triggered_slot,
+                resource_status.last_triggered_run,
+            );
             // The recorded inventory — not `hosts_to_trigger` — is what every later step reads the
             // run's host set back from, so it is also what the initial host count is taken from.
             let inventory = flatten_hosts(run_groups);
@@ -1430,6 +1504,7 @@ async fn try_start_run(
                     run_id: &run_id,
                     preparation_fingerprint: run.preparation_fingerprint,
                     run_number: selected.run_number,
+                    attempt,
                     inventory: &inventory,
                     triggered_slot: run.triggered_slot,
                 },
@@ -1441,6 +1516,9 @@ async fn try_start_run(
 
     let holder_identity = holder_identity(run.namespace, run.name, &active_run);
     resource_status.last_run_number = active_run.mirror.run_number;
+    // From the record either way: a resumed run's try was numbered on the tick that prepared it, and
+    // re-deriving it here would hand its budget back on every tick it spends waiting for locks.
+    resource_status.retry_count = active_run.mirror.attempt;
     resource_status.phase = Phase::Applying;
     resource_status.summary = Some(applying_summary(&active_run.mirror));
     resource_status.next_run = None;
@@ -3031,6 +3109,9 @@ fn update_desired_hash(status: &mut PlaybookPlanStatus, execution_hash: &Executi
 
     status.current_hash = execution_hash.to_string();
     status.last_run_number = 0;
+    // A new revision is a new execution, and its budget is its own: the tries the previous one spent
+    // say nothing about a playbook that has since been fixed.
+    status.retry_count = 0;
     // Clearing the slot is what lets an edit take effect inside the very window it was made in: the
     // dedupe exists to stop one revision re-triggering itself, not to stop a different one from
     // running. Reverting to an earlier revision is a change like any other, so it runs again too.
@@ -3054,11 +3135,13 @@ fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usi
 }
 
 /// Puts a recovered run back onto the plan's status: the run itself, the `Applying` phase it
-/// implies, and — only while the run applies the currently desired revision — the run number
-/// it reached, which is what stops a later run from reusing its name.
+/// implies, and — only while the run applies the currently desired revision — the run number it
+/// reached, which is what stops a later run from reusing its name, and the try it was, which is what
+/// stops the budget being offered twice.
 fn adopt_recovered_run(status: &mut PlaybookPlanStatus, active_run: &ActiveRun) {
     if status.current_hash == active_run.execution_hash {
         status.last_run_number = status.last_run_number.max(active_run.run_number);
+        status.retry_count = status.retry_count.max(active_run.attempt);
     }
     status.phase = Phase::Applying;
     status.summary = Some(applying_summary(active_run));
@@ -3221,6 +3304,9 @@ fn sync_desired_hash_after_finished_run(
     if finished.execution_hash == *desired_hash {
         record_triggered_slot(status, surviving_slot.or(finished.mirror.triggered_slot));
         status.last_run_number = status.last_run_number.max(finished.mirror.run_number);
+        // The try is claimed for the same reason the number is: it was spent, and a status that was
+        // behind this run must not offer its budget a second time.
+        status.retry_count = status.retry_count.max(finished.mirror.attempt);
     } else {
         record_triggered_slot(status, surviving_slot);
     }
@@ -3604,6 +3690,7 @@ fn recorded_run_from_play(play: &Play) -> Result<RecordedRun, ReconcileError> {
             play_uid,
             hosts: host_names(&play.spec.inventory),
             run_number: play.spec.run_number,
+            attempt: play.spec.attempt,
             triggered_slot: play.spec.triggered_slot,
         },
         execution_hash,
@@ -5027,6 +5114,7 @@ mod tests {
                 play_uid: play_uid.into(),
                 hosts: vec!["worker-1".into()],
                 run_number: 1,
+                attempt: 1,
                 triggered_slot: None,
             },
         };
@@ -5116,6 +5204,7 @@ mod tests {
                 play_uid: "play-uid".into(),
                 hosts: vec!["worker-1".into()],
                 run_number: 1,
+                attempt: 1,
                 triggered_slot: None,
             },
         };
@@ -5155,6 +5244,7 @@ mod tests {
                     run_id: run_id.into(),
                     preparation_fingerprint: "fingerprint".into(),
                     run_number: 1,
+                    attempt: 1,
                     inventory: vec![ResolvedHosts {
                         name: "workers".into(),
                         hosts: vec!["worker-1".into()],
@@ -5207,6 +5297,7 @@ mod tests {
                 play_uid: "play-uid".into(),
                 hosts: vec!["worker-1".into()],
                 run_number: 1,
+                attempt: 1,
                 triggered_slot: None,
             }),
             ..Default::default()
@@ -5379,6 +5470,7 @@ mod tests {
                     run_id: "run-1".into(),
                     preparation_fingerprint: "fingerprint".into(),
                     run_number: 1,
+                    attempt: 1,
                     inventory: Vec::new(),
                     triggered_slot,
                 },
@@ -5699,10 +5791,12 @@ spec:
 
     #[test]
     fn suspend_vetoes_starting_a_new_run_even_with_work_to_do() {
-        assert!(!may_start_new_run(true, true));
+        assert!(!may_start_new_run(true, true, true));
         // The veto is suspend's alone: without it the work gate decides.
-        assert!(may_start_new_run(false, true));
-        assert!(!may_start_new_run(false, false));
+        assert!(may_start_new_run(false, true, true));
+        assert!(!may_start_new_run(false, false, true));
+        // ...and the budget's alone the same way.
+        assert!(!may_start_new_run(false, true, false));
     }
 
     /// The other half of the contract: a suspended plan never advertises a run it will not start.
@@ -5978,6 +6072,7 @@ spec:
                 play_uid: "play-uid".into(),
                 hosts: vec!["worker-1".into()],
                 run_number: 1,
+                attempt: 1,
                 triggered_slot: Some(slot),
             }),
             current_hash: old_hash.to_string(),
@@ -6078,6 +6173,7 @@ spec:
                 play_uid: "play-uid".into(),
                 hosts: vec!["worker-1".into()],
                 run_number: 1,
+                attempt: 1,
                 triggered_slot: None,
             }),
             phase: Phase::Applying,
@@ -6196,6 +6292,7 @@ spec:
             play_uid: "play-uid".into(),
             hosts: vec!["worker-1".into()],
             run_number: 4,
+            attempt: 4,
             triggered_slot: None,
         };
         let mut matching = PlaybookPlanStatus {
@@ -6238,6 +6335,7 @@ spec:
             play_uid: "play-uid".into(),
             hosts: vec!["worker-1".into()],
             run_number: 4,
+            attempt: 4,
             triggered_slot: None,
         };
 
@@ -6295,6 +6393,7 @@ spec:
                     run_id: "run-1".into(),
                     preparation_fingerprint: "fingerprint".into(),
                     run_number: 1,
+                    attempt: 1,
                     inventory: vec![ResolvedHosts {
                         name: "workers".into(),
                         hosts: vec!["worker-1".into()],
@@ -6380,6 +6479,7 @@ spec:
                 run_id: "run-2".into(),
                 preparation_fingerprint: "fingerprint".into(),
                 run_number: 2,
+                attempt: 2,
                 inventory: vec![ResolvedHosts {
                     name: "workers".into(),
                     hosts: vec!["worker-1".into(), "worker-2".into()],
@@ -6496,6 +6596,7 @@ spec:
     fn finished_run(
         hash: ExecutionHash,
         run_number: u32,
+        attempt: u32,
         slot: DateTime<FixedOffset>,
     ) -> RecordedRun {
         RecordedRun {
@@ -6507,6 +6608,7 @@ spec:
                 play_uid: "play-uid".into(),
                 hosts: vec!["worker-1".into()],
                 run_number,
+                attempt,
                 triggered_slot: Some(slot),
             },
         }
@@ -6527,14 +6629,58 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &finished_run(hash, 3, slot),
+            &finished_run(hash, 3, 2, slot),
             None,
         );
 
         assert_eq!(status.last_run_number, 3);
+        // The try the run spent is claimed too, so a status that was behind it cannot offer the
+        // attempt budget a second time.
+        assert_eq!(status.retry_count, 2);
         // Still the desired revision, so the slot it consumed keeps it from re-triggering itself
         // inside its own grace window.
         assert_eq!(status.last_triggered_run, Some(slot));
+    }
+
+    #[test]
+    fn attempt_budgets_default_per_mode_and_never_fall_to_zero() {
+        assert_eq!(max_attempts(&ExecutionMode::OneShot, None), 3);
+        assert_eq!(max_attempts(&ExecutionMode::Recurring, None), 1);
+        assert_eq!(max_attempts(&ExecutionMode::OneShot, Some(7)), 7);
+        // The CRD refuses it, but a cluster that ignores validation rules must not be able to
+        // configure a plan that can never run.
+        assert_eq!(max_attempts(&ExecutionMode::Recurring, Some(0)), 1);
+    }
+
+    #[test]
+    fn a_oneshot_plan_stops_once_its_revision_has_spent_its_tries() {
+        // Its failed hosts stay outdated, so the work gate never closes on its own: without the
+        // budget the plan numbers a fresh Job every tick, forever.
+        assert!(attempt_budget_available(&ExecutionMode::OneShot, 2, 3));
+        assert!(!attempt_budget_available(&ExecutionMode::OneShot, 3, 3));
+        // Raising the budget on a plan that already stopped lets it try again.
+        assert!(attempt_budget_available(&ExecutionMode::OneShot, 3, 5));
+
+        // Recurring is answered by the window gate instead — a spent tick must not stop the next
+        // one from starting, and this gate cannot tell the two apart.
+        assert!(attempt_budget_available(&ExecutionMode::Recurring, 9, 1));
+    }
+
+    #[test]
+    fn a_new_recurring_tick_is_the_only_thing_that_restarts_the_try_count() {
+        let slot = |s: &str| Some(s.parse::<DateTime<FixedOffset>>().unwrap());
+        let first = slot("2025-08-12T20:00:00Z");
+        let second = slot("2025-08-13T20:00:00Z");
+
+        // A tick the plan has not run for begins a new execution with a full budget.
+        assert_eq!(next_attempt(&ExecutionMode::Recurring, 2, second, first), 1);
+        // Inside the tick it already ran for, a run is the next try of it.
+        assert_eq!(next_attempt(&ExecutionMode::Recurring, 2, first, first), 3);
+
+        // OneShot has no ticks to divide its revision into: a schedule says when it may run, not
+        // how often it may fail, so only an edit gives it a fresh budget.
+        assert_eq!(next_attempt(&ExecutionMode::OneShot, 2, second, first), 3);
+        assert_eq!(next_attempt(&ExecutionMode::OneShot, 0, None, None), 1);
     }
 
     fn surviving_run(hash: ExecutionHash, slot: Option<DateTime<FixedOffset>>) -> SurvivingRun {
@@ -6556,6 +6702,7 @@ spec:
                     play_uid: "surviving-play-uid".into(),
                     hosts: vec!["worker-1".into()],
                     run_number: 4,
+                    attempt: 4,
                     triggered_slot: slot,
                 },
             },
@@ -6586,7 +6733,7 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &finished_run(hash, 3, finished_slot),
+            &finished_run(hash, 3, 2, finished_slot),
             Some(&surviving_run(hash, Some(live_slot))),
         );
 
@@ -6621,7 +6768,7 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &finished_run(hash, 3, finished_slot),
+            &finished_run(hash, 3, 2, finished_slot),
             Some(&surviving_run(hash, Some(live_slot))),
         );
 
@@ -6645,7 +6792,7 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &finished_run(hash, 3, finished_slot),
+            &finished_run(hash, 3, 2, finished_slot),
             Some(&surviving_run(hash, None)),
         );
 
@@ -6687,7 +6834,7 @@ spec:
             sync_desired_hash_after_finished_run(
                 &mut status,
                 &hash,
-                &finished_run(hash, 3, finished_slot),
+                &finished_run(hash, 3, 2, finished_slot),
                 Some(&surviving_run_in(phase.clone(), hash, Some(live_slot))),
             );
 
@@ -6735,7 +6882,7 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
-            &finished_run(old_hash, 3, slot),
+            &finished_run(old_hash, 3, 2, slot),
             None,
         );
 
@@ -6760,7 +6907,7 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
-            &finished_run(old_hash, 3, slot),
+            &finished_run(old_hash, 3, 2, slot),
             Some(&surviving_run(old_hash, Some(slot))),
         );
 
@@ -6784,7 +6931,7 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
-            &finished_run(old_hash, 3, slot),
+            &finished_run(old_hash, 3, 2, slot),
             None,
         );
 

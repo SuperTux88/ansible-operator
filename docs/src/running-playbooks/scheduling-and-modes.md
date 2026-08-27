@@ -187,6 +187,31 @@ single-digit run, leaving 44: a plan named 45 characters or more is shortened, a
 character goes each time the run number gains a digit. The `Play` shares the shortened name, so
 the two always match.
 
+## Retries
+
+A run that fails is tried again, up to `spec.maxAttempts` tries counting the first one — so
+`maxAttempts: 1` means no retry at all. Each try is a run in its own right: its own Job, its own
+`Play` record, its own run number. `.status.retryCount` says how many of the budget the plan has
+spent so far, and the `Play`'s `Try` column (`kubectl get plays -o wide`) says which try each run
+was.
+
+What the budget covers depends on the mode, because what counts as "the same piece of work" does:
+
+- **`OneShot`** spends its budget on the current playbook and inputs, and defaults to `3`. Once it is
+  spent the plan stays `Failed` and starts nothing further — that is the point: its hosts are still
+  out of date precisely *because* the runs failed, so nothing else would stop it. Editing the
+  playbook or a referenced Secret changes the execution hash and hands it a fresh budget; so does
+  raising `maxAttempts`. A `schedule` does not: it says when a `OneShot` plan may run, not how often
+  it may fail.
+- **`Recurring`** spends its budget on one schedule tick, and defaults to `1` — no retry, since the
+  next tick re-applies the same playbook anyway. With a higher `maxAttempts` a failed run is retried
+  within the current tick, and the next tick starts over with a full budget whatever the previous one
+  did. Retries are still bound by `startingDeadlineSeconds` (see above): a retry that cannot start
+  before the tick's grace window closes is not started, and the plan waits for the next tick.
+
+A run that never got as far as its Job — one given up because the plan was edited, suspended, or
+missed its window — is not a failed try, but it does consume a run number.
+
 ## Host locks
 
 The operator applies at most one playbook to a given host at a time, across the whole cluster. Before

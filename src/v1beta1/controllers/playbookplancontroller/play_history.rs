@@ -60,6 +60,7 @@ pub struct PlayRef<'a> {
     pub run_id: &'a str,
     pub preparation_fingerprint: &'a str,
     pub run_number: u32,
+    pub attempt: u32,
     pub inventory: &'a [ResolvedHosts],
     pub triggered_slot: Option<chrono::DateTime<chrono::FixedOffset>>,
 }
@@ -619,6 +620,7 @@ fn build_play(play: &PlayRef<'_>) -> Result<Play, ReconcileError> {
             run_id: play.run_id.to_string(),
             preparation_fingerprint: play.preparation_fingerprint.to_string(),
             run_number: play.run_number,
+            attempt: play.attempt,
             inventory: play.inventory.to_vec(),
             triggered_slot: play.triggered_slot,
         },
@@ -811,6 +813,7 @@ mod tests {
             run_id,
             preparation_fingerprint: fingerprint,
             run_number,
+            attempt: 1,
             inventory,
             triggered_slot: None,
         }
@@ -836,6 +839,7 @@ mod tests {
         assert_eq!(built.spec.run_id, "run-1");
         assert_eq!(built.spec.preparation_fingerprint, "fp-1");
         assert_eq!(built.spec.run_number, 3);
+        assert_eq!(built.spec.attempt, 1);
         assert_eq!(built.spec.inventory, inventory);
 
         // The plan-name label is what `prune` and the recovery scan list on.
