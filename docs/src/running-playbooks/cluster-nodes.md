@@ -95,12 +95,40 @@ For each targeted Node in a run, the operator:
    same run cannot reach the pods of the attempt it replaced.
 3. Locks each proxy pod's ingress to that attempt's Job with a NetworkPolicy.
 4. Renders the inventory so Ansible dials the proxy pod and verifies the Node's host certificate.
-5. Tears the proxy pods, their Secrets, and the NetworkPolicy down when the run finishes.
+5. Holds the Job back, in a `managed-ssh-preflight` init container, until every proxy actually
+   answers. See [Preflight connectivity check](#preflight-connectivity-check).
+6. Tears the proxy pods, their Secrets, and the NetworkPolicy down when the run finishes.
 
 There is **no standing agent or DaemonSet** on your Nodes: proxy pods exist only for the duration of
 a run. The security properties of this path — per-attempt certificate isolation, the in-memory CA,
 and why `NodeAccessPolicy` is mandatory — are covered in
 [Security model](../cluster-operators/security.md).
+
+## Preflight connectivity check
+
+A proxy pod being `Ready` does not yet mean your Job can reach it. Kubelet probes the pod from its
+own Node, whereas the NetworkPolicy that admits your Job to the proxies selects the Job's pod by
+label — so the cluster network can only start programming that rule once the Job pod exists. On a
+run targeting several Nodes at once, the proxy on the Job's own Node answers immediately while the
+remote ones briefly refuse connections.
+
+To keep that from surfacing as a failed run, the operator adds a `managed-ssh-preflight` init
+container that waits for every proxy in the run to answer on port 22 before `ansible-playbook`
+starts. It normally adds no measurable delay, and it never fails a run: after 60 seconds it starts
+Ansible regardless, and any proxy still not answering is reported **unreachable** for that run and
+retried on the next one, exactly as it would have been.
+
+If a run seems slow to start, the gate says what it was waiting for:
+
+```console
+$ kubectl logs job/<job-name> -c managed-ssh-preflight
+preflight: node-a (10.42.1.7:22) reachable after 0.0s
+preflight: node-b (10.42.3.9:22) reachable after 1.5s
+preflight: all 2 managed-ssh proxies reachable after 1.5s
+```
+
+Nothing about this is configurable, and playbooks do not need their own `wait_for` or `pause` tasks
+to work around connection timing.
 
 ## NotReady nodes
 
