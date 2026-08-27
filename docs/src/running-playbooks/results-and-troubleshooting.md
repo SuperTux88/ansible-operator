@@ -222,6 +222,14 @@ keeps failing and retrying) can keep an overlapping plan waiting for a long time
 
 ### The plan is stuck in `Applying`
 
+A plan stays `Applying` for as long as a run is in flight, which for a long playbook is simply
+normal — `.status.summary` then reads **"applying run …"**, naming the run, and the `Blocked` and
+`WaitingForNodes` conditions say whether it is waiting on a host lock or on proxy pods rather than
+executing.
+
+If it stays there with nothing progressing, `.status.summary` says which of the following it is
+instead, and `.status.activeRun` names the run it is waiting on:
+
 - **"waiting for Job … which does not carry this run's identity"** — a Job with the name this run
   expects exists, but it is not the one this run created. This normally means a Job was created or
   edited outside the operator; a very unlikely generated-name collision can produce the same symptom
@@ -289,6 +297,14 @@ keeps failing and retrying) can keep an overlapping plan waiting for a long time
   own once the underlying problem does. Until then the run's proxy pods may still be up — worth
   looking at if the message persists, since these are node-root pods. The run's `Play` is deliberately
   kept meanwhile: it is the handle the retry works from, so do not delete it to unstick the plan.
+- **"run recovery failed: …"** — the operator could not resume the run after a restart. The rest of
+  the message is the underlying error; the operator retries every tick. If the message is
+  **"more than one Play claims to be this plan's active run"**, something outside the operator
+  created a second run record: a plan only ever has one run in flight, and the operator refuses to
+  guess which one is real rather than orphan the other's proxy pods. Look at
+  `kubectl get plays -n <ns> -l ansible.cloudbending.dev/playbookplan=<plan>`, work out which record
+  the operator wrote, and delete the stray one. The host locks of both are kept alive meanwhile, so
+  no other plan can start on those hosts while you do.
 - **"run recovery paused: …"** — the operator needs something it cannot currently read to decide
   what to do with the run: an inventory, `NodeAccessPolicy` or referenced Secret lookup that is
   failing for a reason that may clear on its own, such as an API error or a lost connection. The
@@ -335,6 +351,53 @@ keeps failing and retrying) can keep an overlapping plan waiting for a long time
   finished result can be waiting to be written to the plan. The operator applies them one tick at a
   time, oldest first, and says so rather than reporting the plan finished while a later attempt is
   still going. It clears on its own.
+- **"could not release the abandoned run …"** — one of the "aborted the run…" cases above got as
+  far as deciding to give the attempt up, but could not finish tearing it down: a proxy pod, Secret,
+  NetworkPolicy or Lease would not delete, or its run record could not be removed afterwards. The
+  rest of the message is the underlying error. The attempt's record is deliberately kept as the
+  handle for retrying that cleanup, and the operator retries every tick, so this clears on its own
+  once the underlying problem does. Until then the run's proxy pods may still be up — worth looking
+  at if the message persists, since these are node-root pods. This is the one message here that can
+  also appear while the phase reads `Pending`, if the teardown got as far as clearing the run before
+  failing.
+
+  Fixing the reported permission, admission, finalizer or API problem is safest: cleanup is
+  idempotent, so the operator resumes it automatically. If that is impossible, a cluster
+  administrator can clean up the exact attempt manually. Read its identity first:
+
+  ```sh
+  PLAN_NAMESPACE=my-team
+  PLAN=my-plan
+  PLAY=apply-my-plan-abcde-1
+  OPERATOR_NAMESPACE=ansible-operator
+  RUN_ID=$(kubectl get play "$PLAY" -n "$PLAN_NAMESPACE" -o jsonpath='{.spec.runId}')
+  HASH=$(kubectl get play "$PLAY" -n "$PLAN_NAMESPACE" -o jsonpath='{.spec.executionHash}')
+  SELECTOR="ansible.cloudbending.dev/hash=$HASH,ansible.cloudbending.dev/run-id=$RUN_ID"
+  ```
+
+  Delete only resources carrying both attempt labels. The first two commands remove the node-root
+  proxy infrastructure in the operator namespace; the third removes the plan-namespace credential
+  and egress policy:
+
+  ```sh
+  kubectl delete pods -n "$OPERATOR_NAMESPACE" \
+    -l "$SELECTOR,ansible.cloudbending.dev/target-host"
+  kubectl delete secrets,networkpolicies -n "$OPERATOR_NAMESPACE" -l "$SELECTOR"
+  kubectl delete secrets,networkpolicies -n "$PLAN_NAMESPACE" -l "$SELECTOR"
+  ```
+
+  Finally inspect Leases in the operator namespace and delete only those whose
+  `.spec.holderIdentity` is exactly `$PLAN_NAMESPACE/$PLAN/$RUN_ID`:
+
+  ```sh
+  kubectl get leases -n "$OPERATOR_NAMESPACE" \
+    -o custom-columns=NAME:.metadata.name,HOLDER:.spec.holderIdentity
+  kubectl delete lease -n "$OPERATOR_NAMESPACE" <matching-lease-name> [...]
+  ```
+
+  Once those resources are gone, the operator can delete the `Aborted` Play itself on its next
+  retry. Delete the Play by hand only after verifying the cleanup; deleting the recovery handle
+  first can leave privileged resources with nothing identifying them for later cleanup.
 
 With the sole exception of the `suspend` one, every "aborted the run…" message above is a transient
 state rather than a resting one: the attempt is gone and the plan re-evaluates immediately, so if the
