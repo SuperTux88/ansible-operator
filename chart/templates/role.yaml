@@ -26,7 +26,7 @@ rules:
   #    `delete` is required in every enrolled namespace, not just the operator's;
   #  - one Job per run is created + watched here;
   #  - the run's Job-owned pod is read here for its termination message;
-  #  - one immutable Play recovery/history record per run attempt is created, status-updated,
+  #  - one immutable Play recovery/history record per run is created, status-updated,
   #    listed, and deleted here (it is owned by its PlaybookPlan in the same namespace, so it
   #    cascades on plan deletion). The PlaybookPlan controller reads these records during recovery.
   - apiGroups: [""]

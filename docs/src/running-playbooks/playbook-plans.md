@@ -126,7 +126,7 @@ lowering it never re-runs the playbook on hosts that are already current.
 
 ## One Job per run
 
-Each run is a single Kubernetes Job (named `apply-<plan>-<id>-<retry>`) that applies the playbook to
+Each run is a single Kubernetes Job (named `apply-<plan>-<id>-<n>`) that applies the playbook to
 all of that run's hosts together, not one Job per host. This lets a playbook use Ansible features
 that span hosts (`serial`, `run_once`, delegation) normally. The operator adds per-host **Leases** so
 two runs never touch the same host at once, and it steers the Job's own pod away from the Nodes the
@@ -141,7 +141,7 @@ that already succeeded on the current hash is skipped. See
 [Scheduling and execution modes](./scheduling-and-modes.md) for the mechanics and
 [Reading results](./results-and-troubleshooting.md) for how to read the outcome.
 
-`Applying` covers the whole active attempt, including waiting for host locks and proxy readiness.
+`Applying` covers the whole active run, including waiting for host locks and proxy readiness.
 The `Running` condition distinguishes the narrower period when the Job itself is active.
 
 ## Deleting a plan
@@ -167,7 +167,7 @@ operator log, which names the run it is waiting on.
 The finalizer is only present while a plan actually holds a run, and a plan that has never started
 one never carries it at all. Deleting an idle plan is immediate — with one exception: a plan gives
 the finalizer back on the tick *after* the one that released its run, so a plan whose run has just
-finished, or whose attempt was interrupted before it created anything, holds it for one more tick. If
+finished, or whose run was interrupted before it created anything, holds it for one more tick. If
 the operator stops inside that moment, even an idle plan waits in `Terminating` until it returns.
 
 Everything a run creates in the plan's own namespace (its Job, `Play` records, workspace Secret,
