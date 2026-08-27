@@ -9,7 +9,7 @@ use k8s_openapi::api::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::{
     Api,
-    api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
+    api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions},
     runtime::{
         Controller,
         controller::Action,
@@ -2598,15 +2598,49 @@ async fn release_deleted_plan(
 
 /// Every run of a deleted plan that may still hold resources, newest handle first.
 ///
-/// The status mirror leads because it is the one source that survives the plan's own cascade. The
-/// records are consulted as well — and only as a best effort — for the window in which an attempt
-/// exists without having reached the plan's status yet; failing the whole teardown because they
-/// could not be listed would stop the mirror-driven half from running at all.
+/// The records are listed before anything is released and a failure to list them ends the teardown,
+/// because they are not a supplement to the status mirror — they are the *only* handle on a run
+/// during the window between `record_prepared` and the status write that mirrors it. An attempt in
+/// that window already holds host Leases and node-root proxy pods, so a teardown that saw only the
+/// (still empty) mirror and then dropped the finalizer would strand them where nothing can reach
+/// them again. Every discovery failure that a later tick could clear is therefore kept as one, in
+/// the same way [`release_run_infrastructure`]'s failures are.
 async fn runs_to_release(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
 ) -> Result<Vec<RecordedRun>, ReconcileError> {
     let (namespace, plan_name) = namespace_and_name(object)?;
+    let plays_api = Api::<Play>::namespaced(context.client.clone(), namespace);
+    let plays = plays_api
+        .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
+        .await?;
+
+    Ok(discovered_runs(object, &plays.items))
+}
+
+/// The runs a deleted plan's status mirror and records name between them, deduplicated.
+///
+/// The mirror leads because it is the one source that survives the plan's own cascade; the records
+/// cover the attempt that has not reached the status yet. A handle that does not parse is dropped
+/// with a warning rather than failing the teardown: there is nothing to release for a run whose
+/// identity is unreadable, and no tick will ever repair it, so holding the finalizer over one would
+/// only trade a leak for a plan that can never finish deleting. The manual cleanup procedure in the
+/// troubleshooting guide is the answer to that case.
+///
+/// A statusless record supplies no identity here, for the same reason [`classify_record`] calls it
+/// `Uninitialized` and recovery deletes it: nothing has crossed the operator-owned status boundary,
+/// so it describes no run. It cannot describe one either — a record is written before the locks and
+/// the proxy pods, and the tick that fails to initialize it stops before both — so this gives up
+/// nothing that was ever releasable. What it does give up is deriving cleanup identities from an
+/// object anything holding `plays: create` alone could have written: `cleanup_proxy_infra` scopes
+/// its operator-namespace deletes by execution hash and run ID, which are not this plan's to prove,
+/// and the status subresource is a separate RBAC grant.
+fn discovered_runs(object: &PlaybookPlan, plays: &[Play]) -> Vec<RecordedRun> {
+    let plan = format!(
+        "{}/{}",
+        object.metadata.namespace.as_deref().unwrap_or("<unknown>"),
+        object.metadata.name.as_deref().unwrap_or("<unknown>")
+    );
     let mut runs = Vec::new();
 
     if let Some(mirror) = object
@@ -2616,36 +2650,26 @@ async fn runs_to_release(
     {
         match RecordedRun::from_mirror(mirror) {
             Ok(run) => runs.push(run),
-            // Nothing can be released for a run whose identity does not parse, and failing here
-            // would keep the plan undeletable over a status field no tick will ever repair.
             Err(error) => warn!(
-                "PlaybookPlan {namespace}/{plan_name} was deleted with an unusable activeRun ({error}); its run cannot be released automatically"
+                "PlaybookPlan {plan} was deleted with an unusable activeRun ({error}); its run cannot be released automatically"
             ),
         }
     }
 
-    let plays_api = Api::<Play>::namespaced(context.client.clone(), namespace);
-    match plays_api
-        .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
-        .await
+    for play in recoverable_plays_for_plan(plays, object)
+        .into_iter()
+        .filter(|play| classify_record(play) != RecordKind::Uninitialized)
     {
-        Ok(plays) => {
-            for play in recoverable_plays_for_plan(&plays.items, object) {
-                match recorded_run_from_play(play) {
-                    Ok(run) => runs.push(run),
-                    Err(error) => warn!(
-                        "PlaybookPlan {namespace}/{plan_name} was deleted with an unusable record {:?} ({error})",
-                        play.metadata.name
-                    ),
-                }
-            }
+        match recorded_run_from_play(play) {
+            Ok(run) => runs.push(run),
+            Err(error) => warn!(
+                "PlaybookPlan {plan} was deleted with an unusable record {:?} ({error}); that run cannot be released automatically",
+                play.metadata.name
+            ),
         }
-        Err(error) => warn!(
-            "PlaybookPlan {namespace}/{plan_name} was deleted but its records could not be listed ({error}); releasing what its status names"
-        ),
     }
 
-    Ok(dedupe_runs(runs))
+    dedupe_runs(runs)
 }
 
 /// The distinct runs among `runs`, in first-seen order. The status mirror and the record it was
@@ -2662,14 +2686,23 @@ fn dedupe_runs(runs: Vec<RecordedRun>) -> Vec<RecordedRun> {
 ///
 /// Deleting the plan already makes Kubernetes reap the Job, but the propagation policy that reaps it
 /// is the deleting client's choice — an orphaning delete would leave the pod running with nothing
-/// pointing at it — so the Job is deleted here explicitly, with background propagation, rather than
-/// assumed gone. Only this run's own Job is touched: a foreign Job at the recorded name belongs to
-/// something this plan never created.
+/// pointing at it — so the Job is deleted here explicitly rather than assumed gone. Only this run's
+/// own Job is touched: a foreign Job at the recorded name belongs to something this plan never
+/// created, and neither its existence nor its pods say anything about this run.
 ///
-/// The answer is read off the pods rather than the Job, because a Job object disappears the moment
-/// its own cascade starts while its pod is still terminating — and it is the pod that holds the SSH
-/// session. The run's Leases are renewed for as long as one is up, since the deletion path is the
-/// one place that would otherwise stop renewing them while a playbook is still running.
+/// The deletion is **foreground**, and the Job's own disappearance is the barrier this waits on.
+/// Under foreground propagation the apiserver keeps the Job until garbage collection has deleted
+/// every dependent that blocks its owner — which is exactly the Job's pods — so a Job that is gone
+/// is proof that no pod of it survives. Background propagation gives no such ordering: the Job is
+/// removed at once, and a pod the Job controller was already creating when the delete landed can
+/// appear afterwards. A single pod list would have missed it and released the hosts of a run that
+/// then started talking to them. Garbage collection accounts for pods by owner reference, so this
+/// also does not depend on the pods still carrying their labels.
+///
+/// The pods are still consulted once the Job is gone, because a pod outlives the Job object while it
+/// terminates — and it is the pod, not the Job, that holds the SSH session. The run's Leases are
+/// renewed for as long as either says the run is up, since the deletion path is the one place that
+/// would otherwise stop renewing them while a playbook is still running.
 async fn cancel_run_job(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -2679,10 +2712,10 @@ async fn cancel_run_job(
     let jobs_api = Api::<Job>::namespaced(context.client.clone(), namespace);
     let pods_api = Api::<Pod>::namespaced(context.client.clone(), namespace);
 
-    if let Some(job) = jobs_api.get_opt(&run.mirror.job_name).await?
-        && job.metadata.deletion_timestamp.is_none()
-        && validate_selected_job(
-            &job,
+    let job = jobs_api.get_opt(&run.mirror.job_name).await?;
+    let job = job.filter(|job| {
+        validate_selected_job(
+            job,
             object,
             run.execution_hash,
             run.mirror.attempt,
@@ -2690,25 +2723,53 @@ async fn cancel_run_job(
             &run.mirror.play_uid,
         )
         .is_ok()
+    });
+
+    if let Some(job) = &job
+        && job.metadata.deletion_timestamp.is_none()
     {
         info!(
             "PlaybookPlan {namespace}/{name} was deleted; cancelling its Job {}",
             run.mirror.job_name
         );
-        match jobs_api
-            .delete(&run.mirror.job_name, &DeleteParams::background())
-            .await
-        {
+        // The UID carries the identity `validate_selected_job` just established into the mutation
+        // itself. Without it the delete applies to whatever holds the name when it lands, so a Job
+        // created at that name in the round-trip since the read — one the validation would have
+        // refused — would be cancelled on this run's behalf. No `resourceVersion` alongside it: the
+        // validation compares immutable identity, never status, so a Job whose counters ticked in
+        // the meantime is still the Job to cancel, and requiring it unchanged would refuse exactly
+        // the busy runs that most need cancelling.
+        let params = DeleteParams::foreground().preconditions(Preconditions {
+            uid: job.metadata.uid.clone(),
+            resource_version: None,
+        });
+        match jobs_api.delete(&run.mirror.job_name, &params).await {
             Ok(_) => {}
             Err(error) if is_not_found(&error) => {}
+            // The precondition refused the delete, so nothing was cancelled and the name is not
+            // this run's any more. Nothing is decided from a stale read: the run counts as still
+            // executing (its Job was there a moment ago), which keeps its host locks renewed while
+            // the next tick re-reads the name and classifies whatever it finds from scratch.
+            Err(error) if is_conflict(&error) => warn!(
+                "PlaybookPlan {namespace}/{name}: Job {} was replaced while it was being cancelled; looking again before releasing its hosts",
+                run.mirror.job_name
+            ),
             Err(error) => return Err(error.into()),
         }
     }
 
-    let pods = pods_api
-        .list(&ListParams::default().labels(&run_pod_selector(&run.mirror.run_id)))
-        .await?;
-    let executing = pods.items.iter().any(pod_may_be_executing);
+    // The pod list is only reached once this run's Job is gone, so it answers the one question the
+    // Job can no longer answer — is a pod that outlived it still up? — instead of standing in for
+    // the Job's own cascade.
+    let executing = match job {
+        Some(_) => true,
+        None => {
+            let pods = pods_api
+                .list(&ListParams::default().labels(&run_pod_selector(&run.mirror.run_id)))
+                .await?;
+            pods.items.iter().any(pod_may_be_executing)
+        }
+    };
     if executing {
         let leases_api =
             Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
@@ -2744,15 +2805,26 @@ fn run_pod_selector(run_id: &str) -> String {
     )
 }
 
-/// Whether a pod may still be running the playbook. A pod that has reached a terminal phase has
-/// stopped talking to its hosts even if its object survives the Job's cascade for a while, so
-/// waiting on it would hold the plan open for nothing.
+/// Whether a pod may still be running the playbook.
+///
+/// Only the two phases that positively say the pod has stopped release its hosts. Everything else —
+/// `Unknown`, a phase that has not been reported yet, a value this operator does not know — is the
+/// same fact: nobody can currently say what that pod is doing, which is not the same as it having
+/// stopped. `Unknown` in particular means the *runner's* node has gone unreachable, and the Job pod
+/// is scheduled away from the nodes the run targets (see `configure_job_for_node_affinity`), so the
+/// usual shape of it is a partitioned runner whose container is still SSHed into perfectly healthy
+/// hosts. Releasing their Leases on that evidence is what lets a second playbook onto them.
+///
+/// Waiting instead cannot hold a host forever: the Leases are only held while this operator keeps
+/// renewing them, so they expire and become takeable within `locking::LEASE_DURATION_SECONDS` of it
+/// stopping — and the plan waiting in `Terminating` is visible in the log, with a documented manual
+/// release for a node that never comes back.
 fn pod_may_be_executing(pod: &Pod) -> bool {
-    matches!(
+    !matches!(
         pod.status
             .as_ref()
             .and_then(|status| status.phase.as_deref()),
-        Some("Pending" | "Running") | None
+        Some("Succeeded" | "Failed")
     )
 }
 
@@ -5004,6 +5076,108 @@ mod tests {
         );
     }
 
+    /// The two halves of the deletion path's discovery answer for different failures. A record is
+    /// the only handle on an attempt that has taken its Leases and proxy pods but has not reached
+    /// the plan's status yet, so its list failing propagates and keeps the finalizer (enforced by
+    /// `runs_to_release`'s `?`). A handle that does not *parse* is a dead end no retry repairs, so
+    /// it is dropped and never stops the runs next to it from being released.
+    #[test]
+    fn a_deleted_plans_runs_come_from_the_records_as_much_as_the_mirror() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
+
+        fn play(name: &str, run_id: &str, execution_hash: &str) -> Play {
+            let mut play = Play::new(
+                name,
+                v1beta1::PlaySpec {
+                    playbook_plan: "plan".into(),
+                    playbook_plan_uid: "plan-uid".into(),
+                    execution_hash: execution_hash.into(),
+                    run_id: run_id.into(),
+                    preparation_fingerprint: "fingerprint".into(),
+                    attempt: 1,
+                    inventory: vec![ResolvedHosts {
+                        name: "workers".into(),
+                        hosts: vec!["worker-1".into()],
+                    }],
+                    triggered_slot: None,
+                },
+            );
+            play.metadata = ObjectMeta {
+                name: Some(name.into()),
+                uid: Some(format!("{name}-uid")),
+                owner_references: Some(vec![OwnerReference {
+                    kind: "PlaybookPlan".into(),
+                    name: "plan".into(),
+                    uid: "plan-uid".into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            };
+            play.status = Some(v1beta1::PlayStatus {
+                phase: v1beta1::PlayPhase::Prepared,
+                ..Default::default()
+            });
+            play
+        }
+
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+        plan.metadata.namespace = Some("default".into());
+
+        let run_ids = |plan: &PlaybookPlan, plays: &[Play]| {
+            discovered_runs(plan, plays)
+                .into_iter()
+                .map(|run| run.mirror.run_id)
+                .collect::<Vec<_>>()
+        };
+
+        // The window this exists for: the record is written before the locks and the proxy pods, the
+        // mirror only at the end of the tick.
+        assert_eq!(
+            run_ids(&plan, &[play("apply-plan-abc-1", "run-a", "1a")]),
+            vec!["run-a"],
+            "an attempt that has not reached the status yet still has to be released"
+        );
+
+        plan.status = Some(PlaybookPlanStatus {
+            active_run: Some(ActiveRun {
+                execution_hash: "not-a-hash".into(),
+                run_id: "run-broken".into(),
+                job_name: "apply-plan-broken-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                attempt: 1,
+                triggered_slot: None,
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            run_ids(
+                &plan,
+                &[
+                    play("apply-plan-broken-1", "run-broken", "also-not-a-hash"),
+                    play("apply-plan-abc-1", "run-a", "1a"),
+                ]
+            ),
+            vec!["run-a"],
+            "unreadable handles are skipped without taking the releasable run down with them"
+        );
+
+        // A statusless record is `Uninitialized` to recovery, which deletes it as describing
+        // nothing. It must describe nothing here too: it names an execution hash and a run ID, and
+        // those are what scope the deletes `cleanup_proxy_infra` performs in the operator's
+        // namespace — where the run it names need not be this plan's at all.
+        let mut uninitialized = play("apply-plan-abc-1", "run-a", "1a");
+        uninitialized.status = None;
+        plan.status = None;
+        assert!(
+            run_ids(&plan, &[uninitialized]).is_empty(),
+            "a record that never crossed the operator-owned status boundary supplies no identity \
+             for cleanup to act on"
+        );
+    }
+
     /// What the deletion path waits on before it releases a host: the playbook pod, not the proxy
     /// pods that share its run ID, and not a pod that has already stopped talking to its hosts.
     #[test]
@@ -5032,6 +5206,18 @@ mod tests {
             pod_may_be_executing(&pod(None)),
             "a pod whose phase has not been reported yet may still start"
         );
+        assert!(
+            pod_may_be_executing(&pod(Some("Unknown"))),
+            "`Unknown` is the node that runs the pod having gone unreachable, not the playbook \
+             having stopped — and the hosts it is applying to are usually on other nodes entirely"
+        );
+        assert!(
+            pod_may_be_executing(&pod(Some("SomePhaseFromALaterKubernetes"))),
+            "a phase this operator cannot interpret says as little about the pod as `Unknown` does"
+        );
+
+        // The whole list of phases that release a run's hosts: a pod has to positively say it has
+        // stopped, because everything else is only an absence of evidence.
         assert!(!pod_may_be_executing(&pod(Some("Succeeded"))));
         assert!(!pod_may_be_executing(&pod(Some("Failed"))));
     }

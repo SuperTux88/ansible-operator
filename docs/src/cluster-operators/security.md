@@ -88,11 +88,19 @@ identity: a principal that can create Jobs can also copy owner references, label
 the expected pod-template metadata.
 
 Treat Job creation in an enrolled namespace as part of the operator trust boundary. The chart grants
-the operator ServiceAccount `create` on `batch/jobs` there, but Kubernetes RBAC is additive. Cluster
-administrators must ensure that untrusted users and ServiceAccounts do not receive another Job-create
-grant through a namespaced `Role`, `RoleBinding`, `ClusterRole`, or `ClusterRoleBinding`. Verify the
-effective permissions with `kubectl auth can-i` and review bindings, as described in
+the operator ServiceAccount `create` and `delete` on `batch/jobs` there, but Kubernetes RBAC is
+additive. Cluster administrators must ensure that untrusted users and ServiceAccounts do not receive
+another Job-create grant through a namespaced `Role`, `RoleBinding`, `ClusterRole`, or
+`ClusterRoleBinding`. Verify the effective permissions with `kubectl auth can-i` and review bindings,
+as described in
 [Deployment → protect operator-created Jobs](./deployment.md#protect-operator-created-jobs).
+
+The `delete` grant exists so a plan deleted mid-run has its Job cancelled explicitly instead of being
+left to the deleting client's propagation policy, which may orphan the pod. The operator only ever
+deletes a Job it has validated as its own run's, passing that Job's UID as a delete precondition so a
+replacement at the same name cannot be caught by it — but RBAC cannot express that restriction, so
+the ServiceAccount's authority covers every Job in an enrolled namespace. Finished Jobs are reaped by
+their own `ttlSecondsAfterFinished`, not by the operator.
 
 If unrelated workloads must create Jobs in an enrolled namespace, enforce the same boundary with an
 admission policy: only the operator ServiceAccount may create Jobs carrying the operator's reserved

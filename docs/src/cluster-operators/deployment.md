@@ -140,11 +140,28 @@ enrolled).
 
 ### Protect operator-created Jobs
 
-The chart's `Role` grants the operator ServiceAccount permission to create Jobs in each enrolled
-namespace. Kubernetes RBAC is additive: this does **not** stop another `Role`, `ClusterRole`, or
-binding from granting the same permission to a user or another ServiceAccount. Keep enrolled
-namespaces dedicated to Ansible operations and do not grant untrusted principals `create` on
-`batch/jobs` there.
+The chart's `Role` grants the operator ServiceAccount permission to create and delete Jobs in each
+enrolled namespace, and to patch `PlaybookPlan` objects there. Kubernetes RBAC is additive: this does
+**not** stop another `Role`, `ClusterRole`, or binding from granting the same permissions to a user
+or another ServiceAccount. Keep enrolled namespaces dedicated to Ansible operations and do not grant
+untrusted principals `create` on `batch/jobs` there.
+
+Two of those grants are wider than what the operator does with them, because RBAC cannot express the
+narrower rule:
+
+- **`delete` on `batch/jobs`** cancels the run of a plan that is deleted mid-run, rather than leaving
+  its pod to the deleting client's propagation policy. The operator deletes only a Job whose identity
+  it has validated, and passes that Job's UID as a delete precondition, but the grant itself covers
+  every Job in the namespace.
+- **`patch` on `playbookplans`** carries the `ansible.cloudbending.dev/run-cleanup` finalizer, which
+  is what keeps a deleted plan alive until its node-root proxy pods and host Leases are released.
+  RBAC cannot restrict a patch to `metadata.finalizers`, so the grant permits writing the spec and
+  metadata of any plan in the namespace. It is deliberately not in the `ClusterRole` — the operator
+  reads plans cluster-wide but can only write them where it is already trusted to run them.
+
+Both are accounted for in the operator privilege summary in the repository's `THREAT_MODEL.md`.
+Neither widens what a compromised operator can reach: it already creates node-root proxy pods for
+runs in those namespaces.
 
 This matters for more than ordinary workload separation. The operator records a run before creating
 its Job and later checks the Job's owner reference and run labels to identify it. A principal that can
@@ -161,14 +178,26 @@ ENROLLED_NAMESPACE=team-a
 OPERATOR_NAMESPACE=ansible-system
 OPERATOR_SERVICE_ACCOUNT=ansible-operator
 
-kubectl auth can-i create jobs -n "$ENROLLED_NAMESPACE" \
-  --as="system:serviceaccount:$OPERATOR_NAMESPACE:$OPERATOR_SERVICE_ACCOUNT"
-# expected: yes
+OPERATOR="system:serviceaccount:$OPERATOR_NAMESPACE:$OPERATOR_SERVICE_ACCOUNT"
+TENANT="system:serviceaccount:$ENROLLED_NAMESPACE:default"
 
-kubectl auth can-i create jobs -n "$ENROLLED_NAMESPACE" \
-  --as="system:serviceaccount:$ENROLLED_NAMESPACE:default"
-# expected for an untrusted tenant ServiceAccount: no
+# expected: yes for all three
+kubectl auth can-i create jobs -n "$ENROLLED_NAMESPACE" --as="$OPERATOR"
+kubectl auth can-i delete jobs -n "$ENROLLED_NAMESPACE" --as="$OPERATOR"
+kubectl auth can-i patch playbookplans.ansible.cloudbending.dev \
+  -n "$ENROLLED_NAMESPACE" --as="$OPERATOR"
+
+# expected for an untrusted tenant ServiceAccount: no for all three
+kubectl auth can-i create jobs -n "$ENROLLED_NAMESPACE" --as="$TENANT"
+kubectl auth can-i delete jobs -n "$ENROLLED_NAMESPACE" --as="$TENANT"
+kubectl auth can-i patch playbookplans.ansible.cloudbending.dev \
+  -n "$ENROLLED_NAMESPACE" --as="$TENANT"
 ```
+
+A `yes` in the second block means some other binding hands a tenant principal the same authority the
+operator relies on: Job creation lets it occupy a run's expected Job name, Job deletion lets it
+cancel runs, and plan patching lets it strip the run-cleanup finalizer and strand a deleted plan's
+proxy pods and host Leases.
 
 Review namespaced `RoleBinding`s and cluster-wide `ClusterRoleBinding`s as well; a cluster-wide grant
 can bypass the namespace's intended local policy. If an enrolled namespace must also host unrelated

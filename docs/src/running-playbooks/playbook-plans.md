@@ -150,18 +150,25 @@ Deleting a plan **cancels** the run it has in flight — the run is not allowed 
 plan object then stays in `Terminating` for a moment while the operator tears the run down, because
 it holds a `ansible.cloudbending.dev/run-cleanup` finalizer:
 
-1. the run's Job is cancelled, and the operator waits for its pod to actually stop;
+1. the run's Job is cancelled with a foreground deletion, and the operator waits for the Job and then
+   its pod to actually be gone;
 2. the run's managed-ssh proxy pods, their NetworkPolicy and Secret are deleted;
 3. the run's host Leases are released;
 4. the finalizer is removed and the plan disappears.
 
 The wait in step 1 is what makes this safe: the run's host locks keep being renewed until its pod is
-gone, so no other plan can start against a host while a playbook may still be talking to it. A plan
-that stays `Terminating` for a long time is therefore usually a pod that will not stop — look at the
-Job's pod, and at the operator log, which names the run it is waiting on.
+gone, so no other plan can start against a host while a playbook may still be talking to it. A
+foreground deletion is what makes the Job's own disappearance mean that — Kubernetes keeps the Job
+object until it has deleted the pods it owns, so the operator never has to infer from a single
+snapshot that a pod it cannot see will not appear a moment later. A plan that stays `Terminating` for
+a long time is therefore usually a pod that will not stop — look at the Job's pod, and at the
+operator log, which names the run it is waiting on.
 
-The finalizer is only present while a plan actually holds a run. Deleting an idle plan is immediate,
-and a plan that has never run is not affected by an operator outage.
+The finalizer is only present while a plan actually holds a run, and a plan that has never started
+one never carries it at all. Deleting an idle plan is immediate — with one exception: a plan gives
+the finalizer back on the tick *after* the one that released its run, so a plan whose run has just
+finished, or whose attempt was interrupted before it created anything, holds it for one more tick. If
+the operator stops inside that moment, even an idle plan waits in `Terminating` until it returns.
 
 Everything a run creates in the plan's own namespace (its Job, `Play` records, workspace Secret,
 client-certificate Secret and egress NetworkPolicy) is owned by the plan and would be removed by
@@ -171,7 +178,19 @@ operator can release.
 
 > **Do not strip the finalizer to force a deletion.** Removing `ansible.cloudbending.dev/run-cleanup`
 > by hand makes the plan disappear immediately and strands exactly the resources it protects: a
-> node-root proxy pod that keeps running, and a host Lease held by a run that no longer exists. If you
-> have to do it, clean the run up afterwards with the
-> [manual procedure](./results-and-troubleshooting.md#the-plan-is-stuck-in-applying), which works from
-> the run's own labels.
+> node-root proxy pod that keeps running, and a host Lease held by a run that no longer exists.
+>
+> If you have to do it, **write the run's identity down first**. The plan's `Play` records and its
+> Job are owned by the plan and are deleted with it, so the moment it disappears there is nothing
+> left in its namespace that names the run — while the proxy pods and Leases in the operator's
+> namespace are found by exactly those values:
+>
+> ```sh
+> kubectl get playbookplan my-plan -n my-team -o jsonpath='{.status.activeRun}'
+> ```
+>
+> Keep the `runId`, `executionHash` and `jobName` it prints, along with the plan's name and
+> namespace, and clean the run up afterwards with the [manual
+> procedure](./results-and-troubleshooting.md#the-plan-is-stuck-in-applying). If the plan is already
+> gone and nothing was captured, see [orphaned run resources with no
+> plan](./results-and-troubleshooting.md#orphaned-run-resources-with-no-plan).

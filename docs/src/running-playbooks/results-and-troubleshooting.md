@@ -422,15 +422,81 @@ proxy pods and its host Leases. Normally that takes a few seconds. It lasts long
   operator log names the run it is waiting on; look at the Job's pod (`kubectl get pods -n
   <plan-namespace> -l ansible.cloudbending.dev/run-id=<runId>`) and at anything blocking its
   termination, such as a long `terminationGracePeriod` or a stuck finalizer on the pod itself.
+- **the node running the run's pod is unreachable.** The pod's phase then reads `Unknown`, which
+  says the node stopped reporting, not that the playbook stopped — a partitioned node keeps running
+  its containers, and the hosts the run is applying to are usually other nodes entirely. The
+  operator therefore keeps waiting and keeps renewing the run's host locks. Recovering the node
+  resolves it; so does removing the `Node` object, after which Kubernetes deletes the pods bound to
+  it and the teardown finishes on its own.
 - **the operator is not running.** Nothing releases the run until it comes back; the plan waits
   rather than leaking. Restore the operator and the deletion completes on its own.
 - **the plan's namespace was un-enrolled while the run was in flight.** The operator can then neither
   release the run nor remove its own finalizer. Re-enrol the namespace and it finishes the teardown;
   see [Deployment → enrolled namespaces](../cluster-operators/deployment.md#enrolled-namespaces).
 
-Removing the finalizer by hand ends the wait but strands the run's proxy pods and host Leases — see
-the manual cleanup procedure under [The plan is stuck in `Applying`](#the-plan-is-stuck-in-applying),
-which applies unchanged to a run whose plan is already gone.
+Removing the finalizer by hand ends the wait but strands the run's proxy pods and host Leases. Before
+doing it, capture the run's identity — the plan's `Play` records and its Job are owned by the plan
+and are deleted with it, and they are what the manual cleanup procedure reads those values from:
+
+```sh
+PLAN_NAMESPACE=my-team
+PLAN=my-plan
+
+kubectl get playbookplan "$PLAN" -n "$PLAN_NAMESPACE" -o jsonpath='{.status.activeRun}'
+```
+
+Keep the `runId`, `executionHash` and `jobName` it prints, together with `$PLAN` and
+`$PLAN_NAMESPACE` — the run's Leases are held under `$PLAN_NAMESPACE/$PLAN/<runId>`. With those in
+hand, the manual cleanup procedure under [The plan is stuck in
+`Applying`](#the-plan-is-stuck-in-applying) applies to a run whose plan is already gone: skip its
+first block, which reads the same values from a `Play` that no longer exists, and set `RUN_ID`, `HASH`
+and `SELECTOR` from what you captured.
+
+If the plan is already gone and nothing was captured, use [orphaned run resources with no
+plan](#orphaned-run-resources-with-no-plan) below.
+
+### Orphaned run resources with no plan
+
+Proxy pods and host Leases in the operator's namespace outlive a plan that was force-deleted, and
+they carry no plan name — only an execution hash, a run ID and a target host. They can still be
+identified without the plan, because a run's `Play` record is written *before* it takes any host lock
+or builds any proxy infrastructure, and is only removed after that infrastructure has been released.
+So every run ID that still owns resources either has a `Play` somewhere or has no plan left at all.
+
+The Node a proxy serves is read from its `ansible.cloudbending.dev/target-host` **annotation**, which
+always spells the Node name out in full. The label of the same name is the selectable form and is
+shortened — truncated, with a hash appended — for a Node whose name does not fit in a label value's
+63 characters, as is the pod's own name.
+
+List what the operator namespace holds and the run IDs that are still accounted for:
+
+```sh
+OPERATOR_NAMESPACE=ansible-operator
+
+kubectl get pods -n "$OPERATOR_NAMESPACE" \
+  -l ansible.cloudbending.dev/component=managed-ssh-proxy \
+  -o custom-columns='NAME:.metadata.name,RUN:.metadata.labels.ansible\.cloudbending\.dev/run-id,HASH:.metadata.labels.ansible\.cloudbending\.dev/hash,NODE:.metadata.annotations.ansible\.cloudbending\.dev/target-host'
+
+kubectl get leases -n "$OPERATOR_NAMESPACE" \
+  -o custom-columns=NAME:.metadata.name,HOLDER:.spec.holderIdentity
+
+kubectl get plays -A \
+  -o custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,RUN:.spec.runId
+```
+
+Compare them run ID by run ID. A Lease's holder identity is `<plan namespace>/<plan>/<run ID>`, so
+its third field is what to match on:
+
+- **the run ID appears in no `Play`** — its plan is gone, so nothing will ever come back for these
+  resources. Delete them with the commands under [The plan is stuck in
+  `Applying`](#the-plan-is-stuck-in-applying), using that run ID and the hash from the pod's label.
+  Only the operator-namespace commands apply: the run's plan-namespace resources were owned by the
+  plan and Kubernetes removed them with it. If you need the plan's name and namespace anyway — to
+  record what was cleaned up, or to match a Lease to a pod — the Lease's holder identity is the last
+  place they still appear.
+- **the run ID does appear in a `Play`** — that record is the run's recovery handle and the operator
+  may still be working on it. Do not delete anything by hand; go to that `Play`'s plan and follow the
+  per-attempt procedure, which is written for exactly that case.
 
 ### Hosts show `NotReached`
 
