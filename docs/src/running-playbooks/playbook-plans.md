@@ -150,15 +150,19 @@ Deleting a plan **cancels** the run it has in flight — the run is not allowed 
 plan object then stays in `Terminating` for a moment while the operator tears the run down, because
 it holds a `ansible.cloudbending.dev/run-cleanup` finalizer:
 
-1. the run's Job is cancelled, and the operator waits for its pod to actually stop;
+1. the run's Job is cancelled with a foreground deletion, and the operator waits for the Job and then
+   its pod to actually be gone;
 2. the run's managed-ssh proxy pods, their NetworkPolicy and Secret are deleted;
 3. the run's host Leases are released;
 4. the finalizer is removed and the plan disappears.
 
 The wait in step 1 is what makes this safe: the run's host locks keep being renewed until its pod is
-gone, so no other plan can start against a host while a playbook may still be talking to it. A plan
-that stays `Terminating` for a long time is therefore usually a pod that will not stop — look at the
-Job's pod, and at the operator log, which names the run it is waiting on.
+gone, so no other plan can start against a host while a playbook may still be talking to it. A
+foreground deletion is what makes the Job's own disappearance mean that — Kubernetes keeps the Job
+object until it has deleted the pods it owns, so the operator never has to infer from a single
+snapshot that a pod it cannot see will not appear a moment later. A plan that stays `Terminating` for
+a long time is therefore usually a pod that will not stop — look at the Job's pod, and at the
+operator log, which names the run it is waiting on.
 
 The finalizer is only present while a plan actually holds a run. Deleting an idle plan is immediate,
 and a plan that has never run is not affected by an operator outage.

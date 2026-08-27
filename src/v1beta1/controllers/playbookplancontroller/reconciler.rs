@@ -2674,14 +2674,23 @@ fn dedupe_runs(runs: Vec<RecordedRun>) -> Vec<RecordedRun> {
 ///
 /// Deleting the plan already makes Kubernetes reap the Job, but the propagation policy that reaps it
 /// is the deleting client's choice — an orphaning delete would leave the pod running with nothing
-/// pointing at it — so the Job is deleted here explicitly, with background propagation, rather than
-/// assumed gone. Only this run's own Job is touched: a foreign Job at the recorded name belongs to
-/// something this plan never created.
+/// pointing at it — so the Job is deleted here explicitly rather than assumed gone. Only this run's
+/// own Job is touched: a foreign Job at the recorded name belongs to something this plan never
+/// created, and neither its existence nor its pods say anything about this run.
 ///
-/// The answer is read off the pods rather than the Job, because a Job object disappears the moment
-/// its own cascade starts while its pod is still terminating — and it is the pod that holds the SSH
-/// session. The run's Leases are renewed for as long as one is up, since the deletion path is the
-/// one place that would otherwise stop renewing them while a playbook is still running.
+/// The deletion is **foreground**, and the Job's own disappearance is the barrier this waits on.
+/// Under foreground propagation the apiserver keeps the Job until garbage collection has deleted
+/// every dependent that blocks its owner — which is exactly the Job's pods — so a Job that is gone
+/// is proof that no pod of it survives. Background propagation gives no such ordering: the Job is
+/// removed at once, and a pod the Job controller was already creating when the delete landed can
+/// appear afterwards. A single pod list would have missed it and released the hosts of a run that
+/// then started talking to them. Garbage collection accounts for pods by owner reference, so this
+/// also does not depend on the pods still carrying their labels.
+///
+/// The pods are still consulted once the Job is gone, because a pod outlives the Job object while it
+/// terminates — and it is the pod, not the Job, that holds the SSH session. The run's Leases are
+/// renewed for as long as either says the run is up, since the deletion path is the one place that
+/// would otherwise stop renewing them while a playbook is still running.
 async fn cancel_run_job(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -2691,10 +2700,10 @@ async fn cancel_run_job(
     let jobs_api = Api::<Job>::namespaced(context.client.clone(), namespace);
     let pods_api = Api::<Pod>::namespaced(context.client.clone(), namespace);
 
-    if let Some(job) = jobs_api.get_opt(&run.mirror.job_name).await?
-        && job.metadata.deletion_timestamp.is_none()
-        && validate_selected_job(
-            &job,
+    let job = jobs_api.get_opt(&run.mirror.job_name).await?;
+    let job = job.filter(|job| {
+        validate_selected_job(
+            job,
             object,
             run.execution_hash,
             run.mirror.attempt,
@@ -2702,13 +2711,17 @@ async fn cancel_run_job(
             &run.mirror.play_uid,
         )
         .is_ok()
+    });
+
+    if let Some(job) = &job
+        && job.metadata.deletion_timestamp.is_none()
     {
         info!(
             "PlaybookPlan {namespace}/{name} was deleted; cancelling its Job {}",
             run.mirror.job_name
         );
         match jobs_api
-            .delete(&run.mirror.job_name, &DeleteParams::background())
+            .delete(&run.mirror.job_name, &DeleteParams::foreground())
             .await
         {
             Ok(_) => {}
@@ -2717,10 +2730,18 @@ async fn cancel_run_job(
         }
     }
 
-    let pods = pods_api
-        .list(&ListParams::default().labels(&run_pod_selector(&run.mirror.run_id)))
-        .await?;
-    let executing = pods.items.iter().any(pod_may_be_executing);
+    // The pod list is only reached once this run's Job is gone, so it answers the one question the
+    // Job can no longer answer — is a pod that outlived it still up? — instead of standing in for
+    // the Job's own cascade.
+    let executing = match job {
+        Some(_) => true,
+        None => {
+            let pods = pods_api
+                .list(&ListParams::default().labels(&run_pod_selector(&run.mirror.run_id)))
+                .await?;
+            pods.items.iter().any(pod_may_be_executing)
+        }
+    };
     if executing {
         let leases_api =
             Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
