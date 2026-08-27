@@ -25,7 +25,7 @@ per-host status, and the summary line.
 |---|---|
 | `Pending` | Triggers not yet evaluated — the resting state right after creation, after the inputs changed, or while an input [cannot be read](#the-plans-inputs-cannot-be-read). |
 | `Delayed` | Reserved for deferred execution; not currently produced. |
-| `Applying` | An attempt is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the Job itself is active. |
+| `Applying` | An attempt is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has seen the attempt's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name. |
 | `Scheduled` | (`Recurring`) The run finished and the plan is waiting for the next schedule tick. |
 | `Succeeded` | (`OneShot`) Every host has succeeded on the current hash; the plan is quiet until the inputs change. |
 | `Failed` | (`OneShot`) The run finished but some host could not be brought current. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
@@ -44,7 +44,13 @@ printer columns:
   differently on purpose: `n/m hosts completed successfully` is a statement about an execution,
   `n/m hosts on the current revision` about the plan's standing, and the second is not a claim that
   anything ran.
-- **`Running`** — a Job is currently applying the playbook.
+- **`Running`** — the operator has observed this attempt's own Job in a non-terminal state
+  (`JobRunning`). It is set from an observation, not from Job creation, so it lags by a reconcile and
+  covers a Job that is still scheduling, pulling its image or starting its pod. `Running=False` with
+  reason `JobIdentityMismatch` means something that is not this run's Job holds the name the run
+  recorded: the plan stays `Applying` and waits, renewing its host locks, because a contested name is
+  never taken over or abandoned — the message names the Job. After a run finishes, `Running=False`
+  carries no reason.
 - **`Blocked`** — the run is due but waiting on a per-host lock held by another run; the condition
   message names the host and the run holding it. This one is not a column — read it with `kubectl
   describe` or `-o yaml`. It clears on its own once every lock the run needs is free. See
