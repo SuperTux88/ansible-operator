@@ -164,8 +164,11 @@ snapshot that a pod it cannot see will not appear a moment later. A plan that st
 a long time is therefore usually a pod that will not stop — look at the Job's pod, and at the
 operator log, which names the run it is waiting on.
 
-The finalizer is only present while a plan actually holds a run. Deleting an idle plan is immediate,
-and a plan that has never run is not affected by an operator outage.
+The finalizer is only present while a plan actually holds a run, and a plan that has never started
+one never carries it at all. Deleting an idle plan is immediate — with one exception: a plan gives
+the finalizer back on the tick *after* the one that released its run, so a plan whose run has just
+finished, or whose attempt was interrupted before it created anything, holds it for one more tick. If
+the operator stops inside that moment, even an idle plan waits in `Terminating` until it returns.
 
 Everything a run creates in the plan's own namespace (its Job, `Play` records, workspace Secret,
 client-certificate Secret and egress NetworkPolicy) is owned by the plan and would be removed by
