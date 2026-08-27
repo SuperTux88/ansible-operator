@@ -367,9 +367,14 @@ pub struct PlaybookPlanStatus {
     /// than the `PLAYBOOKPLAN_HASH` label alone, since that label is stable across every retry
     /// of an unchanged spec and could match an older, already-finished retry's Job.
     pub current_job_name: Option<String>,
-    /// How many Jobs have been created for `current_hash` so far, including the current one —
-    /// distinguishes retries in the Job name (`apply-{plan}-{shortid}-{n}`). Reset to 0 whenever
-    /// `current_hash` changes; incremented once per Job actually created, in `spawn_ansible_job`.
+    /// The attempt number of the current run, which is what distinguishes retries in the Job name
+    /// (`apply-{plan}-{shortid}-{n}`). Reset to 0 whenever `currentHash` changes, but that reset
+    /// only ever lowers the *starting point*: a new attempt is numbered past every attempt still
+    /// claiming a name — all of this plan's Jobs and all of its retained `Play` records, whatever
+    /// revision they belong to — so it can advance by more than one, and a new revision does not
+    /// restart at 1 while earlier runs are still retained. Names are reserved plan-wide rather than
+    /// per revision because the short id truncates a hash over the plan and the revision, so two
+    /// revisions of one plan can share one; see `reconciler::select_job`.
     #[schemars(with = "UnsignedInt")]
     pub retry_count: u32,
 }

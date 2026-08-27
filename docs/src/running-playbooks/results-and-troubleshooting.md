@@ -171,6 +171,69 @@ share hosts: the run proceeds once the other finishes. If it never clears, look 
 the holder — a plan that runs very often (a `Recurring` plan on a tight schedule, or a `OneShot` that
 keeps failing and retrying) can keep an overlapping plan waiting for a long time.
 
+### The plan is stuck in `Applying`
+
+- **"waiting for Job … which does not carry this run's identity"** — a Job with the name this run
+  expects exists, but it is not the one this run created. This normally means a Job was created or
+  edited outside the operator; a very unlikely generated-name collision can produce the same symptom
+  after an older `Play` was pruned while its Job was still retained. The operator will not adopt the
+  Job or modify it. For a run that had already reached `Running`, it waits for that Job to finish or be
+  removed; then its locks and proxy pods are cleaned up and its hosts are reported
+  [`Unknown`](#hosts-show-unknown), since the recap of a Job the operator did not create is not this
+  run's to read, and the plan carries on. For a `Launching` run, even a finished foreign Job still
+  occupies the recorded name, so the Job must be removed; if the run is still wanted, the operator
+  then creates its own Job, otherwise it abandons the unlaunched run.
+
+  An administrator should first confirm that the Job is really foreign, then delete that **exact Job**
+  if it is safe to stop it. Do not delete the `Play`, its Leases, or the operator's proxy resources as
+  a first step: they are the recovery handle and the protection against another run using the same
+  hosts. Set the identifiers from the plan and its active `Play`:
+
+  ```sh
+  PLAN_NAMESPACE=my-team
+  PLAN=my-plan
+
+  if ! JOB=$(kubectl get playbookplan "$PLAN" -n "$PLAN_NAMESPACE" \
+    -o jsonpath='{.status.activeRun.jobName}'); then
+    printf '%s\n' "could not read the PlaybookPlan; this section does not apply" >&2
+  elif [ -z "$JOB" ]; then
+    printf '%s\n' "no active run recorded; this section does not apply"
+  else
+    PLAY="$JOB"
+
+    kubectl get play "$PLAY" -n "$PLAN_NAMESPACE" -o yaml
+    kubectl get job "$JOB" -n "$PLAN_NAMESPACE" -o yaml
+  fi
+  ```
+
+  Compare the Job with the `Play` and plan. For the Job to be the operator's own Job, its own metadata
+  must carry an owner reference identifying the plan by both name and UID, the plan name, component,
+  run's hash, and run ID as labels, and the `Play`'s UID as an annotation. Its pod template must carry
+  the run ID, hash, and `Play` UID as well, plus the plan name and the `playbook` component. The Job's
+  name must also be the one recorded by the `Play`, including the trailing attempt number, which is
+  where the operator reads the attempt from. Any mismatch confirms that the Job is foreign. A Job that
+  happens to copy every one of these fields is indistinguishable from an operator-created Job at the
+  Kubernetes object level, which is why
+  enrolled-namespace Job creation must be protected by administrator RBAC or admission controls (see
+  [the Job trust boundary](../cluster-operators/security.md#the-job-trust-boundary)).
+
+  If the Job is foreign and its owner confirms that deleting it will not interrupt unrelated work,
+  remove only that exact Job. This may stop its pods, so check its status and owner before running the
+  command:
+
+  ```sh
+  kubectl get job "$JOB" -n "$PLAN_NAMESPACE" \
+    -o 'custom-columns=NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].name,COMPLETION:.status.completionTime,FAILED:.status.failed'
+  kubectl delete job "$JOB" -n "$PLAN_NAMESPACE" --cascade=background --wait=true
+  kubectl get job "$JOB" -n "$PLAN_NAMESPACE"  # expected: NotFound
+  ```
+
+  The operator will observe the free name on its next reconcile. It either creates the recorded
+  `Launching` run's Job or finalizes a run that had already been running as `Unknown`, then cleans up
+  its own proxy resources and Leases. If the plan remains stuck after the foreign Job is gone, inspect
+  the new `.status.summary` and operator logs rather than deleting the `Play`; it may be reporting a
+  separate cleanup or API-permission problem.
+
 ### Hosts show `NotReached`
 
 Expected when a play stops early — for example a `serial` batch that failed before reaching later

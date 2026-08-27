@@ -1623,6 +1623,48 @@ fn play_belongs_to_plan(play: &Play, plan_name: &str, plan_uid: &str) -> bool {
     play.spec.playbook_plan == plan_name && play.spec.playbook_plan_uid == plan_uid
 }
 
+fn job_belongs_to_plan(job: &Job, plan_name: &str, plan_uid: &str) -> bool {
+    owner_references_plan(&job.metadata.owner_references, plan_name, plan_uid)
+}
+
+fn owner_references_plan(
+    owners: &Option<Vec<OwnerReference>>,
+    plan_name: &str,
+    plan_uid: &str,
+) -> bool {
+    owners.as_ref().is_some_and(|owners| {
+        owners.iter().any(|owner| {
+            owner.kind == "PlaybookPlan" && owner.name == plan_name && owner.uid == plan_uid
+        })
+    })
+}
+
+fn job_label<'a>(job: &'a Job, key: &str) -> Option<&'a str> {
+    job.metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(key))
+        .map(String::as_str)
+}
+
+fn job_execution_hash(job: &Job) -> Result<ExecutionHash, ReconcileError> {
+    job_label(job, labels::PLAYBOOKPLAN_HASH)
+        .and_then(ExecutionHash::from_hex)
+        .ok_or(ReconcileError::PreconditionFailed(
+            "active Job has no valid execution hash",
+        ))
+}
+
+fn job_run_id(job: &Job) -> Result<&str, ReconcileError> {
+    job_label(job, labels::RUN_ID).ok_or(ReconcileError::PreconditionFailed(
+        "active Job has no run ID",
+    ))
+}
+
+fn retry_count_from_job_name(job_name: &str) -> Option<u32> {
+    job_name.rsplit('-').next()?.parse().ok()
+}
+
 /// Whether a plan's name fits where the run protocol has to put it: a Kubernetes **label value**, on
 /// its `Play`, its Job, that Job's pod template and the run's egress NetworkPolicy — and the
 /// selectors that later find them again (`recover_active_run`, `select_job`, `play_history::prune`).
@@ -1698,127 +1740,253 @@ fn run_id(plan: &PlaybookPlan, execution_hash: &ExecutionHash) -> Result<String,
     ))
 }
 
-
-/// Picks the most recently created Job that hasn't reached a terminal state — the "still active"
-/// attempt for a run, if there is one. Pure so it's unit-testable without a kube client.
-fn newest_active_job(jobs: &[Job]) -> Option<&Job> {
-    jobs.iter()
-        .filter(|job| !status::job_finished(job))
-        .max_by_key(|job| job.metadata.creation_timestamp.as_ref().map(|t| t.0))
+struct SelectedJob {
+    job_name: String,
+    attempt: u32,
 }
 
-/// The decision `spawn_ansible_job` makes from the Jobs currently labelled for this run: adopt an
-/// already-active one, or start a new numbered attempt. Split out (and pure) so the `retry_count`
-/// bookkeeping — advanced once per genuinely-new attempt, never on adoption — is unit-testable.
-#[derive(Debug, PartialEq)]
-enum JobAction {
-    /// An active Job already exists for this run; record it without creating anything.
-    Adopt { job_name: String },
-    /// No active Job — start a new attempt numbered `retry_count`.
-    CreateNext { retry_count: u32 },
+/// One past the highest attempt number any of `claimed` occupies. Pure so the "never reuse a name
+/// something still on the cluster claims" rule is unit-testable without a kube client.
+fn next_attempt_number(claimed: &[u32]) -> Result<u32, ReconcileError> {
+    claimed
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or_default()
+        .checked_add(1)
+        .ok_or(ReconcileError::PreconditionFailed(
+            "run attempt number overflowed",
+        ))
 }
 
-fn decide_job_action(existing: &[Job], current_retry_count: u32) -> JobAction {
-    use kube::runtime::reflector::Lookup as _;
-
-    match newest_active_job(existing) {
-        Some(active) => JobAction::Adopt {
-            job_name: active
-                .name()
-                .expect("a listed Job always has a name")
-                .to_string(),
-        },
-        None => JobAction::CreateNext {
-            retry_count: current_retry_count + 1,
-        },
-    }
-}
-
-/// Ensures exactly one active Job exists for this run, adopting an already-active one instead of
-/// creating a duplicate.
+/// Names the next attempt of `hash`, one past every attempt number anything still on the cluster
+/// claims: **all** of this plan's Jobs, and **all** of its retained `Play` records (which reserve
+/// their number even after the Job has been reaped, and even before their status exists — an
+/// uninitialized record still occupies its name until recovery deletes it).
 ///
-/// The `reconcile` spawn gate keys off `phase` read from the *reflector cache*, which lags this
-/// controller's own `patch_status` writes — so several reconciles fired in quick succession
-/// (proxy pods turning Ready, Job status events) can all reach this point before any observes
-/// `phase = Applying`. Guarding on the cached status therefore can't prevent duplicates; only a
-/// fresh (quorum) `list` by the run's hash label reliably sees a Job a previous tick just created.
-/// If one is still active, adopt it; otherwise this is a genuinely new attempt (first run, or a
-/// retry after the previous one reached a terminal state) and we create the next numbered Job.
-async fn spawn_ansible_job(
+/// Deliberately counted across every revision rather than only `hash`'s own. The short id in
+/// `job_builder::job_name` is ten symbols of a hash over the plan's UID and the revision, so it
+/// makes different plans unlikely to share a name but cannot guarantee that, and two revisions of
+/// one plan can still produce the same `apply-{plan}-{shortid}-{n}` — which is also the `Play`'s.
+/// Numbering per hash would let a new revision pick a number a retained record of the colliding one
+/// still holds, and `record_prepared` would then reject it as somebody else's run on every tick
+/// until history pruning happened to remove it. Numbering per plan makes the name unique by
+/// construction instead, at the cost of numbers that no longer restart at 1 for a new revision.
+///
+/// Deliberately never adopts an already-active Job. `try_start_run` only reaches here with no
+/// recovered `Play`, and under the write-ahead protocol every Job this plan created has a `Play`
+/// recorded *before* it — so an active Job with no recoverable record is not this run's, and
+/// adopting it would mint a fresh `run_id` for a Job whose own record claims a different one,
+/// wedging the attempt on an unrepairable `PreconditionFailed`. Resuming a genuinely in-flight run
+/// is `recover_active_run`'s job; same-run idempotency within a tick is `spawn_ansible_job`'s.
+async fn select_job(
+    client: &kube::Client,
     api: &Api<Job>,
     hash: ExecutionHash,
-    run_id: &str,
-    run_groups: &[ResolvedInventoryGroup],
     playbookplan: &PlaybookPlan,
-    resource_status: &mut PlaybookPlanStatus,
+    current_retry_count: u32,
+) -> Result<SelectedJob, ReconcileError> {
+    use kube::runtime::reflector::Lookup as _;
+
+    let plan_name = playbookplan
+        .name()
+        .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
+    let plan_uid = playbookplan
+        .uid()
+        .ok_or(ReconcileError::PreconditionFailed("uid not set"))?;
+    let namespace = playbookplan
+        .namespace()
+        .ok_or(ReconcileError::PreconditionFailed("namespace not set"))?;
+
+    let jobs = api
+        .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
+        .await?;
+    let max_job_attempt = jobs
+        .items
+        .iter()
+        .filter(|job| job_belongs_to_plan(job, plan_name.as_ref(), plan_uid.as_ref()))
+        .filter_map(|job| job.metadata.name.as_deref())
+        .filter_map(retry_count_from_job_name)
+        .max()
+        .unwrap_or_default();
+
+    let plays = Api::<Play>::namespaced(client.clone(), namespace.as_ref())
+        .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
+        .await?;
+    let max_recorded_attempt = plays
+        .items
+        .iter()
+        .filter(|play| play_belongs_to_plan(play, plan_name.as_ref(), plan_uid.as_ref()))
+        .map(|play| play.spec.attempt)
+        .max()
+        .unwrap_or_default();
+
+    let attempt =
+        next_attempt_number(&[current_retry_count, max_job_attempt, max_recorded_attempt])?;
+
+    Ok(SelectedJob {
+        job_name: job_builder::job_name(plan_name.as_ref(), plan_uid.as_ref(), &hash, attempt),
+        attempt,
+    })
+}
+
+/// Creates this attempt's Job, tolerating the fact that it may already exist.
+///
+/// Same-run idempotency, and nothing wider: which attempt gets to run is decided long before this by
+/// `select_job` (which never adopts a Job it has no record for) and `recover_active_run`. What is
+/// left here is that the *same* attempt can reach this point more than once — several reconciles
+/// fired in quick succession all read `phase` from the reflector cache, which lags this controller's
+/// own `patch_status` writes, and a `create` whose response was lost still left a real Job behind.
+/// So the Job is looked up by its exact name and, either way, `validate_selected_job` has to confirm
+/// it carries this attempt's identity before it is adopted.
+async fn spawn_ansible_job(
+    api: &Api<Job>,
+    playbookplan: &PlaybookPlan,
+    selected: &SelectedJob,
+    play_uid: &str,
+    expected_job: Job,
+) -> Result<(), ReconcileError> {
+    let job_name = &selected.job_name;
+    let retry_count = selected.attempt;
+    let hash = job_execution_hash(&expected_job)?;
+    let run_id = job_run_id(&expected_job)?.to_string();
+    if let Some(existing) = api.get_opt(job_name).await? {
+        validate_selected_job(
+            &existing,
+            playbookplan,
+            hash,
+            retry_count,
+            &run_id,
+            play_uid,
+        )?;
+        debug!("Adopting already-active job {job_name} for this run");
+        return Ok(());
+    }
+
+    info!("Creating job {job_name}");
+    match api
+        .create(
+            &PostParams {
+                field_manager: Some("ansible-operator".into()),
+                ..Default::default()
+            },
+            &expected_job,
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(err) if is_conflict(&err) => {
+            let existing = api.get(job_name).await?;
+            validate_selected_job(
+                &existing,
+                playbookplan,
+                hash,
+                retry_count,
+                &run_id,
+                play_uid,
+            )?;
+            debug!("Adopting already-active job {job_name} for this run");
+        }
+        Err(err) => return Err(err.into()),
+    }
+
+    Ok(())
+}
+
+/// Whether `job` is the exact Job this run committed to. Identity, not content: the run's `Play` UID
+/// (unique per attempt) has to be on both the Job and its pod template, alongside the plan's owner
+/// reference, the execution hash, the per-attempt run ID and the attempt number in the name.
+///
+/// Deliberately *not* a comparison against the stored blueprint. A Job's pod template is immutable
+/// once created, so a Job carrying this attempt's `Play` UID can only have been created from that
+/// blueprint — while a field-by-field comparison would have to model every server-side default and
+/// mutating webhook, and each field it failed to predict would disown a healthy run: the operator
+/// would sit out the whole run holding this plan's host Leases against every other plan targeting
+/// those hosts, and then write the run off as `Unknown` once its Job finished.
+fn validate_selected_job(
+    job: &Job,
+    plan: &PlaybookPlan,
+    expected_hash: ExecutionHash,
+    expected_attempt: u32,
+    expected_run_id: &str,
+    expected_play_uid: &str,
 ) -> Result<(), ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
 
-    let existing = api
-        .list(&ListParams::default().labels(&format!("{}={hash}", labels::PLAYBOOKPLAN_HASH)))
-        .await?;
-
-    let job_name = match decide_job_action(&existing.items, resource_status.retry_count) {
-        JobAction::Adopt { job_name } => {
-            debug!("Adopting already-active job {job_name} for this run");
-            job_name
-        }
-        JobAction::CreateNext { retry_count } => {
-            // A genuinely new attempt. `retry_count` climbs monotonically so the new name is
-            // expected not to collide with an already-finished attempt's; it's reset to 0 in
-            // `reconcile` whenever `current_hash` changes.
-            resource_status.retry_count = retry_count;
-
-            let job = job_builder::create_job_blueprint(
-                &hash,
-                retry_count,
-                run_id,
-                run_groups,
-                playbookplan,
-            )?;
-            let job_name = job
-                .name()
-                .expect(".metadata.name must be set at this point")
-                .to_string();
-
-            info!("Creating job {job_name}");
-            match api
-                .create(
-                    &PostParams {
-                        field_manager: Some("ansible-operator".into()),
-                        ..Default::default()
-                    },
-                    &job,
-                )
-                .await
-            {
-                Ok(_) => {}
-                // A Job by this exact name already exists. In principle `retry_count` should always
-                // be ahead of every name already in the cluster, but if a previous tick created a
-                // Job and then errored *before* `patch_status` ran, the bump above never got
-                // persisted — so this tick recomputes the same name a real Job already holds.
-                // Treating that as fatal (instead of adopting it here) would be the actual bug:
-                // erroring via `?` skips `patch_status` too, so nothing this tick would get
-                // persisted either, and the next tick would recompute the exact same name and hit
-                // the exact same 409 — a permanent stall on one name, observed live. Adopting
-                // instead means current_job_name/phase are persisted this tick regardless, so the
-                // run can proceed against whatever Job holds that name, and the next genuinely-new
-                // attempt computes its retry_count from state that now matches reality.
-                Err(err) if is_conflict(&err) => {
-                    info!("Job {job_name} already exists, adopting it");
-                }
-                Err(err) => return Err(err.into()),
-            }
-
-            job_name
-        }
-    };
-
-    resource_status.current_job_name = Some(job_name);
-    resource_status.phase = Phase::Applying;
-    resource_status.next_run = None;
+    let plan_name = plan
+        .name()
+        .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
+    let plan_uid = plan
+        .uid()
+        .ok_or(ReconcileError::PreconditionFailed("uid not set"))?;
+    let actual_attempt = job
+        .metadata
+        .name
+        .as_deref()
+        .and_then(retry_count_from_job_name);
+    let expected_hash_string = expected_hash.to_string();
+    if !job_belongs_to_plan(job, plan_name.as_ref(), plan_uid.as_ref())
+        || job_label(job, labels::PLAYBOOKPLAN_NAME) != Some(plan_name.as_ref())
+        || job_label(job, labels::COMPONENT) != Some(labels::PLAYBOOK_COMPONENT)
+        || job_execution_hash(job)? != expected_hash
+        || actual_attempt != Some(expected_attempt)
+        || job_label(job, labels::RUN_ID) != Some(expected_run_id)
+        || job_template_label(job, labels::RUN_ID) != Some(expected_run_id)
+        || annotation_value(&job.metadata, labels::PLAY_UID_ANNOTATION) != Some(expected_play_uid)
+        || job_template_annotation(job, labels::PLAY_UID_ANNOTATION) != Some(expected_play_uid)
+        || job_template_label(job, labels::PLAYBOOKPLAN_HASH) != Some(expected_hash_string.as_str())
+        || job_template_label(job, labels::PLAYBOOKPLAN_NAME) != Some(plan_name.as_ref())
+        || job_template_label(job, labels::COMPONENT) != Some(labels::PLAYBOOK_COMPONENT)
+    {
+        return Err(ReconcileError::PreconditionFailed(
+            "existing Job does not belong to the selected run",
+        ));
+    }
 
     Ok(())
+}
+
+fn job_template_annotation<'a>(job: &'a Job, key: &str) -> Option<&'a str> {
+    job.spec
+        .as_ref()
+        .and_then(|spec| spec.template.metadata.as_ref())
+        .and_then(|metadata| annotation_value(metadata, key))
+}
+
+fn job_template_label<'a>(job: &'a Job, key: &str) -> Option<&'a str> {
+    job.spec
+        .as_ref()
+        .and_then(|spec| spec.template.metadata.as_ref())
+        .and_then(|metadata| metadata.labels.as_ref())
+        .and_then(|labels| labels.get(key))
+        .map(String::as_str)
+}
+
+fn pod_belongs_to_job(pod: &Pod, job: &Job) -> bool {
+    let (Some(job_name), Some(job_uid)) =
+        (job.metadata.name.as_deref(), job.metadata.uid.as_deref())
+    else {
+        return false;
+    };
+    pod.metadata
+        .owner_references
+        .as_ref()
+        .is_some_and(|owners| {
+            owners
+                .iter()
+                .any(|owner| owner.kind == "Job" && owner.name == job_name && owner.uid == job_uid)
+        })
+}
+
+fn annotation_value<'a>(
+    metadata: &'a k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
+    key: &str,
+) -> Option<&'a str> {
+    metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(key))
+        .map(String::as_str)
 }
 
 #[cfg(test)]
@@ -1936,102 +2104,109 @@ mod tests {
         assert_eq!(tolerations, Some(first));
     }
 
+    /// The run-identity predicates recovery and Job validation are built from. Each one answers
+    /// "is this object part of *this* attempt?", and each is deliberately proof rather than a label
+    /// match — a name or a label can be reused by a later attempt or a recreated plan.
     #[test]
-    fn newest_active_job_skips_finished_and_picks_the_latest() {
-        use k8s_openapi::api::batch::v1::{Job, JobCondition, JobStatus};
-        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
-        use k8s_openapi::jiff::Timestamp;
+    fn ownership_predicates_require_the_plan_uid_not_just_its_name() {
+        let owner = |kind: &str, name: &str, uid: &str| OwnerReference {
+            kind: kind.into(),
+            name: name.into(),
+            uid: uid.into(),
+            ..Default::default()
+        };
 
-        fn job(name: &str, created_secs: i64, finished: bool) -> Job {
-            let conditions = finished.then(|| {
-                vec![JobCondition {
-                    type_: "Failed".into(),
-                    status: "True".into(),
-                    ..Default::default()
-                }]
-            });
-            Job {
-                metadata: ObjectMeta {
-                    name: Some(name.into()),
-                    creation_timestamp: Some(Time(Timestamp::from_second(created_secs).unwrap())),
-                    ..Default::default()
-                },
-                status: Some(JobStatus {
-                    conditions,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }
-        }
+        let owners = Some(vec![owner("PlaybookPlan", "web", "uid-1")]);
+        assert!(owner_references_plan(&owners, "web", "uid-1"));
+        // A plan deleted and recreated under the same name is a different plan.
+        assert!(!owner_references_plan(&owners, "web", "uid-2"));
+        assert!(!owner_references_plan(&owners, "other", "uid-1"));
+        // A same-named owner of another kind must not satisfy it.
+        assert!(!owner_references_plan(
+            &Some(vec![owner("Job", "web", "uid-1")]),
+            "web",
+            "uid-1"
+        ));
+        assert!(!owner_references_plan(&None, "web", "uid-1"));
 
-        // A finished attempt plus two still-running ones — the newest active wins, not the newest
-        // overall and not a finished one.
-        let jobs = vec![
-            job("apply-x-4", 100, true),
-            job("apply-x-5", 200, false),
-            job("apply-x-6", 300, false),
-        ];
-        assert_eq!(
-            newest_active_job(&jobs).and_then(|j| j.metadata.name.as_deref()),
-            Some("apply-x-6")
-        );
-
-        // Everything terminal -> no active job, so the caller creates a fresh retry.
-        let all_finished = vec![job("apply-x-4", 100, true), job("apply-x-5", 200, true)];
-        assert!(newest_active_job(&all_finished).is_none());
-
-        assert!(newest_active_job(&[]).is_none());
+        // `Play` ownership is decided on its immutable spec, not its ownerReference or label, so a
+        // hand-edited label cannot make a foreign record look recoverable.
+        let mut play = Play::new("apply-web-abc-1", PlaySpec::default());
+        play.spec.playbook_plan = "web".into();
+        play.spec.playbook_plan_uid = "uid-1".into();
+        assert!(play_belongs_to_plan(&play, "web", "uid-1"));
+        assert!(!play_belongs_to_plan(&play, "web", "uid-2"));
+        assert!(!play_belongs_to_plan(&play, "other", "uid-1"));
     }
 
     #[test]
-    fn decide_job_action_adopts_active_else_starts_next_numbered_attempt() {
-        use k8s_openapi::api::batch::v1::{Job, JobCondition, JobStatus};
-        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
-        use k8s_openapi::jiff::Timestamp;
+    fn pod_belongs_to_job_requires_the_jobs_uid() {
+        let mut job = Job::default();
+        job.metadata.name = Some("apply-web-abc-1".into());
+        job.metadata.uid = Some("job-uid".into());
 
-        fn job(name: &str, created_secs: i64, finished: bool) -> Job {
-            let conditions = finished.then(|| {
-                vec![JobCondition {
-                    type_: "Complete".into(),
-                    status: "True".into(),
-                    ..Default::default()
-                }]
-            });
-            Job {
-                metadata: ObjectMeta {
-                    name: Some(name.into()),
-                    creation_timestamp: Some(Time(Timestamp::from_second(created_secs).unwrap())),
-                    ..Default::default()
-                },
-                status: Some(JobStatus {
-                    conditions,
-                    ..Default::default()
-                }),
+        let pod_owned_by = |name: &str, uid: &str, kind: &str| {
+            let mut pod = Pod::default();
+            pod.metadata.owner_references = Some(vec![OwnerReference {
+                kind: kind.into(),
+                name: name.into(),
+                uid: uid.into(),
                 ..Default::default()
-            }
-        }
+            }]);
+            pod
+        };
 
-        // An active Job exists -> adopt it by name; retry_count is left untouched (no new attempt).
-        let with_active = vec![job("apply-x-2", 100, true), job("apply-x-3", 200, false)];
-        assert_eq!(
-            decide_job_action(&with_active, 3),
-            JobAction::Adopt {
-                job_name: "apply-x-3".into()
-            }
+        assert!(pod_belongs_to_job(
+            &pod_owned_by("apply-web-abc-1", "job-uid", "Job"),
+            &job
+        ));
+        // A Job recreated under the same name has a new UID; its predecessor's pods are not ours.
+        assert!(!pod_belongs_to_job(
+            &pod_owned_by("apply-web-abc-1", "older-job-uid", "Job"),
+            &job
+        ));
+        assert!(!pod_belongs_to_job(
+            &pod_owned_by("apply-web-abc-1", "job-uid", "ReplicaSet"),
+            &job
+        ));
+        assert!(!pod_belongs_to_job(&Pod::default(), &job));
+
+        // A Job that has not been created yet has no UID, so nothing can belong to it.
+        let mut uidless = job.clone();
+        uidless.metadata.uid = None;
+        assert!(!pod_belongs_to_job(
+            &pod_owned_by("apply-web-abc-1", "job-uid", "Job"),
+            &uidless
+        ));
+    }
+
+    #[test]
+    fn job_run_id_is_read_from_the_label_and_required() {
+        let mut job = Job::default();
+        assert!(
+            job_run_id(&job).is_err(),
+            "a Job with no run ID cannot be matched to an attempt"
         );
 
-        // Every prior attempt is terminal -> a new attempt, numbered one past the current count.
-        let all_finished = vec![job("apply-x-2", 100, true), job("apply-x-3", 200, true)];
-        assert_eq!(
-            decide_job_action(&all_finished, 3),
-            JobAction::CreateNext { retry_count: 4 }
-        );
+        job.metadata.labels = Some(BTreeMap::from([(
+            labels::RUN_ID.to_string(),
+            "run-1".to_string(),
+        )]));
+        assert_eq!(job_run_id(&job).unwrap(), "run-1");
+    }
 
-        // First run (no Jobs yet) -> attempt number 1.
+    /// The attempt number is carried in the Job name, so recovering it has to survive plan names
+    /// that themselves contain dashes and digits.
+    #[test]
+    fn retry_count_is_read_from_the_trailing_segment_of_a_job_name() {
+        assert_eq!(retry_count_from_job_name("apply-web-abc-7"), Some(7));
         assert_eq!(
-            decide_job_action(&[], 0),
-            JobAction::CreateNext { retry_count: 1 }
+            retry_count_from_job_name("apply-web-2-config-abc-12"),
+            Some(12),
+            "a plan name containing digits must not confuse the attempt number"
         );
+        assert_eq!(retry_count_from_job_name("apply-web-abc-notanumber"), None);
+        assert_eq!(retry_count_from_job_name(""), None);
     }
 
     /// The run's lock set. Group order is preserved so the list reads like the inventory, and a host
@@ -2065,6 +2240,80 @@ mod tests {
         ];
 
         assert_eq!(host_names(&overlapping), vec!["a", "b", "c"]);
+    }
+
+    /// Every attempt number anything still on the cluster claims — this plan's Jobs for the hash
+    /// and its retained `Play` records — is skipped, so a new attempt can never land on a name an
+    /// existing object already occupies.
+    #[test]
+    fn next_attempt_number_starts_past_everything_still_claiming_a_name() {
+        // First run: nothing claims a number yet.
+        assert_eq!(next_attempt_number(&[0, 0, 0]).unwrap(), 1);
+
+        // A retained Play reserves its number even after its Job has been reaped.
+        assert_eq!(next_attempt_number(&[0, 0, 7]).unwrap(), 8);
+
+        // A surviving Job past the plan's own retry count still wins.
+        assert_eq!(next_attempt_number(&[3, 5, 0]).unwrap(), 6);
+
+        assert!(next_attempt_number(&[u32::MAX]).is_err());
+    }
+
+    /// Why `select_job` reserves names across *every* revision instead of only the one it is naming.
+    ///
+    /// A run name's short id is ten symbols, so it cannot separate an unbounded number of revisions:
+    /// two of them eventually produce the same `apply-{plan}-{shortid}-{n}` — which is also the
+    /// `Play`'s name. If numbering restarted per hash, the second revision would claim a name a
+    /// retained record of the first still holds, and `record_prepared` would reject it as another
+    /// run's on every tick until history pruning happened to remove it. Widening the short id would
+    /// only move the collision, so the number, not the hash, carries the uniqueness.
+    ///
+    /// Asserted structurally rather than by exhibiting a colliding pair. Searching for one would
+    /// have to brute-force the digest, which is only feasible while the digest is small — so the
+    /// test would quietly become a several-minute loop the moment it was widened, and would be
+    /// testing the width rather than the rule that survives it.
+    #[test]
+    fn two_revisions_can_share_a_run_name_so_numbers_are_reserved_plan_wide() {
+        /// Splits `apply-{plan}-{digest}-{attempt}` on its last two separators.
+        fn parts(name: &str) -> (&str, &str, &str) {
+            let (head, attempt) = name.rsplit_once('-').unwrap();
+            let (plan, digest) = head.rsplit_once('-').unwrap();
+            (plan, digest, attempt)
+        }
+
+        let a = ExecutionHash::from_hex("1").unwrap();
+        let b = ExecutionHash::from_hex("2").unwrap();
+        let name_a = job_builder::job_name("web", "plan-uid", &a, 1);
+        let name_b = job_builder::job_name("web", "plan-uid", &b, 1);
+        let (plan_a, digest_a, attempt_a) = parts(&name_a);
+        let (plan_b, digest_b, attempt_b) = parts(&name_b);
+
+        // Two revisions of one plan are separated by the digest and nothing else...
+        assert_ne!(name_a, name_b);
+        assert_eq!((plan_a, attempt_a), (plan_b, attempt_b));
+        assert_ne!(digest_a, digest_b);
+
+        // ...and that digest is a fixed width, so it cannot keep an unbounded number of revisions
+        // apart: some pair eventually lands on the same one, and then the whole name matches — which
+        // is also the `Play`'s name. Numbering per hash would let the second revision claim a name a
+        // retained record of the first still holds.
+        assert_eq!(digest_a.len(), digest_b.len());
+        assert_eq!(
+            digest_a.len(),
+            job_builder::job_name("web", "other-plan-uid", &a, 1)
+                .rsplit_once('-')
+                .unwrap()
+                .0
+                .rsplit_once('-')
+                .unwrap()
+                .1
+                .len(),
+            "the digest is fixed width, whatever it is derived from"
+        );
+
+        // The attempt number is the part that is guaranteed to differ, which is why it is reserved
+        // across every revision of the plan rather than per hash.
+        assert_ne!(name_a, job_builder::job_name("web", "plan-uid", &a, 2));
     }
 
     /// The one-run-at-a-time invariant the whole protocol rests on. Two in-flight records mean
@@ -2569,6 +2818,61 @@ mod tests {
     }
 
     #[test]
+    fn selected_job_requires_the_prepared_play_uid() {
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+        plan.metadata.namespace = Some("default".into());
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+        let mut job = job_builder::create_job_blueprint(&hash, 1, "run-1", &[], &plan).unwrap();
+        job_builder::correlate_job_to_play(&mut job, "play-uid");
+
+        assert!(validate_selected_job(&job, &plan, hash, 1, "run-1", "play-uid").is_ok());
+
+        // A Job created for a different attempt of the same revision is not this run's Job, even
+        // though it shares the plan, the execution hash and the attempt number.
+        assert!(matches!(
+            validate_selected_job(&job, &plan, hash, 1, "run-2", "play-uid"),
+            Err(ReconcileError::PreconditionFailed(
+                "existing Job does not belong to the selected run"
+            ))
+        ));
+
+        // The pod template's correlation has to hold too: a Job whose pods aren't tied to this Play
+        // can't have its termination message trusted as this run's recap.
+        let mut tampered = job.clone();
+        tampered
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .metadata
+            .as_mut()
+            .unwrap()
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(labels::PLAY_UID_ANNOTATION.into(), "another-play".into());
+        assert!(matches!(
+            validate_selected_job(&tampered, &plan, hash, 1, "run-1", "play-uid"),
+            Err(ReconcileError::PreconditionFailed(
+                "existing Job does not belong to the selected run"
+            ))
+        ));
+
+        job.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(labels::PLAY_UID_ANNOTATION.into(), "another-play".into());
+        assert!(matches!(
+            validate_selected_job(&job, &plan, hash, 1, "run-1", "play-uid"),
+            Err(ReconcileError::PreconditionFailed(
+                "existing Job does not belong to the selected run"
+            ))
+        ));
+    }
+
+    #[test]
     fn get_related_secrets_collects_variable_and_file_secrets_but_not_inline_or_image_sources() {
         let yaml = r#"
 apiVersion: ansible.cloudbending.dev/v1beta1
@@ -2684,6 +2988,91 @@ spec:
             true,
             true
         ));
+    }
+
+    /// The identity check that classifies what holds a run's name, exercised at the boundary that
+    /// used to trust the name alone. A colliding name is not evidence of ownership: the Job has to
+    /// carry this attempt's own run ID, `Play` UID, hash, attempt number and owner reference — on the
+    /// Job *and* on the pod template that actually does the work.
+    #[test]
+    fn a_job_at_the_expected_name_is_only_this_runs_if_it_carries_its_identity() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+        plan.metadata.namespace = Some("team".into());
+        plan.metadata.uid = Some("plan-uid".into());
+
+        let own = || {
+            let mut job = job_builder::create_job_blueprint(&hash, 7, "run-1", &[], &plan).unwrap();
+            job_builder::correlate_job_to_play(&mut job, "play-uid");
+            job.metadata.owner_references = Some(vec![playbookplan_owner_ref(&plan).unwrap()]);
+            job
+        };
+        let validate = |job: &Job| validate_selected_job(job, &plan, hash, 7, "run-1", "play-uid");
+
+        assert!(validate(&own()).is_ok(), "the run's own Job is recognized");
+
+        // Another plan's Job that happened to land on the same name: same shape, different owner.
+        let mut other_plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+        other_plan.metadata.namespace = Some("team".into());
+        other_plan.metadata.uid = Some("other-plan-uid".into());
+        let mut foreign =
+            job_builder::create_job_blueprint(&hash, 7, "run-1", &[], &other_plan).unwrap();
+        job_builder::correlate_job_to_play(&mut foreign, "play-uid");
+        foreign.metadata.owner_references =
+            Some(vec![playbookplan_owner_ref(&other_plan).unwrap()]);
+        assert!(
+            validate(&foreign).is_err(),
+            "another plan's Job must never pass as this run's"
+        );
+
+        // A retry of this same plan, which shares the name's readable half but not the attempt.
+        let mut retry = job_builder::create_job_blueprint(&hash, 8, "run-2", &[], &plan).unwrap();
+        job_builder::correlate_job_to_play(&mut retry, "other-play-uid");
+        retry.metadata.owner_references = Some(vec![playbookplan_owner_ref(&plan).unwrap()]);
+        assert!(validate(&retry).is_err());
+
+        // The pod template is checked as well as the Job, because the pod is what reaches the hosts.
+        // A Job whose own metadata is impeccable but whose template lost the correlation fails —
+        // this is the `create_job_blueprint`/`correlate_job_to_play` ordering hazard, caught here
+        // rather than by adopting a Job whose pods carry no run identity at all.
+        let mut uncorrelated = own();
+        uncorrelated
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .metadata
+            .as_mut()
+            .unwrap()
+            .annotations = None;
+        assert!(
+            validate(&uncorrelated).is_err(),
+            "a matching Job metadata alone must not be enough"
+        );
+
+        let mut missing_plan_label = own();
+        missing_plan_label
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .remove(labels::PLAYBOOKPLAN_NAME);
+        assert!(
+            validate(&missing_plan_label).is_err(),
+            "the Job metadata must carry the plan label"
+        );
+
+        let mut missing_component_label = own();
+        missing_component_label
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .remove(labels::COMPONENT);
+        assert!(
+            validate(&missing_component_label).is_err(),
+            "the Job metadata must carry the component label"
+        );
     }
 
     #[test]

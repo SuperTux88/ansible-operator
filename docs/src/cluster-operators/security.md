@@ -80,6 +80,27 @@ plan's inventory groups expanded to. It carries no Secret material and no plan c
 that host list is enough that `get plays` should be treated as equivalent to `get playbookplans` for
 the namespace.
 
+## The Job trust boundary
+
+The operator validates the identity of an existing Job before adopting it during recovery. That
+prevents a name collision from being mistaken for the operator's run, but it is not proof of creator
+identity: a principal that can create Jobs can also copy owner references, labels, annotations, and
+the expected pod-template metadata.
+
+Treat Job creation in an enrolled namespace as part of the operator trust boundary. The chart grants
+the operator ServiceAccount `create` on `batch/jobs` there, but Kubernetes RBAC is additive. Cluster
+administrators must ensure that untrusted users and ServiceAccounts do not receive another Job-create
+grant through a namespaced `Role`, `RoleBinding`, `ClusterRole`, or `ClusterRoleBinding`. Verify the
+effective permissions with `kubectl auth can-i` and review bindings, as described in
+[Deployment → protect operator-created Jobs](./deployment.md#protect-operator-created-jobs).
+
+If unrelated workloads must create Jobs in an enrolled namespace, enforce the same boundary with an
+admission policy: only the operator ServiceAccount may create Jobs carrying the operator's reserved
+`ansible.cloudbending.dev` run/component metadata or using the generated `apply-...` name convention.
+Do not grant a namespace-wide admission exception. Without this RBAC or admission boundary, a forged
+Job can be adopted as a run even though its pod template was not built by the operator, and a foreign
+Job can also hold a generated name and leave a run waiting for manual cleanup.
+
 ## Privileges the proxy pods hold
 
 Proxy pods take the **minimum** that makes `nsenter`-to-host work: `hostPID: true`, a host `/proc`

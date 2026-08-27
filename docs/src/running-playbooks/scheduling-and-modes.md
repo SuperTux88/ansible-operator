@@ -86,12 +86,15 @@ This is what makes `OneShot` idempotent and cheap: editing an unrelated field do
 everything, but a real change to the playbook or its inputs does. The current hash is visible as
 `.status.currentHash` and in the `Current hash` printer column.
 
-## Retries and adoption
+## Retries and attempt numbers
 
-Within a single hash, if a run's Job needs to be retried the operator numbers successive Jobs
-(`apply-<plan>-<id>-<n>`) rather than colliding on one name — the playbook and inputs are unchanged,
-so the hash alone cannot distinguish attempts. You generally do not interact with this; it is why you
-may see more than one Job object for the same run.
+If a run's Job needs to be retried, the operator numbers successive Jobs
+(`apply-<plan>-<id>-<n>`) rather than colliding on one name. Attempt numbers are reserved across
+the plan as a whole, not per execution hash: each is one past every Job and retained `Play` record
+that still claims a number. The hash suffix can be shared by different revisions, so numbers may
+skip ahead and do not restart at 1 when you edit the plan. You generally do not interact with this;
+it is why you may see more than one Job object, and more than one `Play`, for the same run, and why
+`.status.retryCount` is not a count of how often the current revision has been tried.
 
 A Job's name is capped at 63 characters by Kubernetes, so the plan-name portion is shortened to fit.
 The rest of the name — `apply-`, the id and the attempt number — takes 19 characters at a

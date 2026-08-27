@@ -205,11 +205,28 @@ makes the lossy readable half safe. Both numbers are pinned by
 `the_plan_name_half_is_truncated_from_45_characters` — they are quoted to the user in
 `scheduling-and-modes.md`, so change them there too or not at all.
 
-`retry_count` is in the name because the hash alone is unchanged between retries of an identical
-spec. Dedup is a fresh `list()` by the run's `PLAYBOOKPLAN_HASH` label plus adopt-newest-active
-(`newest_active_job`), not an owner-based get — the reflector-cached `phase` lags this
-controller's own writes, so a cache read can't prevent duplicate creates. Per-node **Leases**
-give run mutual exclusion.
+The attempt number is in the name because the hash alone is unchanged between retries of an identical
+spec. `select_job` numbers a new attempt one past everything still claiming a name — *all* of this
+plan's Jobs *and* all of its retained `Play`s (including statusless ones, which occupy their name
+until recovery deletes them), across every revision and not just the one being named. That last part
+is load-bearing: `shortid` truncates a 64-bit hash to ten symbols, so two revisions *of one plan*
+(same UID) can still produce the same name, and per-hash numbering would let one claim a name a
+retained record of the other still holds — `record_prepared` then rejects it as another run's on
+every tick until pruning removes it.
+The number, not the hash, is what makes the name unique; a new revision therefore does not restart at
+1. It **never adopts an already-running Job**: every Job the operator creates has
+a `Play` recorded before it, so an active Job that `recover_active_run` didn't account for isn't this
+run's, and adopting it would pair it with a freshly minted `run_id` its own record contradicts.
+Resuming a genuinely in-flight run is recovery's job; same-run idempotency within a tick is
+`spawn_ansible_job`'s (`get_opt` + 409-tolerant create, both validated by `validate_selected_job`).
+
+`validate_selected_job` matches on **identity, not content**: the attempt's `Play` UID on both the Job
+and its pod template, the plan owner reference, the hash, the run ID and the attempt number. A Job's
+pod template is immutable once created, so identity already implies the blueprint — while a
+field-by-field comparison would have to model every server-side default and mutating webhook, and each
+field it mispredicted would disown a healthy run — the operator would sit out the whole run holding
+its host Leases, then write it off as `Unknown`.
+Per-node **Leases** give run mutual exclusion.
 
 ### Secret / Node change triggers
 

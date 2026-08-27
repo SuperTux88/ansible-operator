@@ -154,6 +154,29 @@ pub fn create_job_blueprint(
     Ok(job)
 }
 
+/// Stamps the attempt's `Play` UID onto the Job and — crucially — onto its pod template, which is
+/// what makes a run's identity checkable on the pod that actually carries out the run.
+///
+/// Must be called **after** [`create_job_blueprint`] (which overwrites the pod template's metadata)
+/// and **before** the Job is created, since a Job's pod template is immutable once it exists. Every
+/// creation path re-stamps an identically rebuilt blueprint with the same UID, so a resumed run
+/// produces a byte-identical template to the one its first attempt would have.
+pub fn correlate_job_to_play(job: &mut Job, play_uid: &str) {
+    job.metadata
+        .annotations
+        .get_or_insert_default()
+        .insert(labels::PLAY_UID_ANNOTATION.into(), play_uid.to_string());
+    job.spec
+        .as_mut()
+        .expect("a built Job always has a spec")
+        .template
+        .metadata
+        .get_or_insert_default()
+        .annotations
+        .get_or_insert_default()
+        .insert(labels::PLAY_UID_ANNOTATION.into(), play_uid.to_string());
+}
+
 /// Names an attempt's Job — and, identically, its `Play` record.
 ///
 /// The plan name is truncated to fit [`utils::MAX_DNS_LABEL_LEN`]. That cap is the Job's, not the
@@ -1017,6 +1040,46 @@ spec:
         let shortid_1 = name_1.rsplit_once('-').unwrap().0;
         let shortid_2 = name_2.rsplit_once('-').unwrap().0;
         assert_eq!(shortid_1, shortid_2);
+    }
+
+    #[test]
+    fn job_and_pod_template_are_correlated_to_the_play_uid() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+
+        let mut job = super::create_job_blueprint(
+            &calculate_execution_hash("- hosts: all", std::iter::empty()),
+            1,
+            "run-1",
+            &[],
+            &minimal_plan(),
+        )
+        .unwrap();
+        super::correlate_job_to_play(&mut job, "play-uid");
+
+        assert_eq!(
+            job.metadata
+                .annotations
+                .as_ref()
+                .unwrap()
+                .get(labels::PLAY_UID_ANNOTATION)
+                .map(String::as_str),
+            Some("play-uid")
+        );
+        assert_eq!(
+            job.spec
+                .as_ref()
+                .unwrap()
+                .template
+                .metadata
+                .as_ref()
+                .unwrap()
+                .annotations
+                .as_ref()
+                .unwrap()
+                .get(labels::PLAY_UID_ANNOTATION)
+                .map(String::as_str),
+            Some("play-uid")
+        );
     }
 
     fn minimal_plan() -> PlaybookPlan {

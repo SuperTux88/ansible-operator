@@ -124,6 +124,48 @@ chart renders into a mounted ConfigMap. For local development you can point the 
 file directly with `run --config <path>` and set `POD_NAMESPACE` (the operator's own namespace, always
 enrolled).
 
+### Protect operator-created Jobs
+
+The chart's `Role` grants the operator ServiceAccount permission to create Jobs in each enrolled
+namespace. Kubernetes RBAC is additive: this does **not** stop another `Role`, `ClusterRole`, or
+binding from granting the same permission to a user or another ServiceAccount. Keep enrolled
+namespaces dedicated to Ansible operations and do not grant untrusted principals `create` on
+`batch/jobs` there.
+
+This matters for more than ordinary workload separation. The operator records a run before creating
+its Job and later checks the Job's owner reference and run labels to identify it. A principal that can
+create Jobs in an enrolled namespace can occupy an expected Job name, or copy the operator's identity
+metadata onto a different pod template. The reconciler refuses an ordinary foreign Job and waits for
+it, but object metadata alone cannot prove which principal created a Job that carries all the expected
+fields.
+
+Check the effective permission for the operator and for every other principal that may act in an
+enrolled namespace. Replace the ServiceAccount names with the ones used by your installation:
+
+```sh
+ENROLLED_NAMESPACE=team-a
+OPERATOR_NAMESPACE=ansible-system
+OPERATOR_SERVICE_ACCOUNT=ansible-operator
+
+kubectl auth can-i create jobs -n "$ENROLLED_NAMESPACE" \
+  --as="system:serviceaccount:$OPERATOR_NAMESPACE:$OPERATOR_SERVICE_ACCOUNT"
+# expected: yes
+
+kubectl auth can-i create jobs -n "$ENROLLED_NAMESPACE" \
+  --as="system:serviceaccount:$ENROLLED_NAMESPACE:default"
+# expected for an untrusted tenant ServiceAccount: no
+```
+
+Review namespaced `RoleBinding`s and cluster-wide `ClusterRoleBinding`s as well; a cluster-wide grant
+can bypass the namespace's intended local policy. If an enrolled namespace must also host unrelated
+Job workloads, use an admission policy to reserve the operator's Job identity instead: allow only the
+operator ServiceAccount to create Jobs with the operator's reserved component/plan/run labels and
+with names matching the operator's `apply-...` convention. Do not solve this by allowing every Job in
+the namespace to bypass admission.
+
+See [Security model → the Job trust boundary](./security.md#the-job-trust-boundary) for why this
+restriction is required even though the operator validates Job identity during recovery.
+
 ## ServiceAccount tokens
 
 The operator ServiceAccount disables implicit token mounting, while the operator Deployment

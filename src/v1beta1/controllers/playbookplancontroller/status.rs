@@ -128,6 +128,25 @@ pub fn set_waiting_for_nodes_condition(
     upsert_condition(&mut status.conditions, condition);
 }
 
+/// Withdraws `Running` while the run's Job name is held by something that failed the identity check.
+///
+/// An earlier tick may have seen this run's own Job and set `Running` from it; leaving that standing
+/// would seat `JobRunning`/"the run's Job is still active" beside a summary saying the opposite, for
+/// as long as the contested name survives — which, since such a name is never abandoned, can be
+/// indefinitely.
+pub fn set_job_identity_mismatch_condition(status: &mut PlaybookPlanStatus, job_name: &str) {
+    upsert_condition(
+        &mut status.conditions,
+        PlaybookPlanCondition {
+            type_: "Running".into(),
+            status: "False".into(),
+            reason: Some("JobIdentityMismatch".into()),
+            message: Some(format!("Job {job_name} does not carry this run's identity")),
+            last_transition_time: Some(chrono::Local::now().fixed_offset()),
+        },
+    );
+}
+
 /// Recomputes the plan-level `Running`/`Ready` conditions from this run's host-outcome tally,
 /// using the parsed callback output as the only host-level signal (there's exactly one Job per
 /// run now, so there's nothing to count across Jobs).
@@ -404,6 +423,31 @@ mod tests {
         assert!(
             status.conditions.iter().all(|c| c.type_ != "Ready"),
             "Ready shouldn't be evaluated while the job is still running"
+        );
+    }
+
+    /// A run whose Job is replaced under its name after an earlier tick already saw the genuine one
+    /// must not keep advertising that Job as active: the contested name is never abandoned, so the
+    /// contradiction would otherwise stand for as long as the foreign Job survives.
+    #[test]
+    fn a_contested_job_name_withdraws_a_running_claim_made_earlier() {
+        let mut status = PlaybookPlanStatus::default();
+        set_running_condition(&mut status);
+
+        set_job_identity_mismatch_condition(&mut status, "plan-abc123-1");
+
+        let running = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Running")
+            .unwrap();
+        assert_eq!(running.status, "False");
+        assert_eq!(running.reason.as_deref(), Some("JobIdentityMismatch"));
+        assert!(
+            running
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("plan-abc123-1"))
         );
     }
 }
