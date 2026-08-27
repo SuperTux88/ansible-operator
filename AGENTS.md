@@ -293,9 +293,18 @@ dedicated to Ansible ops (see `THREAT_MODEL.md` §6 / T-INFO-1).
 
 ## Known rough edges / things to know before touching related code
 
-- **Status writes are JSON merge patches** in all three controllers (`patch_status` →
-  `Patch::Merge({"status": …})`), never `Api::replace_status` (a version-checked PUT that would
-  routinely 409 across a reconcile's many async steps). Only the `.status` subresource is sent.
+- **Status writes on the reconciled primary object are JSON merge patches** in all three
+  controllers (`patch_status` → `Patch::Merge({"status": …})`), not `Api::replace_status` (a
+  version-checked PUT that would routinely 409 across a reconcile's many async steps). Only the
+  `.status` subresource is sent.
+- **`Play` records go the opposite way, deliberately.** Every step of the record protocol
+  (`play_history::record_prepared` … `acknowledge_finished`) reads the object fresh and writes it
+  back through `replace_status`, so each write carries a `resourceVersion` precondition. The 409 the
+  plan's status write must avoid is the whole point here: a record is a per-attempt receipt for a
+  privileged run, and losing a write race on one must be noticed, not merged over. `decide_transition`
+  makes replaying a step that already landed a no-op, and `transition_phase` re-reads and re-decides
+  once before surfacing a conflict. Don't "fix" this to a merge patch for consistency with the bullet
+  above — the two are answering different questions.
 - `examples/v1beta1/*.yaml` is the canonical CRD shape; `examples/ssh.yaml` (top-level) is the
   only remaining older example — prefer `v1beta1/` when writing docs/examples.
 - Deliberate `.unwrap()`/`.expect()` style: preconditions the apiserver genuinely guarantees are
