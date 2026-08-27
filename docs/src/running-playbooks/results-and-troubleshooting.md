@@ -24,7 +24,7 @@ per-host status, and the summary line.
 | Phase | Meaning |
 |---|---|
 | `Pending` | Triggers not yet evaluated — the resting state right after creation, after the inputs changed, or while an input [cannot be read](#the-plans-inputs-cannot-be-read). |
-| `Delayed` | Execution was deferred (e.g. waiting on proxy readiness). Transient. |
+| `Delayed` | Reserved for deferred execution; not currently produced. |
 | `Applying` | An attempt is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the Job itself is active. |
 | `Scheduled` | (`Recurring`) The run finished and the plan is waiting for the next schedule tick. |
 | `Succeeded` | (`OneShot`) Every host has succeeded on the current hash; the plan is quiet until the inputs change. |

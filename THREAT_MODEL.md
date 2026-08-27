@@ -466,15 +466,16 @@ This design is **only** as strong as the environment it runs in. The following a
    zero nodes (T-DOS-2). See the `cluster-admins` doc in
    [`examples/v1beta1/node-access-policy.yaml`](examples/v1beta1/node-access-policy.yaml).
 3. **Lock down the operator namespace.** It runs the node-root proxy pods and the Tier-0
-   operator ServiceAccount, and holds per-run client-cert Secrets (A3). The CA itself does not
-   live here (in-memory only, A2), but operator compromise still yields it. Restrict RBAC,
+   operator ServiceAccount, and holds their per-host Secrets and NetworkPolicies. Per-attempt client
+   certificates live in enrolled plan namespaces (A3), while the CA itself is in-memory only (A2).
+   Operator compromise still yields it. Restrict RBAC,
    enable etcd encryption at rest, and treat this namespace as Tier-0.
 4. **Author policies against immutable/admin-controlled labels** (`kubernetes.io/metadata.name`
    for namespaces; admin-managed node pool labels), never tenant-settable ones (T-ESC-3).
 5. **Restrict who can create ClusterInventory/PlaybookPlan** (e.g. admission policy). NAP
    bounds *which nodes*, but managed-ssh on any authorized node is root on that node (T-ESC-4).
-6. **Pin the proxy image** to a digest from a registry you trust, via `managedSsh.proxyImage`
-   (the default is an unpinned third-party `:latest` tag) (T-ESC-5).
+6. **Pin the proxy image** to a digest from a registry you trust, via `managedSsh.proxyImage`.
+   The chart seed is digest-pinned; preserve that property when overriding it (T-ESC-5).
 
 ---
 
