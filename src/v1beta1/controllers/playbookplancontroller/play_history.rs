@@ -38,7 +38,7 @@ use crate::v1beta1::{
     labels,
     playbookplancontroller::{
         callback_output::{CallbackOutput, HostStats},
-        execution_evaluator::ExecutionHash,
+        execution_evaluator::{self, ExecutionHash},
         reconciler::playbookplan_owner_ref,
     },
 };
@@ -126,11 +126,7 @@ fn prepared_status(play: &PlayRef<'_>) -> PlayStatus {
 /// twice but is one host to Ansible, so a count that said otherwise would make a clean run look
 /// partially failed for as long as the record stayed non-terminal.
 fn distinct_host_count(inventory: &[ResolvedHosts]) -> u32 {
-    inventory
-        .iter()
-        .flat_map(|group| group.hosts.iter())
-        .collect::<std::collections::HashSet<&String>>()
-        .len() as u32
+    execution_evaluator::distinct_host_count(inventory) as u32
 }
 
 /// Marks a `Launching` run as running after its exact Job has been created or independently

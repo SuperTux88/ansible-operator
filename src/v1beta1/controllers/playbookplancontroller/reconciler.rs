@@ -25,7 +25,7 @@ use crate::v1beta1::{
     Phase, Play, PlaybookPlanStatus, ResolvedHosts, ResolvedInventoryGroup, StaticInventory,
     Toleration, ansible, flatten_hosts, labels,
     playbookplancontroller::{
-        execution_evaluator::{ExecutionHash, find_all_hosts},
+        execution_evaluator::{ExecutionHash, distinct_host_count, find_all_hosts},
         locking, managed_ssh,
         triggers::{Timing, evaluate_schedule, forecast_next_run},
         workspace::render_secret,
@@ -774,11 +774,7 @@ async fn reconcile(
                 Some("previous run finished; the next scheduled run is already due".to_string());
             requeue_after = std::time::Duration::from_secs(1);
         } else {
-            let total_count: usize = resource_status
-                .eligible_hosts
-                .iter()
-                .map(|group| group.hosts.len())
-                .sum();
+            let total_count = distinct_host_count(&resource_status.eligible_hosts);
             // Reaching here without a schedule means it was removed mid-run: the eligibility gate
             // normally stops such a plan from ever starting one. Log the anomaly — `decide_terminal`
             // deliberately leaves the plan in `Applying` for this case.
@@ -810,11 +806,7 @@ async fn reconcile(
     {
         // A failed input read clears the visible terminal state, but not the per-host results. Once
         // the inputs recover, restore the idle verdict instead of waiting for a hash change.
-        let total_count: usize = resource_status
-            .eligible_hosts
-            .iter()
-            .map(|group| group.hosts.len())
-            .sum();
+        let total_count = distinct_host_count(&resource_status.eligible_hosts);
         restore_idle_oneshot_status(&mut resource_status, total_count);
     } else if eligible_to_start && resource_status.active_run.is_none() {
         match timing {

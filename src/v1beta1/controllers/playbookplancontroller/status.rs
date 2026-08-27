@@ -5,7 +5,10 @@ use crate::{
     v1beta1::{HostOutcome, PlayPhase, PlayStatus, PlaybookPlanCondition, PlaybookPlanStatus},
 };
 
-use super::{execution_evaluator::ExecutionHash, locking::BlockedBy};
+use super::{
+    execution_evaluator::{ExecutionHash, distinct_host_count},
+    locking::BlockedBy,
+};
 
 /// Whether this run's single Job has reached a terminal state — `Complete` or `Failed`.
 pub fn job_finished(job: &batch::v1::Job) -> bool {
@@ -263,11 +266,7 @@ pub fn clear_inputs_unavailable_condition(status: &mut PlaybookPlanStatus, outda
         return;
     }
 
-    let total: usize = status
-        .eligible_hosts
-        .iter()
-        .map(|group| group.hosts.len())
-        .sum();
+    let total = distinct_host_count(&status.eligible_hosts);
     let current = total.saturating_sub(outdated_count);
     let now = chrono::Local::now().fixed_offset();
     let condition = PlaybookPlanCondition {
