@@ -82,9 +82,10 @@ reflects the latest inputs.
 ### `OneShot` (default)
 
 Converge to a goal state and then stop. Only **out-of-date** hosts run; once every host has succeeded
-on the current playbook and inputs, the plan settles into `Succeeded` (or `Failed` if some host could
-not be brought current) and stops — it does **not** keep re-running on the schedule. It wakes again
-only when the inputs change (see drift detection below). Good for "make it so": apply a configuration
+on the current playbook and inputs, the plan settles into `Succeeded` and stops — it does **not** keep
+re-running on the schedule. A run that fails is tried again a bounded number of times (see
+[Retries](#retries)); once that budget is spent the plan settles into `Failed` and stops the same way.
+Either way it wakes again only when the inputs change (see drift detection below). Good for "make it so": apply a configuration
 or a one-time migration and confirm every host got it.
 
 ### `Recurring`
