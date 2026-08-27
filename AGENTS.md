@@ -159,7 +159,12 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    `Unknown`) — not in step 0a: recovery has no record left to dispatch on, so it is the *mirror*
    in `status.activeRun` that brings the run here to be released.
 8. **`patch_status`** — JSON **merge patch** (not `replace_status`); many async steps pass
-   between read and write, so a version-checked PUT would routinely 409.
+   between read and write, so a version-checked PUT would routinely 409. It is also where the
+   suspension contract is held (`suspended_advertises_no_next_run`): a tick has several ways to write
+   a status and only one way to reach the end of the pipeline, so "a suspended plan advertises no
+   `nextRun`" belongs at the write, not at the end. The version-checked *finalizer* write
+   (`drop_run_cleanup_finalizer`) comes **after** it and treats a 409 as "retry next tick" — it
+   raced the status write this tick just made, and losing that race must not discard it.
 
 Requeue is dynamic: 3600s default, tightened to "time until next scheduled run" / 15s
 (Job-polling) / 5s (waiting on proxy readiness) as appropriate.

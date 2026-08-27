@@ -875,16 +875,6 @@ async fn reconcile(
         };
     }
 
-    // While suspended, don't advertise a next run: the start gate above already blocks new runs, so
-    // a `nextRun` pointing at a slot that won't fire would be misleading. Applied after the advance
-    // step so it also clears the next slot a just-finished Recurring run would have set. A run still
-    // in progress is untouched (it has no `nextRun` anyway) and is left to finish; the phase keeps
-    // reflecting the plan's real state, with the `Suspended` printer column (from `.spec.suspend`)
-    // signalling the pause. The schedule path recomputes `nextRun` once the plan resumes.
-    if object.spec.suspend {
-        resource_status.next_run = None;
-    }
-
     if retry_prune {
         requeue_after = prune_retry_after(requeue_after);
     }
@@ -893,11 +883,26 @@ async fn reconcile(
     // plan never waits on this operator. Deliberately conservative about *when* that is: a tick that
     // recovered anything keeps it, even if the run finished on this very tick, because the release
     // it just performed is the last thing that needed the finalizer and one extra tick costs nothing.
-    if !recovered_a_run && resource_status.active_run.is_none() {
-        drop_run_cleanup_finalizer(&api, &object).await?;
-    }
+    let release_finalizer = !recovered_a_run && resource_status.active_run.is_none();
 
     patch_status(&api, &object, resource_status).await?;
+
+    // After the plan has been told what this tick decided, and never at its expense. This is a
+    // version-checked write (see `patch_finalizers`) against an object the operator has just written
+    // the status of, so it loses that race routinely — and losing it must cost one more tick before
+    // an idle plan can be deleted, not the whole tick's account of the plan. Doing it the other way
+    // round is what left a plan advertising a `nextRun` it would never reach.
+    if release_finalizer && let Err(error) = drop_run_cleanup_finalizer(&api, &object).await {
+        if !error.is_conflict() {
+            return Err(error);
+        }
+        debug!(
+            "Could not give back the run-cleanup finalizer of {namespace}/{name}: the plan changed \
+             underneath this tick; retrying shortly"
+        );
+        requeue_after = requeue_after.min(std::time::Duration::from_secs(5));
+    }
+
     Ok(Action::requeue(requeue_after))
 }
 
@@ -1017,6 +1022,28 @@ fn has_work_to_start(mode: &ExecutionMode, has_schedule: bool, has_hosts_to_trig
 /// pinned as its own function so `suspend` losing its veto breaks a test, not a cluster.
 fn may_start_new_run(suspend: bool, has_work_to_start: bool) -> bool {
     !suspend && has_work_to_start
+}
+
+/// The other half of the suspension contract: while suspended, the plan advertises no next run. The
+/// start gate blocks the run itself, so a `nextRun` pointing at a slot that will not fire says the
+/// plan is about to do something it will not do — to an operator reading it, and to any client
+/// scheduling around it.
+///
+/// Held where the status is *written* rather than at the end of the pipeline, because a tick has
+/// more than one way to write one and only one way to reach the end. A tick that finalizes a run, or
+/// that reports an unreadable inventory and gives up, writes the status too — and those writes were
+/// carrying whatever `nextRun` the plan already advertised straight back onto it, so a plan
+/// suspended while `Scheduled` could keep advertising its old slot until some later tick happened to
+/// run the whole pipeline through. Every write now settles it, so the first one after the suspend
+/// takes effect regardless of how the tick ends.
+///
+/// A run in progress is untouched (it has no `nextRun` anyway) and is left to finish; the phase
+/// keeps reflecting the plan's real state, with the `Suspended` printer column (from `.spec.suspend`)
+/// signalling the pause. The schedule path recomputes `nextRun` once the plan resumes.
+fn suspended_advertises_no_next_run(suspend: bool, status: &mut PlaybookPlanStatus) {
+    if suspend {
+        status.next_run = None;
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3794,12 +3821,17 @@ fn get_related_secrets(playbookplan: &PlaybookPlan) -> Vec<&String> {
 /// many async steps between reading `target` and this final write, long enough that a concurrent
 /// write to the same object routinely lands first and would reject a version-checked PUT with a
 /// 409. A merge patch carries no such precondition.
+///
+/// Every write goes through [`suspended_advertises_no_next_run`] on the way out — see there for why
+/// the suspension contract is held at this boundary rather than at the end of the pipeline.
 async fn patch_status(
     api: &Api<PlaybookPlan>,
     target: &PlaybookPlan,
-    status: PlaybookPlanStatus,
+    mut status: PlaybookPlanStatus,
 ) -> Result<(), ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
+
+    suspended_advertises_no_next_run(target.spec.suspend, &mut status);
 
     let name = target
         .name()
@@ -5401,6 +5433,33 @@ spec:
         // The veto is suspend's alone: without it the work gate decides.
         assert!(may_start_new_run(false, true));
         assert!(!may_start_new_run(false, false));
+    }
+
+    /// The other half of the contract: a suspended plan never advertises a run it will not start.
+    /// Asserted over a status that already carries a forecast, because that is the case the rule
+    /// exists for — a plan suspended while `Scheduled` has one standing on it.
+    #[test]
+    fn a_suspended_plan_advertises_no_next_run() {
+        let forecast = || PlaybookPlanStatus {
+            phase: Phase::Scheduled,
+            next_run: Some(
+                "2025-08-12T20:00:00Z"
+                    .parse::<DateTime<FixedOffset>>()
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+
+        let mut suspended = forecast();
+        suspended_advertises_no_next_run(true, &mut suspended);
+        assert_eq!(suspended.next_run, None);
+        // Only the forecast: the phase keeps saying what the plan's underlying state is, and the
+        // `Suspended` printer column is what says it is paused.
+        assert_eq!(suspended.phase, Phase::Scheduled);
+
+        let mut running = forecast();
+        suspended_advertises_no_next_run(false, &mut running);
+        assert_eq!(running.next_run, forecast().next_run);
     }
 
     /// The suspend half of the unlaunched-attempt decision: a suspended plan must never keep an
