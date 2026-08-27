@@ -16,14 +16,13 @@ use crate::v1beta1::controllers::reconcile_error::{ReconcileError, is_conflict};
 /// stale lock around for a short window before it's eligible for reclaim.
 pub const LEASE_DURATION_SECONDS: i32 = 90;
 
-/// Why `ensure_locks` couldn't take the full set this tick: the first host whose lock is held by
-/// someone else, and — when the lease recorded one — that holder's `namespace/name/hash` identity
-/// so the caller can name the run that's blocking it.
+/// A host whose lock this run couldn't take or keep this tick, and — when the Lease recorded one —
+/// that holder's `namespace/name/hash` identity so the caller can name the run involved.
 #[derive(Debug, PartialEq, Eq)]
 pub struct BlockedBy {
     pub host: String,
-    /// The current holder's identity (`namespace/name/hash`), or `None` when we simply lost a write
-    /// race (a 409) rather than observing a live holder.
+    /// The observed holder's identity (`namespace/name/hash`), or `None` when we only lost a write
+    /// race (a 409) and never saw who won it.
     pub holder: Option<String>,
 }
 
@@ -247,20 +246,56 @@ pub fn renewal_decision(existing: Option<&Lease>, holder_identity: &str) -> Rene
     }
 }
 
+/// What one pass of [`renew_locks`] found across a run's whole host set.
+///
+/// The distinction between the two contended variants is the point: only `Lost` is evidence that
+/// this run no longer protects a host, and only evidence justifies abandoning an attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RenewalOutcome {
+    /// Every requested lock is (still) this run's.
+    Held,
+    /// Another holder was observed on one of them — its lease lapsed and a competing run took it
+    /// over. Nothing can reclaim it from here; a caller whose Job does not exist yet should give the
+    /// attempt up rather than run a second playbook against that host.
+    Lost(BlockedBy),
+    /// A write race left one lock's ownership unconfirmed this tick. Nothing was seen to have taken
+    /// it, so this is a reason to look again shortly, never a reason to give an attempt up.
+    Unconfirmed(BlockedBy),
+}
+
+impl RenewalOutcome {
+    /// The contended host, whichever way it was contended — what the plan's `Blocked` condition
+    /// reports.
+    pub fn contended(&self) -> Option<&BlockedBy> {
+        match self {
+            RenewalOutcome::Held => None,
+            RenewalOutcome::Lost(blocked) | RenewalOutcome::Unconfirmed(blocked) => Some(blocked),
+        }
+    }
+}
+
 /// Renews every per-host Lease this run holds, extending each for another `LEASE_DURATION_SECONDS`.
 /// Called every tick while a run is in progress (`Applying`) so a run that outlasts the lease
 /// duration doesn't have its locks silently reclaimed by a competing plan mid-flight.
 ///
 /// Deliberately *not* `ensure_locks`: this never acquires locks it doesn't hold and never releases
 /// on conflict (releasing a still-running run's other locks would be exactly the double-run hazard
-/// we're guarding against). A lock that another holder has taken over is reported and skipped — the
-/// run keeps going, but its `.status`/logs surface that the host is no longer protected.
+/// we're guarding against). A contended lock is *reported* only after every still-owned lock has
+/// been renewed, so one problem host cannot let the rest of the set expire.
+///
+/// The two contended outcomes are deliberately kept apart, because only one of them justifies giving
+/// a run up: [`RenewalOutcome::Lost`] means another holder was *observed* on the Lease, while
+/// [`RenewalOutcome::Unconfirmed`] means a write race left this tick unable to say — nothing was seen
+/// to have taken the lock over. Collapsing the second into the first would let a transient 409 tear
+/// down a healthy attempt's proxy infrastructure.
 pub async fn renew_locks(
     api: &Api<Lease>,
     target_hosts: &[String],
     holder_identity: &str,
-) -> Result<(), ReconcileError> {
+) -> Result<RenewalOutcome, ReconcileError> {
     let now = Utc::now();
+    let mut lost: Option<BlockedBy> = None;
+    let mut unconfirmed: Option<BlockedBy> = None;
 
     for host in target_hosts {
         let name = lease_name(host);
@@ -272,6 +307,10 @@ pub async fn renew_locks(
                     "Lock for host {host} is now held by {holder}, not this run — its lease lapsed \
                      and another run took it over; both may target {host} concurrently"
                 );
+                lost.get_or_insert_with(|| BlockedBy {
+                    host: host.clone(),
+                    holder: Some(holder),
+                });
             }
             RenewalAction::Reassert { resource_version } => {
                 let mut lease = build_lease(&name, holder_identity, now);
@@ -287,10 +326,14 @@ pub async fn renew_locks(
 
                 match result {
                     Ok(()) => {}
-                    // Raced with another writer; the next tick re-reads and renews again, still
-                    // well within the lease duration.
+                    // Ownership is unconfirmed for this host, but continue renewing every other host
+                    // before reporting it so one write race cannot let the rest of the set expire.
                     Err(err) if is_conflict(&err) => {
-                        debug!("Lease renewal for host {host} conflicted, will retry next tick");
+                        debug!("Lease renewal for host {host} conflicted; ownership unconfirmed");
+                        unconfirmed.get_or_insert_with(|| BlockedBy {
+                            host: host.clone(),
+                            holder: None,
+                        });
                     }
                     Err(err) => return Err(err.into()),
                 }
@@ -298,7 +341,16 @@ pub async fn renew_locks(
         }
     }
 
-    Ok(())
+    // An observed takeover outranks a mere write race: it is the one this run can act on.
+    Ok(renewal_outcome(lost, unconfirmed))
+}
+
+fn renewal_outcome(lost: Option<BlockedBy>, unconfirmed: Option<BlockedBy>) -> RenewalOutcome {
+    match (lost, unconfirmed) {
+        (Some(blocked), _) => RenewalOutcome::Lost(blocked),
+        (None, Some(blocked)) => RenewalOutcome::Unconfirmed(blocked),
+        (None, None) => RenewalOutcome::Held,
+    }
 }
 
 /// Releases every Lease this run holds for `target_hosts`. Called explicitly when a run
@@ -483,6 +535,40 @@ mod tests {
                 holder: "ns/other/hash".into()
             }
         );
+    }
+
+    #[test]
+    fn observed_takeover_outweighs_a_later_unconfirmed_write() {
+        let lost = BlockedBy {
+            host: "worker-1".into(),
+            holder: Some("ns/other/run".into()),
+        };
+        let unconfirmed = BlockedBy {
+            host: "worker-2".into(),
+            holder: None,
+        };
+
+        assert_eq!(
+            renewal_outcome(Some(lost), Some(unconfirmed)),
+            RenewalOutcome::Lost(BlockedBy {
+                host: "worker-1".into(),
+                holder: Some("ns/other/run".into()),
+            })
+        );
+        assert_eq!(
+            renewal_outcome(
+                None,
+                Some(BlockedBy {
+                    host: "worker-2".into(),
+                    holder: None,
+                })
+            ),
+            RenewalOutcome::Unconfirmed(BlockedBy {
+                host: "worker-2".into(),
+                holder: None,
+            })
+        );
+        assert_eq!(renewal_outcome(None, None), RenewalOutcome::Held);
     }
 
     #[test]

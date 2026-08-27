@@ -655,7 +655,8 @@ async fn advance_applying_run(
     if let Some(job) = &job
         && !status::job_finished(job)
     {
-        locking::renew_locks(&leases_api, run.hosts_to_trigger, run.holder_identity).await?;
+        let _outcome =
+            locking::renew_locks(&leases_api, run.hosts_to_trigger, run.holder_identity).await?;
         status::evaluate_playbookplan_conditions(
             run.hosts_to_trigger,
             false,
