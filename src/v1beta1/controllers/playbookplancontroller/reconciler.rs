@@ -502,24 +502,16 @@ async fn reconcile(
         match resolve_authorized_inventory(&context, &object).await {
             Ok(resolved) => resolved,
             Err(error) => {
-                let summary = format!("cannot resolve the plan's inventories: {error}");
-                if let Some(unlaunched) = unlaunched_run.as_ref() {
-                    handle_unlaunched_input_error(
-                        &context,
-                        &object,
-                        &api,
-                        unlaunched,
-                        &mut resource_status,
-                        &error,
-                        &summary,
-                    )
-                    .await?;
-                } else {
-                    // Nothing in flight to hold open, but the plan still has to say why it is not
-                    // running: a deleted inventory would otherwise leave the last successful run's
-                    // summary standing while every tick fails in the log only.
-                    report_input_failure(&api, &object, &mut resource_status, summary).await;
-                }
+                report_desired_input_error(
+                    &context,
+                    &object,
+                    &api,
+                    unlaunched_run.as_ref(),
+                    &mut resource_status,
+                    &error,
+                    format!("cannot resolve the plan's inventories: {error}"),
+                )
+                .await?;
                 return Err(error);
             }
         };
@@ -555,26 +547,20 @@ async fn reconcile(
     {
         Ok(hash) => hash,
         Err(error) => {
-            let summary = format!("cannot read referenced Secrets: {error}");
-            if let Some(unlaunched) = unlaunched_run.as_ref() {
-                // Same decision as the inventory read above, through the same function: a Secret
-                // that is merely unreadable holds the attempt open, a Secret that is gone supersedes
-                // it. Holding is safe here — the inventory resolved, so this attempt's hosts are
-                // still known-authorized — but it is not free: the hold renews their Leases every
-                // tick, and an indefinite one starves every other plan targeting those hosts.
-                handle_unlaunched_input_error(
-                    &context,
-                    &object,
-                    &api,
-                    unlaunched,
-                    &mut resource_status,
-                    &error,
-                    &summary,
-                )
-                .await?;
-            } else {
-                report_input_failure(&api, &object, &mut resource_status, summary).await;
-            }
+            // A held attempt is holding *host Leases* by this point — the inventory resolved, so
+            // its hosts are still known-authorized and the hold is safe, but it is not free: the
+            // hold renews those Leases every tick, and an indefinite one starves every other plan
+            // targeting the same hosts. That is what `input_error_supersedes_unlaunched` bounds.
+            report_desired_input_error(
+                &context,
+                &object,
+                &api,
+                unlaunched_run.as_ref(),
+                &mut resource_status,
+                &error,
+                format!("cannot read referenced Secrets: {error}"),
+            )
+            .await?;
             return Err(error);
         }
     };
@@ -2369,6 +2355,47 @@ async fn preserve_unlaunched_run_after_error(
     }
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
         warn!("Could not report paused run recovery on {namespace}/{name}: {patch_error}");
+    }
+}
+
+/// Reports a failed desired-input read on the plan, whichever of the two reads it came from and
+/// whether or not an attempt is waiting behind it.
+///
+/// Both reads — the inventories and the referenced Secrets — fail the same way and are answered the
+/// same way, so the choice between the two reporting paths is made once here instead of at each
+/// call site. What differs between them is only the diagnostic, which the caller passes in.
+///
+/// The caller still returns the original error afterwards: this reports, it does not decide the
+/// tick's outcome.
+async fn report_desired_input_error(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    api: &Api<PlaybookPlan>,
+    unlaunched: Option<&UnlaunchedRun>,
+    resource_status: &mut PlaybookPlanStatus,
+    error: &ReconcileError,
+    summary: String,
+) -> Result<(), ReconcileError> {
+    match unlaunched {
+        Some(unlaunched) => {
+            handle_unlaunched_input_error(
+                context,
+                object,
+                api,
+                unlaunched,
+                resource_status,
+                error,
+                &summary,
+            )
+            .await
+        }
+        // Nothing in flight to hold open, but the plan still has to say why it is not running: a
+        // deleted inventory or Secret would otherwise leave the last successful run's summary
+        // standing while every tick fails in the log only.
+        None => {
+            report_input_failure(api, object, resource_status, summary).await;
+            Ok(())
+        }
     }
 }
 
