@@ -6,10 +6,13 @@ use k8s_openapi::{
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
     jiff,
 };
-use kube::{Api, api::PostParams};
+use kube::{
+    Api,
+    api::{DeleteParams, PostParams, Preconditions},
+};
 use tracing::{debug, warn};
 
-use crate::v1beta1::controllers::reconcile_error::{ReconcileError, is_conflict};
+use crate::v1beta1::controllers::reconcile_error::{ReconcileError, is_conflict, is_not_found};
 
 /// How long a Lease is considered valid without being renewed. Deliberately short and renewed
 /// every reconcile tick (not sized to a run's total length) so a crashed operator only leaves a
@@ -356,6 +359,14 @@ fn renewal_outcome(lost: Option<BlockedBy>, unconfirmed: Option<BlockedBy>) -> R
 /// Releases every Lease this run holds for `target_hosts`. Called explicitly when a run
 /// finishes (success or terminal failure) — TTL expiry is the crash safety net only, not the
 /// everyday release path.
+///
+/// Each delete carries the `resourceVersion` of the Lease the holder check was made against, so it
+/// cannot outlive the observation that justified it. Without that, a release that arrives after this
+/// run's own Lease expired can delete a Lease another run has since taken over, leaving that run
+/// executing with no record of its lock and a third free to take the host. The `resourceVersion` is
+/// what does the work here, not the UID: a takeover is a `replace` on the same object, so it keeps
+/// the UID and changes only the holder and the version. The UID is sent as well, for the one shape
+/// the version cannot describe — the Lease being deleted and a new one created under the same name.
 pub async fn release_locks(
     api: &Api<Lease>,
     target_hosts: &[String],
@@ -378,11 +389,19 @@ pub async fn release_locks(
             continue;
         }
 
-        match api.delete(&name, &Default::default()).await {
+        let params = DeleteParams::default().preconditions(Preconditions {
+            resource_version: existing.metadata.resource_version.clone(),
+            uid: existing.metadata.uid.clone(),
+        });
+        match api.delete(&name, &params).await {
             Ok(_) => {}
+            // The Lease moved on between the read and the delete, so the object standing here now is
+            // not the one the holder check passed for. Whoever holds it now is entitled to it.
             Err(err) if is_conflict(&err) => {
-                // Someone else already reclaimed/deleted it — nothing left for us to release.
+                debug!("Lease {name} changed while it was being released; leaving it alone");
             }
+            // Already gone — released by an earlier attempt at this same cleanup, or reclaimed.
+            Err(err) if is_not_found(&err) => {}
             Err(err) => return Err(err.into()),
         }
     }
