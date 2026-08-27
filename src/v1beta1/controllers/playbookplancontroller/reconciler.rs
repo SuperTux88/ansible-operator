@@ -624,7 +624,7 @@ async fn reconcile(
         object.spec.schedule.is_some(),
         !hosts_to_trigger.is_empty(),
     );
-    let eligible_to_start = !object.spec.suspend && has_work_to_start;
+    let eligible_to_start = may_start_new_run(object.spec.suspend, has_work_to_start);
 
     // Whether a recorded attempt's preparation inputs are still the desired ones. While this holds,
     // the plan spec, resolved groups and Job blueprint are re-derivable from live state; once it
@@ -879,14 +879,21 @@ fn slot_already_triggered(
 /// yet, and that decision is made *before* the inventory is resolved
 /// ([`resolve_unlaunched_before_inputs`]) — dropping such an attempt needs no inventory, and
 /// deferring it would leave a suspended plan holding host Leases behind a failing inventory read.
-/// Starting a *new* run is gated on `!suspend && has_work_to_start` at the one call site that does
-/// so; see [`decide_unlaunched_action`] for why the resume path must not fold `suspend` in again.
+/// Starting a *new* run is gated by [`may_start_new_run`] at the one call site that does so; see
+/// [`decide_unlaunched_action`] for why the resume path must not fold `suspend` in again.
 fn has_work_to_start(mode: &ExecutionMode, has_schedule: bool, has_hosts_to_trigger: bool) -> bool {
     has_hosts_to_trigger
         && match mode {
             ExecutionMode::OneShot => true,
             ExecutionMode::Recurring => has_schedule,
         }
+}
+
+/// The start gate: whether this tick may start a *new* run. [`has_work_to_start`] deliberately
+/// leaves `spec.suspend` out (see its doc), so this is the one place that folds it back in —
+/// pinned as its own function so `suspend` losing its veto breaks a test, not a cluster.
+fn may_start_new_run(suspend: bool, has_work_to_start: bool) -> bool {
+    !suspend && has_work_to_start
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1006,6 +1013,32 @@ async fn job_at_recorded_name(
     )
 }
 
+/// How `spec.suspend` disposes of a recovered absent-Job attempt, decided before the desired
+/// inputs are read. Pure so the rule that suspending always drops an unlaunched attempt — and does
+/// so through the right door — stays pinned by unit tests rather than implied by control flow.
+///
+/// Only `Launching` straddles Job creation; the earlier phases cannot have a Job, so for them
+/// `suspend` is the whole decision and the attempt is released outright. A `Launching` attempt may
+/// already have committed its Job, so its fate belongs to [`resume_launching_run`] alone, called
+/// with nothing left to resume for.
+#[derive(Debug, PartialEq, Eq)]
+enum SuspendedUnlaunched {
+    /// The attempt cannot have a Job yet: release its locks and delete its record outright.
+    Abandon,
+    /// The attempt straddles Job creation: only [`resume_launching_run`] may decide its fate.
+    GiveUpThroughResume,
+    /// The plan is not suspended: the gate holds no opinion on the attempt.
+    NotSuspended,
+}
+
+fn decide_suspended_unlaunched(phase: &v1beta1::PlayPhase, suspend: bool) -> SuspendedUnlaunched {
+    match (suspend, phase) {
+        (false, _) => SuspendedUnlaunched::NotSuspended,
+        (true, v1beta1::PlayPhase::Launching) => SuspendedUnlaunched::GiveUpThroughResume,
+        (true, _) => SuspendedUnlaunched::Abandon,
+    }
+}
+
 /// Everything that can be decided about a recovered absent-Job attempt *before* the live desired
 /// inputs are read. Returns `true` when the attempt survives and the remaining gates need those
 /// inputs after all — which is also what makes this the sole owner of the two decisions below, and
@@ -1025,10 +1058,8 @@ async fn resolve_unlaunched_before_inputs(
     unlaunched: &UnlaunchedRun,
     resource_status: &mut PlaybookPlanStatus,
 ) -> Result<bool, ReconcileError> {
-    // Only `Launching` straddles Job creation; the earlier phases cannot have one, so `suspend` is
-    // the whole decision for them.
-    if unlaunched.phase != v1beta1::PlayPhase::Launching {
-        if object.spec.suspend {
+    match decide_suspended_unlaunched(&unlaunched.phase, object.spec.suspend) {
+        SuspendedUnlaunched::Abandon => {
             abandon_unlaunched_run(
                 context,
                 object,
@@ -1041,16 +1072,20 @@ async fn resolve_unlaunched_before_inputs(
             .await?;
             return Ok(false);
         }
-        return Ok(true);
+        SuspendedUnlaunched::GiveUpThroughResume => {
+            // Its outcome and requeue hint are dropped deliberately: whichever way it went, a
+            // suspended plan has nothing to start next, so there is nothing to come back promptly
+            // for.
+            let _outcome =
+                resume_launching_run(context, object, api, &unlaunched.run, None, resource_status)
+                    .await?;
+            return Ok(false);
+        }
+        SuspendedUnlaunched::NotSuspended => {}
     }
 
-    if object.spec.suspend {
-        // Its outcome and requeue hint are dropped deliberately: whichever way it went, a suspended
-        // plan has nothing to start next, so there is nothing to come back promptly for.
-        let _outcome =
-            resume_launching_run(context, object, api, &unlaunched.run, None, resource_status)
-                .await?;
-        return Ok(false);
+    if unlaunched.phase != v1beta1::PlayPhase::Launching {
+        return Ok(true);
     }
 
     // Not suspended: this attempt's own Job is adopted *now* rather than after inventory resolution,
@@ -4561,6 +4596,49 @@ spec:
         assert!(has_work_to_start(&ExecutionMode::Recurring, true, true));
         // ...but still only when there are hosts to trigger.
         assert!(!has_work_to_start(&ExecutionMode::Recurring, true, false));
+    }
+
+    #[test]
+    fn suspend_vetoes_starting_a_new_run_even_with_work_to_do() {
+        assert!(!may_start_new_run(true, true));
+        // The veto is suspend's alone: without it the work gate decides.
+        assert!(may_start_new_run(false, true));
+        assert!(!may_start_new_run(false, false));
+    }
+
+    /// The suspend half of the unlaunched-attempt decision: a suspended plan must never keep an
+    /// unlaunched attempt sitting on its host Leases, and a `Launching` attempt may only be given
+    /// up through `resume_launching_run`, which adopts a Job that made it out before the suspend.
+    #[test]
+    fn a_suspended_plan_drops_every_unlaunched_attempt_through_the_right_door() {
+        use v1beta1::PlayPhase;
+        assert_eq!(
+            decide_suspended_unlaunched(&PlayPhase::Prepared, true),
+            SuspendedUnlaunched::Abandon
+        );
+        assert_eq!(
+            decide_suspended_unlaunched(&PlayPhase::Starting, true),
+            SuspendedUnlaunched::Abandon
+        );
+        assert_eq!(
+            decide_suspended_unlaunched(&PlayPhase::Launching, true),
+            SuspendedUnlaunched::GiveUpThroughResume
+        );
+    }
+
+    #[test]
+    fn an_unsuspended_plan_passes_the_suspend_gate_in_every_phase() {
+        use v1beta1::PlayPhase;
+        for phase in [
+            PlayPhase::Prepared,
+            PlayPhase::Starting,
+            PlayPhase::Launching,
+        ] {
+            assert_eq!(
+                decide_suspended_unlaunched(&phase, false),
+                SuspendedUnlaunched::NotSuspended
+            );
+        }
     }
 
     /// The one rule shared by every "may this attempt still go on?" site: the attempt's *own* Job is
