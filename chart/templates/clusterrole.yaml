@@ -9,10 +9,12 @@ metadata:
 # rolebinding.yaml and .Values.watchNamespaces). This bounds operator compromise to the enrolled
 # namespaces instead of the whole cluster (THREAT_MODEL R1 / T-INFO-1).
 rules:
-  # PlaybookPlan/ClusterInventory/StaticInventory are user-created and only ever read + watched by
-  # the operator — it never creates/deletes them itself. Read cluster-wide so plans in ANY namespace
-  # are discovered; a plan in a non-enrolled namespace is reported as UnauthorizedNamespace rather
-  # than silently ignored.
+  # PlaybookPlan/ClusterInventory/StaticInventory are user-created and never created or deleted by
+  # the operator. Read cluster-wide so plans in ANY namespace are discovered; a plan in a
+  # non-enrolled namespace is reported as UnauthorizedNamespace rather than silently ignored. Write
+  # access stays out of here on purpose: the run-cleanup finalizer needs `patch` on playbookplans,
+  # and that is granted per enrolled namespace by the Role (see role.yaml) so the operator can only
+  # write plan objects in namespaces it is already trusted to run them in.
   - apiGroups: ["ansible.cloudbending.dev"]
     resources: ["playbookplans", "clusterinventories", "staticinventories"]
     verbs: ["get", "list", "watch"]

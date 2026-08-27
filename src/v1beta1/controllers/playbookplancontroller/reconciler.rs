@@ -9,7 +9,7 @@ use k8s_openapi::api::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::{
     Api,
-    api::{ListParams, Patch, PatchParams, PostParams},
+    api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
     runtime::{
         Controller,
         controller::Action,
@@ -229,7 +229,7 @@ async fn reconcile(
     context: Arc<ReconciliationContext>,
 ) -> Result<Action, ReconcileError> {
     if object.metadata.deletion_timestamp.is_some() {
-        return Ok(Action::await_change());
+        return release_deleted_plan(&context, &object).await;
     }
 
     let (namespace, name) = namespace_and_name(&object)?;
@@ -309,6 +309,16 @@ async fn reconcile(
     // and the schedule window that attempt holds is what the plan records.
     let mut surviving_attempt: Option<Box<SurvivingAttempt>> = None;
     let mut finalized_run = false;
+    // Whether this tick found the plan holding a run at all. Recovery is the only complete answer:
+    // a record whose result has not been drained, or one being given up, owns resources while the
+    // status mirror may already have moved on — so the finalizer is kept until a tick finds neither.
+    let recovered_a_run = recovered.is_some();
+    if recovered_a_run {
+        // Re-asserted rather than assumed: a plan that lost the finalizer — stripped by hand, or
+        // adopted from a release that predates it — would otherwise keep the run it is holding
+        // outside the contract for as long as that run lasts.
+        ensure_run_cleanup_finalizer(&api, &object).await?;
+    }
     if let Some(recovered) = recovered {
         match recovered {
             RecoveredRun::Active(run) => {
@@ -862,6 +872,14 @@ async fn reconcile(
         requeue_after = prune_retry_after(requeue_after);
     }
 
+    // Given back the moment the plan holds nothing outside its own namespace, so deleting an idle
+    // plan never waits on this operator. Deliberately conservative about *when* that is: a tick that
+    // recovered anything keeps it, even if the run finished on this very tick, because the release
+    // it just performed is the last thing that needed the finalizer and one extra tick costs nothing.
+    if !recovered_a_run && resource_status.active_run.is_none() {
+        drop_run_cleanup_finalizer(&api, &object).await?;
+    }
+
     patch_status(&api, &object, resource_status).await?;
     Ok(Action::requeue(requeue_after))
 }
@@ -1254,6 +1272,11 @@ async fn try_start_run(
     prepared: Option<&UnlaunchedRun>,
 ) -> Result<Option<std::time::Duration>, ReconcileError> {
     let leases_api = Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
+
+    // Before the record, the locks and the proxy pods: from here on the plan owns resources its own
+    // deletion cannot reach, and the finalizer is the only thing that will release them.
+    let plan_api = Api::<PlaybookPlan>::namespaced(context.client.clone(), run.namespace);
+    ensure_run_cleanup_finalizer(&plan_api, object).await?;
 
     let run_groups = run.run_groups;
     let active_run = match prepared {
@@ -2394,6 +2417,321 @@ async fn release_run_infrastructure(
         &holder_identity(namespace, name, run),
     )
     .await
+}
+
+/// Keeps a deleted plan around until the resources its run holds outside the plan's namespace are
+/// gone.
+///
+/// Everything a run creates in the plan's *own* namespace carries an `OwnerReference` to the plan
+/// and is reaped by Kubernetes when the plan goes. Its proxy pods, their NetworkPolicy and Secret,
+/// and its host Leases live in the operator's namespace, where an owner reference is not allowed to
+/// reach — so nothing but this operator can ever release them. Without the finalizer a deleted plan
+/// leaves a node-root proxy pod running and a host Lease held by an identity that will never renew
+/// or release it, locking that host against every other plan until it expires.
+///
+/// Held only while a run actually owns such resources, never on an idle plan: a finalizer that is
+/// always present makes a plan undeletable for as long as the operator is down, and there is nothing
+/// to clean up between runs.
+pub const RUN_CLEANUP_FINALIZER: &str = "ansible.cloudbending.dev/run-cleanup";
+
+/// Tears down a deleted plan's run and then lets the object go.
+///
+/// The plan's spec and status survive for as long as the finalizer does, so `status.activeRun` — the
+/// same mirror `finalize_lost_run` recovers a run by — is still readable here. That is the primary
+/// handle: the `Play` records are owned by the plan and may already be halfway through their own
+/// cascade by the time this runs.
+///
+/// The run's Job is cancelled and *awaited* before anything is released, because releasing a host
+/// Lease while Ansible may still be talking to that host is the one outcome the whole locking design
+/// exists to prevent. The wait is unbounded and renews the run's Leases while it lasts: a plan that
+/// will not finish deleting is visible and fixable, whereas a host handed to another plan while a
+/// playbook is still running against it is neither.
+async fn release_deleted_plan(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+) -> Result<Action, ReconcileError> {
+    if !holds_run_cleanup_finalizer(object) {
+        return Ok(Action::await_change());
+    }
+    let (namespace, name) = namespace_and_name(object)?;
+    let api = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace);
+
+    let runs = runs_to_release(context, object).await?;
+    let mut executing = false;
+    for run in &runs {
+        executing |= cancel_run_job(context, object, run).await?;
+    }
+    if executing {
+        return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+    }
+
+    for run in &runs {
+        release_run_infrastructure(context, object, run).await?;
+        info!(
+            "PlaybookPlan {namespace}/{name} was deleted; released run {}",
+            run.mirror.job_name
+        );
+    }
+
+    patch_finalizers(
+        &api,
+        object,
+        without_run_cleanup_finalizer(&object.metadata.finalizers),
+    )
+    .await?;
+    Ok(Action::await_change())
+}
+
+/// Every run of a deleted plan that may still hold resources, newest handle first.
+///
+/// The status mirror leads because it is the one source that survives the plan's own cascade. The
+/// records are consulted as well — and only as a best effort — for the window in which an attempt
+/// exists without having reached the plan's status yet; failing the whole teardown because they
+/// could not be listed would stop the mirror-driven half from running at all.
+async fn runs_to_release(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+) -> Result<Vec<RecordedRun>, ReconcileError> {
+    let (namespace, plan_name) = namespace_and_name(object)?;
+    let mut runs = Vec::new();
+
+    if let Some(mirror) = object
+        .status
+        .as_ref()
+        .and_then(|status| status.active_run.clone())
+    {
+        match RecordedRun::from_mirror(mirror) {
+            Ok(run) => runs.push(run),
+            // Nothing can be released for a run whose identity does not parse, and failing here
+            // would keep the plan undeletable over a status field no tick will ever repair.
+            Err(error) => warn!(
+                "PlaybookPlan {namespace}/{plan_name} was deleted with an unusable activeRun ({error}); its run cannot be released automatically"
+            ),
+        }
+    }
+
+    let plays_api = Api::<Play>::namespaced(context.client.clone(), namespace);
+    match plays_api
+        .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
+        .await
+    {
+        Ok(plays) => {
+            for play in recoverable_plays_for_plan(&plays.items, object) {
+                match recorded_run_from_play(play) {
+                    Ok(run) => runs.push(run),
+                    Err(error) => warn!(
+                        "PlaybookPlan {namespace}/{plan_name} was deleted with an unusable record {:?} ({error})",
+                        play.metadata.name
+                    ),
+                }
+            }
+        }
+        Err(error) => warn!(
+            "PlaybookPlan {namespace}/{plan_name} was deleted but its records could not be listed ({error}); releasing what its status names"
+        ),
+    }
+
+    Ok(dedupe_runs(runs))
+}
+
+/// The distinct runs among `runs`, in first-seen order. The status mirror and the record it was
+/// built from describe the same run, and releasing it twice would spend a second round of deletes
+/// and Lease calls on resources the first pass already removed.
+fn dedupe_runs(runs: Vec<RecordedRun>) -> Vec<RecordedRun> {
+    let mut seen = std::collections::HashSet::new();
+    runs.into_iter()
+        .filter(|run| seen.insert(run.mirror.run_id.clone()))
+        .collect()
+}
+
+/// Cancels a deleted plan's Job and reports whether Ansible may still be executing on its hosts.
+///
+/// Deleting the plan already makes Kubernetes reap the Job, but the propagation policy that reaps it
+/// is the deleting client's choice — an orphaning delete would leave the pod running with nothing
+/// pointing at it — so the Job is deleted here explicitly, with background propagation, rather than
+/// assumed gone. Only this run's own Job is touched: a foreign Job at the recorded name belongs to
+/// something this plan never created.
+///
+/// The answer is read off the pods rather than the Job, because a Job object disappears the moment
+/// its own cascade starts while its pod is still terminating — and it is the pod that holds the SSH
+/// session. The run's Leases are renewed for as long as one is up, since the deletion path is the
+/// one place that would otherwise stop renewing them while a playbook is still running.
+async fn cancel_run_job(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    run: &RecordedRun,
+) -> Result<bool, ReconcileError> {
+    let (namespace, name) = namespace_and_name(object)?;
+    let jobs_api = Api::<Job>::namespaced(context.client.clone(), namespace);
+    let pods_api = Api::<Pod>::namespaced(context.client.clone(), namespace);
+
+    if let Some(job) = jobs_api.get_opt(&run.mirror.job_name).await?
+        && job.metadata.deletion_timestamp.is_none()
+        && validate_selected_job(
+            &job,
+            object,
+            run.execution_hash,
+            run.mirror.attempt,
+            &run.mirror.run_id,
+            &run.mirror.play_uid,
+        )
+        .is_ok()
+    {
+        info!(
+            "PlaybookPlan {namespace}/{name} was deleted; cancelling its Job {}",
+            run.mirror.job_name
+        );
+        match jobs_api
+            .delete(&run.mirror.job_name, &DeleteParams::background())
+            .await
+        {
+            Ok(_) => {}
+            Err(error) if is_not_found(&error) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let pods = pods_api
+        .list(&ListParams::default().labels(&run_pod_selector(&run.mirror.run_id)))
+        .await?;
+    let executing = pods.items.iter().any(pod_may_be_executing);
+    if executing {
+        let leases_api =
+            Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
+        if let Err(error) = locking::renew_locks(
+            &leases_api,
+            &run.mirror.hosts,
+            &holder_identity(namespace, name, run),
+        )
+        .await
+        {
+            warn!(
+                "Could not renew the host locks of deleted plan {namespace}/{name}'s run {}: {error}",
+                run.mirror.job_name
+            );
+        }
+        debug!(
+            "PlaybookPlan {namespace}/{name} is waiting for run {} to stop before releasing its hosts",
+            run.mirror.job_name
+        );
+    }
+    Ok(executing)
+}
+
+/// Selects an attempt's *playbook* pods — the Job's — and not the proxy pods it shares its run ID
+/// with, which carry the managed-ssh component instead and are released with the rest of the
+/// infrastructure.
+fn run_pod_selector(run_id: &str) -> String {
+    format!(
+        "{}={run_id},{}={}",
+        labels::RUN_ID,
+        labels::COMPONENT,
+        labels::PLAYBOOK_COMPONENT
+    )
+}
+
+/// Whether a pod may still be running the playbook. A pod that has reached a terminal phase has
+/// stopped talking to its hosts even if its object survives the Job's cascade for a while, so
+/// waiting on it would hold the plan open for nothing.
+fn pod_may_be_executing(pod: &Pod) -> bool {
+    matches!(
+        pod.status
+            .as_ref()
+            .and_then(|status| status.phase.as_deref()),
+        Some("Pending" | "Running") | None
+    )
+}
+
+fn holds_run_cleanup_finalizer(object: &PlaybookPlan) -> bool {
+    object
+        .metadata
+        .finalizers
+        .iter()
+        .flatten()
+        .any(|finalizer| finalizer == RUN_CLEANUP_FINALIZER)
+}
+
+/// The two edits to a plan's finalizer list, kept pure and total so neither can drop an entry this
+/// operator does not own — `foregroundDeletion` and anything a user or another controller added sit
+/// in the same list, and the patch that writes it replaces the whole array.
+fn with_run_cleanup_finalizer(current: &Option<Vec<String>>) -> Vec<String> {
+    let mut finalizers: Vec<String> = current.clone().unwrap_or_default();
+    if !finalizers.iter().any(|f| f == RUN_CLEANUP_FINALIZER) {
+        finalizers.push(RUN_CLEANUP_FINALIZER.to_string());
+    }
+    finalizers
+}
+
+fn without_run_cleanup_finalizer(current: &Option<Vec<String>>) -> Vec<String> {
+    current
+        .iter()
+        .flatten()
+        .filter(|finalizer| *finalizer != RUN_CLEANUP_FINALIZER)
+        .cloned()
+        .collect()
+}
+
+/// Claims the cleanup finalizer before a run creates anything outside the plan's namespace.
+///
+/// Kubernetes refuses to add a finalizer to an object whose deletion has already started, so a plan
+/// deleted in the same instant fails *here* — before the proxy pods and Leases exist — rather than
+/// after, with nothing left to release them. That is why every path that creates run infrastructure
+/// goes through this first, and why the error is not swallowed.
+async fn ensure_run_cleanup_finalizer(
+    api: &Api<PlaybookPlan>,
+    object: &PlaybookPlan,
+) -> Result<(), ReconcileError> {
+    if holds_run_cleanup_finalizer(object) {
+        return Ok(());
+    }
+    patch_finalizers(
+        api,
+        object,
+        with_run_cleanup_finalizer(&object.metadata.finalizers),
+    )
+    .await
+}
+
+/// Gives the finalizer back once the plan holds no run, so an idle plan deletes immediately.
+async fn drop_run_cleanup_finalizer(
+    api: &Api<PlaybookPlan>,
+    object: &PlaybookPlan,
+) -> Result<(), ReconcileError> {
+    if !holds_run_cleanup_finalizer(object) {
+        return Ok(());
+    }
+    patch_finalizers(
+        api,
+        object,
+        without_run_cleanup_finalizer(&object.metadata.finalizers),
+    )
+    .await
+}
+
+/// Writes a finalizer list, version-checked — unlike [`patch_status`], which deliberately is not.
+///
+/// A merge patch replaces the whole array, so a blind write would drop an entry added since this
+/// object was read. Carrying the `resourceVersion` turns that race into a 409 the tick retries,
+/// which is safe here because the list is only touched on the two transitions rather than every
+/// tick.
+async fn patch_finalizers(
+    api: &Api<PlaybookPlan>,
+    object: &PlaybookPlan,
+    finalizers: Vec<String>,
+) -> Result<(), ReconcileError> {
+    let (_, name) = namespace_and_name(object)?;
+    api.patch(
+        name,
+        &PatchParams::default(),
+        &Patch::Merge(serde_json::json!({
+            "metadata": {
+                "resourceVersion": object.metadata.resource_version,
+                "finalizers": finalizers,
+            }
+        })),
+    )
+    .await?;
+    Ok(())
 }
 
 /// The Lease holder identity for a run. Derived from the run ID rather than the execution hash, so
@@ -4470,6 +4808,113 @@ mod tests {
             status.active_run.as_ref().map(|run| run.play_uid.as_str()),
             Some("other-play-uid")
         );
+    }
+
+    /// The finalizer edits must be surgical: the list they rewrite also holds Kubernetes' own
+    /// `foregroundDeletion` entry and anything another controller put there, and the merge patch
+    /// that writes it replaces the array wholesale — so dropping a stranger's entry here would
+    /// release an object somebody else is still holding.
+    #[test]
+    fn finalizer_edits_touch_only_this_operators_entry() {
+        let plan = |finalizers: Option<Vec<String>>| {
+            let mut plan = PlaybookPlan::new("web", Default::default());
+            plan.metadata.finalizers = finalizers;
+            plan
+        };
+        let foreign = "foregroundDeletion".to_string();
+        let ours = RUN_CLEANUP_FINALIZER.to_string();
+
+        assert!(!holds_run_cleanup_finalizer(&plan(None)));
+        assert!(!holds_run_cleanup_finalizer(&plan(Some(vec![
+            foreign.clone()
+        ]))));
+        assert!(holds_run_cleanup_finalizer(&plan(Some(vec![ours.clone()]))));
+
+        assert_eq!(with_run_cleanup_finalizer(&None), vec![ours.clone()]);
+        assert_eq!(
+            with_run_cleanup_finalizer(&Some(vec![foreign.clone()])),
+            vec![foreign.clone(), ours.clone()],
+            "a stranger's finalizer survives the claim"
+        );
+        assert_eq!(
+            with_run_cleanup_finalizer(&Some(vec![ours.clone()])),
+            vec![ours.clone()],
+            "claiming twice must not stack up entries"
+        );
+
+        assert_eq!(
+            without_run_cleanup_finalizer(&Some(vec![foreign.clone(), ours.clone()])),
+            vec![foreign.clone()],
+            "a stranger's finalizer survives the release"
+        );
+        assert!(without_run_cleanup_finalizer(&Some(vec![ours])).is_empty());
+        assert!(without_run_cleanup_finalizer(&None).is_empty());
+    }
+
+    /// The teardown a deleted plan performs is driven by two sources that overlap: the status mirror
+    /// and the record it was built from name the same run. Releasing it twice is not harmful, but it
+    /// spends a second round of deletes and Lease calls on resources the first pass already removed.
+    #[test]
+    fn a_deleted_plan_releases_each_run_once() {
+        let run = |run_id: &str, job: &str| RecordedRun {
+            execution_hash: ExecutionHash::from_hex("1").unwrap(),
+            mirror: ActiveRun {
+                execution_hash: "1".into(),
+                run_id: run_id.into(),
+                job_name: job.into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                attempt: 1,
+                triggered_slot: None,
+            },
+        };
+
+        let released = dedupe_runs(vec![
+            run("run-a", "apply-web-abc-1"),
+            run("run-a", "apply-web-abc-1"),
+            run("run-b", "apply-web-abc-2"),
+        ]);
+
+        assert_eq!(
+            released
+                .iter()
+                .map(|run| run.mirror.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run-a", "run-b"],
+            "the mirror is seen first, and every distinct run is still released"
+        );
+    }
+
+    /// What the deletion path waits on before it releases a host: the playbook pod, not the proxy
+    /// pods that share its run ID, and not a pod that has already stopped talking to its hosts.
+    #[test]
+    fn only_a_live_playbook_pod_holds_a_deleted_plans_hosts() {
+        let selector = run_pod_selector("run-a");
+        assert!(selector.contains("ansible.cloudbending.dev/run-id=run-a"));
+        assert!(
+            selector.contains(&format!(
+                "{}={}",
+                labels::COMPONENT,
+                labels::PLAYBOOK_COMPONENT
+            )),
+            "the proxy pods share the run ID and must not be waited on: {selector}"
+        );
+
+        let pod = |phase: Option<&str>| Pod {
+            status: Some(k8s_openapi::api::core::v1::PodStatus {
+                phase: phase.map(String::from),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(pod_may_be_executing(&pod(Some("Running"))));
+        assert!(pod_may_be_executing(&pod(Some("Pending"))));
+        assert!(
+            pod_may_be_executing(&pod(None)),
+            "a pod whose phase has not been reported yet may still start"
+        );
+        assert!(!pod_may_be_executing(&pod(Some("Succeeded"))));
+        assert!(!pod_may_be_executing(&pod(Some("Failed"))));
     }
 
     #[test]
