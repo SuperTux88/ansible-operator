@@ -71,8 +71,9 @@ the operator (via a `checksum/config` annotation) rather than hot-reloading.
 
 When a `ClusterInventory` targets a `NotReady` Node, the operator still schedules its proxy pod and
 waits for the pod to become Ready. If it does not become Ready in time, the run proceeds without that
-Node — Ansible reports it unreachable, and it is retried on the next run. The wait applies only to a
-pod that has not yet started; a pod that has reached `Running` is waited on until Ready as usual.
+Node — Ansible reports it unreachable, and it is retried on the next run. The same bound applies to
+an old-credential pod still terminating after a reset; it is never reused. A pod that has reached
+`Running` normally is waited on until Ready as usual.
 
 The wait scales with how long the Node has been silent (its last `Ready` heartbeat): a Node that only
 just went `NotReady` is given the full wait, one silent for longer is given up on sooner. Tune it via

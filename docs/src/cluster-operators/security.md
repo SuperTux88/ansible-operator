@@ -42,7 +42,9 @@ Cross-run isolation is enforced at the **certificate** layer, not merely by netw
 
 - The operator runs its **own SSH certificate authority**, generated **in memory at startup**. The CA
   private key is never written to a Secret, never persisted to etcd, never logged. **Restarting the
-  operator rotates the CA** and invalidates every outstanding certificate.
+  operator rotates the CA**. An attempt still has mutually valid old-CA client and proxy certificates
+  until its infrastructure is reset or cleaned up; new infrastructure is always minted from the new
+  CA.
 - Each attempt gets fresh, short-lived host and client certificates. Each proxy pod's
   authorized-principals list contains **only its own per-attempt run ID** — never `root`, never a
   wildcard — so even retries of the same execution hash authenticate only to their own proxies.

@@ -116,25 +116,103 @@ pub enum ProxyReadiness {
         ready: Vec<ProxyPodInfo>,
         unreachable: Vec<String>,
     },
-    /// At least one proxy pod is still `Running`-not-yet-Ready or within its pre-`Running` grace
-    /// window; `waiting` names them so the caller can report them on the plan.
+    /// At least one proxy pod is still `Running`-not-yet-Ready or within its startup/termination
+    /// grace window; `waiting` names them so the caller can report them on the plan.
     Pending { waiting: Vec<String> },
 }
 
+/// Discards the half-built proxy infrastructure of a run that is being resumed after the CA rotated,
+/// so `ensure_proxy_infra` rebuilds it against the current CA instead of adopting credentials nobody
+/// can authenticate against any more. The CA is in-memory (INV-6), so every operator restart rotates
+/// it — which is exactly when a run gets resumed.
+///
+/// Scoped entirely to this attempt: every name derives from `run_id`, so it can never touch another
+/// run's resources.
+///
+/// **Two things here are load-bearing and must not be "tidied":**
+///
+/// 1. *The client-cert Secret is the gate, and is deleted last.* Its presence-and-staleness is the
+///    only signal that a reset is owed, so it has to outlive every delete that can fail. An
+///    interrupted reset therefore leaves the gate open and the next tick re-enters and finishes the
+///    job. Deleting it first (or folding it into the loop) would make an interrupted reset look
+///    complete, leaving stale per-host Secrets that `ensure_proxy_infra` happily adopts — the run
+///    then wedges with old-CA host certificates and a new-CA client certificate.
+/// 2. *Returning early when the Secret already trusts the current CA.* That is what makes this
+///    idempotent and free on the overwhelmingly common path (a resume within one operator lifetime).
+///
+/// Deleting a pod only *starts* its termination; see `proxy_pod_readiness`, which refuses to adopt a
+/// pod still carrying a deletion timestamp, so the rebuild waits for the old pod to actually go away.
+pub async fn reset_incomplete_run(
+    client: &kube::Client,
+    operator_namespace: &str,
+    job_namespace: &str,
+    run_id: &str,
+    hosts: &[String],
+    ca: &CertificateAuthority,
+) -> Result<(), ReconcileError> {
+    let job_secrets_api = Api::<Secret>::namespaced(client.clone(), job_namespace);
+    let client_secret_name = client_cert_secret_name(run_id);
+    let Some(client_secret) = job_secrets_api.get_opt(&client_secret_name).await? else {
+        return Ok(());
+    };
+    let current_ca = ca.public_key_openssh()?;
+    let trusts_current_ca = client_secret
+        .data
+        .as_ref()
+        .and_then(|data| data.get(paths::MANAGED_SSH_KNOWN_HOSTS_FILENAME))
+        .and_then(|value| std::str::from_utf8(&value.0).ok())
+        .is_some_and(|known_hosts| known_hosts.contains(&current_ca));
+    if trusts_current_ca {
+        return Ok(());
+    }
+
+    let pods_api = Api::<Pod>::namespaced(client.clone(), operator_namespace);
+    let secrets_api = Api::<Secret>::namespaced(client.clone(), operator_namespace);
+    for host in hosts {
+        let name = resource_name(host, run_id);
+        delete_if_exists(&pods_api, &name, &DeleteParams::default()).await?;
+        delete_if_exists(&secrets_api, &name, &DeleteParams::default()).await?;
+    }
+    // Last, deliberately: this Secret is the gate that brought us here, so it must outlive every
+    // delete above for an interrupted reset to be retried rather than looking finished. See the
+    // doc comment.
+    delete_if_exists(
+        &job_secrets_api,
+        &client_secret_name,
+        &DeleteParams::default(),
+    )
+    .await
+}
+
 /// A proxy pod's k8s state as far as the readiness gate cares: Ready (with its pod IP), still
-/// `Running` (waited on indefinitely), or stuck before `Running` (subject to the grace window).
+/// `Running` (waited on indefinitely), stuck before `Running` (subject to the grace window), or
+/// `Terminating` (a deleted pod that has not disappeared yet, also subject to the grace window).
 #[derive(Debug, PartialEq)]
 enum PodReadyState {
     ReadyWithIp(String),
     Running,
     PreRunning,
+    Terminating,
 }
 
-/// Pure classification of a proxy pod. Ready-condition `True` + a pod IP ⇒ `ReadyWithIp`; else a pod
-/// that has reached `Running` ⇒ `Running` (sshd still coming up — waited on with no timeout, as
-/// before); anything earlier (`Pending`/`Unknown`/absent phase) ⇒ `PreRunning`, the only state the
-/// grace window applies to.
+/// Pure classification of a proxy pod. A pod carrying a `deletionTimestamp` ⇒ `Terminating`, checked
+/// *first* and deliberately ahead of the Ready condition: pod deletion is graceful and asynchronous,
+/// so a doomed pod keeps `phase: Running`, `Ready=True` and a live pod IP for its whole termination
+/// grace period. `reset_incomplete_run` deletes this run's pods and immediately re-enters
+/// `ensure_proxy_infra` in the same tick, so without this check the run would adopt a corpse still
+/// serving the *previous* CA's host certificate — and, because it looks Ready, sail straight through
+/// the readiness gate and launch the Job against it (every session then failing
+/// `Permission denied (publickey)`). Treating it as not-yet-ready instead makes the tick wait until
+/// the object is really gone, at which point the pod is recreated against the current CA.
+///
+/// Otherwise: Ready-condition `True` + a pod IP ⇒ `ReadyWithIp`; else a pod that has reached
+/// `Running` ⇒ `Running` (sshd still coming up — waited on with no timeout, as before); anything
+/// earlier (`Pending`/`Unknown`/absent phase) ⇒ `PreRunning`.
 fn proxy_pod_readiness(pod: &Pod) -> PodReadyState {
+    if pod.metadata.deletion_timestamp.is_some() {
+        return PodReadyState::Terminating;
+    }
+
     let status = pod.status.as_ref();
     let ready = status
         .and_then(|s| s.conditions.as_ref())
@@ -171,10 +249,10 @@ fn node_ready_heartbeat_age_secs(node: &Node, now_epoch_secs: i64) -> Option<i64
     Some(now_epoch_secs - last.0.as_second())
 }
 
-/// The effective grace for a pre-`Running` pod: `grace_seconds / aggressiveness^k` for the first tier
-/// `k` whose boundary the heartbeat age falls within, `0` past the last boundary. An unknown age ⇒
-/// full grace (never shorten on missing data). A healthy node's heartbeat is always recent, so it
-/// always lands in tier 0.
+/// The effective grace for a pre-`Running` or terminating pod: `grace_seconds / aggressiveness^k`
+/// for the first tier `k` whose boundary the heartbeat age falls within, `0` past the last boundary.
+/// An unknown age means full grace (never shorten on missing data). A healthy node's heartbeat is
+/// always recent, so it always lands in tier 0.
 fn effective_grace_secs(heartbeat_age_secs: Option<i64>, policy: &ProxyGracePolicy) -> i64 {
     let Some(age) = heartbeat_age_secs else {
         return policy.grace_seconds;
@@ -186,6 +264,15 @@ fn effective_grace_secs(heartbeat_age_secs: Option<i64>, policy: &ProxyGracePoli
         }
     }
     0
+}
+
+fn proxy_wait_age_secs(pod: &Pod, state: &PodReadyState, now_epoch_secs: i64) -> Option<i64> {
+    let started = match state {
+        PodReadyState::Terminating => pod.metadata.deletion_timestamp.as_ref(),
+        PodReadyState::PreRunning => pod.metadata.creation_timestamp.as_ref(),
+        PodReadyState::ReadyWithIp(_) | PodReadyState::Running => None,
+    }?;
+    Some(now_epoch_secs - started.0.as_second())
 }
 
 /// Node taints Kubernetes auto-applies to a `NotReady` node tolerated by every proxy pod, merged with
@@ -729,20 +816,17 @@ pub async fn ensure_proxy_infra(
             }),
             // Reached Running — sshd is coming up; wait indefinitely, exactly as before (no timeout).
             PodReadyState::Running => waiting.push(host.clone()),
-            // Stuck before Running: give it a heartbeat-scaled grace window, then give up. Fetch the
-            // Node only here, so healthy runs incur no extra reads once pods are Running.
-            PodReadyState::PreRunning => {
+            // A pod stuck before Running or terminating after a reset gets the same
+            // heartbeat-scaled deadline. Until then a terminating pod is never adopted; after the
+            // deadline the host is rendered unreachable so a dead kubelet cannot wedge this run and
+            // its Leases forever.
+            state @ (PodReadyState::PreRunning | PodReadyState::Terminating) => {
                 let heartbeat_age = match nodes_api.get_opt(host).await? {
                     Some(node) => node_ready_heartbeat_age_secs(&node, now),
                     None => None,
                 };
                 let grace = effective_grace_secs(heartbeat_age, grace_policy);
-                let pod_age = pod
-                    .metadata
-                    .creation_timestamp
-                    .as_ref()
-                    .map(|t| now - t.0.as_second());
-                match pod_age {
+                match proxy_wait_age_secs(&pod, &state, now) {
                     Some(age) if age >= grace => unreachable.push(host.clone()),
                     _ => waiting.push(host.clone()),
                 }
@@ -764,14 +848,21 @@ pub async fn ensure_proxy_infra(
 /// drifted since the run started. (The CA is in-memory only, not a Secret, so nothing CA-related is
 /// in scope here.) The operator-ns resources can't use ownerReferences, since Kubernetes GC ignores
 /// references that cross namespaces (they live in the operator namespace, the Job/PlaybookPlan in the
-/// plan namespace). Best-effort: delete errors are ignored, the next run's cleanup retries.
+/// plan namespace).
+///
+/// **Not** best-effort: every delete is propagated, and the caller must not treat a run as released
+/// until this returns `Ok`. These are node-root pods and the credentials that reach them, so a
+/// partial sweep has to be retried rather than forgotten — the run's `Play` deliberately outlives
+/// cleanup so the next reconcile can re-enter here, and every delete is idempotent. The deletes run
+/// in sequence and short-circuit on the first error, so a stuck cleanup should be diagnosed from the
+/// *first* failing resource, not the last.
 ///
 /// The client-cert Secret is deleted **by name**, not by the hash label: it lives in the plan
 /// namespace where the ansible Job and its pod carry that same `PLAYBOOKPLAN_HASH` label, so a
 /// label-scoped `delete_collection` there would also sweep them. Its ownerReference on the
 /// PlaybookPlan is the backstop if this explicit delete never runs (operator crash / plan deleted
-/// mid-run). Deleting it is not the revocation mechanism — that is the deletion of the proxy pods
-/// below, after which the cert authenticates to nothing (INV-4 / T-INFO-3).
+/// mid-run). Deleting it is not the revocation mechanism — that is the deletion of the proxy pods,
+/// which happens first and after which the cert authenticates to nothing (INV-4 / T-INFO-3).
 ///
 /// Pods use a tighter selector than the operator-ns Secrets/NetworkPolicy: the ansible Job pod
 /// carries the same `PLAYBOOKPLAN_HASH` and `RUN_ID` labels but is NOT proxy infra — it must be
@@ -805,21 +896,34 @@ pub async fn cleanup_proxy_infra(
     // Hash + run ID selector: no other attempt shares this cleanup identity.
     let rest_lp = ListParams::default().labels(&run_selector);
 
-    let _ = pods_api.delete_collection(&dp, &pods_lp).await;
-    let _ = secrets_api.delete_collection(&dp, &rest_lp).await;
-    let _ = netpol_api.delete_collection(&dp, &rest_lp).await;
-    let _ = job_netpol_api
-        .delete(
-            &super::job_builder::job_network_policy_name(playbookplan_name, run_id),
-            &dp,
-        )
-        .await;
+    pods_api.delete_collection(&dp, &pods_lp).await?;
+    secrets_api.delete_collection(&dp, &rest_lp).await?;
+    netpol_api.delete_collection(&dp, &rest_lp).await?;
+    delete_if_exists(
+        &job_netpol_api,
+        &super::job_builder::job_network_policy_name(playbookplan_name, run_id),
+        &dp,
+    )
+    .await?;
     // Plan-namespace client-cert Secret: by name, never by label (would catch the Job/pod). See doc.
-    let _ = job_secrets_api
-        .delete(&client_cert_secret_name(run_id), &dp)
-        .await;
+    delete_if_exists(&job_secrets_api, &client_cert_secret_name(run_id), &dp).await?;
 
     Ok(())
+}
+
+async fn delete_if_exists<K>(
+    api: &Api<K>,
+    name: &str,
+    params: &DeleteParams,
+) -> Result<(), ReconcileError>
+where
+    K: kube::Resource<DynamicType = ()> + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+{
+    match api.delete(name, params).await {
+        Ok(_) => Ok(()),
+        Err(error) if is_not_found(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(test)]
@@ -1154,6 +1258,42 @@ mod tests {
         assert_eq!(
             proxy_pod_readiness(&pod_with(None, false, None, Some(0))),
             PodReadyState::PreRunning
+        );
+    }
+
+    /// A pod deleted by `reset_incomplete_run` keeps `Running`/`Ready=True`/a pod IP for its whole
+    /// termination grace period. Adopting it would hand the run a proxy still serving the previous
+    /// CA's host certificate — and, because it looks Ready, would let the Job launch against it.
+    #[test]
+    fn a_terminating_proxy_pod_is_never_adopted_even_while_it_still_looks_ready() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        use k8s_openapi::jiff::Timestamp;
+
+        let mut pod = pod_with(Some("Running"), true, Some("10.0.0.5"), Some(0));
+        pod.metadata.deletion_timestamp = Some(Time(Timestamp::from_second(0).unwrap()));
+
+        assert_eq!(proxy_pod_readiness(&pod), PodReadyState::Terminating);
+    }
+
+    #[test]
+    fn terminating_pod_wait_age_starts_at_deletion_not_creation() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        use k8s_openapi::jiff::Timestamp;
+
+        let mut pod = pod_with(Some("Running"), true, Some("10.0.0.5"), Some(100));
+        pod.metadata.deletion_timestamp = Some(Time(Timestamp::from_second(900).unwrap()));
+
+        assert_eq!(
+            proxy_wait_age_secs(&pod, &PodReadyState::Terminating, 1_000),
+            Some(100)
+        );
+        assert_eq!(
+            proxy_wait_age_secs(&pod, &PodReadyState::PreRunning, 1_000),
+            Some(900)
+        );
+        assert_eq!(
+            proxy_wait_age_secs(&pod, &PodReadyState::Running, 1_000),
+            None
         );
     }
 

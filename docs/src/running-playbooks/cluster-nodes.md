@@ -113,6 +113,10 @@ Ansible reports it **unreachable** for the run, and the Node is retried on the n
 its own once it recovers. The wait window is set by the cluster operator and shrinks the longer a Node
 has been unreachable (see [Deployment](../cluster-operators/deployment.md)).
 
+The same bounded wait applies when a proxy from an interrupted credential reset is still terminating.
+It is never reused, even if Kubernetes still reports it `Ready`; after the deadline the Node is marked
+unreachable for that run rather than holding the attempt and its host locks indefinitely.
+
 ## Requirements and limitations
 
 - The operator must be installed and your namespace **enrolled** (see

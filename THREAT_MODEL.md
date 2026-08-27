@@ -273,6 +273,12 @@ to a single run.
 - *Severity:* **Low** — cross-run reuse requires forging a run-ID principal (needs the CA
   key, i.e. T-INFO-2), not merely defeating NetworkPolicy. See §7 INV-4.
 
+When an old-credential proxy pod is stuck terminating on a Node whose kubelet is unavailable, recovery
+waits only for the configured heartbeat-aware grace period. It never adopts that proxy and deletes the
+attempt's client-cert Secret during cleanup, but Kubernetes cannot guarantee the already-running
+container has exited until the kubelet returns. This is a residual availability and stale-process risk
+on the unreachable Node, not a path for a new attempt to authenticate to that proxy.
+
 ### Denial of service
 
 **T-DOS-1 — Proxy-pod / Job flooding.**
