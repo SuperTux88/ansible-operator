@@ -367,13 +367,6 @@ spec:
                 type: array
               currentHash:
                 type: string
-              currentJobName:
-                description: |-
-                  Name of the Job backing the currently-`Applying` run, if any. Looked up by name rather
-                  than the `PLAYBOOKPLAN_HASH` label alone, since that label is stable across every retry
-                  of an unchanged spec and could match an older, already-finished retry's Job.
-                nullable: true
-                type: string
               eligibleHosts:
                 items:
                   properties:

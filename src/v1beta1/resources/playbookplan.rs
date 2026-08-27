@@ -371,10 +371,6 @@ pub struct PlaybookPlanStatus {
     pub phase: Phase,
     pub current_hash: String,
     pub summary: Option<String>,
-    /// Name of the Job backing the currently-`Applying` run, if any. Looked up by name rather
-    /// than the `PLAYBOOKPLAN_HASH` label alone, since that label is stable across every retry
-    /// of an unchanged spec and could match an older, already-finished retry's Job.
-    pub current_job_name: Option<String>,
     /// The attempt number of the current run, which is what distinguishes retries in the Job name
     /// (`apply-{plan}-{shortid}-{n}`). Reset to 0 whenever `currentHash` changes, but that reset
     /// only ever lowers the *starting point*: a new attempt is numbered past every attempt still
@@ -657,7 +653,6 @@ spec:
             "phase": "Applying",
             "currentHash": "abc123",
             "summary": null,
-            "currentJobName": null,
             "retryCount": 1
         });
 

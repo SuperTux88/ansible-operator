@@ -1412,7 +1412,6 @@ async fn try_start_run(
 
     let holder_identity = holder_identity(run.namespace, run.name, &active_run);
     resource_status.retry_count = active_run.mirror.attempt;
-    resource_status.current_job_name = Some(active_run.mirror.job_name.clone());
     resource_status.phase = Phase::Applying;
     resource_status.summary = Some(applying_summary(&active_run.mirror));
     resource_status.next_run = None;
@@ -1905,7 +1904,6 @@ async fn advance_active_run(
         resource_status,
     );
     resource_status.active_run = None;
-    resource_status.current_job_name = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
         record: TerminalRecord::Present,
@@ -1960,7 +1958,6 @@ async fn finalize_lost_run(
         resource_status,
     );
     resource_status.active_run = None;
-    resource_status.current_job_name = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
         record: TerminalRecord::Lost,
@@ -2136,7 +2133,6 @@ async fn abandon_run(
 
     if mirrors_run(resource_status, run) {
         resource_status.active_run = None;
-        resource_status.current_job_name = None;
         resource_status.phase = Phase::Pending;
         resource_status.next_run = None;
     }
@@ -3009,7 +3005,6 @@ fn update_desired_hash(status: &mut PlaybookPlanStatus, execution_hash: &Executi
     status.last_triggered_run = None;
     if status.active_run.is_none() {
         status.phase = Phase::Pending;
-        status.current_job_name = None;
     }
 }
 
@@ -3033,7 +3028,6 @@ fn adopt_recovered_attempt(status: &mut PlaybookPlanStatus, active_run: &ActiveR
     if status.current_hash == active_run.execution_hash {
         status.retry_count = status.retry_count.max(active_run.attempt);
     }
-    status.current_job_name = Some(active_run.job_name.clone());
     status.phase = Phase::Applying;
     status.summary = Some(applying_summary(active_run));
     status.active_run = Some(active_run.clone());
@@ -3127,7 +3121,6 @@ async fn finalize_finished_run(
 
     if mirrors_run(resource_status, finished) {
         resource_status.active_run = None;
-        resource_status.current_job_name = None;
         resource_status.phase = Phase::Pending;
         resource_status.next_run = None;
     }
@@ -5918,7 +5911,6 @@ spec:
                 triggered_slot: Some(slot),
             }),
             current_hash: old_hash.to_string(),
-            current_job_name: Some("apply-plan-1-1".into()),
             phase: Phase::Applying,
             retry_count: 1,
             last_triggered_run: Some(slot),
@@ -5931,10 +5923,14 @@ spec:
         assert_eq!(status.phase, Phase::Applying);
         assert_eq!(status.retry_count, 0);
         assert_eq!(status.last_triggered_run, None);
-        assert_eq!(status.current_job_name.as_deref(), Some("apply-plan-1-1"));
         assert_eq!(
             status.active_run.as_ref().unwrap().execution_hash,
             old_hash.to_string()
+        );
+        assert_eq!(
+            status.active_run.as_ref().unwrap().job_name,
+            "apply-plan-1-1",
+            "the run in flight keeps the Job it is reconciled through"
         );
         assert_eq!(
             status.active_run.as_ref().unwrap().triggered_slot,
@@ -5943,7 +5939,6 @@ spec:
 
         let mut idle = PlaybookPlanStatus {
             current_hash: old_hash.to_string(),
-            current_job_name: Some("old-job".into()),
             phase: Phase::Succeeded,
             retry_count: 3,
             last_triggered_run: Some(slot),
@@ -5951,7 +5946,6 @@ spec:
         };
         update_desired_hash(&mut idle, &new_hash);
         assert_eq!(idle.phase, Phase::Pending);
-        assert_eq!(idle.current_job_name, None);
         assert_eq!(idle.retry_count, 0);
         assert_eq!(idle.last_triggered_run, None);
     }
@@ -6142,7 +6136,6 @@ spec:
         adopt_recovered_attempt(&mut matching, &active_run);
         assert_eq!(matching.retry_count, 4);
         assert_eq!(matching.phase, Phase::Applying);
-        assert_eq!(matching.current_job_name.as_deref(), Some("apply-plan-1-4"));
         assert_eq!(
             matching
                 .active_run
