@@ -2598,15 +2598,40 @@ async fn release_deleted_plan(
 
 /// Every run of a deleted plan that may still hold resources, newest handle first.
 ///
-/// The status mirror leads because it is the one source that survives the plan's own cascade. The
-/// records are consulted as well — and only as a best effort — for the window in which an attempt
-/// exists without having reached the plan's status yet; failing the whole teardown because they
-/// could not be listed would stop the mirror-driven half from running at all.
+/// The records are listed before anything is released and a failure to list them ends the teardown,
+/// because they are not a supplement to the status mirror — they are the *only* handle on a run
+/// during the window between `record_prepared` and the status write that mirrors it. An attempt in
+/// that window already holds host Leases and node-root proxy pods, so a teardown that saw only the
+/// (still empty) mirror and then dropped the finalizer would strand them where nothing can reach
+/// them again. Every discovery failure that a later tick could clear is therefore kept as one, in
+/// the same way [`release_run_infrastructure`]'s failures are.
 async fn runs_to_release(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
 ) -> Result<Vec<RecordedRun>, ReconcileError> {
     let (namespace, plan_name) = namespace_and_name(object)?;
+    let plays_api = Api::<Play>::namespaced(context.client.clone(), namespace);
+    let plays = plays_api
+        .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
+        .await?;
+
+    Ok(discovered_runs(object, &plays.items))
+}
+
+/// The runs a deleted plan's status mirror and records name between them, deduplicated.
+///
+/// The mirror leads because it is the one source that survives the plan's own cascade; the records
+/// cover the attempt that has not reached the status yet. A handle that does not parse is dropped
+/// with a warning rather than failing the teardown: there is nothing to release for a run whose
+/// identity is unreadable, and no tick will ever repair it, so holding the finalizer over one would
+/// only trade a leak for a plan that can never finish deleting. The manual cleanup procedure in the
+/// troubleshooting guide is the answer to that case.
+fn discovered_runs(object: &PlaybookPlan, plays: &[Play]) -> Vec<RecordedRun> {
+    let plan = format!(
+        "{}/{}",
+        object.metadata.namespace.as_deref().unwrap_or("<unknown>"),
+        object.metadata.name.as_deref().unwrap_or("<unknown>")
+    );
     let mut runs = Vec::new();
 
     if let Some(mirror) = object
@@ -2616,36 +2641,23 @@ async fn runs_to_release(
     {
         match RecordedRun::from_mirror(mirror) {
             Ok(run) => runs.push(run),
-            // Nothing can be released for a run whose identity does not parse, and failing here
-            // would keep the plan undeletable over a status field no tick will ever repair.
             Err(error) => warn!(
-                "PlaybookPlan {namespace}/{plan_name} was deleted with an unusable activeRun ({error}); its run cannot be released automatically"
+                "PlaybookPlan {plan} was deleted with an unusable activeRun ({error}); its run cannot be released automatically"
             ),
         }
     }
 
-    let plays_api = Api::<Play>::namespaced(context.client.clone(), namespace);
-    match plays_api
-        .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
-        .await
-    {
-        Ok(plays) => {
-            for play in recoverable_plays_for_plan(&plays.items, object) {
-                match recorded_run_from_play(play) {
-                    Ok(run) => runs.push(run),
-                    Err(error) => warn!(
-                        "PlaybookPlan {namespace}/{plan_name} was deleted with an unusable record {:?} ({error})",
-                        play.metadata.name
-                    ),
-                }
-            }
+    for play in recoverable_plays_for_plan(plays, object) {
+        match recorded_run_from_play(play) {
+            Ok(run) => runs.push(run),
+            Err(error) => warn!(
+                "PlaybookPlan {plan} was deleted with an unusable record {:?} ({error}); that run cannot be released automatically",
+                play.metadata.name
+            ),
         }
-        Err(error) => warn!(
-            "PlaybookPlan {namespace}/{plan_name} was deleted but its records could not be listed ({error}); releasing what its status names"
-        ),
     }
 
-    Ok(dedupe_runs(runs))
+    dedupe_runs(runs)
 }
 
 /// The distinct runs among `runs`, in first-seen order. The status mirror and the record it was
@@ -5001,6 +5013,91 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["run-a", "run-b"],
             "the mirror is seen first, and every distinct run is still released"
+        );
+    }
+
+    /// The two halves of the deletion path's discovery answer for different failures. A record is
+    /// the only handle on an attempt that has taken its Leases and proxy pods but has not reached
+    /// the plan's status yet, so its list failing propagates and keeps the finalizer (enforced by
+    /// `runs_to_release`'s `?`). A handle that does not *parse* is a dead end no retry repairs, so
+    /// it is dropped and never stops the runs next to it from being released.
+    #[test]
+    fn a_deleted_plans_runs_come_from_the_records_as_much_as_the_mirror() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
+
+        fn play(name: &str, run_id: &str, execution_hash: &str) -> Play {
+            let mut play = Play::new(
+                name,
+                v1beta1::PlaySpec {
+                    playbook_plan: "plan".into(),
+                    playbook_plan_uid: "plan-uid".into(),
+                    execution_hash: execution_hash.into(),
+                    run_id: run_id.into(),
+                    preparation_fingerprint: "fingerprint".into(),
+                    attempt: 1,
+                    inventory: vec![ResolvedHosts {
+                        name: "workers".into(),
+                        hosts: vec!["worker-1".into()],
+                    }],
+                    triggered_slot: None,
+                },
+            );
+            play.metadata = ObjectMeta {
+                name: Some(name.into()),
+                uid: Some(format!("{name}-uid")),
+                owner_references: Some(vec![OwnerReference {
+                    kind: "PlaybookPlan".into(),
+                    name: "plan".into(),
+                    uid: "plan-uid".into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            };
+            play
+        }
+
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+        plan.metadata.namespace = Some("default".into());
+
+        let run_ids = |plan: &PlaybookPlan, plays: &[Play]| {
+            discovered_runs(plan, plays)
+                .into_iter()
+                .map(|run| run.mirror.run_id)
+                .collect::<Vec<_>>()
+        };
+
+        // The window this exists for: the record is written before the locks and the proxy pods, the
+        // mirror only at the end of the tick.
+        assert_eq!(
+            run_ids(&plan, &[play("apply-plan-abc-1", "run-a", "1a")]),
+            vec!["run-a"],
+            "an attempt that has not reached the status yet still has to be released"
+        );
+
+        plan.status = Some(PlaybookPlanStatus {
+            active_run: Some(ActiveRun {
+                execution_hash: "not-a-hash".into(),
+                run_id: "run-broken".into(),
+                job_name: "apply-plan-broken-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                attempt: 1,
+                triggered_slot: None,
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            run_ids(
+                &plan,
+                &[
+                    play("apply-plan-broken-1", "run-broken", "also-not-a-hash"),
+                    play("apply-plan-abc-1", "run-a", "1a"),
+                ]
+            ),
+            vec!["run-a"],
+            "unreadable handles are skipped without taking the releasable run down with them"
         );
     }
 
