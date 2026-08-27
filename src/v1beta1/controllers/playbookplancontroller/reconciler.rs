@@ -9,7 +9,7 @@ use k8s_openapi::api::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::{
     Api,
-    api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
+    api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions},
     runtime::{
         Controller,
         controller::Action,
@@ -2720,12 +2720,28 @@ async fn cancel_run_job(
             "PlaybookPlan {namespace}/{name} was deleted; cancelling its Job {}",
             run.mirror.job_name
         );
-        match jobs_api
-            .delete(&run.mirror.job_name, &DeleteParams::foreground())
-            .await
-        {
+        // The UID carries the identity `validate_selected_job` just established into the mutation
+        // itself. Without it the delete applies to whatever holds the name when it lands, so a Job
+        // created at that name in the round-trip since the read — one the validation would have
+        // refused — would be cancelled on this run's behalf. No `resourceVersion` alongside it: the
+        // validation compares immutable identity, never status, so a Job whose counters ticked in
+        // the meantime is still the Job to cancel, and requiring it unchanged would refuse exactly
+        // the busy runs that most need cancelling.
+        let params = DeleteParams::foreground().preconditions(Preconditions {
+            uid: job.metadata.uid.clone(),
+            resource_version: None,
+        });
+        match jobs_api.delete(&run.mirror.job_name, &params).await {
             Ok(_) => {}
             Err(error) if is_not_found(&error) => {}
+            // The precondition refused the delete, so nothing was cancelled and the name is not
+            // this run's any more. Nothing is decided from a stale read: the run counts as still
+            // executing (its Job was there a moment ago), which keeps its host locks renewed while
+            // the next tick re-reads the name and classifies whatever it finds from scratch.
+            Err(error) if is_conflict(&error) => warn!(
+                "PlaybookPlan {namespace}/{name}: Job {} was replaced while it was being cancelled; looking again before releasing its hosts",
+                run.mirror.job_name
+            ),
             Err(error) => return Err(error.into()),
         }
     }
