@@ -3013,11 +3013,14 @@ fn update_desired_hash(status: &mut PlaybookPlanStatus, execution_hash: &Executi
     }
 }
 
+/// Restores the terminal verdict a `OneShot` plan had before a failed input read cleared it.
+///
+/// The conditions under which that is the right thing to do — idle, `OneShot`, no outdated hosts,
+/// per-host results still on the plan, and a phase that a read failure reset to `Pending` — are the
+/// caller's `else if`, and are not restated here. They have to be the caller's: they select this
+/// branch out of the chain that also decides scheduling, so a plan that fails them must fall
+/// through to the next arm rather than reach a function that quietly does nothing.
 fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usize) {
-    if status.phase != Phase::Pending || status.hosts_status.is_none() {
-        return;
-    }
-
     status.phase = Phase::Succeeded;
     status.next_run = None;
     status.summary = Some(format!("{total_count}/{total_count} up-to-date"));
