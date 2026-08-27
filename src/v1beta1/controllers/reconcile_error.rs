@@ -11,6 +11,12 @@ pub enum ReconcileError {
     #[error("Inventory group {group:?} sets variable {key:?}, which the operator manages")]
     ReservedInventoryVariable { group: String, key: String },
 
+    #[error("Referenced {kind} {name:?} does not exist")]
+    InventoryNotFound { kind: &'static str, name: String },
+
+    #[error("Referenced Secret {name:?} does not exist")]
+    SecretNotFound { name: String },
+
     #[error(transparent)]
     RenderError(#[from] ansible::RenderError),
 
