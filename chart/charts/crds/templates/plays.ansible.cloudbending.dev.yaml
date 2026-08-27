@@ -22,6 +22,10 @@ spec:
       name: Run
       priority: 1
       type: integer
+    - jsonPath: .spec.attempt
+      name: Try
+      priority: 1
+      type: integer
     - jsonPath: .status.hostCount
       name: Hosts
       type: integer
@@ -69,6 +73,18 @@ spec:
               retention beyond that is bounded per-plan by `successfulPlaysHistoryLimit`/
               `failedPlaysHistoryLimit`. The Job and pod template carry this Play's UID for correlation.
             properties:
+              attempt:
+                description: |-
+                  Which try of its execution this run is: 1 for the first, one more for each retry of a failed
+                  one, up to the plan's `spec.maxAttempts`. An execution is the current playbook and inputs
+                  for a `OneShot` plan and one schedule tick for a `Recurring` one, so this restarts at 1
+                  whenever the plan is edited and, for `Recurring`, at every tick.
+
+                  Orthogonal to `runNumber`, which every try advances because every try *is* a run — with its
+                  own record, its own `runId` and its own Job. This says which try of its execution that run
+                  was, which the run number cannot: it is reserved plan-wide and continues across editions.
+                minimum: 0.0
+                type: integer
               executionHash:
                 description: The execution hash the run applied — matches the backing Job's hash label.
                 type: string
@@ -135,6 +151,7 @@ spec:
                 nullable: true
                 type: string
             required:
+            - attempt
             - executionHash
             - inventory
             - playbookPlan
