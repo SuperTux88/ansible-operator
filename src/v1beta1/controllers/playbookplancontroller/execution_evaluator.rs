@@ -62,16 +62,34 @@ impl ExecutionHash {
     }
 }
 
+/// The hosts a group list names, each one exactly once, in first-seen order.
+///
+/// A node reachable through two inventory groups is listed twice in the flat `ResolvedHosts`
+/// projection, but it is one host to Ansible and one host to whoever reads an `n/m hosts` summary.
+/// Every population the plan reports on is therefore taken over the distinct names, which is also
+/// what `play_history` has always counted per record — the two surfaces sit next to each other in
+/// `kubectl` output and must not disagree about how many hosts a plan has.
+pub fn distinct_hosts(groups: &[v1beta1::ResolvedHosts]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    groups
+        .iter()
+        .flat_map(|group| group.hosts.iter())
+        .filter(|host| seen.insert(host.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// How many distinct hosts a group list names — see [`distinct_hosts`].
+pub fn distinct_host_count(groups: &[v1beta1::ResolvedHosts]) -> usize {
+    distinct_hosts(groups).len()
+}
+
 /// Returns an iterator over hosts where the PlaybookPlan needs to be (re)applied.
 pub fn find_outdated_hosts(
     status: &v1beta1::PlaybookPlanStatus,
     execution_hash: &ExecutionHash,
 ) -> Vec<String> {
-    let hosts: Vec<_> = status
-        .eligible_hosts
-        .iter()
-        .flat_map(|g| g.hosts.iter().cloned())
-        .collect();
+    let hosts = distinct_hosts(&status.eligible_hosts);
 
     // If we don't have any hosts_status yet, simply return all hosts for execution
     let Some(hosts_status) = &status.hosts_status else {
@@ -97,13 +115,7 @@ pub fn find_outdated_hosts(
 }
 
 pub fn find_all_hosts(status: &v1beta1::PlaybookPlanStatus) -> Vec<String> {
-    let hosts: Vec<_> = status
-        .eligible_hosts
-        .iter()
-        .flat_map(|g| g.hosts.iter().cloned())
-        .collect();
-
-    hosts
+    distinct_hosts(&status.eligible_hosts)
 }
 
 /// Given a playbook and some secrets, calculate a hash that only changes if the inputs change.
@@ -281,6 +293,54 @@ mod tests {
         assert_ne!(
             with_vars,
             base.fold_inventory_variables([("workers", &changed), ("edge", &edge)])
+        );
+    }
+
+    /// A node reachable through two inventory groups is one host everywhere the plan counts or
+    /// lists hosts. The counts feed the `n/m` summary and the restated `Ready` message, which sit
+    /// beside a `Play`'s own always-distinct `Hosts` column, and the lists feed `filter_groups_to_hosts`.
+    #[test]
+    fn a_host_in_two_groups_counts_and_lists_once() {
+        let overlapping = vec![
+            ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["node-a".into(), "node-b".into()],
+            },
+            ResolvedHosts {
+                name: "storage".into(),
+                hosts: vec!["node-b".into(), "node-c".into()],
+            },
+        ];
+        assert_eq!(
+            distinct_hosts(&overlapping),
+            vec!["node-a".to_string(), "node-b".into(), "node-c".into()],
+            "first-seen order, so group membership still reads naturally"
+        );
+        assert_eq!(distinct_host_count(&overlapping), 3);
+
+        let hash = ExecutionHash(1);
+        let mut status = PlaybookPlanStatus {
+            eligible_hosts: overlapping,
+            ..Default::default()
+        };
+        assert_eq!(find_all_hosts(&status).len(), 3);
+        assert_eq!(
+            find_outdated_hosts(&status, &hash).len(),
+            3,
+            "a plan that never ran owes each host one run, not one per group it appears in"
+        );
+
+        status.hosts_status = Some(BTreeMap::from([(
+            "node-b".to_string(),
+            HostStatus {
+                last_applied_hash: hash.to_string(),
+                ..Default::default()
+            },
+        )]));
+        assert_eq!(
+            find_outdated_hosts(&status, &hash),
+            vec!["node-a".to_string(), "node-c".into()],
+            "the shared host is current once, not once per group"
         );
     }
 
