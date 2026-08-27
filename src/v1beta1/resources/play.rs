@@ -22,6 +22,7 @@ use crate::v1beta1::{HostOutcome, ResolvedHosts, UnsignedInt};
     status = "PlayStatus",
     printcolumn = r#"{"name":"Plan","type":"string","jsonPath":".spec.playbookPlan"}"#,
     printcolumn = r#"{"name":"Run","type":"integer","jsonPath":".spec.runNumber","priority":1}"#,
+    printcolumn = r#"{"name":"Try","type":"integer","jsonPath":".spec.attempt","priority":1}"#,
     printcolumn = r#"{"name":"Hosts","type":"integer","jsonPath":".status.hostCount"}"#,
     printcolumn = r#"{"name":"Ok","type":"integer","jsonPath":".status.recap.ok"}"#,
     printcolumn = r#"{"name":"Changed","type":"integer","jsonPath":".status.recap.changed"}"#,
@@ -77,6 +78,17 @@ pub struct PlaySpec {
     /// name is the whole contract.
     #[schemars(with = "UnsignedInt")]
     pub run_number: u32,
+
+    /// Which try of its execution this run is: 1 for the first, one more for each retry of a failed
+    /// one, up to the plan's `spec.maxAttempts`. An execution is the current playbook and inputs
+    /// for a `OneShot` plan and one schedule tick for a `Recurring` one, so this restarts at 1
+    /// whenever the plan is edited and, for `Recurring`, at every tick.
+    ///
+    /// Orthogonal to `runNumber`, which every try advances because every try *is* a run — with its
+    /// own record, its own `runId` and its own Job. This says which try of its execution that run
+    /// was, which the run number cannot: it is reserved plan-wide and continues across editions.
+    #[schemars(with = "UnsignedInt")]
+    pub attempt: u32,
 
     /// The inventory this run targeted, preserving the groups the user designed (each group's name
     /// and its hosts) rather than a flat host list. Same shape as the plan's `.status.eligibleHosts`,

@@ -191,6 +191,19 @@ Either way the phase of a finished run comes from that run's own `Play` verdict
 (`phase_for_finished_run`), never from the plan's drift state: a failed `Recurring` run leaves every
 host on the hash an earlier run applied, so drift would report it as a success.
 
+### Retries (`spec.maxAttempts`)
+
+Tries per *execution*, counting the first run: the current hash for `OneShot` (default 3), one
+schedule tick for `Recurring` (default 1). Every try is a full run — own `Play`, own `runId`, own
+Job, own run number — and `status.retryCount` counts them within the execution, restarting on a hash
+change (`update_desired_hash`) and, for `Recurring`, at each tick (`next_attempt`). It is written
+from the run's record, never re-derived, so a lagging status cannot hand the budget back.
+
+Two gates, deliberately: `attempt_budget_available` at `may_start_new_run` is the whole answer for
+`OneShot` (nothing else ever stops it — its failed hosts stay outdated), while `Recurring` is
+answered by the schedule-window gate, which is the only one that can tell a retry of the current
+tick from the first run of the next.
+
 ### Run records and recovery (`Play`)
 
 Every run is written down **before** anything is created for it, as a `Play` in the plan's

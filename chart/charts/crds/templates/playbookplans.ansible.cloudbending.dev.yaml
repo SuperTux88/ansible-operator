@@ -81,6 +81,17 @@ spec:
                       type: string
                   type: object
                 type: array
+              maxAttempts:
+                description: |-
+                  How many times a failed run may be tried again before the operator stops, counting the first
+                  run — so `1` means no retry. Defaults to 3 for `OneShot` and 1 for `Recurring`.
+
+                  The budget covers one *execution*: for `OneShot` the current playbook and inputs, which an
+                  edit resets; for `Recurring` one schedule tick, since the next tick is going to re-apply the
+                  playbook anyway. Every try is a run of its own, with its own `Play` record and its own Job.
+                minimum: 1.0
+                nullable: true
+                type: integer
               mode:
                 default: OneShot
                 description: Controls if a playbook is executed once or repeatedly
@@ -311,6 +322,10 @@ spec:
                   whose `Play` was deleted out from under it.
                 nullable: true
                 properties:
+                  attempt:
+                    description: Which try of the current execution this run is — see `status.retryCount`.
+                    minimum: 0.0
+                    type: integer
                   executionHash:
                     description: The execution hash used to create this run's Job and infrastructure.
                     type: string
@@ -337,6 +352,7 @@ spec:
                     nullable: true
                     type: string
                 required:
+                - attempt
                 - executionHash
                 - hosts
                 - jobName
@@ -451,6 +467,18 @@ spec:
                 - Succeeded
                 - UnauthorizedNamespace
                 type: string
+              retryCount:
+                default: 0
+                description: |-
+                  How many tries the current execution has spent of its `spec.maxAttempts` budget, the latest
+                  run included. Unlike `lastRunNumber` this counts, and it counts within one execution only:
+                  it restarts at 1 whenever `currentHash` changes and, for `Recurring` plans, whenever a new
+                  schedule tick starts a run — the two events that begin a new execution.
+
+                  Written from the run's own `Play` record, so a status that lags a run in flight cannot hand
+                  the budget back by forgetting a try that was already made.
+                minimum: 0.0
+                type: integer
               summary:
                 nullable: true
                 type: string
