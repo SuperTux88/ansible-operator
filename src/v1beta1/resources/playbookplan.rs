@@ -28,6 +28,16 @@ impl JsonSchema for GenericMap {
     }
 }
 
+/// Cap on a plan's own object name, enforced at admission by the CRD rule below and re-checked by
+/// the reconciler for clusters that do not evaluate such rules.
+///
+/// Kubernetes would allow the full DNS *subdomain* length here, but the plan's name is written as a
+/// **label value** onto every object a run creates — its `Play`, its Job, that Job's pod template and
+/// the run's egress NetworkPolicy — and label values stop at 63 characters. Without this cap a longer
+/// name is accepted happily and then fails at the first of those creates, with an error naming a
+/// label the user never wrote. See `reconciler::plan_name_within_label_limit`.
+pub const MAX_PLAN_NAME_LEN: usize = 63;
+
 #[derive(CustomResource, Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
 #[kube(
     group = "ansible.cloudbending.dev",
@@ -35,6 +45,13 @@ impl JsonSchema for GenericMap {
     kind = "PlaybookPlan",
     namespaced,
     status = "PlaybookPlanStatus",
+    // Root-level rule: `self` is the whole object, and `metadata.name` is one of the few metadata
+    // fields CEL can always reach from here. See `MAX_PLAN_NAME_LEN` for why the cap exists, and
+    // `deployment.md` for the same caveat the `Play` rule carries — an API server that does not
+    // evaluate validation rules ignores this silently rather than rejecting it, which is why the
+    // reconciler checks it too.
+    validation = Rule::new("!has(self.metadata.name) || self.metadata.name.size() <= 63")
+        .message("PlaybookPlan name must be at most 63 characters: it is used as a label value on the objects each run creates"),
     printcolumn = r#"{"name":"Mode","type":"string","jsonPath":".spec.mode"}"#,
     printcolumn = r#"{"name":"Schedule","type":"string","jsonPath":".spec.schedule"}"#,
     printcolumn = r#"{"name":"Suspended","type":"boolean","jsonPath":".spec.suspend"}"#,
@@ -424,6 +441,42 @@ impl PlaybookPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The plan-name cap has to reach the API server as a rule on the *root* of the object: only
+    /// there can CEL see `metadata.name`, and the spec is where a rule would otherwise land. The
+    /// reconciler enforces the same bound for clusters that ignore validation rules, so this pins
+    /// the admission-time half — the one that gives the user the error at `kubectl apply`.
+    #[test]
+    fn crd_caps_the_plan_name_at_the_label_value_limit() {
+        use kube::CustomResourceExt as _;
+
+        let crd = serde_json::to_value(PlaybookPlan::crd()).unwrap();
+        let root = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
+        let validations = root["x-kubernetes-validations"].as_array().unwrap();
+
+        let rule = validations
+            .iter()
+            .find(|validation| {
+                validation["rule"]
+                    .as_str()
+                    .is_some_and(|rule| rule.contains("metadata.name"))
+            })
+            .expect("the plan-name rule is on the root schema, not the spec");
+
+        assert_eq!(
+            rule["rule"],
+            format!("!has(self.metadata.name) || self.metadata.name.size() <= {MAX_PLAN_NAME_LEN}"),
+            "the rule must state the same bound the reconciler enforces"
+        );
+        assert!(
+            rule["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("label value")),
+            "the message has to say why, or the cap reads as arbitrary"
+        );
+    }
+
+
 
     #[test]
     fn test_serialization() {

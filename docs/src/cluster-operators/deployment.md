@@ -194,6 +194,21 @@ manifests are generated from the operator binary itself (`ansible-operator crds`
 the subchart's `templates/` directory.
 The regeneration procedure lives in `chart/README.md`.
 
+The chart declares `kubeVersion: ">=1.25.0-0"` because two CRDs use **CRD validation rules**
+(`x-kubernetes-validations`):
+
+- The `Play` CRD freezes a run record's spec for its lifetime, one of the controls that keeps a
+  committed run from being steered by anyone with write access to `plays` (see
+  [Security](./security.md) and `T-ESC-8`).
+- The `PlaybookPlan` CRD caps a plan's name at 63 characters, because that name is written as a
+  label value onto every object a run creates.
+
+Kubernetes only evaluates such rules from 1.25 onwards, and an older or non-conformant API server
+would **ignore them silently** rather than reject them — so if you bypass the version constraint,
+confirm they are actually in force rather than assuming it. The operator re-checks the plan-name cap
+itself and refuses an over-long plan with a clear message on the resource, so only the `Play` rule
+depends on the API server alone.
+
 Being ordinary release resources also means Helm would delete them on `helm uninstall`, and
 deleting a CRD deletes every custom resource of that kind cluster-wide. `crds.keep` defaults to
 `true` and annotates the definitions with `helm.sh/resource-policy: keep`, so uninstalling the

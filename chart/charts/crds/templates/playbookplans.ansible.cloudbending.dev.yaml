@@ -408,6 +408,9 @@ spec:
         - spec
         title: PlaybookPlan
         type: object
+        x-kubernetes-validations:
+        - message: 'PlaybookPlan name must be at most 63 characters: it is used as a label value on the objects each run creates'
+          rule: '!has(self.metadata.name) || self.metadata.name.size() <= 63'
     served: true
     storage: true
     subresources:

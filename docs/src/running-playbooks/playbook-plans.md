@@ -5,6 +5,12 @@ A `PlaybookPlan` is the central resource the operator reconciles. It ties a **pl
 reported. This page explains how the fields fit together; the full field list and defaults live in
 the CRD schema (`ansible-operator crds`) and the generated API reference.
 
+A plan's **name** is capped at 63 characters, shorter than Kubernetes would otherwise allow for a
+custom resource. The operator records that name as a label on every object a run creates — its
+`Play`, its Job, that Job's pod, and the run's NetworkPolicy — and Kubernetes label values stop at 63
+characters. A longer name is rejected when you apply it; if your cluster does not enforce CRD
+validation rules, the operator refuses the plan instead and says so in `.status.summary`.
+
 ## Spec fields
 
 | Field | Required | Meaning |

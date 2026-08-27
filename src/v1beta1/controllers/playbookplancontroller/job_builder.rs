@@ -933,7 +933,8 @@ spec:
     /// safe when its name was already being cut.
     #[test]
     fn the_plan_name_half_is_truncated_from_45_characters() {
-        use crate::utils::{MAX_DNS_LABEL_LEN, MAX_DNS_SUBDOMAIN_LEN};
+        use crate::utils::MAX_DNS_LABEL_LEN;
+        use crate::v1beta1::MAX_PLAN_NAME_LEN;
         use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
 
         let hash = calculate_execution_hash("playbook", std::iter::empty());
@@ -959,7 +960,7 @@ spec:
 
         // Whatever the plan name and attempt, the result stays inside the cap a Job is validated
         // against — which is the property the truncation exists for.
-        for length in [1, 44, 45, MAX_DNS_SUBDOMAIN_LEN] {
+        for length in [1, 44, 45, MAX_PLAN_NAME_LEN] {
             assert!(name_of(length, u32::MAX).len() <= MAX_DNS_LABEL_LEN);
         }
     }

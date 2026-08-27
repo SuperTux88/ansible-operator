@@ -28,7 +28,7 @@ per-host status, and the summary line.
 | `Applying` | A Job is running the playbook right now. The `Running` condition is `True`. |
 | `Scheduled` | (`Recurring`) The run finished and the plan is waiting for the next schedule tick. |
 | `Succeeded` | (`OneShot`) Every host has succeeded on the current hash; the plan is quiet until the inputs change. |
-| `Failed` | (`OneShot`) The run finished but some host could not be brought current. |
+| `Failed` | (`OneShot`) The run finished but some host could not be brought current. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
 | `UnauthorizedNamespace` | The plan's namespace is not enrolled for the operator — it will not run. See below. |
 
 ## Conditions
@@ -117,6 +117,16 @@ admin which policy applies to your namespace (see
 [Node access policies](../cluster-operators/node-access-policies.md)). The `ClusterInventory`'s own
 `.status.hostCount` shows how many Nodes match *before* policy clamping, which helps localise the
 problem.
+
+### The plan's name is too long
+
+The plan is `Failed` and its summary reads **"name is N characters; a PlaybookPlan name must be at
+most 63 …"**. Applying such a plan is normally rejected outright; you only see this state on a
+cluster that does not enforce CRD validation rules. Either way nothing is created for the plan.
+
+The name is used as a label value on every object a run creates, and Kubernetes label values stop at
+63 characters. An object's name cannot be changed, so recreate the plan under a shorter one — a
+`kubectl edit` will not clear this.
 
 ### A plan is not starting and its `Blocked` condition is `True`
 

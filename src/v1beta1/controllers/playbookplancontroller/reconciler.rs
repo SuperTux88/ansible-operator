@@ -249,6 +249,30 @@ async fn reconcile(
         return Ok(Action::await_change());
     }
 
+    // Name guard: the plan's name becomes a label value on every object a run creates, so a name the
+    // CRD rule should have refused would instead fail at the first of those creates, blaming a label
+    // the user never wrote. Refused here for the same reason and in the same shape as the enrollment
+    // guard above — before any Play/Job/NetworkPolicy call, with `await_change()`, since an object's
+    // name never changes and there is nothing to poll for.
+    if !plan_name_within_label_limit(name) {
+        warn!(
+            "PlaybookPlan {namespace}/{name} has a name longer than {} characters; refusing to run",
+            v1beta1::MAX_PLAN_NAME_LEN
+        );
+        if object.status.as_ref().map(|s| &s.phase) != Some(&Phase::Failed) {
+            let mut status = object.status.clone().unwrap_or_default();
+            status.phase = Phase::Failed;
+            status.summary = Some(format!(
+                "name is {} characters; a PlaybookPlan name must be at most {} because it is used as a label value on the objects each run creates. Recreate the plan under a shorter name",
+                name.chars().count(),
+                v1beta1::MAX_PLAN_NAME_LEN
+            ));
+            patch_status(&api, &object, status).await?;
+        }
+        return Ok(Action::await_change());
+    }
+
+
     let secrets_api = Api::<Secret>::namespaced(context.client.clone(), namespace);
 
     let mut requeue_after = std::time::Duration::from_secs(3600);
@@ -1149,6 +1173,21 @@ fn host_names(inventory: &[ResolvedHosts]) -> Vec<String> {
         .collect()
 }
 
+/// Whether a plan's name fits where the run protocol has to put it: a Kubernetes **label value**, on
+/// its `Play`, its Job, that Job's pod template and the run's egress NetworkPolicy — and the
+/// selectors that later find them again (`recover_active_run`, `select_job`, `play_history::prune`).
+///
+/// The cap is the label value's, not the object name's: a custom resource may carry a full DNS
+/// subdomain, so a plan can legitimately be named far longer than any object derived from it can
+/// record. Generated *names* handle that by truncating (`job_builder::job_name`), which a label value
+/// cannot do — truncating it would break the selectors that have to match it exactly.
+///
+/// Counted in characters rather than bytes to match the message the user is shown; a name is a DNS
+/// subdomain, so the two are the same anyway.
+fn plan_name_within_label_limit(name: &str) -> bool {
+    name.chars().count() <= v1beta1::MAX_PLAN_NAME_LEN
+}
+
 /// The plan's namespace and name — the two things almost every step needs to address its resources.
 /// One helper so the pair is read (and refused) identically everywhere rather than being re-derived
 /// with slightly different error handling at each site.
@@ -1578,6 +1617,76 @@ mod tests {
 
         pp.metadata.name = Some("an-example".into());
         assert_eq!(namespace_and_name(&pp).unwrap(), ("default", "an-example"));
+    }
+
+    /// Every object a run creates records the plan's name as a **label value**, and the selectors
+    /// that find them again match on it exactly — so unlike a generated object name it cannot be
+    /// truncated to fit. The guard is what keeps an over-long name from being accepted and then
+    /// failing at the first create, blaming a label the user never wrote.
+    ///
+    /// The label value's own limit is what the boundary has to be, so it is asserted against
+    /// `MAX_DNS_LABEL_LEN` rather than against the constant the guard uses — the two agreeing is the
+    /// point.
+    #[test]
+    fn a_plan_name_is_bounded_by_what_a_label_value_can_hold() {
+        use crate::utils::{MAX_DNS_LABEL_LEN, MAX_DNS_SUBDOMAIN_LEN};
+
+        assert_eq!(v1beta1::MAX_PLAN_NAME_LEN, MAX_DNS_LABEL_LEN);
+
+        assert!(plan_name_within_label_limit("web"));
+        assert!(plan_name_within_label_limit(&"a".repeat(MAX_DNS_LABEL_LEN)));
+        assert!(!plan_name_within_label_limit(
+            &"a".repeat(MAX_DNS_LABEL_LEN + 1)
+        ));
+        // A name Kubernetes accepts for the custom resource itself, but no label value can carry.
+        assert!(!plan_name_within_label_limit(
+            &"a".repeat(MAX_DNS_SUBDOMAIN_LEN)
+        ));
+    }
+
+    /// Every label an accepted plan name is written into, and every selector that matches on it, has
+    /// to stay valid at the boundary — this is the case the guard exists to make safe, so it is
+    /// asserted on the real objects rather than on the guard alone.
+    #[test]
+    fn a_maximum_length_plan_name_still_builds_valid_labels_and_selectors() {
+        use crate::utils::MAX_DNS_LABEL_LEN;
+
+        let plan_name = "a".repeat(v1beta1::MAX_PLAN_NAME_LEN);
+        let hash = execution_evaluator::calculate_execution_hash("- hosts: all", std::iter::empty());
+        let mut plan = PlaybookPlan::new(&plan_name, PlaybookPlanSpec::default());
+        plan.metadata.namespace = Some("team".into());
+        plan.metadata.uid = Some("plan-uid".into());
+
+        let job = job_builder::create_job_blueprint(&hash, 1, &[], &plan).unwrap();
+        let template_labels = job
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .metadata
+            .as_ref()
+            .unwrap()
+            .labels
+            .clone()
+            .unwrap();
+
+        for labels in [job.metadata.labels.clone().unwrap(), template_labels] {
+            for (key, value) in labels {
+                assert!(
+                    value.len() <= MAX_DNS_LABEL_LEN,
+                    "label {key} is {} characters",
+                    value.len()
+                );
+            }
+        }
+
+        // The selector every recovery and retention pass narrows on carries the same value.
+        let selector = format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME);
+        assert_eq!(
+            job.metadata.labels.as_ref().unwrap()[labels::PLAYBOOKPLAN_NAME],
+            plan_name
+        );
+        assert!(selector.ends_with(&plan_name));
     }
 
     #[test]

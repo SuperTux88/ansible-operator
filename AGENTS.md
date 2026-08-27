@@ -101,6 +101,11 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    (`config.rs`: operator ns ∪ `watch_namespaces`), refuse with `Phase::UnauthorizedNamespace`
    and `await_change` — before any Secret/Job call (the operator holds no Secret/Job RBAC
    outside the enrolled set).
+   A **name guard** follows in the same shape (`plan_name_within_label_limit`): a plan name over
+   `MAX_PLAN_NAME_LEN` (63, the *label value* cap — the name is written as a label onto the `Play`,
+   the Job, its pod template and the run's NetworkPolicy) is refused with `Phase::Failed` and
+   `await_change`. The CRD rejects it at admission too; the reconciler re-checks it for clusters
+   that don't evaluate validation rules.
 2. **Step 0 — resolve inventory.** `resolve_inventory` → `Vec<ResolvedInventoryGroup>`
    (`ClusterInventory` ⇒ `ManagedSsh`, `StaticInventory` ⇒ `Ssh`), preserving which resource
    each group came from.
