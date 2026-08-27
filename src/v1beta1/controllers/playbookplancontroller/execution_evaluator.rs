@@ -25,6 +25,12 @@ impl std::ops::Deref for ExecutionHash {
 }
 
 impl ExecutionHash {
+    /// Reconstructs a persisted execution hash. Hashes are serialized as lowercase hexadecimal
+    /// strings by `Display`, so this accepts the status representation used by `ActiveRun`.
+    pub fn from_hex(value: &str) -> Option<Self> {
+        u64::from_str_radix(value, 16).ok().map(Self)
+    }
+
     /// Folds inventory-author group variables into an existing hash. Kept separate from
     /// [`calculate_execution_hash`] so the many call sites that hash only playbook + secrets stay
     /// unchanged — the reconciler chains this on with the run's resolved groups.

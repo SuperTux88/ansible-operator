@@ -1717,7 +1717,7 @@ mod tests {
         use crate::utils::MAX_DNS_LABEL_LEN;
 
         let plan_name = "a".repeat(v1beta1::MAX_PLAN_NAME_LEN);
-        let hash = execution_evaluator::calculate_execution_hash("- hosts: all", std::iter::empty());
+        let hash = ExecutionHash::from_hex("1").unwrap();
         let mut plan = PlaybookPlan::new(&plan_name, PlaybookPlanSpec::default());
         plan.metadata.namespace = Some("team".into());
         plan.metadata.uid = Some("plan-uid".into());
@@ -1758,7 +1758,7 @@ mod tests {
     fn run_ids_are_minted_fresh_and_stay_short_enough_for_resource_names() {
         let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
         plan.metadata.uid = Some("plan-uid".into());
-        let hash = execution_evaluator::calculate_execution_hash("- hosts: all", std::iter::empty());
+        let hash = ExecutionHash::from_hex("1a").unwrap();
 
         let first = run_id(&plan, &hash).unwrap();
         let second = run_id(&plan, &hash).unwrap();

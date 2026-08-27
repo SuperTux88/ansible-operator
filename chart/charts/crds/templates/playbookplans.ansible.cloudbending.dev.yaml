@@ -298,6 +298,50 @@ spec:
           status:
             nullable: true
             properties:
+              activeRun:
+                description: |-
+                  The run that is currently being applied, independent of the newly desired execution hash.
+                  This remains stable while a spec change queues a replacement run, so the old Job, locks, and
+                  managed-ssh resources continue to be reconciled until the run finishes.
+
+                  Only what finishing that run needs: everything else about it lives in its immutable `Play`,
+                  which is the record recovery reads. This copy is what lets the operator still release a run
+                  whose `Play` was deleted out from under it.
+                nullable: true
+                properties:
+                  attempt:
+                    description: Attempt number represented by `jobName`.
+                    minimum: 0.0
+                    type: integer
+                  executionHash:
+                    description: The execution hash used to create this run's Job and infrastructure.
+                    type: string
+                  hosts:
+                    description: Hosts targeted by this run, preserved even if the desired inventory changes while it runs.
+                    items:
+                      type: string
+                    type: array
+                  jobName:
+                    description: The Job backing this run, which is also the name of its `Play`.
+                    type: string
+                  playUid:
+                    description: UID of the immutable `Play` recovery record correlated with the Job and its pod template.
+                    type: string
+                  runId:
+                    description: Stable per-attempt resource/cleanup identity, distinct even across same-hash retries.
+                    type: string
+                  triggeredSlot:
+                    description: Start of the schedule slot consumed by this run, if it is scheduled.
+                    nullable: true
+                    type: string
+                required:
+                - attempt
+                - executionHash
+                - hosts
+                - jobName
+                - playUid
+                - runId
+                type: object
               conditions:
                 items:
                   properties:

@@ -805,10 +805,7 @@ mod tests {
     }
 
     fn hash() -> ExecutionHash {
-        crate::v1beta1::playbookplancontroller::execution_evaluator::calculate_execution_hash(
-            "- hosts: all",
-            std::iter::empty(),
-        )
+        ExecutionHash::from_hex("1").unwrap()
     }
 
     #[test]

@@ -46,6 +46,11 @@ printer columns:
 `.status.summary` is a one-line human summary (also a column), and `.status.currentHash` is the
 current [execution hash](./scheduling-and-modes.md#drift-detection).
 
+When a plan changes during `Applying`, `.status.currentHash` shows the newly desired revision while
+`.status.activeRun` identifies the older run still being completed. The operator keeps renewing its
+host locks and removes its run-specific proxy infrastructure before starting the replacement. This
+prevents an old Job and a new revision from targeting the same host concurrently.
+
 ## Per-host outcomes
 
 `.status.hostsStatus` maps each targeted host to its result. `lastOutcome` is one of:
@@ -179,6 +184,11 @@ the playbook, is the suspect. Common causes: the run image is missing something 
 needs, or the Job pod was killed before it could write its termination message (a disruptive playbook
 that took down its own runner is one way). Inspect the (not-yet-reaped) Job pod; raising
 `spec.ttlSecondsAfterFinished` buys time to look before it is cleaned up.
+
+If *every* host of one run shows `Unknown` at once, the likely cause is different: the run's `Play`
+was deleted while the run was still live. That record is the only thing the run can be recovered
+from, so the operator releases the run's locks and proxy pods and reports the whole run as unknown
+rather than leaving the plan stuck. The next run reports these hosts normally.
 
 ### A change is not being picked up
 

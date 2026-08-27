@@ -130,6 +130,9 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    from the pod's **termination message** (`callback_output.rs`, written by the callback
    plugin — not from logs, no `pods/log` access), record host outcomes, `cleanup_proxy_infra`,
    release Leases, set the terminal `Phase` (or reschedule for `Recurring`).
+   This is also where a run whose `Play` is gone is `finalize_lost_run`'d (infra released, hosts
+   `Unknown`) — not in step 0a: recovery has no record left to dispatch on, so it is the *mirror*
+   in `status.activeRun` that brings the run here to be released.
 8. **`patch_status`** — JSON **merge patch** (not `replace_status`); many async steps pass
    between read and write, so a version-checked PUT would routinely 409.
 
@@ -177,6 +180,11 @@ handful of decisions that are easy to undo by accident:
   deliberately does *not* second-guess a `Running` record's Job: only `advance_active_run` can tell an
   unfinished foreign Job (wait) from a finished one (finalize with no recap), and deciding it in
   recovery wedged the plan forever.
+- **`PlaybookPlanStatus.activeRun` is a thin mirror** of what *finishing* a run needs, so a run whose
+  `Play` was deleted can still be released (`finalize_lost_run`) instead of wedging in `Applying`. It
+  is read from the reflector cache, which lags this controller's own writes, so `finalize_lost_run`
+  re-reads the plan from the apiserver first and adopts a disagreeing live status wholesale
+  (`ActiveRunProgress::AlreadyFinalized`).
 - **Do not make the run ID a function of (plan, hash, attempt)** to save recording it. An aborted
   attempt frees its number again, so a derived ID would hand the retry that attempt's
   still-terminating proxy pods — see `reconciler::run_id`.

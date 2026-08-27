@@ -333,6 +333,14 @@ pub enum Phase {
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybookPlanStatus {
+    /// The run that is currently being applied, independent of the newly desired execution hash.
+    /// This remains stable while a spec change queues a replacement run, so the old Job, locks, and
+    /// managed-ssh resources continue to be reconciled until the run finishes.
+    ///
+    /// Only what finishing that run needs: everything else about it lives in its immutable `Play`,
+    /// which is the record recovery reads. This copy is what lets the operator still release a run
+    /// whose `Play` was deleted out from under it.
+    pub active_run: Option<ActiveRun>,
     pub eligible_hosts: Vec<ResolvedHosts>,
     pub last_rendered_generation: Option<i64>,
     pub conditions: Vec<PlaybookPlanCondition>,
@@ -364,6 +372,28 @@ pub struct PlaybookPlanStatus {
     /// `current_hash` changes; incremented once per Job actually created, in `spawn_ansible_job`.
     #[schemars(with = "UnsignedInt")]
     pub retry_count: u32,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveRun {
+    /// The execution hash used to create this run's Job and infrastructure.
+    pub execution_hash: String,
+    /// Stable per-attempt resource/cleanup identity, distinct even across same-hash retries.
+    pub run_id: String,
+    /// The Job backing this run, which is also the name of its `Play`.
+    pub job_name: String,
+    /// UID of the immutable `Play` recovery record correlated with the Job and its pod template.
+    pub play_uid: String,
+    /// Hosts targeted by this run, preserved even if the desired inventory changes while it runs.
+    pub hosts: Vec<String>,
+    /// Attempt number represented by `jobName`.
+    #[schemars(with = "UnsignedInt")]
+    pub attempt: u32,
+    /// Start of the schedule slot consumed by this run, if it is scheduled.
+    #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
+    #[schemars(with = "Option<String>")]
+    pub triggered_slot: Option<DateTime<FixedOffset>>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
