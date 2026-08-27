@@ -2626,6 +2626,15 @@ async fn runs_to_release(
 /// identity is unreadable, and no tick will ever repair it, so holding the finalizer over one would
 /// only trade a leak for a plan that can never finish deleting. The manual cleanup procedure in the
 /// troubleshooting guide is the answer to that case.
+///
+/// A statusless record supplies no identity here, for the same reason [`classify_record`] calls it
+/// `Uninitialized` and recovery deletes it: nothing has crossed the operator-owned status boundary,
+/// so it describes no run. It cannot describe one either — a record is written before the locks and
+/// the proxy pods, and the tick that fails to initialize it stops before both — so this gives up
+/// nothing that was ever releasable. What it does give up is deriving cleanup identities from an
+/// object anything holding `plays: create` alone could have written: `cleanup_proxy_infra` scopes
+/// its operator-namespace deletes by execution hash and run ID, which are not this plan's to prove,
+/// and the status subresource is a separate RBAC grant.
 fn discovered_runs(object: &PlaybookPlan, plays: &[Play]) -> Vec<RecordedRun> {
     let plan = format!(
         "{}/{}",
@@ -2647,7 +2656,10 @@ fn discovered_runs(object: &PlaybookPlan, plays: &[Play]) -> Vec<RecordedRun> {
         }
     }
 
-    for play in recoverable_plays_for_plan(plays, object) {
+    for play in recoverable_plays_for_plan(plays, object)
+        .into_iter()
+        .filter(|play| classify_record(play) != RecordKind::Uninitialized)
+    {
         match recorded_run_from_play(play) {
             Ok(run) => runs.push(run),
             Err(error) => warn!(
@@ -5101,6 +5113,10 @@ mod tests {
                 }]),
                 ..Default::default()
             };
+            play.status = Some(v1beta1::PlayStatus {
+                phase: v1beta1::PlayPhase::Prepared,
+                ..Default::default()
+            });
             play
         }
 
@@ -5146,6 +5162,19 @@ mod tests {
             ),
             vec!["run-a"],
             "unreadable handles are skipped without taking the releasable run down with them"
+        );
+
+        // A statusless record is `Uninitialized` to recovery, which deletes it as describing
+        // nothing. It must describe nothing here too: it names an execution hash and a run ID, and
+        // those are what scope the deletes `cleanup_proxy_infra` performs in the operator's
+        // namespace — where the run it names need not be this plan's at all.
+        let mut uninitialized = play("apply-plan-abc-1", "run-a", "1a");
+        uninitialized.status = None;
+        plan.status = None;
+        assert!(
+            run_ids(&plan, &[uninitialized]).is_empty(),
+            "a record that never crossed the operator-owned status boundary supplies no identity \
+             for cleanup to act on"
         );
     }
 
