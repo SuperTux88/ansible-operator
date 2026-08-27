@@ -4,6 +4,14 @@ use chrono::{DateTime, FixedOffset};
 use kube::api::{Patch, PatchParams, PostParams};
 use serde::{Serialize, de::DeserializeOwned};
 
+/// RFC 1123 *label* cap. Bounds every label **value**, and the names of the objects Kubernetes
+/// requires to be DNS labels — Jobs and NetworkPolicies among them.
+pub const MAX_DNS_LABEL_LEN: usize = 63;
+
+/// RFC 1123 *subdomain* cap used by resource-name budget tests.
+#[cfg(test)]
+pub const MAX_DNS_SUBDOMAIN_LEN: usize = 253;
+
 pub async fn create_or_update<K>(
     api: &kube::Api<K>,
     field_manager: &str,
@@ -104,16 +112,21 @@ fn encode_kubelike(mut num: u64) -> String {
 
 /// Generate a short Kubernetes-like ID for use in resource names
 pub fn generate_id(num: u64) -> String {
-    const LEN: usize = 5;
+    generate_id_with_length(num, 5)
+}
 
+/// [`generate_id`] with an explicit length, for IDs that need more of `num`'s entropy than a name
+/// suffix does. The alphabet has 27 symbols, so `length` caps out at 14 (a full `u64`); anything
+/// longer is just zero-padding.
+pub fn generate_id_with_length(num: u64, length: usize) -> String {
     let encoded = encode_kubelike(num);
 
-    if encoded.len() == LEN {
+    if encoded.len() == length {
         encoded
-    } else if encoded.len() > LEN {
-        encoded[encoded.len() - LEN..].to_string()
+    } else if encoded.len() > length {
+        encoded[encoded.len() - length..].to_string()
     } else {
-        let padding = "a".repeat(LEN - encoded.len());
+        let padding = "a".repeat(length - encoded.len());
         format!("{padding}{encoded}")
     }
 }
