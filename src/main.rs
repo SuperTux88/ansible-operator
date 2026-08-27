@@ -16,8 +16,9 @@ use clap::{Parser, Subcommand};
 use futures_util::StreamExt as _;
 use kube::CustomResourceExt as _;
 use kube::config::KubeConfigOptions;
+use kube::runtime::controller::Error as ControllerError;
 use tokio::join;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 use tracing_subscriber::EnvFilter;
@@ -140,34 +141,51 @@ async fn run(args: RunArgs) {
             managed_ssh: operator_config.managed_ssh_network_policy_egress,
         },
     )
-    .for_each(|res| async move {
-        match res {
-            Ok(o) => debug!("reconciled {:?}", o),
-            Err(e) => warn!("reconcile failed: {:?}", e),
-        }
-    });
+    .for_each(|outcome| async move { report_outcome("PlaybookPlan", outcome) });
 
-    let inventory_controller =
-        v1beta1::clusterinventorycontroller::new(client.clone()).for_each(|res| async move {
-            match res {
-                Ok(o) => debug!("reconciled {:?}", o),
-                Err(e) => warn!("reconcile failed: {:?}", e),
-            }
-        });
+    let inventory_controller = v1beta1::clusterinventorycontroller::new(client.clone())
+        .for_each(|outcome| async move { report_outcome("ClusterInventory", outcome) });
 
-    let node_access_policy_controller =
-        v1beta1::nodeaccesspolicycontroller::new(client).for_each(|res| async move {
-            match res {
-                Ok(o) => debug!("reconciled {:?}", o),
-                Err(e) => warn!("reconcile failed: {:?}", e),
-            }
-        });
+    let node_access_policy_controller = v1beta1::nodeaccesspolicycontroller::new(client)
+        .for_each(|outcome| async move { report_outcome("NodeAccessPolicy", outcome) });
 
     join!(
         playbookplan_controller,
         inventory_controller,
         node_access_policy_controller
     );
+}
+
+/// Reports what one controller made of one object, for the three controllers that share a
+/// reconcile loop shape.
+///
+/// `ObjectNotFound` is deliberately not a warning. It means a reconcile was scheduled for an object
+/// that is no longer in the local store by the time the runner reached it — which is what deleting a
+/// resource looks like from here, and also what a watch mapping that names a resource someone else
+/// has since removed looks like. Nothing was attempted and nothing needs attention, so reporting it
+/// as a failed reconcile invited a reader to hunt for a problem that does not exist. It is still
+/// worth an `info!`: it corresponds to something a person did, and the operator falling silent on a
+/// deletion is its own kind of confusing.
+///
+/// Everything else keeps `warn!` but is rendered through `Display` rather than `Debug`: the error
+/// types already say which object they concern, and the debug form spelled out the whole
+/// `ObjectRef` — API group, version, plural, UID — around a message that was usually one line.
+fn report_outcome<T, E, Q>(kind: &str, outcome: Result<T, ControllerError<E, Q>>)
+where
+    T: std::fmt::Debug,
+    E: std::error::Error + 'static,
+    Q: std::error::Error + 'static,
+{
+    match outcome {
+        Ok(object) => debug!(controller = kind, "reconciled {object:?}"),
+        Err(ControllerError::ObjectNotFound(object)) => {
+            info!(
+                controller = kind,
+                "{object} no longer exists; nothing to reconcile"
+            )
+        }
+        Err(error) => warn!(controller = kind, "{error}"),
+    }
 }
 
 fn setup_tracing() {
