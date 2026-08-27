@@ -338,6 +338,67 @@ mod tests {
         );
     }
 
+    /// Only a host that actually succeeded is stamped with the revision. `lastAppliedHash` is the
+    /// sole input to `find_outdated_hosts`, so stamping a host that failed, was never reached, or
+    /// whose result could not be recovered would declare it current and retire it from every future
+    /// run of this revision — the plan would report the failure once and then never touch the host
+    /// again. The outcome and the timestamp are recorded for all of them regardless, because those
+    /// are what report the failure; it is only the revision claim that is withheld.
+    #[test]
+    fn only_a_succeeded_host_is_stamped_with_the_applied_revision() {
+        let h = hash();
+        let mut status = PlaybookPlanStatus {
+            hosts_status: Some(BTreeMap::from([(
+                "failed".into(),
+                crate::v1beta1::HostStatus {
+                    last_applied_hash: "previous-revision".into(),
+                    last_outcome: HostOutcome::Succeeded,
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        let result = |outcome: HostOutcome| crate::v1beta1::PlayHostResult {
+            outcome,
+            ..Default::default()
+        };
+        let play_status = PlayStatus {
+            phase: PlayPhase::Failed,
+            host_count: 4,
+            hosts: BTreeMap::from([
+                ("succeeded".into(), result(HostOutcome::Succeeded)),
+                ("failed".into(), result(HostOutcome::Failed)),
+                ("not-reached".into(), result(HostOutcome::NotReached)),
+                ("unknown".into(), result(HostOutcome::Unknown)),
+            ]),
+            ..Default::default()
+        };
+
+        apply_terminal_play_status(&h, &play_status, &mut status);
+
+        let hosts = status.hosts_status.unwrap();
+        assert_eq!(hosts["succeeded"].last_applied_hash, h.to_string());
+        assert_eq!(
+            hosts["failed"].last_applied_hash, "previous-revision",
+            "a failed host keeps the last revision it really applied"
+        );
+        assert_eq!(
+            hosts["not-reached"].last_applied_hash, "",
+            "a host Ansible never reached has applied nothing"
+        );
+        assert_eq!(
+            hosts["unknown"].last_applied_hash, "",
+            "an unrecoverable result is not evidence the revision landed"
+        );
+        for host in ["succeeded", "failed", "not-reached", "unknown"] {
+            assert_eq!(
+                hosts[host].last_outcome, play_status.hosts[host].outcome,
+                "{host} must still report what happened to it"
+            );
+            assert!(hosts[host].last_transition_time.is_some(), "{host}");
+        }
+    }
+
     #[test]
     fn blocked_condition_names_the_holder_then_clears_in_place() {
         let mut status = PlaybookPlanStatus::default();
