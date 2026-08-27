@@ -1232,7 +1232,7 @@ async fn try_start_run(
     resource_status.retry_count = active_run.mirror.attempt;
     resource_status.current_job_name = Some(active_run.mirror.job_name.clone());
     resource_status.phase = Phase::Applying;
-    resource_status.summary = Some(format!("applying run {}", active_run.mirror.job_name));
+    resource_status.summary = Some(applying_summary(&active_run.mirror));
     resource_status.next_run = None;
     resource_status.active_run = Some(active_run.mirror.clone());
 
@@ -1664,7 +1664,7 @@ async fn advance_active_run(
             locking::renew_locks(&leases_api, &run.mirror.hosts, &holder_identity).await?;
         status::clear_attempt_conditions(resource_status);
         status::set_running_condition(resource_status);
-        resource_status.summary = Some(format!("applying run {}", run.mirror.job_name));
+        resource_status.summary = Some(applying_summary(&run.mirror));
         return Ok(ActiveRunProgress::Running(std::time::Duration::from_secs(
             15,
         )));
@@ -2122,7 +2122,9 @@ async fn preserve_unlaunched_run_after_error(
         }
     }
 
-    resource_status.summary = Some(format!("run recovery paused: {error}"));
+    if summary_unclaimed_since_adoption(resource_status, &unlaunched.run.mirror) {
+        resource_status.summary = Some(format!("run recovery paused: {error}"));
+    }
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
         warn!("Could not report paused run recovery on {namespace}/{name}: {patch_error}");
     }
@@ -2852,8 +2854,34 @@ fn adopt_recovered_attempt(status: &mut PlaybookPlanStatus, active_run: &ActiveR
     }
     status.current_job_name = Some(active_run.job_name.clone());
     status.phase = Phase::Applying;
-    status.summary = Some(format!("applying run {}", active_run.job_name));
+    status.summary = Some(applying_summary(active_run));
     status.active_run = Some(active_run.clone());
+}
+
+/// The plan's summary while an attempt is in progress.
+///
+/// Written wherever a run is adopted or advanced, and deliberately said in one line rather than
+/// narrating the step the attempt has reached: waiting on host locks and waiting on proxy pods are
+/// reported by the `Blocked`/`WaitingForNodes` conditions, and duplicating them here would only give
+/// them a second chance to disagree.
+///
+/// What matters is that *something* claims the summary on the way in. Every error path this tick
+/// might take overwrites it with its own message, and merge patches never drop the key, so without
+/// this a message explaining why an earlier attempt was given up would stay on the plan for the
+/// whole of the run that replaced it.
+fn applying_summary(active_run: &ActiveRun) -> String {
+    format!("applying run {}", active_run.job_name)
+}
+
+/// Whether the summary is still the one [`adopt_recovered_attempt`] claimed for this attempt on the
+/// way into the tick — i.e. no step has since replaced it with an account of its own failure.
+///
+/// This is what lets a fallback message defer to a specific one without the two having to be
+/// sequenced through a shared return value: every recovered attempt passes through
+/// `adopt_recovered_attempt`, so anything else standing here was written by the step that just
+/// failed, and that step knew more about the failure than the fallback does.
+fn summary_unclaimed_since_adoption(status: &PlaybookPlanStatus, active_run: &ActiveRun) -> bool {
+    status.summary.as_deref() == Some(applying_summary(active_run).as_str())
 }
 
 /// A run the operator is driving this tick: the mirror the plan's status carries for it, plus the
@@ -4918,6 +4946,41 @@ spec:
         adopt_recovered_attempt(&mut replacement, &active_run);
         assert_eq!(replacement.retry_count, 0);
         assert!(replacement.active_run.is_some());
+    }
+
+    /// A fallback summary must not bury a specific one. `preserve_unlaunched_run_after_error` runs
+    /// after steps that may already have reported themselves — `report_failed_abandon` names the run
+    /// whose node-root proxy pods and host Leases could not be released, and points at the manual
+    /// cleanup — so it claims the summary only while nothing has replaced the one every recovered
+    /// attempt is adopted with.
+    #[test]
+    fn a_step_that_reported_itself_keeps_the_summary() {
+        let active_run = ActiveRun {
+            execution_hash: "1".into(),
+            run_id: "run-1".into(),
+            job_name: "apply-plan-1-4".into(),
+            play_uid: "play-uid".into(),
+            hosts: vec!["worker-1".into()],
+            attempt: 4,
+            triggered_slot: None,
+        };
+
+        let mut status = PlaybookPlanStatus::default();
+        adopt_recovered_attempt(&mut status, &active_run);
+        assert!(summary_unclaimed_since_adoption(&status, &active_run));
+
+        status.summary = Some("could not release the abandoned run apply-plan-1-4: boom".into());
+        assert!(!summary_unclaimed_since_adoption(&status, &active_run));
+
+        // A summary left over from a *previous* tick describes a run that is no longer current, so
+        // it is not a claim on this one and must not suppress the fallback.
+        let mut stale = PlaybookPlanStatus {
+            summary: Some("applying run apply-plan-1-3".into()),
+            ..Default::default()
+        };
+        assert!(!summary_unclaimed_since_adoption(&stale, &active_run));
+        adopt_recovered_attempt(&mut stale, &active_run);
+        assert!(summary_unclaimed_since_adoption(&stale, &active_run));
     }
 
     #[test]
