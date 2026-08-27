@@ -134,8 +134,8 @@ run targets, so a disruptive playbook is less likely to evict its own runner mid
 
 ## Lifecycle at a glance
 
-A plan moves through phases: `Pending` → `Applying` → `Succeeded`/`Failed`, in both modes, from the
-recap of the run that just finished. A `Recurring` plan keeps that result between ticks and
+A plan moves through phases: `Pending` → `Delayed` while it waits for a scheduled start →
+`Applying` → `Succeeded`/`Failed`, in both modes, from the recap of the run that just finished. A `Recurring` plan keeps that result between ticks and
 advertises the next one through `.status.nextRun`. Drift detection decides *which* hosts actually run: an
 execution hash over the playbook plus every referenced Secret marks hosts out of date, and a host
 that already succeeded on the current hash is skipped. See

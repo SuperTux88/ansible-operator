@@ -67,7 +67,7 @@ Set `spec.suspend: true` to stop the operator starting new runs, the same idea a
 - No **new** run is started while suspended, in any mode: a `Recurring` plan skips its schedule
   ticks, and a `OneShot` plan holds off even when hosts are out of date.
 - The `Suspended` printer column reads `true` and `.status.nextRun` is cleared — there is no next run
-  while paused. The plan's phase keeps showing its underlying state (e.g. `Scheduled` or
+  while paused. The plan's phase keeps showing its underlying state (e.g. `Delayed` or
   `Succeeded`); the column, not the phase, is what tells you it is paused.
 
 Clear the flag (`spec.suspend: false`, or remove it) to resume; a `Recurring` plan picks up again at

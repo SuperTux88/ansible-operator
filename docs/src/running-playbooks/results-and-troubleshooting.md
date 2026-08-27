@@ -24,9 +24,8 @@ per-host status, and the summary line.
 | Phase | Meaning |
 |---|---|
 | `Pending` | Triggers not yet evaluated — the resting state right after creation, after the inputs changed, or while an input [cannot be read](#the-plans-inputs-cannot-be-read). |
-| `Delayed` | Reserved for deferred execution; not currently produced. |
+| `Delayed` | The plan is waiting for its scheduled time and has no result yet under the current playbook and inputs. |
 | `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has seen the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name. |
-| `Scheduled` | The plan is waiting for a scheduled run. |
 | `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. |
 | `Failed` | The latest run did not succeed on every host, or its recap could not be read. A `Recurring` plan keeps this result between ticks the same way. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
 | `UnauthorizedNamespace` | The plan's namespace is not enrolled for the operator — it will not run. See below. |

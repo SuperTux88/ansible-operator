@@ -104,7 +104,7 @@ pub fn apply_terminal_play_status(
 /// a per-host lock held by another run (locks are global per node — see `locking::ensure_locks`).
 /// `Some(blocked)` sets it `True` with the offending host and, when known, the holding run named in
 /// the message; `None` — the run holds (or could take) all its locks — sets it `False`. The `phase`
-/// stays whatever it was (typically `Scheduled`): being blocked is an orthogonal, transient overlay
+/// stays whatever it was (typically `Applying`): being blocked is an orthogonal, transient overlay
 /// on the plan's lifecycle, not a lifecycle state of its own, so a condition models it better than a
 /// phase would.
 pub fn set_blocked_condition(status: &mut PlaybookPlanStatus, blocked: Option<&BlockedBy>) {

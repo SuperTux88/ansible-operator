@@ -310,14 +310,13 @@ pub enum Phase {
     #[default]
     Pending,
 
-    /// Playbook execution has been delayed.
+    /// The plan is waiting for its scheduled time, and the current playbook and inputs have not
+    /// produced a result yet. Once a run has finished, its `Succeeded`/`Failed` verdict is what the
+    /// plan reports between runs, with `nextRun` naming the next one.
     Delayed,
 
     /// Playbook has not yet been applied to all hosts.
     Applying,
-
-    /// Playbook is scheduled for reexecution.
-    Scheduled,
 
     /// The latest run did not succeed on every host it targeted, or its recap could not be read.
     /// A `Recurring` plan keeps this result between schedule ticks, with `nextRun` naming the next
