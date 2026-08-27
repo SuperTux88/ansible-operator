@@ -89,6 +89,7 @@ use crate::{
 pub fn create_job_blueprint(
     hash: &ExecutionHash,
     retry_count: u32,
+    run_id: &str,
     target_groups: &[ResolvedInventoryGroup],
     object: &PlaybookPlan,
 ) -> Result<batch::v1::Job, ReconcileError> {
@@ -113,7 +114,7 @@ pub fn create_job_blueprint(
     let mut job = create_job_skeleton(object, object.spec.template.requirements.is_some())?;
 
     if has_managed_ssh_group(target_groups) {
-        let secret_name = managed_ssh::client_cert_secret_name(hash);
+        let secret_name = managed_ssh::client_cert_secret_name(run_id);
         configure_job_for_managed_ssh_client_cert(&mut job, &secret_name);
     }
 
@@ -135,6 +136,7 @@ pub fn create_job_blueprint(
     let job_labels: BTreeMap<String, String> = BTreeMap::from([
         (labels::PLAYBOOKPLAN_NAME.into(), pb_name.to_string()),
         (labels::PLAYBOOKPLAN_HASH.into(), hash.to_string()),
+        (labels::RUN_ID.into(), run_id.to_string()),
         (labels::COMPONENT.into(), labels::PLAYBOOK_COMPONENT.into()),
     ]);
     job.metadata.labels = Some(job_labels.clone());
@@ -235,6 +237,7 @@ pub async fn ensure_job_network_policy(
     client: kube::Client,
     operator_namespace: &str,
     hash: &ExecutionHash,
+    run_id: &str,
     target_groups: &[ResolvedInventoryGroup],
     plan: &PlaybookPlan,
     mut egress: Vec<NetworkPolicyEgressRule>,
@@ -262,6 +265,7 @@ pub async fn ensure_job_network_policy(
                 pod_selector: Some(LabelSelector {
                     match_labels: Some(BTreeMap::from([
                         (labels::PLAYBOOKPLAN_HASH.into(), hash.to_string()),
+                        (labels::RUN_ID.into(), run_id.to_string()),
                         (
                             labels::COMPONENT.into(),
                             labels::MANAGED_SSH_PROXY_COMPONENT.into(),
@@ -279,7 +283,7 @@ pub async fn ensure_job_network_policy(
         });
     }
 
-    let np_name = job_network_policy_name(&name, hash);
+    let np_name = job_network_policy_name(&name, run_id);
     let policy = NetworkPolicy {
         metadata: ObjectMeta {
             name: Some(np_name.clone()),
@@ -295,6 +299,7 @@ pub async fn ensure_job_network_policy(
             labels: Some(BTreeMap::from([
                 (labels::PLAYBOOKPLAN_NAME.into(), name.to_string()),
                 (labels::PLAYBOOKPLAN_HASH.into(), hash.to_string()),
+                (labels::RUN_ID.into(), run_id.to_string()),
                 (labels::COMPONENT.into(), labels::PLAYBOOK_COMPONENT.into()),
             ])),
             ..Default::default()
@@ -304,6 +309,7 @@ pub async fn ensure_job_network_policy(
                 match_labels: Some(BTreeMap::from([
                     (labels::PLAYBOOKPLAN_NAME.into(), name.to_string()),
                     (labels::PLAYBOOKPLAN_HASH.into(), hash.to_string()),
+                    (labels::RUN_ID.into(), run_id.to_string()),
                     (labels::COMPONENT.into(), labels::PLAYBOOK_COMPONENT.into()),
                 ])),
                 ..Default::default()
@@ -326,22 +332,21 @@ pub async fn ensure_job_network_policy(
 
 /// Name of a run's egress `NetworkPolicy` in the plan's namespace.
 ///
-/// The plan name is both truncated (for readability) *and* hashed to reduce collision risk.
-/// Truncation alone is not enough: object names are capped at 63 characters, so two plans in one
-/// namespace sharing a long common prefix and the same execution hash — identical playbook and
-/// Secrets, which is plausible for templated or copy-pasted plans — would collapse onto the same
-/// policy name. The write is a forced server-side apply, so that collision would be silent and
-/// destructive: the second plan takes over the `controller: true` owner reference, and the first
-/// plan's cleanup (a delete by this same name) then removes the second plan's policy mid-run.
-/// Including the full name in the hash substantially reduces collision risk from shared prefixes.
-pub(super) fn job_network_policy_name(plan_name: &str, hash: &ExecutionHash) -> String {
+/// Uniqueness comes from the run ID, which `reconciler::run_id` mints per attempt from the plan's
+/// UID, so two plans can never name the same policy however alike they are. The truncated plan name
+/// is there to keep the object recognizable in `kubectl get netpol`, and the plan-name hash next to
+/// it keeps that readable half faithful: object names are capped at 63 characters, so two plans
+/// sharing a long common prefix truncate to the same text, and a name that reads as another plan's
+/// is worth avoiding even when nothing collides.
+///
+/// The run ID contributes to the length budget. `reconciler::RUN_ID_LENGTH` is what keeps the result
+/// inside [`utils::MAX_DNS_LABEL_LEN`], the cap that applies to a NetworkPolicy name; the saturating
+/// subtraction below is not a second guarantee on top of that, only insurance that an over-long run
+/// ID fails as a clean apiserver rejection rather than an underflow panic.
+pub(super) fn job_network_policy_name(plan_name: &str, run_id: &str) -> String {
     let mut hasher = twox_hash::XxHash3_64::new();
     plan_name.hash(&mut hasher);
-    let suffix = format!(
-        "-{}-{}-egress",
-        utils::generate_id(hasher.finish()),
-        utils::generate_id(**hash)
-    );
+    let suffix = format!("-{}-{}-egress", utils::generate_id(hasher.finish()), run_id);
     let prefix = "playbook-";
     let budget = utils::MAX_DNS_LABEL_LEN.saturating_sub(prefix.len() + suffix.len());
     format!("{prefix}{}{suffix}", plan_name_segment(plan_name, budget))
@@ -989,9 +994,9 @@ spec:
         let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
 
-        let attempt_1 = super::create_job_blueprint(&hash, 1, &[], &pp).unwrap();
-        let attempt_2 = super::create_job_blueprint(&hash, 2, &[], &pp).unwrap();
-        let attempt_1_again = super::create_job_blueprint(&hash, 1, &[], &pp).unwrap();
+        let attempt_1 = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp).unwrap();
+        let attempt_2 = super::create_job_blueprint(&hash, 2, "run-2", &[], &pp).unwrap();
+        let attempt_1_again = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp).unwrap();
 
         let name_1 = attempt_1.name().unwrap().to_string();
         let name_2 = attempt_2.name().unwrap().to_string();
@@ -1050,7 +1055,7 @@ spec:
             variables: None,
         }];
 
-        let job = super::create_job_blueprint(&hash, 1, &groups, &pp).unwrap();
+        let job = super::create_job_blueprint(&hash, 1, "run-1", &groups, &pp).unwrap();
         let node_affinity = job
             .spec
             .unwrap()
@@ -1089,7 +1094,7 @@ spec:
 
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
         let ttl = |plan: &PlaybookPlan| {
-            super::create_job_blueprint(&hash, 1, &[], plan)
+            super::create_job_blueprint(&hash, 1, "run-1", &[], plan)
                 .unwrap()
                 .spec
                 .unwrap()
@@ -1136,7 +1141,7 @@ spec:
             variables: None,
         }];
 
-        let job = super::create_job_blueprint(&hash, 1, &groups, &pp).unwrap();
+        let job = super::create_job_blueprint(&hash, 1, "run-1", &groups, &pp).unwrap();
         assert!(
             job.spec.unwrap().template.spec.unwrap().affinity.is_none(),
             "StaticInventory hosts aren't cluster nodes, so nothing constrains placement"
@@ -1151,7 +1156,7 @@ spec:
         assert!(pp.spec.service_account_name.is_none());
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
 
-        let pod_spec = super::create_job_blueprint(&hash, 1, &[], &pp)
+        let pod_spec = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp)
             .unwrap()
             .spec
             .unwrap()
@@ -1172,7 +1177,7 @@ spec:
         pp.spec.service_account_name = Some("playbook-sa".into());
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
 
-        let pod_spec = super::create_job_blueprint(&hash, 1, &[], &pp)
+        let pod_spec = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp)
             .unwrap()
             .spec
             .unwrap()
@@ -1197,7 +1202,7 @@ spec:
         });
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
 
-        let pod_spec = super::create_job_blueprint(&hash, 1, &[], &pp)
+        let pod_spec = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp)
             .unwrap()
             .spec
             .unwrap()
@@ -1223,27 +1228,29 @@ spec:
         );
     }
 
-    /// The budget this name has to fit: any plan name at all, inside the label cap a NetworkPolicy
-    /// name is held to.
+    /// The budget this name has to fit: any plan name at all, against a run ID of the length the
+    /// operator actually mints, inside the label cap a NetworkPolicy name is held to. Growing
+    /// `RUN_ID_LENGTH` has to fail here rather than at the apiserver.
     ///
-    /// The second half pins the readable half of the name. Two names that truncate to the same
+    /// The second half pins the readable half of the name. Two plans can no longer *collide* — the
+    /// run ID is minted per attempt from the plan's UID — but two names that truncate to the same
     /// text still read as each other in `kubectl get netpol`, which the plan-name hash is what
     /// prevents.
     #[test]
     fn job_network_policy_name_fits_its_budget_and_stays_distinguishable() {
-        use crate::utils::{MAX_DNS_LABEL_LEN, MAX_DNS_SUBDOMAIN_LEN};
-        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+        use crate::utils::{MAX_DNS_LABEL_LEN, MAX_DNS_SUBDOMAIN_LEN, generate_id_with_length};
+        use crate::v1beta1::controllers::playbookplancontroller::reconciler::RUN_ID_LENGTH;
 
         // A plan name is an object name, so the worst case it has to survive is a full subdomain.
-        let hash = calculate_execution_hash("playbook", std::iter::empty());
+        let run_id = generate_id_with_length(u64::MAX, RUN_ID_LENGTH);
         assert!(
-            super::job_network_policy_name(&"a".repeat(MAX_DNS_SUBDOMAIN_LEN), &hash).len()
+            super::job_network_policy_name(&"a".repeat(MAX_DNS_SUBDOMAIN_LEN), &run_id).len()
                 <= MAX_DNS_LABEL_LEN
         );
 
         let long_prefix = "a".repeat(60);
-        let first = super::job_network_policy_name(&format!("{long_prefix}-one"), &hash);
-        let second = super::job_network_policy_name(&format!("{long_prefix}-two"), &hash);
+        let first = super::job_network_policy_name(&format!("{long_prefix}-one"), &run_id);
+        let second = super::job_network_policy_name(&format!("{long_prefix}-two"), &run_id);
 
         assert_ne!(first, second);
         assert!(first.len() <= MAX_DNS_LABEL_LEN);
@@ -1338,6 +1345,7 @@ spec:
         use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
 
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
+        let run_id = "abcdefghij";
 
         // Sweep every truncation point across a dotted name, so whichever one lands on (or just
         // after) a dot is covered rather than guessed at.
@@ -1355,7 +1363,7 @@ spec:
                 let name = super::job_name(plan_name, "plan-uid", &hash, attempt);
                 assert!(is_dns_label(&name), "job name {name:?} is not a DNS label");
             }
-            let policy = super::job_network_policy_name(plan_name, &hash);
+            let policy = super::job_network_policy_name(plan_name, run_id);
             assert!(
                 is_dns_label(&policy),
                 "policy name {policy:?} is not a DNS label"

@@ -508,11 +508,15 @@ async fn try_start_run(
     // cleanup runs (the explicit per-run delete in `cleanup_proxy_infra` is the primary path).
     let plan_owner = playbookplan_owner_ref(object)?;
 
+    // This attempt's run ID — the identity every run-scoped resource is keyed on.
+    let run_id = run_id(object, &run.execution_hash)?;
+
     let proxy_readiness = managed_ssh::ensure_proxy_infra(
         &context.client,
         &context.operator_namespace,
         run.namespace,
         &run.execution_hash,
+        &run_id,
         &managed_ssh_hosts,
         tolerations.as_deref(),
         &context.proxy_grace,
@@ -588,6 +592,7 @@ async fn try_start_run(
             context.client.clone(),
             &context.operator_namespace,
             &run.execution_hash,
+            &run_id,
             run_groups,
             object,
             network_policy_egress,
@@ -598,6 +603,7 @@ async fn try_start_run(
     spawn_ansible_job(
         &jobs_api,
         run.execution_hash,
+        &run_id,
         run_groups,
         object,
         resource_status,
@@ -722,11 +728,21 @@ async fn advance_applying_run(
     .await?;
     play_history::prune(&context.client, run.namespace, object).await?;
 
+    // The attempt's run ID travels on the Job's labels for now; cleanup needs it to address this
+    // attempt's proxy resources. A reaped Job takes the ID with it — that sweep is then a no-op and
+    // the plan-owned client-cert Secret falls back to Kubernetes GC.
+    let job_run_id = job
+        .as_ref()
+        .and_then(|job| job.metadata.labels.as_ref())
+        .and_then(|job_labels| job_labels.get(labels::RUN_ID))
+        .cloned()
+        .unwrap_or_default();
     managed_ssh::cleanup_proxy_infra(
         &context.client,
         &context.operator_namespace,
         run.namespace,
         &run.execution_hash,
+        &job_run_id,
         run.name,
     )
     .await?;
@@ -1208,6 +1224,48 @@ fn namespace_and_name(object: &PlaybookPlan) -> Result<(&str, &str), ReconcileEr
     Ok((namespace, name))
 }
 
+/// How many characters [`run_id`] mints.
+///
+/// Long enough that concurrent attempts cannot collide on it, short enough to leave room for a node
+/// name inside the object names it feeds. Every name budget that depends on it — the proxy pods and
+/// Secrets in `managed_ssh::resource_name`, the egress policy in
+/// `job_builder::job_network_policy_name` — is pinned by a test that mints an ID of exactly this
+/// length, so raising it fails in all of them at once rather than at the apiserver.
+pub(super) const RUN_ID_LENGTH: usize = 10;
+
+/// Mints this attempt's run ID — the identity that scopes its Leases, proxy resources, client
+/// certificate principal and cleanup.
+///
+/// Deliberately *not* a function of (plan, hash, attempt): an aborted attempt frees its number
+/// again, so a derived ID would be reused by the retry while the aborted attempt's proxy pods are
+/// still terminating, and the retry would adopt those dying pods under the same names. A counter
+/// separates the IDs minted by one process and the clock separates them across restarts; the run ID
+/// never has to be recomputed, since it is recorded in the `Play` before anything is named after it.
+fn run_id(plan: &PlaybookPlan, execution_hash: &ExecutionHash) -> Result<String, ReconcileError> {
+    use kube::runtime::reflector::Lookup as _;
+    use std::hash::{Hash as _, Hasher as _};
+    static MINTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let mut hasher = twox_hash::XxHash3_64::new();
+    plan.uid()
+        .ok_or(ReconcileError::PreconditionFailed("uid not set"))?
+        .hash(&mut hasher);
+    execution_hash.to_string().hash(&mut hasher);
+    MINTED
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .hash(&mut hasher);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ReconcileError::PreconditionFailed("system clock is before the epoch"))?
+        .as_nanos()
+        .hash(&mut hasher);
+    Ok(crate::utils::generate_id_with_length(
+        hasher.finish(),
+        RUN_ID_LENGTH,
+    ))
+}
+
+
 /// Picks the most recently created Job that hasn't reached a terminal state — the "still active"
 /// attempt for a run, if there is one. Pure so it's unit-testable without a kube client.
 fn newest_active_job(jobs: &[Job]) -> Option<&Job> {
@@ -1256,6 +1314,7 @@ fn decide_job_action(existing: &[Job], current_retry_count: u32) -> JobAction {
 async fn spawn_ansible_job(
     api: &Api<Job>,
     hash: ExecutionHash,
+    run_id: &str,
     run_groups: &[ResolvedInventoryGroup],
     playbookplan: &PlaybookPlan,
     resource_status: &mut PlaybookPlanStatus,
@@ -1277,8 +1336,13 @@ async fn spawn_ansible_job(
             // `reconcile` whenever `current_hash` changes.
             resource_status.retry_count = retry_count;
 
-            let job =
-                job_builder::create_job_blueprint(&hash, retry_count, run_groups, playbookplan)?;
+            let job = job_builder::create_job_blueprint(
+                &hash,
+                retry_count,
+                run_id,
+                run_groups,
+                playbookplan,
+            )?;
             let job_name = job
                 .name()
                 .expect(".metadata.name must be set at this point")
@@ -1658,7 +1722,7 @@ mod tests {
         plan.metadata.namespace = Some("team".into());
         plan.metadata.uid = Some("plan-uid".into());
 
-        let job = job_builder::create_job_blueprint(&hash, 1, &[], &plan).unwrap();
+        let job = job_builder::create_job_blueprint(&hash, 1, "run-1", &[], &plan).unwrap();
         let template_labels = job
             .spec
             .as_ref()
@@ -1688,6 +1752,22 @@ mod tests {
             plan_name
         );
         assert!(selector.ends_with(&plan_name));
+    }
+
+    #[test]
+    fn run_ids_are_minted_fresh_and_stay_short_enough_for_resource_names() {
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+        let hash = execution_evaluator::calculate_execution_hash("- hosts: all", std::iter::empty());
+
+        let first = run_id(&plan, &hash).unwrap();
+        let second = run_id(&plan, &hash).unwrap();
+
+        // Same plan, same revision, same attempt number: an aborted attempt's retry must still not
+        // land on the identity whose proxy pods may still be terminating.
+        assert_ne!(first, second);
+        assert_eq!(first.len(), RUN_ID_LENGTH);
+        assert!(first.chars().all(|c| c.is_ascii_alphanumeric()));
     }
 
     #[test]

@@ -17,11 +17,11 @@ use crate::v1beta1::controllers::reconcile_error::{ReconcileError, is_conflict};
 pub const LEASE_DURATION_SECONDS: i32 = 90;
 
 /// A host whose lock this run couldn't take or keep this tick, and — when the Lease recorded one —
-/// that holder's `namespace/name/hash` identity so the caller can name the run involved.
+/// that holder's `namespace/name/run-id` identity so the caller can name the run involved.
 #[derive(Debug, PartialEq, Eq)]
 pub struct BlockedBy {
     pub host: String,
-    /// The observed holder's identity (`namespace/name/hash`), or `None` when we only lost a write
+    /// The observed holder's identity (`namespace/name/run-id`), or `None` when we only lost a write
     /// race (a 409) and never saw who won it.
     pub holder: Option<String>,
 }

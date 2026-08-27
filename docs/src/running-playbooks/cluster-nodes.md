@@ -89,16 +89,17 @@ For each targeted Node in a run, the operator:
    granted just enough privilege (`hostPID`, a host `/proc` mount, `CAP_SYS_ADMIN` +
    `CAP_SYS_PTRACE`) that each SSH session can `nsenter` into the Node's host namespaces, making the
    session `root` on the Node. The pod does not use `privileged: true`, `hostNetwork`, or `hostIPC`.
-2. Mints a fresh SSH **host certificate** for that run from the operator's in-memory certificate
-   authority, and a matching **client certificate** for the Job. Certificates are per-run and
-   short-lived; a run can authenticate only to *its own* proxy pods.
-3. Locks each proxy pod's ingress to that run's Job with a NetworkPolicy.
+2. Mints a fresh SSH **host certificate** for that attempt from the operator's in-memory certificate
+   authority, and a matching **client certificate** for the Job. Certificates are per-attempt and
+   short-lived, so an attempt can authenticate only to *its own* proxy pods — even a retry of the
+   same run cannot reach the pods of the attempt it replaced.
+3. Locks each proxy pod's ingress to that attempt's Job with a NetworkPolicy.
 4. Renders the inventory so Ansible dials the proxy pod and verifies the Node's host certificate.
-5. Tears the proxy pods, per-run Secrets, and NetworkPolicy down when the run finishes.
+5. Tears the proxy pods, their Secrets, and the NetworkPolicy down when the run finishes.
 
 There is **no standing agent or DaemonSet** on your Nodes: proxy pods exist only for the duration of
-a run. The security properties of this path — per-run certificate isolation, the in-memory CA, and
-why `NodeAccessPolicy` is mandatory — are covered in
+a run. The security properties of this path — per-attempt certificate isolation, the in-memory CA,
+and why `NodeAccessPolicy` is mandatory — are covered in
 [Security model](../cluster-operators/security.md).
 
 ## NotReady nodes

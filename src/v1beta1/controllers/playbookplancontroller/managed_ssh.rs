@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
 
 use k8s_openapi::{
     api::{
@@ -23,17 +22,14 @@ use kube::{
 };
 
 use super::paths;
-use crate::{
-    utils,
-    v1beta1::{
-        ca::CertificateAuthority,
-        controllers::{
-            playbookplancontroller::execution_evaluator::ExecutionHash,
-            reconcile_error::{ReconcileError, is_not_found},
-        },
-        labels,
-        resources::Toleration,
+use crate::v1beta1::{
+    ca::CertificateAuthority,
+    controllers::{
+        playbookplancontroller::execution_evaluator::ExecutionHash,
+        reconcile_error::{ReconcileError, is_not_found},
     },
+    labels,
+    resources::Toleration,
 };
 
 pub const PROXY_SSH_PORT: i32 = 22;
@@ -44,9 +40,9 @@ const HOST_CERT_FILENAME: &str = "ssh_host_ed25519_key-cert.pub";
 const CA_PUB_FILENAME: &str = "ca.pub";
 const ENTER_HOST_SCRIPT_FILENAME: &str = "enter-host.sh";
 
-/// Per-run principals file for sshd's `AuthorizedPrincipalsFile`. It contains **only this run's
-/// execution hash** (see `build_secret`) — never `root`. That scopes the proxy to certs carrying
-/// that run's hash principal, so a leaked/strayed client cert from another run is rejected at the
+/// Per-attempt principals file for sshd's `AuthorizedPrincipalsFile`. It contains **only this run's
+/// run ID** (see `build_secret`) — never `root`. That scopes the proxy to certs carrying
+/// that attempt's principal, so a leaked/strayed client cert from another run is rejected at the
 /// sshd cert-principal layer, not just by the per-run NetworkPolicy (THREAT_MODEL R3 / T-INFO-3).
 const AUTHORIZED_PRINCIPALS_FILENAME: &str = "authorized_principals";
 
@@ -220,10 +216,10 @@ fn merge_default_tolerations(
     merged
 }
 
-/// Deterministic, human-readable resource name for a (host, run) pair. The host is used verbatim
+/// Deterministic, human-readable resource name for a (host, attempt) pair. The host is used verbatim
 /// (not hashed) since managed-ssh only targets `ClusterInventory` hosts, i.e. real Node names,
-/// which are already valid Kubernetes object name components. The run uses `utils::generate_id`'s
-/// short-id, matching `job_builder::create_job_for_run`'s Job naming.
+/// which are already valid Kubernetes object name components. The attempt is identified by its run
+/// ID, so a delayed cleanup can never reach a retry's pods.
 ///
 /// Length budget, since nothing truncates here: the result names a Pod and a Secret, so it is bounded
 /// by `utils::MAX_DNS_SUBDOMAIN_LEN`. The host is separately bounded to `utils::MAX_DNS_LABEL_LEN`
@@ -231,24 +227,26 @@ fn merge_default_tolerations(
 /// worst case is 13 + 63 + 1 + `reconciler::RUN_ID_LENGTH`, leaving well over 150 characters of
 /// headroom. A test pins that, so growing the run ID (or ever sourcing the host from something
 /// unlabelled) fails there rather than at the apiserver.
-fn resource_name(host: &str, execution_hash: &ExecutionHash) -> String {
-    format!(
-        "ansible-sshd-{host}-{}",
-        utils::generate_id(**execution_hash)
-    )
+fn resource_name(host: &str, run_id: &str) -> String {
+    format!("ansible-sshd-{host}-{run_id}")
 }
 
 /// Name of this run's client-cert Secret, shared by `job_builder`'s mount and `ensure_client_cert`.
-pub fn client_cert_secret_name(execution_hash: &ExecutionHash) -> String {
-    format!("managed-ssh-client-{execution_hash}")
+pub fn client_cert_secret_name(run_id: &str) -> String {
+    format!("managed-ssh-client-{run_id}")
 }
 
-fn run_labels(execution_hash: &ExecutionHash, host: &str) -> BTreeMap<String, String> {
+fn run_labels(
+    execution_hash: &ExecutionHash,
+    run_id: &str,
+    host: &str,
+) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
             labels::PLAYBOOKPLAN_HASH.to_string(),
             execution_hash.to_string(),
         ),
+        (labels::RUN_ID.to_string(), run_id.to_string()),
         (labels::PLAYBOOKPLAN_HOST.to_string(), host.to_string()),
         (
             labels::COMPONENT.to_string(),
@@ -269,7 +267,7 @@ fn run_labels(execution_hash: &ExecutionHash, host: &str) -> BTreeMap<String, St
 /// `secure_filename` refuses under the default `StrictModes yes`. sshd then silently *discards* the
 /// principals file, so no cert principal ever matches and every login fails with
 /// `Permission denied (publickey)`. Disabling StrictModes does not weaken isolation: the per-run
-/// `<hash>` principal check still runs (INV-4 / T-INFO-3); only the file-permission gate is skipped,
+/// run-ID principal check still runs (INV-4 / T-INFO-3); only the file-permission gate is skipped,
 /// and every file in the mount is operator-rendered and read-only.
 fn render_sshd_config() -> String {
     format!(
@@ -330,6 +328,7 @@ fn render_enter_host_script() -> String {
 fn build_secret(
     name: &str,
     execution_hash: &ExecutionHash,
+    run_id: &str,
     host: &str,
     ca: &CertificateAuthority,
 ) -> Result<Secret, ReconcileError> {
@@ -346,13 +345,13 @@ fn build_secret(
     string_data.insert(HOST_KEY_FILENAME.to_string(), host_key_openssh);
     string_data.insert(HOST_CERT_FILENAME.to_string(), host_cert);
     string_data.insert(CA_PUB_FILENAME.to_string(), ca_pub);
-    // ONLY this run's hash — never "root". This is the sole principal sshd's
-    // `AuthorizedPrincipalsFile` will accept, so a client cert from any other run (whose hash
-    // differs) is rejected even if it can reach this pod. Must match the client cert's hash
-    // principal minted in `ensure_client_cert`.
+    // ONLY this attempt's run ID — never "root". This is the sole principal sshd's
+    // `AuthorizedPrincipalsFile` will accept, so a client cert from any other attempt (whose run ID
+    // differs, even for a retry of the same execution hash) is rejected even if it can reach this
+    // pod. Must match the run-ID principal minted in `ensure_client_cert`.
     string_data.insert(
         AUTHORIZED_PRINCIPALS_FILENAME.to_string(),
-        format!("{execution_hash}\n"),
+        format!("{run_id}\n"),
     );
     string_data.insert("sshd_config".to_string(), render_sshd_config());
     string_data.insert(
@@ -363,7 +362,7 @@ fn build_secret(
     Ok(Secret {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
-            labels: Some(run_labels(execution_hash, host)),
+            labels: Some(run_labels(execution_hash, run_id, host)),
             ..Default::default()
         },
         string_data: Some(string_data),
@@ -375,6 +374,7 @@ fn build_pod(
     name: &str,
     secret_name: &str,
     execution_hash: &ExecutionHash,
+    run_id: &str,
     host: &str,
     tolerations: Option<&[Toleration]>,
     proxy_image: &str,
@@ -454,7 +454,7 @@ fn build_pod(
     Pod {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
-            labels: Some(run_labels(execution_hash, host)),
+            labels: Some(run_labels(execution_hash, run_id, host)),
             ..Default::default()
         },
         spec: Some(PodSpec {
@@ -485,6 +485,7 @@ fn build_pod(
 fn build_network_policy(
     name: &str,
     execution_hash: &ExecutionHash,
+    run_id: &str,
     job_namespace: &str,
     egress: Option<Vec<NetworkPolicyEgressRule>>,
 ) -> NetworkPolicy {
@@ -495,10 +496,13 @@ fn build_network_policy(
     NetworkPolicy {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
-            labels: Some(BTreeMap::from([(
-                labels::PLAYBOOKPLAN_HASH.to_string(),
-                execution_hash.to_string(),
-            )])),
+            labels: Some(BTreeMap::from([
+                (
+                    labels::PLAYBOOKPLAN_HASH.to_string(),
+                    execution_hash.to_string(),
+                ),
+                (labels::RUN_ID.to_string(), run_id.to_string()),
+            ])),
             ..Default::default()
         },
         spec: Some(NetworkPolicySpec {
@@ -512,6 +516,7 @@ fn build_network_policy(
                         labels::COMPONENT.to_string(),
                         labels::MANAGED_SSH_PROXY_COMPONENT.to_string(),
                     ),
+                    (labels::RUN_ID.to_string(), run_id.to_string()),
                 ])),
                 ..Default::default()
             }),
@@ -535,6 +540,7 @@ fn build_network_policy(
                                 labels::COMPONENT.to_string(),
                                 labels::PLAYBOOK_COMPONENT.to_string(),
                             ),
+                            (labels::RUN_ID.to_string(), run_id.to_string()),
                         ])),
                         ..Default::default()
                     }),
@@ -551,22 +557,21 @@ fn build_network_policy(
     }
 }
 
-/// Renders this run's client-cert files — private key, a cert signed for `["root", <hash>]`, and
+/// Renders this run's client-cert files — private key, a cert signed for `["root", <run-id>]`, and
 /// the `@cert-authority` known_hosts line — as a `filename -> contents` map. Split out from
 /// `ensure_client_cert` (which just wraps this in a Secret) so tests can exercise the exact client
 /// material the Job pod mounts against a real sshd, rather than re-deriving it.
 ///
-/// The run hash is the *enforced* principal: each proxy pod's `AuthorizedPrincipalsFile` lists only
-/// its own run's hash, so this cert authenticates only to this run's proxies. "root" is kept as a
+/// The per-attempt run ID is the *enforced* principal: each proxy's principals file lists only
+/// its own run ID, so this cert authenticates only to this attempt's proxies. "root" is kept as a
 /// harmless second principal (belt-and-suspenders for sshd's default username check on builds/configs
 /// where `AuthorizedPrincipalsFile` isn't in force); `PermitRootLogin yes` authorizes the root login.
 fn render_client_cert_files(
     ca: &CertificateAuthority,
-    execution_hash: &ExecutionHash,
+    run_id: &str,
 ) -> Result<BTreeMap<String, String>, ReconcileError> {
     let client_key = crate::v1beta1::ca::generate_ephemeral_keypair()?;
-    let principal = execution_hash.to_string();
-    let client_cert = ca.sign_client_cert(client_key.public_key(), &["root", &principal])?;
+    let client_cert = ca.sign_client_cert(client_key.public_key(), &["root", run_id])?;
     let ca_pub = ca.public_key_openssh()?;
 
     let client_key_openssh = client_key
@@ -602,24 +607,28 @@ fn render_client_cert_files(
 async fn ensure_client_cert(
     secrets_api: &Api<Secret>,
     execution_hash: &ExecutionHash,
+    run_id: &str,
     ca: &CertificateAuthority,
     plan_owner: &OwnerReference,
 ) -> Result<(), ReconcileError> {
-    let name = client_cert_secret_name(execution_hash);
+    let name = client_cert_secret_name(run_id);
 
     if secrets_api.get_opt(&name).await?.is_some() {
         return Ok(());
     }
 
-    let string_data = render_client_cert_files(ca, execution_hash)?;
+    let string_data = render_client_cert_files(ca, run_id)?;
 
     let secret = Secret {
         metadata: ObjectMeta {
             name: Some(name),
-            labels: Some(BTreeMap::from([(
-                labels::PLAYBOOKPLAN_HASH.to_string(),
-                execution_hash.to_string(),
-            )])),
+            labels: Some(BTreeMap::from([
+                (
+                    labels::PLAYBOOKPLAN_HASH.to_string(),
+                    execution_hash.to_string(),
+                ),
+                (labels::RUN_ID.to_string(), run_id.to_string()),
+            ])),
             owner_references: Some(vec![plan_owner.clone()]),
             ..Default::default()
         },
@@ -642,6 +651,7 @@ pub async fn ensure_proxy_infra(
     operator_namespace: &str,
     job_namespace: &str,
     execution_hash: &ExecutionHash,
+    run_id: &str,
     hosts: &[String],
     tolerations: Option<&[Toleration]>,
     grace_policy: &ProxyGracePolicy,
@@ -661,14 +671,11 @@ pub async fn ensure_proxy_infra(
     let job_secrets_api: Api<Secret> = Api::namespaced(client.clone(), job_namespace);
 
     if !hosts.is_empty() {
-        let netpol_name = format!("managed-ssh-{:x}", {
-            let mut hasher = twox_hash::XxHash3_64::new();
-            execution_hash.to_string().hash(&mut hasher);
-            hasher.finish()
-        });
+        let netpol_name = format!("managed-ssh-{run_id}");
         let netpol = build_network_policy(
             &netpol_name,
             execution_hash,
+            run_id,
             job_namespace,
             network_policy_egress,
         );
@@ -680,7 +687,7 @@ pub async fn ensure_proxy_infra(
             )
             .await?;
 
-        ensure_client_cert(&job_secrets_api, execution_hash, ca, plan_owner).await?;
+        ensure_client_cert(&job_secrets_api, execution_hash, run_id, ca, plan_owner).await?;
     }
 
     let now = chrono::Utc::now().timestamp();
@@ -690,10 +697,10 @@ pub async fn ensure_proxy_infra(
     let mut waiting = Vec::new();
 
     for host in hosts {
-        let name = resource_name(host, execution_hash);
+        let name = resource_name(host, run_id);
 
         if secrets_api.get_opt(&name).await?.is_none() {
-            let secret = build_secret(&name, execution_hash, host, ca)?;
+            let secret = build_secret(&name, execution_hash, run_id, host, ca)?;
             secrets_api.create(&PostParams::default(), &secret).await?;
         }
 
@@ -701,7 +708,15 @@ pub async fn ensure_proxy_infra(
         let pod = match pods_api.get_opt(&name).await? {
             Some(pod) => pod,
             None => {
-                let pod = build_pod(&name, &name, execution_hash, host, tolerations, proxy_image);
+                let pod = build_pod(
+                    &name,
+                    &name,
+                    execution_hash,
+                    run_id,
+                    host,
+                    tolerations,
+                    proxy_image,
+                );
                 pods_api.create(&PostParams::default(), &pod).await?
             }
         };
@@ -745,7 +760,7 @@ pub async fn ensure_proxy_infra(
 /// Deletes every resource belonging to this run: the operator-namespace proxy pods, their per-host
 /// Secrets and the run's NetworkPolicy via label-scoped `delete_collection`, plus the plan-namespace
 /// client-cert Secret by exact name. The operator-ns sweep is by-label so the host list isn't needed
-/// — GC-by-label catches everything tagged with the run's hash regardless of how the inventory
+/// — GC-by-label catches everything tagged with the attempt's run ID regardless of how the inventory
 /// drifted since the run started. (The CA is in-memory only, not a Secret, so nothing CA-related is
 /// in scope here.) The operator-ns resources can't use ownerReferences, since Kubernetes GC ignores
 /// references that cross namespaces (they live in the operator namespace, the Job/PlaybookPlan in the
@@ -759,15 +774,16 @@ pub async fn ensure_proxy_infra(
 /// below, after which the cert authenticates to nothing (INV-4 / T-INFO-3).
 ///
 /// Pods use a tighter selector than the operator-ns Secrets/NetworkPolicy: the ansible Job pod
-/// carries the same `PLAYBOOKPLAN_HASH` label (the run's NetworkPolicy targets it by that label) but
-/// is NOT proxy infra — it must be reaped by its own Job's `ttlSecondsAfterFinished`, never here.
-/// That only collides when the operator and the plan share a namespace, but requiring the per-host
-/// `PLAYBOOKPLAN_HOST` label (which only proxy pods carry) excludes the ansible pod cleanly.
+/// carries the same `PLAYBOOKPLAN_HASH` and `RUN_ID` labels but is NOT proxy infra — it must be
+/// reaped by its own Job's `ttlSecondsAfterFinished`, never here. That only collides when the
+/// operator and the plan share a namespace, but requiring the per-host `PLAYBOOKPLAN_HOST` label
+/// (which only proxy pods carry) excludes the ansible pod cleanly.
 pub async fn cleanup_proxy_infra(
     client: &kube::Client,
     operator_namespace: &str,
     job_namespace: &str,
     execution_hash: &ExecutionHash,
+    run_id: &str,
     playbookplan_name: &str,
 ) -> Result<(), ReconcileError> {
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), operator_namespace);
@@ -777,26 +793,30 @@ pub async fn cleanup_proxy_infra(
     let job_netpol_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), job_namespace);
 
     let dp = DeleteParams::default();
-    let hash_selector = format!("{}={execution_hash}", labels::PLAYBOOKPLAN_HASH);
+    let run_selector = format!(
+        "{}={execution_hash},{}={run_id}",
+        labels::PLAYBOOKPLAN_HASH,
+        labels::RUN_ID
+    );
 
     // Existence of PLAYBOOKPLAN_HOST spares the ansible Job pod (which lacks it) — see the doc.
     let pods_lp =
-        ListParams::default().labels(&format!("{hash_selector},{}", labels::PLAYBOOKPLAN_HOST));
-    // Bare hash selector: no other operator-managed Secret/NetworkPolicy carries the hash label.
-    let rest_lp = ListParams::default().labels(&hash_selector);
+        ListParams::default().labels(&format!("{run_selector},{}", labels::PLAYBOOKPLAN_HOST));
+    // Hash + run ID selector: no other attempt shares this cleanup identity.
+    let rest_lp = ListParams::default().labels(&run_selector);
 
     let _ = pods_api.delete_collection(&dp, &pods_lp).await;
     let _ = secrets_api.delete_collection(&dp, &rest_lp).await;
     let _ = netpol_api.delete_collection(&dp, &rest_lp).await;
     let _ = job_netpol_api
         .delete(
-            &super::job_builder::job_network_policy_name(playbookplan_name, execution_hash),
+            &super::job_builder::job_network_policy_name(playbookplan_name, run_id),
             &dp,
         )
         .await;
     // Plan-namespace client-cert Secret: by name, never by label (would catch the Job/pod). See doc.
     let _ = job_secrets_api
-        .delete(&client_cert_secret_name(execution_hash), &dp)
+        .delete(&client_cert_secret_name(run_id), &dp)
         .await;
 
     Ok(())
@@ -806,25 +826,108 @@ pub async fn cleanup_proxy_infra(
 mod tests {
     use super::*;
 
+    /// Pins the wire format of the per-attempt resource names, and the length budget behind
+    /// `resource_name` — see its doc comment for why nothing truncates there.
     #[test]
-    fn resource_name_is_deterministic_per_host_and_run() {
+    fn attempt_scoped_resource_names_keep_their_shape_and_fit() {
+        use crate::utils::{MAX_DNS_LABEL_LEN, MAX_DNS_SUBDOMAIN_LEN, generate_id_with_length};
+        use crate::v1beta1::controllers::playbookplancontroller::reconciler::RUN_ID_LENGTH;
+
+        assert_eq!(
+            resource_name("worker-1", "run-a"),
+            "ansible-sshd-worker-1-run-a"
+        );
+        assert_eq!(client_cert_secret_name("run-a"), "managed-ssh-client-run-a");
+
+        // The host is bounded by the label cap (it is also a label value), the whole name by the
+        // subdomain cap (it names a Pod and a Secret).
+        let run_id = generate_id_with_length(u64::MAX, RUN_ID_LENGTH);
+        let name = resource_name(&"n".repeat(MAX_DNS_LABEL_LEN), &run_id);
+        assert!(
+            name.len() <= MAX_DNS_SUBDOMAIN_LEN,
+            "worst-case proxy resource name is {} characters",
+            name.len()
+        );
+    }
+
+    /// These labels are the cleanup selector's whole contract: `PLAYBOOKPLAN_HOST` is what tells a
+    /// proxy pod apart from the ansible Job pod, and `RUN_ID` is what keeps one attempt's sweep off
+    /// another's resources.
+    #[test]
+    fn run_labels_carry_the_hash_run_id_host_and_component() {
         use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
 
-        let hash_a = calculate_execution_hash("playbook-a", std::iter::empty());
-        let hash_b = calculate_execution_hash("playbook-b", std::iter::empty());
+        let hash = calculate_execution_hash("playbook", std::iter::empty());
+        let labels = run_labels(&hash, "run-1", "worker-1");
 
-        let a1 = resource_name("worker-1", &hash_a);
-        let a2 = resource_name("worker-1", &hash_a);
-        let b = resource_name("worker-1", &hash_b);
-        let other_host = resource_name("worker-2", &hash_a);
-
-        assert_eq!(a1, a2);
-        assert_ne!(a1, b, "same host, different run must differ");
-        assert_ne!(a1, other_host, "different host, same run must differ");
+        assert_eq!(labels[labels::PLAYBOOKPLAN_HASH], hash.to_string());
+        assert_eq!(labels[labels::RUN_ID], "run-1");
+        assert_eq!(labels[labels::PLAYBOOKPLAN_HOST], "worker-1");
         assert_eq!(
-            a1,
-            format!("ansible-sshd-worker-1-{}", utils::generate_id(*hash_a))
+            labels[labels::COMPONENT],
+            labels::MANAGED_SSH_PROXY_COMPONENT
         );
+    }
+
+    /// INV-7. The pod sweep and the ansible Job pod both carry `PLAYBOOKPLAN_HASH` *and* `RUN_ID`,
+    /// so requiring `PLAYBOOKPLAN_HOST` — which only proxy pods have — is the single thing standing
+    /// between `cleanup_proxy_infra`'s `delete_collection` and the Job pod running the playbook.
+    /// Deleting that pod mid-run would kill the run it is cleaning up after.
+    #[test]
+    fn the_proxy_pod_sweep_selector_cannot_match_the_ansible_job_pod() {
+        use crate::v1beta1::controllers::playbookplancontroller::{
+            execution_evaluator::calculate_execution_hash, job_builder,
+        };
+
+        let hash = calculate_execution_hash("playbook", std::iter::empty());
+        let run_id = "run-1";
+
+        let mut plan =
+            crate::v1beta1::PlaybookPlan::new("web", crate::v1beta1::PlaybookPlanSpec::default());
+        plan.metadata.namespace = Some("team".into());
+        plan.metadata.uid = Some("plan-uid".into());
+        let job = job_builder::create_job_blueprint(&hash, 1, run_id, &[], &plan).unwrap();
+        let job_pod_labels = job
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .metadata
+            .as_ref()
+            .unwrap()
+            .labels
+            .clone()
+            .unwrap();
+
+        // The Job pod does match the hash+run-id part of the selector — that is the whole risk.
+        assert_eq!(job_pod_labels[labels::PLAYBOOKPLAN_HASH], hash.to_string());
+        assert_eq!(job_pod_labels[labels::RUN_ID], run_id);
+
+        // ...and is spared only because it carries no target-host label.
+        assert!(
+            !job_pod_labels.contains_key(labels::PLAYBOOKPLAN_HOST),
+            "the ansible Job pod must never carry {}, or cleanup would sweep it",
+            labels::PLAYBOOKPLAN_HOST
+        );
+
+        // A proxy pod, by contrast, is matched by every part of the selector.
+        let proxy = build_pod(
+            "ansible-sshd-worker-1-run-1",
+            "ansible-sshd-worker-1-run-1",
+            &hash,
+            run_id,
+            "worker-1",
+            None,
+            "proxy:latest",
+        );
+        let proxy_labels = proxy.metadata.labels.as_ref().unwrap();
+        for key in [
+            labels::PLAYBOOKPLAN_HASH,
+            labels::RUN_ID,
+            labels::PLAYBOOKPLAN_HOST,
+        ] {
+            assert!(proxy_labels.contains_key(key), "proxy pod must carry {key}");
+        }
     }
 
     #[test]
@@ -832,7 +935,7 @@ mod tests {
         use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
 
         let hash = calculate_execution_hash("playbook", std::iter::empty());
-        let ingress_only = build_network_policy("proxy", &hash, "plans", None);
+        let ingress_only = build_network_policy("proxy", &hash, "run-1", "plans", None);
         assert_eq!(
             ingress_only.spec.unwrap().policy_types.unwrap(),
             vec!["Ingress"]
@@ -841,6 +944,7 @@ mod tests {
         let with_egress = build_network_policy(
             "proxy",
             &hash,
+            "run-1",
             "plans",
             Some(vec![NetworkPolicyEgressRule::default()]),
         );
@@ -850,23 +954,24 @@ mod tests {
     }
 
     #[test]
-    fn build_secret_writes_the_run_hash_as_the_sole_authorized_principal() {
+    fn build_secret_writes_the_run_id_as_the_sole_authorized_principal() {
         use crate::v1beta1::ca::CertificateAuthority;
         use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
 
         let ca = CertificateAuthority::generate().unwrap();
         let hash = calculate_execution_hash("playbook-a", std::iter::empty());
 
-        let secret = build_secret("ansible-sshd-worker-1-abc", &hash, "worker-1", &ca).unwrap();
+        let secret =
+            build_secret("ansible-sshd-worker-1-abc", &hash, "run-1", "worker-1", &ca).unwrap();
         let principals = secret
             .string_data
             .as_ref()
             .and_then(|d| d.get(AUTHORIZED_PRINCIPALS_FILENAME))
             .expect("proxy secret must carry an authorized_principals file");
 
-        // The file must name exactly this run's hash and nothing else — in particular not "root",
+        // The file must name exactly this attempt's run ID and nothing else — in particular not "root",
         // which would make every run's client cert authenticate to every proxy (R3 / T-INFO-3).
-        assert_eq!(principals.trim(), hash.to_string());
+        assert_eq!(principals.trim(), "run-1");
         assert!(
             !principals.contains("root"),
             "authorized_principals must not contain 'root', or cross-run isolation is void"
@@ -1242,11 +1347,10 @@ mod container_tests {
     async fn proxy_rejects_other_runs_cert_and_accepts_its_own() {
         let ca = CertificateAuthority::generate().unwrap();
         let run_b = calculate_execution_hash("plan-b", std::iter::empty());
-        let run_a = calculate_execution_hash("plan-a", std::iter::empty());
 
         // Server: proxy config for run B — host cert principal = HOST_NAME, and the
-        // AuthorizedPrincipalsFile carries only run B's hash.
-        let server_files = build_secret("proxy-b", &run_b, HOST_NAME, &ca)
+        // AuthorizedPrincipalsFile carries only run B's run ID.
+        let server_files = build_secret("proxy-b", &run_b, "run-b", HOST_NAME, &ca)
             .unwrap()
             .string_data
             .expect("proxy secret must carry string_data");
@@ -1257,11 +1361,11 @@ mod container_tests {
         let client_a = tempfile::tempdir().unwrap();
         write_client_files(
             client_b.path(),
-            &render_client_cert_files(&ca, &run_b).unwrap(),
+            &render_client_cert_files(&ca, "run-b").unwrap(),
         );
         write_client_files(
             client_a.path(),
-            &render_client_cert_files(&ca, &run_a).unwrap(),
+            &render_client_cert_files(&ca, "run-a").unwrap(),
         );
 
         // Boot the real proxy image with our rendered config injected into its own fs layer. The
@@ -1303,7 +1407,7 @@ mod container_tests {
             "run B's cert did not reach the ForceCommand — host-cert or auth failed:\n{accepted_err}"
         );
 
-        // Foreign cert (run A's hash): sshd must refuse it at the AuthorizedPrincipalsFile check.
+        // Foreign cert (run A's run ID): sshd must refuse it at the AuthorizedPrincipalsFile check.
         let rejected = ssh_attempt(port, client_a.path());
         let rejected_err = String::from_utf8_lossy(&rejected.stderr);
         assert!(

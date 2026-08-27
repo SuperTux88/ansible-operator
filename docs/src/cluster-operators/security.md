@@ -43,13 +43,13 @@ Cross-run isolation is enforced at the **certificate** layer, not merely by netw
 - The operator runs its **own SSH certificate authority**, generated **in memory at startup**. The CA
   private key is never written to a Secret, never persisted to etcd, never logged. **Restarting the
   operator rotates the CA** and invalidates every outstanding certificate.
-- Each run gets fresh, short-lived host and client certificates. Each proxy pod's
-  authorized-principals list contains **only its own run's execution hash** — never `root`, never a
-  wildcard — so a run can authenticate only to *its own* proxy pods.
-- A per-run **NetworkPolicy** locks each proxy pod's ingress to that run's Job. This is defense in
-  depth on top of the certificate isolation, not the primary control.
-- Proxy pods, their per-run Secrets, and the NetworkPolicy are **torn down when the run ends** — there
-  is no standing SSH surface on your Nodes between runs.
+- Each attempt gets fresh, short-lived host and client certificates. Each proxy pod's
+  authorized-principals list contains **only its own per-attempt run ID** — never `root`, never a
+  wildcard — so even retries of the same execution hash authenticate only to their own proxies.
+- A per-attempt **NetworkPolicy** locks each proxy pod's ingress to that attempt's Job. This is
+  defense in depth on top of the certificate isolation, not the primary control.
+- Proxy pods, their Secrets, and the NetworkPolicy are **torn down when the run ends** — there is no
+  standing SSH surface on your Nodes between runs.
 
 ## Privileges the proxy pods hold
 
@@ -96,7 +96,7 @@ cannot reach:
   Secrets that are already part of the Ansible trust boundary.
 - **Bounded to policy-granted Nodes.** Even a fully forged request cannot reach a Node outside the
   intersection of the admin-authored policies.
-- **No persistent node foothold from the mechanism itself.** Proxy infra is per-run and ephemeral, and
+- **No persistent node foothold from the mechanism itself.** Proxy infra is per-attempt and ephemeral, and
   the CA is in-memory and rotates on restart. What a *playbook* does to a Node is up to the playbook —
   that is the tenant's power, gated by the two fences above.
 

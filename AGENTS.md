@@ -28,8 +28,8 @@ whole point of the design. If a change would weaken one, stop and surface it; do
   resolve time (reconcile "step 0b"), on **every** reconcile, before any proxy pod/Secret/
   NetworkPolicy is created.
 - **INV-4 — Cross-run isolation is at the cert layer.** Each proxy pod's
-  `AuthorizedPrincipalsFile` lists **only its own run's execution hash** (`build_secret`) —
-  never `root`, never a wildcard. The client cert carries that hash as a principal. The
+  `AuthorizedPrincipalsFile` lists **only its own per-attempt run ID** (`build_secret`) —
+  never `root`, never a wildcard. The client cert carries that run ID as a principal. The
   per-run `NetworkPolicy` is defense-in-depth on top, not the primary control.
 - **INV-5 — Node set is authoritative & live.** The allow-set is a **live** Node read in
   `enforce`, never a cached one.
@@ -74,20 +74,20 @@ src/v1beta1/
   controllers/playbookplancontroller/
     reconciler.rs                    the reconcile pipeline (below); patch_status via JSON merge patch
     node_access.rs                   NodeAccessPolicy enforcement: fail-closed intersection clamp (INV-2/3/5)
-    managed_ssh.rs                   proxy pods (hostPID + nsenter = NODE ROOT), per-run sshd config/certs/principals, NetworkPolicy, cleanup (INV-4/7)
+    managed_ssh.rs                   proxy pods (hostPID + nsenter = NODE ROOT), per-attempt sshd config/certs/principals, NetworkPolicy, cleanup (INV-4/7)
     locking.rs                       per-host Leases (operator ns) for run mutual-exclusion
     job_builder.rs                   builds the one Job per run (volumes, client-cert mount, callback env, node anti-affinity)
     workspace.rs                     renders the per-plan workspace Secret (playbook.yml/inventory.yml/recap plugin/vars), owner-ref'd to the plan
     execution_evaluator.rs           ExecutionHash over playbook + referenced Secrets (excludes the self-rendered workspace Secret)
     callback_output.rs               parses the recap the callback wrote to the pod termination message
     triggers.rs                      cron schedule eval (evaluate_schedule / forecast_next_run), timezone-aware
-    status.rs                        folds Job/host outcomes into PlaybookPlanStatus conditions
+    status.rs                        folds a terminal Play's per-host results into PlaybookPlanStatus conditions (the only place run outcomes reach the plan)
     paths.rs                         shared mount-path conventions between workspace/inventory_renderer/job_builder
   ansible/
     playbook_renderer.rs             round-trips spec.template.playbook YAML (validation)
     inventory_renderer.rs            ResolvedInventoryGroup → Ansible YAML inventory (managed-ssh: proxy IP + HostKeyAlias; ssh: BYO key)
     ansible_operator_recap.py        Ansible callback plugin: writes per-host recap to /dev/termination-log
-  labels.rs                          PLAYBOOKPLAN_NAME / _HASH / _HOST label keys
+  labels.rs                          PLAYBOOKPLAN_NAME / _HASH / _HOST / RUN_ID label keys, plus PLAY_UID_ANNOTATION (an annotation, never selectable)
 ```
 
 ## Core reconcile flow (playbookplancontroller/reconciler.rs)
@@ -141,8 +141,8 @@ A `ClusterInventory` host is reached by scheduling an ephemeral **proxy pod onto
 (`hostPID: true`, host `/proc` bind-mount, `CAP_SYS_ADMIN`+`CAP_SYS_PTRACE`, SELinux `spc_t`);
 every SSH session is wrapped in `nsenter` into the host namespaces (`enter-host.sh`). So a
 managed-ssh session is **root on the node** — that is the feature, and the reason
-`NodeAccessPolicy` exists. Certs are minted per run from the in-memory CA; cross-run isolation
-is the per-run `AuthorizedPrincipalsFile` hash principal (INV-4). See `managed_ssh.rs` doc
+`NodeAccessPolicy` exists. Certs are minted per attempt from the in-memory CA; cross-run isolation
+is the per-attempt `AuthorizedPrincipalsFile` run-ID principal (INV-4). See `managed_ssh.rs` doc
 comments (they encode hard-won runtime facts: BusyBox `nsenter` short-option quirks, the sftp
 `ForceCommand` trick, `StrictModes no`, why `hostPID` can't be joined per-session).
 
