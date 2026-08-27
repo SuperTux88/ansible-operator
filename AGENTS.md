@@ -199,6 +199,12 @@ handful of decisions that are easy to undo by accident:
 - **Only `Prepared` is gated on the schedule window** and the rest of `has_work_to_start`.
   `Starting`/`Launching` wait on proxy pods, which routinely outlasts `startingDeadlineSeconds`;
   gating them would leave a scheduled plan unable to launch.
+- **The schedule window is gated on the records, not only on `lastTriggeredRun`.** That marker is a
+  *derived* view of "an attempt for this slot got a Job", written onto a status read from the
+  reflector cache and re-stated from it by every merge patch — so a tick running behind the write, or
+  one whose write was lost to a conflict, would start a second run for one slot.
+  `schedule_window_already_taken`/`window_taken_by_a_record` re-ask the question of the plan's own
+  `Play`s (which book revision and slot before anything is created) before a new attempt is prepared.
 - **`spec.suspend` is decided before the inventory is read** (`resolve_unlaunched_before_inputs`),
   for every phase — dropping an unlaunched attempt needs no inventory, and deferring it would leave a
   suspended plan sitting on its host Leases behind a read that may never succeed. That is why
