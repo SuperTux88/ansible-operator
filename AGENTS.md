@@ -159,7 +159,12 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    `Unknown`) — not in step 0a: recovery has no record left to dispatch on, so it is the *mirror*
    in `status.activeRun` that brings the run here to be released.
 8. **`patch_status`** — JSON **merge patch** (not `replace_status`); many async steps pass
-   between read and write, so a version-checked PUT would routinely 409.
+   between read and write, so a version-checked PUT would routinely 409. It is also where the
+   suspension contract is held (`suspended_advertises_no_next_run`): a tick has several ways to write
+   a status and only one way to reach the end of the pipeline, so "a suspended plan advertises no
+   `nextRun`" belongs at the write, not at the end. The version-checked *finalizer* write
+   (`drop_run_cleanup_finalizer`) comes **after** it and treats a 409 as "retry next tick" — it
+   raced the status write this tick just made, and losing that race must not discard it.
 
 Requeue is dynamic: 3600s default, tightened to "time until next scheduled run" / 15s
 (Job-polling) / 5s (waiting on proxy readiness) as appropriate.
@@ -199,6 +204,12 @@ handful of decisions that are easy to undo by accident:
 - **Only `Prepared` is gated on the schedule window** and the rest of `has_work_to_start`.
   `Starting`/`Launching` wait on proxy pods, which routinely outlasts `startingDeadlineSeconds`;
   gating them would leave a scheduled plan unable to launch.
+- **The schedule window is gated on the records, not only on `lastTriggeredRun`.** That marker is a
+  *derived* view of "an attempt for this slot got a Job", written onto a status read from the
+  reflector cache and re-stated from it by every merge patch — so a tick running behind the write, or
+  one whose write was lost to a conflict, would start a second run for one slot.
+  `schedule_window_already_taken`/`window_taken_by_a_record` re-ask the question of the plan's own
+  `Play`s (which book revision and slot before anything is created) before a new attempt is prepared.
 - **`spec.suspend` is decided before the inventory is read** (`resolve_unlaunched_before_inputs`),
   for every phase — dropping an unlaunched attempt needs no inventory, and deferring it would leave a
   suspended plan sitting on its host Leases behind a read that may never succeed. That is why

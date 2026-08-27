@@ -45,6 +45,13 @@ clears `lastTriggeredRun`, so an edit made moments after a run started takes eff
 than waiting for the next tick. Reverting to an earlier revision is a change like any other and runs
 again too.
 
+`lastTriggeredRun` is a summary of something the run records already say, and it is the records that
+decide. Every attempt writes down the revision and the schedule tick it was started for before
+anything is created for it, so before the operator starts a run for a tick it also checks whether one
+of the plan's own [`Play` records](./results-and-troubleshooting.md) already took that tick at the
+current revision. A status update the operator has not caught up with, or one lost to a competing
+write, therefore cannot cost you a second run of the same tick.
+
 ## Suspending a plan
 
 Set `spec.suspend: true` to stop the operator starting new runs, the same idea as a CronJob's

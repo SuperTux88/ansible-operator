@@ -826,7 +826,24 @@ async fn reconcile(
             Timing::Now(start) => {
                 let this_slot = start.map(|s| s.fixed_offset());
 
-                if slot_already_triggered(this_slot, resource_status.last_triggered_run) {
+                // The marker first, because it answers from state this tick already holds; the
+                // records only when it says the window is free, so the extra read happens once per
+                // window rather than on every tick of it.
+                let window_taken =
+                    if slot_already_triggered(this_slot, resource_status.last_triggered_run) {
+                        true
+                    } else if let Some(slot) = this_slot {
+                        schedule_window_already_taken(&context, &object, slot, &execution_hash)
+                            .await?
+                    } else {
+                        false
+                    };
+
+                if window_taken {
+                    // Writes the marker back when it was the records that answered, so the rest of
+                    // the window is decided from the status again — and so a marker lost to a
+                    // conflicting write is repaired rather than left to be re-derived every tick.
+                    record_triggered_slot(&mut resource_status, this_slot);
                     // A run for this scheduled slot already started within its grace window;
                     // `evaluate_schedule` keeps returning `Now` for the rest of that window, so
                     // don't start another — sleep until the next slot instead. Without this a run
@@ -858,16 +875,6 @@ async fn reconcile(
         };
     }
 
-    // While suspended, don't advertise a next run: the start gate above already blocks new runs, so
-    // a `nextRun` pointing at a slot that won't fire would be misleading. Applied after the advance
-    // step so it also clears the next slot a just-finished Recurring run would have set. A run still
-    // in progress is untouched (it has no `nextRun` anyway) and is left to finish; the phase keeps
-    // reflecting the plan's real state, with the `Suspended` printer column (from `.spec.suspend`)
-    // signalling the pause. The schedule path recomputes `nextRun` once the plan resumes.
-    if object.spec.suspend {
-        resource_status.next_run = None;
-    }
-
     if retry_prune {
         requeue_after = prune_retry_after(requeue_after);
     }
@@ -876,11 +883,26 @@ async fn reconcile(
     // plan never waits on this operator. Deliberately conservative about *when* that is: a tick that
     // recovered anything keeps it, even if the run finished on this very tick, because the release
     // it just performed is the last thing that needed the finalizer and one extra tick costs nothing.
-    if !recovered_a_run && resource_status.active_run.is_none() {
-        drop_run_cleanup_finalizer(&api, &object).await?;
-    }
+    let release_finalizer = !recovered_a_run && resource_status.active_run.is_none();
 
     patch_status(&api, &object, resource_status).await?;
+
+    // After the plan has been told what this tick decided, and never at its expense. This is a
+    // version-checked write (see `patch_finalizers`) against an object the operator has just written
+    // the status of, so it loses that race routinely — and losing it must cost one more tick before
+    // an idle plan can be deleted, not the whole tick's account of the plan. Doing it the other way
+    // round is what left a plan advertising a `nextRun` it would never reach.
+    if release_finalizer && let Err(error) = drop_run_cleanup_finalizer(&api, &object).await {
+        if !error.is_conflict() {
+            return Err(error);
+        }
+        debug!(
+            "Could not give back the run-cleanup finalizer of {namespace}/{name}: the plan changed \
+             underneath this tick; retrying shortly"
+        );
+        requeue_after = requeue_after.min(std::time::Duration::from_secs(5));
+    }
+
     Ok(Action::requeue(requeue_after))
 }
 
@@ -897,6 +919,76 @@ fn slot_already_triggered(
     last_triggered_run: Option<DateTime<FixedOffset>>,
 ) -> bool {
     start.is_some() && start == last_triggered_run
+}
+
+/// The second half of the start gate: whether one of this plan's own `Play` records already took
+/// this schedule window, read from the apiserver.
+///
+/// `status.lastTriggeredRun` is a *derived* view of that fact. It is written by whichever tick got
+/// an attempt's Job created, onto a status this tick read from the reflector cache — which lags this
+/// controller's own writes — and a merge patch of the whole status re-states it from that cached
+/// value on every tick. So a tick running from a status that predates the marker's write, or one
+/// whose write was lost to a conflicting write, sees a window nothing has taken and starts a second
+/// attempt for it. That breaks the one property the window exists for: a recurring plan applies its
+/// playbook at most once per slot, and a non-idempotent playbook applied twice is a real change to
+/// the hosts.
+///
+/// The records cannot lag in that way — every attempt books its revision and its slot on its own
+/// immutable record *before* anything is created for it — so they, not the marker, are what the gate
+/// falls back to.
+async fn schedule_window_already_taken(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    slot: DateTime<FixedOffset>,
+    desired_hash: &ExecutionHash,
+) -> Result<bool, ReconcileError> {
+    let (namespace, plan_name) = namespace_and_name(object)?;
+    let plays = Api::<Play>::namespaced(context.client.clone(), namespace)
+        .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
+        .await?;
+    Ok(window_taken_by_a_record(
+        &plays.items,
+        object,
+        slot,
+        desired_hash,
+    ))
+}
+
+/// Whether any record in `plays` describes an attempt that took `slot` at the desired revision.
+///
+/// Pure so the rule stays pinned beside [`consumed_its_slot`], which asks the same question of a
+/// *live* attempt and must keep answering it the same way. The two differ in one place only: a
+/// terminal record had a Job by definition, while there the terminal phases are excluded because the
+/// tick draining the result re-records the window from the run it is finishing. `Prepared`,
+/// `Starting` and `Aborted` never reached a Job and hand the window back, exactly as they do there.
+/// `Launching` is left out for the same reason — `play_history::abort_unlaunched` accepts it only
+/// once its Job is known to be absent — and cannot be seen here anyway: a record still in flight is
+/// dispatched long before the start gate is reached.
+fn window_taken_by_a_record(
+    plays: &[Play],
+    plan: &PlaybookPlan,
+    slot: DateTime<FixedOffset>,
+    desired_hash: &ExecutionHash,
+) -> bool {
+    let (Some(plan_name), Some(uid)) =
+        (plan.metadata.name.as_deref(), plan.metadata.uid.as_deref())
+    else {
+        return false;
+    };
+    plays.iter().any(|play| {
+        play_belongs_to_plan(play, plan_name, uid)
+            && play.spec.triggered_slot == Some(slot)
+            && play.spec.execution_hash == desired_hash.to_string()
+            && play.status.as_ref().is_some_and(|status| {
+                matches!(
+                    status.phase,
+                    v1beta1::PlayPhase::Running
+                        | v1beta1::PlayPhase::Succeeded
+                        | v1beta1::PlayPhase::Failed
+                        | v1beta1::PlayPhase::Unknown
+                )
+            })
+    })
 }
 
 /// Whether the plan has work a run could start this tick, from the mode, whether a schedule is set,
@@ -930,6 +1022,28 @@ fn has_work_to_start(mode: &ExecutionMode, has_schedule: bool, has_hosts_to_trig
 /// pinned as its own function so `suspend` losing its veto breaks a test, not a cluster.
 fn may_start_new_run(suspend: bool, has_work_to_start: bool) -> bool {
     !suspend && has_work_to_start
+}
+
+/// The other half of the suspension contract: while suspended, the plan advertises no next run. The
+/// start gate blocks the run itself, so a `nextRun` pointing at a slot that will not fire says the
+/// plan is about to do something it will not do — to an operator reading it, and to any client
+/// scheduling around it.
+///
+/// Held where the status is *written* rather than at the end of the pipeline, because a tick has
+/// more than one way to write one and only one way to reach the end. A tick that finalizes a run, or
+/// that reports an unreadable inventory and gives up, writes the status too — and those writes were
+/// carrying whatever `nextRun` the plan already advertised straight back onto it, so a plan
+/// suspended while `Scheduled` could keep advertising its old slot until some later tick happened to
+/// run the whole pipeline through. Every write now settles it, so the first one after the suspend
+/// takes effect regardless of how the tick ends.
+///
+/// A run in progress is untouched (it has no `nextRun` anyway) and is left to finish; the phase
+/// keeps reflecting the plan's real state, with the `Suspended` printer column (from `.spec.suspend`)
+/// signalling the pause. The schedule path recomputes `nextRun` once the plan resumes.
+fn suspended_advertises_no_next_run(suspend: bool, status: &mut PlaybookPlanStatus) {
+    if suspend {
+        status.next_run = None;
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3707,12 +3821,17 @@ fn get_related_secrets(playbookplan: &PlaybookPlan) -> Vec<&String> {
 /// many async steps between reading `target` and this final write, long enough that a concurrent
 /// write to the same object routinely lands first and would reject a version-checked PUT with a
 /// 409. A merge patch carries no such precondition.
+///
+/// Every write goes through [`suspended_advertises_no_next_run`] on the way out — see there for why
+/// the suspension contract is held at this boundary rather than at the end of the pipeline.
 async fn patch_status(
     api: &Api<PlaybookPlan>,
     target: &PlaybookPlan,
-    status: PlaybookPlanStatus,
+    mut status: PlaybookPlanStatus,
 ) -> Result<(), ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
+
+    suspended_advertises_no_next_run(target.spec.suspend, &mut status);
 
     let name = target
         .name()
@@ -4988,6 +5107,119 @@ mod tests {
         ));
     }
 
+    /// The half of the start gate that does not go through the plan's status: a window one of the
+    /// plan's own records already took must never be handed to a second attempt, however far behind
+    /// `lastTriggeredRun` happens to be.
+    #[test]
+    fn a_record_with_a_job_takes_the_window_for_its_own_revision() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+        let other_hash = ExecutionHash::from_hex("2b").unwrap();
+
+        let play = |uid: &str,
+                    execution_hash: &str,
+                    triggered_slot: Option<DateTime<FixedOffset>>,
+                    phase: Option<v1beta1::PlayPhase>| {
+            let mut play = Play::new(
+                "apply-plan-abc-1",
+                v1beta1::PlaySpec {
+                    playbook_plan: "plan".into(),
+                    playbook_plan_uid: uid.into(),
+                    execution_hash: execution_hash.into(),
+                    run_id: "run-1".into(),
+                    preparation_fingerprint: "fingerprint".into(),
+                    attempt: 1,
+                    inventory: Vec::new(),
+                    triggered_slot,
+                },
+            );
+            play.metadata = ObjectMeta {
+                name: Some("apply-plan-abc-1".into()),
+                ..Default::default()
+            };
+            play.status = phase.map(|phase| v1beta1::PlayStatus {
+                phase,
+                ..Default::default()
+            });
+            play
+        };
+
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+
+        let taken = |plays: &[Play]| window_taken_by_a_record(plays, &plan, slot, &hash);
+
+        // An attempt that reached a Job takes the window, running or already finished — the plan's
+        // marker is written from these and may be behind them, or missing entirely.
+        for phase in [
+            v1beta1::PlayPhase::Running,
+            v1beta1::PlayPhase::Succeeded,
+            v1beta1::PlayPhase::Failed,
+            v1beta1::PlayPhase::Unknown,
+        ] {
+            assert!(
+                taken(&[play("plan-uid", "1a", Some(slot), Some(phase.clone()))]),
+                "{phase:?} reached a Job, so its window is spent"
+            );
+        }
+
+        // Nothing ran for the window: an attempt given up before its Job hands it back, exactly as
+        // `consumed_its_slot` decides it for a live one.
+        for phase in [
+            None,
+            Some(v1beta1::PlayPhase::Prepared),
+            Some(v1beta1::PlayPhase::Starting),
+            Some(v1beta1::PlayPhase::Aborted),
+        ] {
+            assert!(
+                !taken(&[play("plan-uid", "1a", Some(slot), phase.clone())]),
+                "{phase:?} never had a Job, so the window is still free"
+            );
+        }
+
+        // A record of another revision leaves the window to the revision that replaced it, and one
+        // of another slot — or of a plan recreated under the same name — says nothing about it.
+        assert!(!taken(&[play(
+            "plan-uid",
+            "2b",
+            Some(slot),
+            Some(v1beta1::PlayPhase::Running)
+        )]));
+        assert!(window_taken_by_a_record(
+            &[play(
+                "plan-uid",
+                "2b",
+                Some(slot),
+                Some(v1beta1::PlayPhase::Running)
+            )],
+            &plan,
+            slot,
+            &other_hash,
+        ));
+        assert!(!taken(&[play(
+            "plan-uid",
+            "1a",
+            Some("2025-08-13T20:00:00Z".parse().unwrap()),
+            Some(v1beta1::PlayPhase::Running)
+        )]));
+        assert!(!taken(&[play(
+            "plan-uid",
+            "1a",
+            None,
+            Some(v1beta1::PlayPhase::Running)
+        )]));
+        assert!(!taken(&[play(
+            "other-uid",
+            "1a",
+            Some(slot),
+            Some(v1beta1::PlayPhase::Running)
+        )]));
+    }
+
     #[test]
     fn namespace_and_name_requires_both() {
         let mut pp = PlaybookPlan::new("placeholder", PlaybookPlanSpec::default());
@@ -5201,6 +5433,33 @@ spec:
         // The veto is suspend's alone: without it the work gate decides.
         assert!(may_start_new_run(false, true));
         assert!(!may_start_new_run(false, false));
+    }
+
+    /// The other half of the contract: a suspended plan never advertises a run it will not start.
+    /// Asserted over a status that already carries a forecast, because that is the case the rule
+    /// exists for — a plan suspended while `Scheduled` has one standing on it.
+    #[test]
+    fn a_suspended_plan_advertises_no_next_run() {
+        let forecast = || PlaybookPlanStatus {
+            phase: Phase::Scheduled,
+            next_run: Some(
+                "2025-08-12T20:00:00Z"
+                    .parse::<DateTime<FixedOffset>>()
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+
+        let mut suspended = forecast();
+        suspended_advertises_no_next_run(true, &mut suspended);
+        assert_eq!(suspended.next_run, None);
+        // Only the forecast: the phase keeps saying what the plan's underlying state is, and the
+        // `Suspended` printer column is what says it is paused.
+        assert_eq!(suspended.phase, Phase::Scheduled);
+
+        let mut running = forecast();
+        suspended_advertises_no_next_run(false, &mut running);
+        assert_eq!(running.next_run, forecast().next_run);
     }
 
     /// The suspend half of the unlaunched-attempt decision: a suspended plan must never keep an
