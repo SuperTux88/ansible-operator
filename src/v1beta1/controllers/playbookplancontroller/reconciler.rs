@@ -2400,484 +2400,6 @@ async fn renew_contested_locks(
     }
 }
 
-/// The terminal-state decision for a finished run: what the plan's `phase`, `next_run`, `summary`,
-/// and the caller's requeue duration become once this run's Job has reached a terminal state. Pure
-/// (every wall-clock/inventory input is passed in) so the per-mode matrix is unit-testable without a
-/// kube client:
-///   - OneShot resolves to `Succeeded`/`Failed` solely by whether any host is still outdated and
-///     never reschedules.
-///   - Recurring with a schedule reschedules to the next slot and requeues until then.
-///   - Recurring *without* a schedule is the dead-end the eligibility gate normally prevents (the
-///     caller logs it): nothing to reschedule against, so the plan stays `Applying`.
-struct TerminalOutcome {
-    phase: Phase,
-    next_run: Option<DateTime<FixedOffset>>,
-    summary: String,
-    requeue: Option<std::time::Duration>,
-}
-
-fn decide_terminal<Tz: TimeZone>(
-    mode: &ExecutionMode,
-    schedule: Option<&str>,
-    outdated_count: usize,
-    total_count: usize,
-    now: DateTime<Tz>,
-) -> TerminalOutcome {
-    let summary = match outdated_count {
-        0 => format!("{total_count}/{total_count} up-to-date"),
-        n => format!("{n}/{total_count} outdated"),
-    };
-
-    match mode {
-        ExecutionMode::OneShot => TerminalOutcome {
-            phase: if outdated_count == 0 {
-                Phase::Succeeded
-            } else {
-                Phase::Failed
-            },
-            next_run: None,
-            summary,
-            requeue: None,
-        },
-        ExecutionMode::Recurring => match schedule {
-            Some(schedule) => {
-                let next =
-                    forecast_next_run(schedule, now.clone(), Some(chrono::Duration::seconds(-5)));
-                let requeue = (next.clone() - now).to_std().ok();
-                TerminalOutcome {
-                    phase: Phase::Scheduled,
-                    next_run: Some(next.fixed_offset()),
-                    summary,
-                    requeue,
-                }
-            }
-            // Any prior forecast is now unreachable, so clear `next_run` and hold at `Applying`.
-            None => TerminalOutcome {
-                phase: Phase::Applying,
-                next_run: None,
-                summary,
-                requeue: None,
-            },
-        },
-    }
-}
-
-/// The `ansible-playbook` container's termination message — the recap the callback wrote to
-/// `/dev/termination-log`, surfaced by the kubelet as `state.terminated.message`. `None` if the
-/// pod has no such terminated container yet or it wrote nothing (hard crash before the stats hook).
-fn termination_message(pod: &Pod) -> Option<String> {
-    pod.status
-        .as_ref()?
-        .container_statuses
-        .as_ref()?
-        .iter()
-        .find(|cs| cs.name == job_builder::ANSIBLE_CONTAINER_NAME)
-        .and_then(|cs| cs.state.as_ref())
-        .and_then(|state| state.terminated.as_ref())
-        .and_then(|terminated| terminated.message.clone())
-}
-
-/// Filters a run's resolved groups down to only the hosts actually targeted this run
-/// (`hosts_to_trigger`), preserving group membership so `serial:`/native grouping in the user's
-/// playbook still means something — a single run's Job/inventory only ever targets this subset,
-/// not the plan's full `eligible_hosts`.
-fn filter_groups_to_hosts(
-    groups: &[ResolvedInventoryGroup],
-    hosts_to_trigger: &[String],
-) -> Vec<ResolvedInventoryGroup> {
-    let allowed: std::collections::HashSet<&str> =
-        hosts_to_trigger.iter().map(String::as_str).collect();
-
-    groups
-        .iter()
-        .filter_map(|group| {
-            let hosts = group.hosts();
-            let filtered_hostnames: Vec<String> = hosts
-                .hosts
-                .iter()
-                .filter(|h| allowed.contains(h.as_str()))
-                .cloned()
-                .collect();
-
-            if filtered_hostnames.is_empty() {
-                return None;
-            }
-
-            let mut filtered_hosts = hosts.clone();
-            filtered_hosts.hosts = filtered_hostnames;
-
-            Some(match group {
-                ResolvedInventoryGroup::ManagedSsh {
-                    tolerations,
-                    variables,
-                    ..
-                } => ResolvedInventoryGroup::ManagedSsh {
-                    hosts: filtered_hosts,
-                    tolerations: tolerations.clone(),
-                    variables: variables.clone(),
-                },
-                ResolvedInventoryGroup::Ssh {
-                    static_inventory_name,
-                    config,
-                    variables,
-                    ..
-                } => ResolvedInventoryGroup::Ssh {
-                    hosts: filtered_hosts,
-                    static_inventory_name: static_inventory_name.clone(),
-                    config: config.clone(),
-                    variables: variables.clone(),
-                },
-            })
-        })
-        .collect()
-}
-
-/// Flat list of managed-ssh-sourced hostnames in these groups, plus the tolerations to use for
-/// their proxy pods. If a run spans multiple ClusterInventory resources with different
-/// tolerations, only the first non-`None` one found is used for all of them.
-fn managed_ssh_hosts_and_tolerations(
-    groups: &[ResolvedInventoryGroup],
-) -> (Vec<String>, Option<Vec<Toleration>>) {
-    let mut hosts = Vec::new();
-    let mut tolerations = None;
-
-    for group in groups {
-        if let ResolvedInventoryGroup::ManagedSsh {
-            hosts: h,
-            tolerations: t,
-            ..
-        } = group
-        {
-            hosts.extend(h.hosts.clone());
-            if tolerations.is_none() {
-                tolerations = t.clone();
-            }
-        }
-    }
-
-    (hosts, tolerations)
-}
-
-async fn upsert_workspace_secret(
-    api: &Api<Secret>,
-    secret_name: &str,
-    secret: Secret,
-) -> Result<(), ReconcileError> {
-    Ok(create_or_update(
-        api,
-        "ansible-operator",
-        secret_name,
-        secret,
-        |existing, desired_state| {
-            desired_state.metadata.managed_fields = None;
-
-            // `string_data` contains our new or updated keys. If they exist in `data`, remove them from there so that `string_data` can take precedence.
-            desired_state.data = {
-                const EMPTY: &BTreeMap<String, String> = &BTreeMap::new();
-                let desired_data = desired_state.string_data.as_ref().unwrap_or(EMPTY);
-
-                existing.data.map(|d| {
-                    BTreeMap::from_iter(
-                        d.into_iter()
-                            .filter(|(key, _)| !desired_data.contains_key(key)),
-                    )
-                })
-            };
-        },
-    )
-    .await?)
-}
-
-/// Returns a list of all secret names that the given PlaybookPlan references (e.g. secrets used
-/// as Ansible variables).
-///
-/// Deliberately excludes the workspace secret itself — its content legitimately differs on every
-/// run even with an unchanged spec (managed-ssh proxy pod IPs are baked into inventory.yml), so
-/// including it here would make `execution_hash` unstable across otherwise-identical runs and
-/// break naming consistency for proxy infra/Job labels/lock identity mid-run. The workspace is
-/// rendered unconditionally in `ensure_infra_and_launch` after current proxy endpoints are known.
-fn get_related_secrets(playbookplan: &PlaybookPlan) -> Vec<&String> {
-    job_builder::extract_secret_names_for_variables(playbookplan)
-        .chain(job_builder::extract_secret_names_for_files(playbookplan))
-        .collect()
-}
-
-/// Persists `status` via a JSON merge patch, not `Api::replace_status` (a PUT requiring
-/// `resourceVersion` to exactly match the server's current one). This reconcile function spans
-/// many async steps between reading `target` and this final write, long enough that a concurrent
-/// write to the same object routinely lands first and would reject a version-checked PUT with a
-/// 409. A merge patch carries no such precondition.
-async fn patch_status(
-    api: &Api<PlaybookPlan>,
-    target: &PlaybookPlan,
-    status: PlaybookPlanStatus,
-) -> Result<(), ReconcileError> {
-    use kube::runtime::reflector::Lookup as _;
-
-    let name = target
-        .name()
-        .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
-
-    api.patch_status(
-        &name,
-        &PatchParams::default(),
-        &Patch::Merge(serde_json::json!({ "status": status })),
-    )
-    .await?;
-
-    Ok(())
-}
-
-async fn hash_playbook_inputs(
-    playbook: &str,
-    secret_names: &[&String],
-    secrets_api: &Api<Secret>,
-    inventory_variables: &[(&str, &serde_json::Value)],
-) -> Result<ExecutionHash, ReconcileError> {
-    let secret_reads = futures::future::join_all(
-        secret_names
-            .iter()
-            .map(|name| async { ((*name).clone(), secrets_api.get(name).await) }),
-    )
-    .await;
-    let variables_secrets = collect_secret_data(secret_reads)?;
-
-    Ok(
-        execution_evaluator::calculate_execution_hash(playbook, variables_secrets.iter())
-            .fold_inventory_variables(inventory_variables.iter().copied()),
-    )
-}
-
-/// Collects the data of every referenced Secret, refusing the whole read if any of them failed —
-/// hashing a partial set would silently produce a revision nobody asked for.
-///
-/// A 404 is separated out as [`ReconcileError::SecretNotFound`] rather than left as a generic
-/// `KubeError`, so [`input_error_supersedes_unlaunched`] can tell "this Secret is gone" from "the
-/// apiserver is having a moment". The name has to be carried in alongside each result to say *which*
-/// Secret, which is why the caller pairs them.
-fn collect_secret_data(
-    reads: Vec<(String, Result<Secret, kube::Error>)>,
-) -> Result<Vec<BTreeMap<String, k8s_openapi::ByteString>>, ReconcileError> {
-    let mut data = Vec::new();
-    let mut missing = None;
-    let mut transient_error = None;
-    for (name, read) in reads {
-        match read {
-            Ok(secret) => data.extend(secret.data),
-            Err(error) if is_not_found(&error) => {
-                missing.get_or_insert(name);
-            }
-            Err(error) => {
-                transient_error.get_or_insert(error);
-            }
-        }
-    }
-
-    if let Some(name) = missing {
-        return Err(ReconcileError::SecretNotFound { name });
-    }
-    if let Some(error) = transient_error {
-        return Err(error.into());
-    }
-
-    Ok(data)
-}
-
-/// Steps 0 and 0b — the plan's desired host set, as the rest of the tick is allowed to see it:
-/// every referenced inventory resolved, then clamped by `NodeAccessPolicy` to the managed-ssh nodes
-/// this namespace may target (INV-2/3/5). Returns the groups plus the nodes enforcement removed.
-///
-/// The two are one step because nothing may ever observe the unclamped result: `eligible_hosts`, the
-/// execution hash, the run's groups and every proxy pod derive from what this returns. Fail-closed —
-/// an ungoverned namespace resolves to zero managed-ssh nodes.
-async fn resolve_authorized_inventory(
-    context: &ReconciliationContext,
-    object: &PlaybookPlan,
-) -> Result<(Vec<ResolvedInventoryGroup>, Vec<String>), ReconcileError> {
-    let namespace = object
-        .metadata
-        .namespace
-        .as_deref()
-        .ok_or(ReconcileError::PreconditionFailed("namespace not set"))?;
-
-    let mut groups = resolve_inventory(context, object).await?;
-    let excluded_nodes = node_access::enforce(
-        &context.client,
-        &context.node_access_policies,
-        namespace,
-        &mut groups,
-    )
-    .await?;
-
-    Ok((groups, excluded_nodes))
-}
-
-/// Resolves every inventory this PlaybookPlan references into `ResolvedInventoryGroup`s,
-/// preserving which resource (and therefore which connection mechanism + config) each group of
-/// hosts came from — `ClusterInventory` always implies managed-ssh, `StaticInventory` always
-/// implies its own embedded SSH config. Not flattened into a single list, since downstream steps
-/// (locking, proxy pods, inventory rendering, job building) need to know which mechanism applies
-/// to which group.
-async fn resolve_inventory(
-    context: &ReconciliationContext,
-    object: &PlaybookPlan,
-) -> Result<Vec<ResolvedInventoryGroup>, ReconcileError> {
-    use kube::ResourceExt;
-
-    let namespace = object
-        .namespace()
-        .ok_or(ReconcileError::PreconditionFailed("namespace not set"))?;
-
-    let cluster_inventory_api: Api<ClusterInventory> =
-        Api::namespaced(context.client.clone(), &namespace);
-    let static_inventory_api: Api<StaticInventory> =
-        Api::namespaced(context.client.clone(), &namespace);
-
-    let inventory_refs = &object.spec.inventory_refs;
-
-    let cluster_inventory_names: Vec<&String> = inventory_refs
-        .iter()
-        .filter_map(|inventory_ref| inventory_ref.cluster_inventory.as_ref())
-        .collect();
-    let cluster_inventory_results = futures::future::join_all(
-        cluster_inventory_names
-            .iter()
-            .map(|name| async { ((*name).clone(), cluster_inventory_api.get(name).await) }),
-    )
-    .await;
-    let mut cluster_inventories = Vec::new();
-    for (name, result) in cluster_inventory_results {
-        match result {
-            Ok(inventory) => cluster_inventories.push(inventory),
-            Err(error) => {
-                return Err(if is_not_found(&error) {
-                    ReconcileError::InventoryNotFound {
-                        kind: "ClusterInventory",
-                        name,
-                    }
-                } else {
-                    ReconcileError::KubeError(error)
-                });
-            }
-        }
-    }
-
-    let static_inventory_names: Vec<&String> = inventory_refs
-        .iter()
-        .filter_map(|inventory_ref| inventory_ref.static_inventory.as_ref())
-        .collect();
-    let static_inventory_results = futures::future::join_all(
-        static_inventory_names
-            .iter()
-            .map(|name| async { ((*name).clone(), static_inventory_api.get(name).await) }),
-    )
-    .await;
-    let mut static_inventories = Vec::new();
-    for (name, result) in static_inventory_results {
-        match result {
-            Ok(inventory) => static_inventories.push(inventory),
-            Err(error) => {
-                return Err(if is_not_found(&error) {
-                    ReconcileError::InventoryNotFound {
-                        kind: "StaticInventory",
-                        name,
-                    }
-                } else {
-                    ReconcileError::KubeError(error)
-                });
-            }
-        }
-    }
-
-    let mut groups = Vec::new();
-
-    for ci in cluster_inventories {
-        let tolerations = ci.spec.tolerations.clone();
-        // Group variables live on the spec's InventoryHosts, but get_hosts() returns the resolved
-        // node lists from status; re-join them by group name.
-        let variables_by_group: BTreeMap<&str, &GenericMap> = ci
-            .spec
-            .hosts
-            .iter()
-            .filter_map(|group| group.variables.as_ref().map(|v| (group.name.as_str(), v)))
-            .collect();
-        for hosts in ci.get_hosts() {
-            let variables = variables_by_group
-                .get(hosts.name.as_str())
-                .copied()
-                .cloned();
-            reject_reserved_variables(&hosts.name, variables.as_ref())?;
-            groups.push(ResolvedInventoryGroup::ManagedSsh {
-                hosts,
-                tolerations: tolerations.clone(),
-                variables,
-            });
-        }
-    }
-
-    for si in static_inventories {
-        let static_inventory_name = si.name_any();
-        let config = si.spec.ssh.clone();
-        for group in &si.spec.hosts {
-            reject_reserved_variables(&group.name, group.variables.as_ref())?;
-            groups.push(ResolvedInventoryGroup::Ssh {
-                hosts: ResolvedHosts {
-                    name: group.name.clone(),
-                    hosts: group.hosts.clone(),
-                },
-                static_inventory_name: static_inventory_name.clone(),
-                config: config.clone(),
-                variables: group.variables.clone(),
-            });
-        }
-    }
-
-    Ok(groups)
-}
-
-/// Fails the reconcile if an inventory group sets a variable the operator manages for
-/// connection/isolation (see [`ansible::RESERVED_HOST_VARS`]). Runs at resolve time, before any
-/// proxy infra or hashing, so a bad inventory surfaces as a clear error rather than a silently
-/// ignored setting or broken connection.
-fn reject_reserved_variables(
-    group_name: &str,
-    variables: Option<&GenericMap>,
-) -> Result<(), ReconcileError> {
-    if let Some(variables) = variables
-        && let Some(key) = ansible::first_reserved_var(&variables.0)
-    {
-        return Err(ReconcileError::ReservedInventoryVariable {
-            group: group_name.to_string(),
-            key: key.to_string(),
-        });
-    }
-    Ok(())
-}
-
-/// Builds an `OwnerReference` to this PlaybookPlan for the plan-namespace resources it owns (the
-/// per-run managed-ssh client-cert Secret), so Kubernetes GC reaps them if the plan is deleted
-/// before explicit cleanup runs. Same pattern/namespace as the workspace secret
-/// (`workspace::render_secret`); a cross-namespace ownerReference would be ignored by GC, which is
-/// why the operator-namespace proxy infra uses label cleanup instead.
-pub(crate) fn playbookplan_owner_ref(
-    object: &PlaybookPlan,
-) -> Result<OwnerReference, ReconcileError> {
-    use kube::runtime::reflector::Lookup as _;
-    Ok(OwnerReference {
-        api_version: PlaybookPlan::api_version(&()).into(),
-        kind: PlaybookPlan::kind(&()).into(),
-        name: object
-            .name()
-            .ok_or(ReconcileError::PreconditionFailed("name not set"))?
-            .into(),
-        uid: object
-            .uid()
-            .ok_or(ReconcileError::PreconditionFailed("uid not set"))?
-            .into(),
-        ..Default::default()
-    })
-}
-
 fn update_desired_hash(status: &mut PlaybookPlanStatus, execution_hash: &ExecutionHash) {
     if status.current_hash == execution_hash.to_string() {
         return;
@@ -3491,6 +3013,484 @@ fn job_run_id(job: &Job) -> Result<&str, ReconcileError> {
 
 fn retry_count_from_job_name(job_name: &str) -> Option<u32> {
     job_name.rsplit('-').next()?.parse().ok()
+}
+
+/// The terminal-state decision for a finished run: what the plan's `phase`, `next_run`, `summary`,
+/// and the caller's requeue duration become once this run's Job has reached a terminal state. Pure
+/// (every wall-clock/inventory input is passed in) so the per-mode matrix is unit-testable without a
+/// kube client:
+///   - OneShot resolves to `Succeeded`/`Failed` solely by whether any host is still outdated and
+///     never reschedules.
+///   - Recurring with a schedule reschedules to the next slot and requeues until then.
+///   - Recurring *without* a schedule is the dead-end the eligibility gate normally prevents (the
+///     caller logs it): nothing to reschedule against, so the plan stays `Applying`.
+struct TerminalOutcome {
+    phase: Phase,
+    next_run: Option<DateTime<FixedOffset>>,
+    summary: String,
+    requeue: Option<std::time::Duration>,
+}
+
+fn decide_terminal<Tz: TimeZone>(
+    mode: &ExecutionMode,
+    schedule: Option<&str>,
+    outdated_count: usize,
+    total_count: usize,
+    now: DateTime<Tz>,
+) -> TerminalOutcome {
+    let summary = match outdated_count {
+        0 => format!("{total_count}/{total_count} up-to-date"),
+        n => format!("{n}/{total_count} outdated"),
+    };
+
+    match mode {
+        ExecutionMode::OneShot => TerminalOutcome {
+            phase: if outdated_count == 0 {
+                Phase::Succeeded
+            } else {
+                Phase::Failed
+            },
+            next_run: None,
+            summary,
+            requeue: None,
+        },
+        ExecutionMode::Recurring => match schedule {
+            Some(schedule) => {
+                let next =
+                    forecast_next_run(schedule, now.clone(), Some(chrono::Duration::seconds(-5)));
+                let requeue = (next.clone() - now).to_std().ok();
+                TerminalOutcome {
+                    phase: Phase::Scheduled,
+                    next_run: Some(next.fixed_offset()),
+                    summary,
+                    requeue,
+                }
+            }
+            // Any prior forecast is now unreachable, so clear `next_run` and hold at `Applying`.
+            None => TerminalOutcome {
+                phase: Phase::Applying,
+                next_run: None,
+                summary,
+                requeue: None,
+            },
+        },
+    }
+}
+
+/// The `ansible-playbook` container's termination message — the recap the callback wrote to
+/// `/dev/termination-log`, surfaced by the kubelet as `state.terminated.message`. `None` if the
+/// pod has no such terminated container yet or it wrote nothing (hard crash before the stats hook).
+fn termination_message(pod: &Pod) -> Option<String> {
+    pod.status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find(|cs| cs.name == job_builder::ANSIBLE_CONTAINER_NAME)
+        .and_then(|cs| cs.state.as_ref())
+        .and_then(|state| state.terminated.as_ref())
+        .and_then(|terminated| terminated.message.clone())
+}
+
+/// Filters a run's resolved groups down to only the hosts actually targeted this run
+/// (`hosts_to_trigger`), preserving group membership so `serial:`/native grouping in the user's
+/// playbook still means something — a single run's Job/inventory only ever targets this subset,
+/// not the plan's full `eligible_hosts`.
+fn filter_groups_to_hosts(
+    groups: &[ResolvedInventoryGroup],
+    hosts_to_trigger: &[String],
+) -> Vec<ResolvedInventoryGroup> {
+    let allowed: std::collections::HashSet<&str> =
+        hosts_to_trigger.iter().map(String::as_str).collect();
+
+    groups
+        .iter()
+        .filter_map(|group| {
+            let hosts = group.hosts();
+            let filtered_hostnames: Vec<String> = hosts
+                .hosts
+                .iter()
+                .filter(|h| allowed.contains(h.as_str()))
+                .cloned()
+                .collect();
+
+            if filtered_hostnames.is_empty() {
+                return None;
+            }
+
+            let mut filtered_hosts = hosts.clone();
+            filtered_hosts.hosts = filtered_hostnames;
+
+            Some(match group {
+                ResolvedInventoryGroup::ManagedSsh {
+                    tolerations,
+                    variables,
+                    ..
+                } => ResolvedInventoryGroup::ManagedSsh {
+                    hosts: filtered_hosts,
+                    tolerations: tolerations.clone(),
+                    variables: variables.clone(),
+                },
+                ResolvedInventoryGroup::Ssh {
+                    static_inventory_name,
+                    config,
+                    variables,
+                    ..
+                } => ResolvedInventoryGroup::Ssh {
+                    hosts: filtered_hosts,
+                    static_inventory_name: static_inventory_name.clone(),
+                    config: config.clone(),
+                    variables: variables.clone(),
+                },
+            })
+        })
+        .collect()
+}
+
+/// Flat list of managed-ssh-sourced hostnames in these groups, plus the tolerations to use for
+/// their proxy pods. If a run spans multiple ClusterInventory resources with different
+/// tolerations, only the first non-`None` one found is used for all of them.
+fn managed_ssh_hosts_and_tolerations(
+    groups: &[ResolvedInventoryGroup],
+) -> (Vec<String>, Option<Vec<Toleration>>) {
+    let mut hosts = Vec::new();
+    let mut tolerations = None;
+
+    for group in groups {
+        if let ResolvedInventoryGroup::ManagedSsh {
+            hosts: h,
+            tolerations: t,
+            ..
+        } = group
+        {
+            hosts.extend(h.hosts.clone());
+            if tolerations.is_none() {
+                tolerations = t.clone();
+            }
+        }
+    }
+
+    (hosts, tolerations)
+}
+
+async fn upsert_workspace_secret(
+    api: &Api<Secret>,
+    secret_name: &str,
+    secret: Secret,
+) -> Result<(), ReconcileError> {
+    Ok(create_or_update(
+        api,
+        "ansible-operator",
+        secret_name,
+        secret,
+        |existing, desired_state| {
+            desired_state.metadata.managed_fields = None;
+
+            // `string_data` contains our new or updated keys. If they exist in `data`, remove them from there so that `string_data` can take precedence.
+            desired_state.data = {
+                const EMPTY: &BTreeMap<String, String> = &BTreeMap::new();
+                let desired_data = desired_state.string_data.as_ref().unwrap_or(EMPTY);
+
+                existing.data.map(|d| {
+                    BTreeMap::from_iter(
+                        d.into_iter()
+                            .filter(|(key, _)| !desired_data.contains_key(key)),
+                    )
+                })
+            };
+        },
+    )
+    .await?)
+}
+
+/// Returns a list of all secret names that the given PlaybookPlan references (e.g. secrets used
+/// as Ansible variables).
+///
+/// Deliberately excludes the workspace secret itself — its content legitimately differs on every
+/// run even with an unchanged spec (managed-ssh proxy pod IPs are baked into inventory.yml), so
+/// including it here would make `execution_hash` unstable across otherwise-identical runs and
+/// break naming consistency for proxy infra/Job labels/lock identity mid-run. The workspace is
+/// rendered unconditionally in `ensure_infra_and_launch` after current proxy endpoints are known.
+fn get_related_secrets(playbookplan: &PlaybookPlan) -> Vec<&String> {
+    job_builder::extract_secret_names_for_variables(playbookplan)
+        .chain(job_builder::extract_secret_names_for_files(playbookplan))
+        .collect()
+}
+
+/// Persists `status` via a JSON merge patch, not `Api::replace_status` (a PUT requiring
+/// `resourceVersion` to exactly match the server's current one). This reconcile function spans
+/// many async steps between reading `target` and this final write, long enough that a concurrent
+/// write to the same object routinely lands first and would reject a version-checked PUT with a
+/// 409. A merge patch carries no such precondition.
+async fn patch_status(
+    api: &Api<PlaybookPlan>,
+    target: &PlaybookPlan,
+    status: PlaybookPlanStatus,
+) -> Result<(), ReconcileError> {
+    use kube::runtime::reflector::Lookup as _;
+
+    let name = target
+        .name()
+        .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
+
+    api.patch_status(
+        &name,
+        &PatchParams::default(),
+        &Patch::Merge(serde_json::json!({ "status": status })),
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn hash_playbook_inputs(
+    playbook: &str,
+    secret_names: &[&String],
+    secrets_api: &Api<Secret>,
+    inventory_variables: &[(&str, &serde_json::Value)],
+) -> Result<ExecutionHash, ReconcileError> {
+    let secret_reads = futures::future::join_all(
+        secret_names
+            .iter()
+            .map(|name| async { ((*name).clone(), secrets_api.get(name).await) }),
+    )
+    .await;
+    let variables_secrets = collect_secret_data(secret_reads)?;
+
+    Ok(
+        execution_evaluator::calculate_execution_hash(playbook, variables_secrets.iter())
+            .fold_inventory_variables(inventory_variables.iter().copied()),
+    )
+}
+
+/// Collects the data of every referenced Secret, refusing the whole read if any of them failed —
+/// hashing a partial set would silently produce a revision nobody asked for.
+///
+/// A 404 is separated out as [`ReconcileError::SecretNotFound`] rather than left as a generic
+/// `KubeError`, so [`input_error_supersedes_unlaunched`] can tell "this Secret is gone" from "the
+/// apiserver is having a moment". The name has to be carried in alongside each result to say *which*
+/// Secret, which is why the caller pairs them.
+fn collect_secret_data(
+    reads: Vec<(String, Result<Secret, kube::Error>)>,
+) -> Result<Vec<BTreeMap<String, k8s_openapi::ByteString>>, ReconcileError> {
+    let mut data = Vec::new();
+    let mut missing = None;
+    let mut transient_error = None;
+    for (name, read) in reads {
+        match read {
+            Ok(secret) => data.extend(secret.data),
+            Err(error) if is_not_found(&error) => {
+                missing.get_or_insert(name);
+            }
+            Err(error) => {
+                transient_error.get_or_insert(error);
+            }
+        }
+    }
+
+    if let Some(name) = missing {
+        return Err(ReconcileError::SecretNotFound { name });
+    }
+    if let Some(error) = transient_error {
+        return Err(error.into());
+    }
+
+    Ok(data)
+}
+
+/// Steps 0 and 0b — the plan's desired host set, as the rest of the tick is allowed to see it:
+/// every referenced inventory resolved, then clamped by `NodeAccessPolicy` to the managed-ssh nodes
+/// this namespace may target (INV-2/3/5). Returns the groups plus the nodes enforcement removed.
+///
+/// The two are one step because nothing may ever observe the unclamped result: `eligible_hosts`, the
+/// execution hash, the run's groups and every proxy pod derive from what this returns. Fail-closed —
+/// an ungoverned namespace resolves to zero managed-ssh nodes.
+async fn resolve_authorized_inventory(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+) -> Result<(Vec<ResolvedInventoryGroup>, Vec<String>), ReconcileError> {
+    let namespace = object
+        .metadata
+        .namespace
+        .as_deref()
+        .ok_or(ReconcileError::PreconditionFailed("namespace not set"))?;
+
+    let mut groups = resolve_inventory(context, object).await?;
+    let excluded_nodes = node_access::enforce(
+        &context.client,
+        &context.node_access_policies,
+        namespace,
+        &mut groups,
+    )
+    .await?;
+
+    Ok((groups, excluded_nodes))
+}
+
+/// Resolves every inventory this PlaybookPlan references into `ResolvedInventoryGroup`s,
+/// preserving which resource (and therefore which connection mechanism + config) each group of
+/// hosts came from — `ClusterInventory` always implies managed-ssh, `StaticInventory` always
+/// implies its own embedded SSH config. Not flattened into a single list, since downstream steps
+/// (locking, proxy pods, inventory rendering, job building) need to know which mechanism applies
+/// to which group.
+async fn resolve_inventory(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+) -> Result<Vec<ResolvedInventoryGroup>, ReconcileError> {
+    use kube::ResourceExt;
+
+    let namespace = object
+        .namespace()
+        .ok_or(ReconcileError::PreconditionFailed("namespace not set"))?;
+
+    let cluster_inventory_api: Api<ClusterInventory> =
+        Api::namespaced(context.client.clone(), &namespace);
+    let static_inventory_api: Api<StaticInventory> =
+        Api::namespaced(context.client.clone(), &namespace);
+
+    let inventory_refs = &object.spec.inventory_refs;
+
+    let cluster_inventory_names: Vec<&String> = inventory_refs
+        .iter()
+        .filter_map(|inventory_ref| inventory_ref.cluster_inventory.as_ref())
+        .collect();
+    let cluster_inventory_results = futures::future::join_all(
+        cluster_inventory_names
+            .iter()
+            .map(|name| async { ((*name).clone(), cluster_inventory_api.get(name).await) }),
+    )
+    .await;
+    let mut cluster_inventories = Vec::new();
+    for (name, result) in cluster_inventory_results {
+        match result {
+            Ok(inventory) => cluster_inventories.push(inventory),
+            Err(error) => {
+                return Err(if is_not_found(&error) {
+                    ReconcileError::InventoryNotFound {
+                        kind: "ClusterInventory",
+                        name,
+                    }
+                } else {
+                    ReconcileError::KubeError(error)
+                });
+            }
+        }
+    }
+
+    let static_inventory_names: Vec<&String> = inventory_refs
+        .iter()
+        .filter_map(|inventory_ref| inventory_ref.static_inventory.as_ref())
+        .collect();
+    let static_inventory_results = futures::future::join_all(
+        static_inventory_names
+            .iter()
+            .map(|name| async { ((*name).clone(), static_inventory_api.get(name).await) }),
+    )
+    .await;
+    let mut static_inventories = Vec::new();
+    for (name, result) in static_inventory_results {
+        match result {
+            Ok(inventory) => static_inventories.push(inventory),
+            Err(error) => {
+                return Err(if is_not_found(&error) {
+                    ReconcileError::InventoryNotFound {
+                        kind: "StaticInventory",
+                        name,
+                    }
+                } else {
+                    ReconcileError::KubeError(error)
+                });
+            }
+        }
+    }
+
+    let mut groups = Vec::new();
+
+    for ci in cluster_inventories {
+        let tolerations = ci.spec.tolerations.clone();
+        // Group variables live on the spec's InventoryHosts, but get_hosts() returns the resolved
+        // node lists from status; re-join them by group name.
+        let variables_by_group: BTreeMap<&str, &GenericMap> = ci
+            .spec
+            .hosts
+            .iter()
+            .filter_map(|group| group.variables.as_ref().map(|v| (group.name.as_str(), v)))
+            .collect();
+        for hosts in ci.get_hosts() {
+            let variables = variables_by_group
+                .get(hosts.name.as_str())
+                .copied()
+                .cloned();
+            reject_reserved_variables(&hosts.name, variables.as_ref())?;
+            groups.push(ResolvedInventoryGroup::ManagedSsh {
+                hosts,
+                tolerations: tolerations.clone(),
+                variables,
+            });
+        }
+    }
+
+    for si in static_inventories {
+        let static_inventory_name = si.name_any();
+        let config = si.spec.ssh.clone();
+        for group in &si.spec.hosts {
+            reject_reserved_variables(&group.name, group.variables.as_ref())?;
+            groups.push(ResolvedInventoryGroup::Ssh {
+                hosts: ResolvedHosts {
+                    name: group.name.clone(),
+                    hosts: group.hosts.clone(),
+                },
+                static_inventory_name: static_inventory_name.clone(),
+                config: config.clone(),
+                variables: group.variables.clone(),
+            });
+        }
+    }
+
+    Ok(groups)
+}
+
+/// Fails the reconcile if an inventory group sets a variable the operator manages for
+/// connection/isolation (see [`ansible::RESERVED_HOST_VARS`]). Runs at resolve time, before any
+/// proxy infra or hashing, so a bad inventory surfaces as a clear error rather than a silently
+/// ignored setting or broken connection.
+fn reject_reserved_variables(
+    group_name: &str,
+    variables: Option<&GenericMap>,
+) -> Result<(), ReconcileError> {
+    if let Some(variables) = variables
+        && let Some(key) = ansible::first_reserved_var(&variables.0)
+    {
+        return Err(ReconcileError::ReservedInventoryVariable {
+            group: group_name.to_string(),
+            key: key.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Builds an `OwnerReference` to this PlaybookPlan for the plan-namespace resources it owns (the
+/// per-run managed-ssh client-cert Secret), so Kubernetes GC reaps them if the plan is deleted
+/// before explicit cleanup runs. Same pattern/namespace as the workspace secret
+/// (`workspace::render_secret`); a cross-namespace ownerReference would be ignored by GC, which is
+/// why the operator-namespace proxy infra uses label cleanup instead.
+pub(crate) fn playbookplan_owner_ref(
+    object: &PlaybookPlan,
+) -> Result<OwnerReference, ReconcileError> {
+    use kube::runtime::reflector::Lookup as _;
+    Ok(OwnerReference {
+        api_version: PlaybookPlan::api_version(&()).into(),
+        kind: PlaybookPlan::kind(&()).into(),
+        name: object
+            .name()
+            .ok_or(ReconcileError::PreconditionFailed("name not set"))?
+            .into(),
+        uid: object
+            .uid()
+            .ok_or(ReconcileError::PreconditionFailed("uid not set"))?
+            .into(),
+        ..Default::default()
+    })
 }
 
 /// Whether a plan's name fits where the run protocol has to put it: a Kubernetes **label value**, on
