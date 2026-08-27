@@ -46,7 +46,7 @@ than waiting for the next tick. Reverting to an earlier revision is a change lik
 again too.
 
 `lastTriggeredRun` is a summary of something the run records already say, and it is the records that
-decide. Every attempt writes down the revision and the schedule tick it was started for before
+decide. Every run writes down the revision and the schedule tick it was started for before
 anything is created for it, so before the operator starts a run for a tick it also checks whether one
 of the plan's own [`Play` records](./results-and-troubleshooting.md) already took that tick at the
 current revision. A status update the operator has not caught up with, or one lost to a competing
@@ -58,10 +58,10 @@ Set `spec.suspend: true` to stop the operator starting new runs, the same idea a
 `.spec.suspend`. It is a pause switch, not a delete:
 
 - A run whose **Job already exists** is left to finish — suspending never kills a running Job.
-- An attempt that has **not created its Job yet** — one still waiting for its host locks, or still
+- A run that has **not created its Job yet** — one still waiting for its host locks, or still
   bringing up its proxy pods — is dropped instead: nothing irrevocable exists for it, so pausing the
   plan stops it rather than letting it launch whenever it becomes able to. It is cleaned up and
-  deleted the same way an attempt superseded by an edit is, and a fresh attempt starts once you
+  deleted the same way a run superseded by an edit is, and a fresh run starts once you
   resume. See [Editing a plan while a run is in
   flight](#editing-a-plan-while-a-run-is-in-flight).
 - No **new** run is started while suspended, in any mode: a `Recurring` plan skips its schedule
@@ -105,8 +105,8 @@ rendered workspace, whose content (e.g. proxy pod IPs) legitimately changes ever
 - A host whose last-applied hash equals the current hash is **current** and is skipped (in
   `OneShot`).
 - When you edit the playbook, or change a referenced variables/files Secret, the hash changes: the
-  desired hash, retry bookkeeping and [consumed schedule slot](#one-tick-one-run-per-revision) update
-  immediately. An in-flight attempt keeps its own hash, target inventory, retry number, and schedule
+  desired hash, run numbering and [consumed schedule slot](#one-tick-one-run-per-revision) update
+  immediately. An in-flight run keeps its own hash, target inventory, run number, and schedule
   slot in an immutable `Play`, so the edit does not disturb it — see [Editing a plan while a run is in
   flight](#editing-a-plan-while-a-run-is-in-flight).
 
@@ -118,7 +118,7 @@ everything, but a real change to the playbook or its inputs does. The current ha
 
 You can edit a plan at any time; you never have to wait for a run to finish. What happens to the run
 already in progress depends on whether its Job has been created yet. That is never assumed: the
-operator asks the API server directly, and asks again immediately before giving up on an attempt, so
+operator asks the API server directly, and asks again immediately before giving up on a run, so
 a Job that only became visible in between is still found and adopted rather than having its
 infrastructure torn down underneath it.
 
@@ -127,60 +127,63 @@ started with, and its results are recorded against the revision it actually ran.
 kill it, swap its playbook underneath it, or attribute its recap to your new revision. Your edit takes
 effect on the next run.
 
-**A run whose Job does not exist yet is abandoned.** An attempt that is still waiting for host locks,
+**A run whose Job does not exist yet is abandoned.** A run that is still waiting for host locks,
 still bringing up its proxy pods, or committed but not yet launched is dropped in favour of the new
 revision: its locks are released and any proxy infrastructure it had started building is cleaned up.
 It is deleted rather than reported as a failed or unknown execution, and it is never retried — there
-is no point applying a revision you have already replaced. A fresh attempt then starts for the plan as
+is no point applying a revision you have already replaced. A fresh run then starts for the plan as
 it now reads.
 
-This second case is triggered by more than the execution hash. An unlaunched attempt is abandoned
+This second case is triggered by more than the execution hash. An unlaunched run is abandoned
 whenever *any* part of the plan spec changes — the image, tolerations, verbosity, inventory
 references — or when the set of nodes the plan resolves to changes, for instance because a node was
 relabelled or a `NodeAccessPolicy` was narrowed. The hash decides which hosts are out of date; this
-check decides whether an attempt still matches the plan it was prepared for, and it is deliberately
+check decides whether a run still matches the plan it was prepared for, and it is deliberately
 the stricter of the two. Setting `spec.suspend: true` has the same effect, for the same reason:
-nothing irrevocable exists for an unlaunched attempt, so a paused plan drops it instead of launching
+nothing irrevocable exists for an unlaunched run, so a paused plan drops it instead of launching
 it later.
 
-One trigger is narrower than the rest. An attempt that is still waiting for its **host locks** is
+One trigger is narrower than the rest. A run that is still waiting for its **host locks** is
 also dropped if it misses its schedule window, because it has yet to consume the slot it was started
 for. That gate lifts as soon as the locks are held: bringing up proxy pods routinely takes longer
 than `startingDeadlineSeconds`, so keeping it would leave a scheduled plan unable to launch at all.
 
-An absent-Job attempt is also abandoned when something it references no longer exists — one of its
+An absent-Job run is also abandoned when something it references no longer exists — one of its
 inventories, or a Secret named by `spec.template.variables`/`files` — or when an inventory group
 contains an operator-reserved connection variable: there is no executable desired state left to
-resume it against. An attempt that had already committed to launching is re-checked first, and if its
+resume it against. A run that had already committed to launching is re-checked first, and if its
 Job does exist by then it is adopted and allowed to finish like any other started run — a broken
 reference belongs to the *next* revision, not to a run that is already under way. A transient failure
 reading otherwise valid inventory, policy or Secret data abandons nothing at all; it only pauses
-recovery, with the attempt's host locks kept alive, rather than launching from incomplete input.
+recovery, with the run's host locks kept alive, rather than launching from incomplete input.
 
-The distinction matters because holding an attempt is not free: its host locks keep being renewed for
-as long as it is held, so an attempt waiting on something that is never coming back would block every
+The distinction matters because holding a run is not free: its host locks keep being renewed for
+as long as it is held, so a run waiting on something that is never coming back would block every
 other plan targeting those hosts indefinitely. A missing reference is therefore resolved rather than
 waited on.
 
 The practical consequence: repeatedly editing a plan while its runs are still starting up can keep
-starting fresh attempts. That is intentional — each abandoned attempt is cleaned up and costs nothing
+starting fresh runs. That is intentional — each abandoned run is cleaned up and costs nothing
 but the setup time — but if you are making a series of edits, `spec.suspend` is the tidier way to
 batch them.
 
-## Retries and attempt numbers
+## Run numbers
 
-If a run's Job needs to be retried, the operator numbers successive Jobs
-(`apply-<plan>-<id>-<n>`) rather than colliding on one name. Attempt numbers are reserved across
-the plan as a whole, not per execution hash: each is one past every Job and retained `Play` record
-that still claims a number. The hash suffix can be shared by different revisions, so numbers may
-skip ahead and do not restart at 1 when you edit the plan. You generally do not interact with this;
-it is why you may see more than one Job object, and more than one `Play`, for the same run, and why
-`.status.retryCount` is not a count of how often the current revision has been tried.
+Two runs of an unchanged plan produce the same execution hash, so the hash alone cannot tell their
+Jobs apart. Each run therefore gets a number, and the Job is named `apply-<plan>-<id>-<n>`. Run
+numbers are reserved across the plan as a whole, not per execution hash: each is one past every Job
+and retained `Play` record that still claims a number. The hash suffix can be shared by different
+revisions, so numbering continues across an edit rather than restarting at 1.
+
+The number exists to keep names unique, and that is all it promises. It is not a dense count of the
+plan's runs — a run abandoned before its Job was created can leave its number unused — and
+`.status.lastRunNumber` is the highest number handed out so far, not a count of how often the
+current revision has been tried. You generally do not interact with either.
 
 A Job's name is capped at 63 characters by Kubernetes, so the plan-name portion is shortened to fit.
-The rest of the name — `apply-`, the id and the attempt number — takes 19 characters at a
-single-digit attempt, leaving 44: a plan named 45 characters or more is shortened, and one more
-character goes each time the attempt number gains a digit. The `Play` shares the shortened name, so
+The rest of the name — `apply-`, the id and the run number — takes 19 characters at a
+single-digit run, leaving 44: a plan named 45 characters or more is shortened, and one more
+character goes each time the run number gains a digit. The `Play` shares the shortened name, so
 the two always match.
 
 ## Host locks
@@ -199,7 +202,7 @@ then the next acquires them. Plans over completely separate hosts never block ea
 While a plan is waiting on a lock held by another run, its
 [`Blocked` condition](./results-and-troubleshooting.md#conditions) is `True`, its `.status` names the
 host and the run holding it, and the operator logs a warning. The plan is `Applying` because its
-recorded attempt is active, while the `Running` condition only becomes `True` once a reconcile has
+recorded run is active, while the `Running` condition only becomes `True` once a reconcile has
 *observed* a non-terminal Job for the run — which may still be scheduling, pulling its image or
 otherwise starting its pod — so it lags Job creation by one tick, and on a plan's first run it is
 not set at all until then. Being blocked is a temporary wait, not a failure, and the run
