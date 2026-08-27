@@ -53,6 +53,9 @@ const DEFAULT_STARTING_DEADLINE_SECONDS: u32 = 30;
 const DEFAULT_ONESHOT_ATTEMPTS: u32 = 3;
 /// Tries one `Recurring` schedule tick gets when the plan does not set `spec.maxAttempts`.
 const DEFAULT_RECURRING_ATTEMPTS: u32 = 1;
+/// How long a plan waits before making a try it still owes. Short because a scheduled retry has only
+/// the remainder of its tick's `startingDeadlineSeconds` window to start in.
+const RETRY_REQUEUE: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub struct WorkloadEgressPolicies {
     pub playbook: Option<Vec<NetworkPolicyEgressRule>>,
@@ -792,6 +795,11 @@ async fn reconcile(
                 &object.spec.mode,
                 object.spec.schedule.as_deref(),
                 &finished.outcome,
+                retry_due(
+                    &phase_for_finished_run(&finished.outcome),
+                    resource_status.retry_count,
+                    max_attempts,
+                ),
                 outdated_hosts.len(),
                 total_count,
                 now(),
@@ -825,15 +833,35 @@ async fn reconcile(
                 let this_slot = start.map(|s| s.fixed_offset());
 
                 // The marker first, because it answers from state this tick already holds; the
-                // records only when it says the window is free, so the extra read happens once per
-                // window rather than on every tick of it.
+                // records only when it settles nothing on its own, so the extra read happens once
+                // per window rather than on every tick of it.
+                //
+                // What the marker settles is narrower than it looks: it says a run for this window
+                // got a Job, which used to end the question and now only ends it while no retry is
+                // due. A retry *is* a second run for the window, so once one is due the records —
+                // which know what each of those runs did and how many there were — are what decide.
+                let retry_is_due = retry_due(
+                    &resource_status.phase,
+                    resource_status.retry_count,
+                    max_attempts,
+                );
                 let window_taken =
-                    if slot_already_triggered(this_slot, resource_status.last_triggered_run) {
+                    if slot_already_triggered(this_slot, resource_status.last_triggered_run)
+                        && !retry_is_due
+                    {
                         true
                     } else if let Some(slot) = this_slot {
-                        schedule_window_already_taken(&context, &object, slot, &execution_hash)
-                            .await?
+                        schedule_window_already_taken(
+                            &context,
+                            &object,
+                            slot,
+                            &execution_hash,
+                            max_attempts,
+                        )
+                        .await?
                     } else {
+                        // Unscheduled plans have no window to take. `OneShot` is the only mode that
+                        // gets here, and its budget was already spent at the start gate.
                         false
                     };
 
@@ -939,6 +967,7 @@ async fn schedule_window_already_taken(
     object: &PlaybookPlan,
     slot: DateTime<FixedOffset>,
     desired_hash: &ExecutionHash,
+    max_attempts: u32,
 ) -> Result<bool, ReconcileError> {
     let (namespace, plan_name) = namespace_and_name(object)?;
     let plays = Api::<Play>::namespaced(context.client.clone(), namespace)
@@ -949,44 +978,56 @@ async fn schedule_window_already_taken(
         object,
         slot,
         desired_hash,
+        max_attempts,
     ))
 }
 
-/// Whether any record in `plays` describes a run that took `slot` at the desired revision.
+/// Whether this schedule window has nothing left for a run to do, judged from the plan's own
+/// records: one of its runs is still going, one of them succeeded, or its failed runs have spent the
+/// execution's attempt budget.
 ///
-/// Pure so the rule stays pinned beside [`consumed_its_slot`], which asks the same question of a
-/// *live* run and must keep answering it the same way. The two differ in one place only: a
+/// Pure so the rule stays pinned beside [`consumed_its_slot`], which asks the neighbouring question
+/// of a *live* run and must keep answering it the same way. The two differ in one place only: a
 /// terminal record had a Job by definition, while there the terminal phases are excluded because the
 /// tick draining the result re-records the window from the run it is finishing. `Prepared`,
 /// `Starting` and `Aborted` never reached a Job and hand the window back, exactly as they do there.
 /// `Launching` is left out for the same reason — `play_history::abort_unlaunched` accepts it only
 /// once its Job is known to be absent — and cannot be seen here anyway: a record still in flight is
 /// dispatched long before the start gate is reached.
+///
+/// Counting the failures here rather than trusting `status.retryCount` alone is what keeps the
+/// window honest when the status lags: the marker and the counter are both written onto a status
+/// read from the reflector cache, while the records are written before anything a run creates. The
+/// counter is still consulted by the caller, so history pruning cannot *grant* tries the status says
+/// were already spent — the two gates only ever agree to a run when both do.
 fn window_taken_by_a_record(
     plays: &[Play],
     plan: &PlaybookPlan,
     slot: DateTime<FixedOffset>,
     desired_hash: &ExecutionHash,
+    max_attempts: u32,
 ) -> bool {
     let (Some(plan_name), Some(uid)) =
         (plan.metadata.name.as_deref(), plan.metadata.uid.as_deref())
     else {
         return false;
     };
-    plays.iter().any(|play| {
+    let mut failures = 0;
+    for play in plays.iter().filter(|play| {
         play_belongs_to_plan(play, plan_name, uid)
             && play.spec.triggered_slot == Some(slot)
             && play.spec.execution_hash == desired_hash.to_string()
-            && play.status.as_ref().is_some_and(|status| {
-                matches!(
-                    status.phase,
-                    v1beta1::PlayPhase::Running
-                        | v1beta1::PlayPhase::Succeeded
-                        | v1beta1::PlayPhase::Failed
-                        | v1beta1::PlayPhase::Unknown
-                )
-            })
-    })
+    }) {
+        match play.status.as_ref().map(|status| &status.phase) {
+            // Still going, or done and done well: either way the window is not a retry's to take.
+            Some(v1beta1::PlayPhase::Running | v1beta1::PlayPhase::Succeeded) => return true,
+            // `Unknown` counts as a failure here for the same reason it does everywhere else: a
+            // recap that could not be read is not evidence the hosts were reached.
+            Some(v1beta1::PlayPhase::Failed | v1beta1::PlayPhase::Unknown) => failures += 1,
+            _ => {}
+        }
+    }
+    failures >= max_attempts
 }
 
 /// Whether the plan has work a run could start this tick, from the mode, whether a schedule is set,
@@ -1057,6 +1098,20 @@ fn attempt_budget_available(mode: &ExecutionMode, tries_spent: u32, max_attempts
         ExecutionMode::OneShot => tries_spent < max_attempts,
         ExecutionMode::Recurring => true,
     }
+}
+
+/// Whether the plan is between tries: its last run failed and its execution has budget left.
+///
+/// The one thing a *failed* plan says that a plan simply waiting does not, and both places that have
+/// to know ask it — the window gate, so a retry is not turned away as a repeat of a window that
+/// already ran, and the terminal decision, so the plan is woken up promptly enough to make that try
+/// rather than left asleep until the next tick.
+///
+/// The phase is the evidence because it is written from the finished run's own record
+/// (`phase_for_finished_run`), so it says what the last run did rather than what the plan's drift
+/// state implies — which for a `Recurring` failure is nothing at all.
+fn retry_due(phase: &Phase, tries_spent: u32, max_attempts: u32) -> bool {
+    phase == &Phase::Failed && tries_spent < max_attempts
 }
 
 /// Which try a run about to start is, from the budget the plan has already spent.
@@ -3853,6 +3908,7 @@ fn decide_terminal<Tz: TimeZone>(
     mode: &ExecutionMode,
     schedule: Option<&str>,
     outcome: &v1beta1::PlayPhase,
+    retry_due: bool,
     outdated_count: usize,
     total_count: usize,
     now: DateTime<Tz>,
@@ -3863,15 +3919,28 @@ fn decide_terminal<Tz: TimeZone>(
     };
     let phase = phase_for_finished_run(outcome);
 
+    // A try that is still owed is the next thing the plan does, so it is what the plan waits for:
+    // the wait is short because a scheduled retry has only the rest of the tick's grace window to
+    // start in, and there is no next run to advertise until the execution is actually finished.
+    let retrying = retry_due.then(|| TerminalOutcome {
+        phase: phase.clone(),
+        next_run: None,
+        summary: summary.clone(),
+        requeue: Some(RETRY_REQUEUE),
+    });
+
     match mode {
-        ExecutionMode::OneShot => TerminalOutcome {
+        ExecutionMode::OneShot => retrying.unwrap_or(TerminalOutcome {
             phase,
             next_run: None,
             summary,
             requeue: None,
-        },
+        }),
         ExecutionMode::Recurring => match schedule {
             Some(schedule) => {
+                if let Some(retrying) = retrying {
+                    return retrying;
+                }
                 let next =
                     forecast_next_run(schedule, now.clone(), Some(chrono::Duration::seconds(-5)));
                 let requeue = (next.clone() - now).to_std().ok();
@@ -5489,7 +5558,8 @@ mod tests {
         let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
         plan.metadata.uid = Some("plan-uid".into());
 
-        let taken = |plays: &[Play]| window_taken_by_a_record(plays, &plan, slot, &hash);
+        // One try per tick — the `Recurring` default — so a single finished run spends the window.
+        let taken = |plays: &[Play]| window_taken_by_a_record(plays, &plan, slot, &hash, 1);
 
         // A run that reached a Job takes the window, running or already finished — the plan's
         // marker is written from these and may be behind them, or missing entirely.
@@ -5537,6 +5607,7 @@ mod tests {
             &plan,
             slot,
             &other_hash,
+            1,
         ));
         assert!(!taken(&[play(
             "plan-uid",
@@ -5556,6 +5627,68 @@ mod tests {
             Some(slot),
             Some(v1beta1::PlayPhase::Running)
         )]));
+    }
+
+    /// With a budget above one, the window is a `Recurring` plan's to retry in until its failures
+    /// have spent it — but never while one of its runs is still going or has already succeeded.
+    #[test]
+    fn a_window_with_budget_left_is_free_for_a_retry() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+
+        let failed = |name: &str| {
+            let mut play = Play::new(
+                name,
+                v1beta1::PlaySpec {
+                    playbook_plan: "plan".into(),
+                    playbook_plan_uid: "plan-uid".into(),
+                    execution_hash: "1a".into(),
+                    run_id: name.into(),
+                    preparation_fingerprint: "fp".into(),
+                    run_number: 1,
+                    attempt: 1,
+                    inventory: Vec::new(),
+                    triggered_slot: Some(slot),
+                },
+            );
+            play.metadata.owner_references = Some(vec![OwnerReference {
+                uid: "plan-uid".into(),
+                name: "plan".into(),
+                ..Default::default()
+            }]);
+            play.status = Some(v1beta1::PlayStatus {
+                phase: v1beta1::PlayPhase::Failed,
+                ..Default::default()
+            });
+            play
+        };
+        let taken = |plays: &[Play], max_attempts| {
+            window_taken_by_a_record(plays, &plan, slot, &hash, max_attempts)
+        };
+
+        assert!(!taken(&[failed("run-1")], 3));
+        assert!(!taken(&[failed("run-1"), failed("run-2")], 3));
+        assert!(taken(
+            &[failed("run-1"), failed("run-2"), failed("run-3")],
+            3
+        ));
+
+        // An unreadable recap is a failure like any other, and spends a try like one.
+        let mut unknown = failed("run-2");
+        unknown.status.as_mut().unwrap().phase = v1beta1::PlayPhase::Unknown;
+        assert!(taken(&[failed("run-1"), unknown], 2));
+
+        // Budget or no budget, a run that succeeded ends the window, and one still going owns it.
+        let mut succeeded = failed("run-2");
+        succeeded.status.as_mut().unwrap().phase = v1beta1::PlayPhase::Succeeded;
+        assert!(taken(&[failed("run-1"), succeeded], 3));
+        let mut running = failed("run-2");
+        running.status.as_mut().unwrap().phase = v1beta1::PlayPhase::Running;
+        assert!(taken(&[failed("run-1"), running], 3));
     }
 
     #[test]
@@ -6667,6 +6800,41 @@ spec:
     }
 
     #[test]
+    fn a_retry_is_due_only_after_a_failure_with_budget_left() {
+        assert!(retry_due(&Phase::Failed, 1, 3));
+        assert!(!retry_due(&Phase::Failed, 3, 3));
+        // Nothing to retry: these are plans that have not failed, and a succeeded plan with budget
+        // to spare must not be tried again.
+        assert!(!retry_due(&Phase::Succeeded, 0, 3));
+        assert!(!retry_due(&Phase::Applying, 1, 3));
+        assert!(!retry_due(&Phase::Delayed, 0, 3));
+    }
+
+    #[test]
+    fn a_terminal_failure_with_budget_left_wakes_the_plan_up_for_the_retry() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        for mode in [ExecutionMode::OneShot, ExecutionMode::Recurring] {
+            let outcome = decide_terminal(
+                &mode,
+                Some("0 3 * * *"),
+                &v1beta1::PlayPhase::Failed,
+                true,
+                1,
+                2,
+                now,
+            );
+
+            assert_eq!(outcome.phase, Phase::Failed);
+            // The retry is the next thing the plan does, so it is not advertised as a scheduled run
+            // — and the wait is short, because a scheduled retry has only the rest of its tick's
+            // grace window to start in.
+            assert_eq!(outcome.next_run, None);
+            assert_eq!(outcome.requeue, Some(RETRY_REQUEUE));
+        }
+    }
+
+    #[test]
     fn a_new_recurring_tick_is_the_only_thing_that_restarts_the_try_count() {
         let slot = |s: &str| Some(s.parse::<DateTime<FixedOffset>>().unwrap());
         let first = slot("2025-08-12T20:00:00Z");
@@ -6948,6 +7116,7 @@ spec:
             &ExecutionMode::OneShot,
             None,
             &v1beta1::PlayPhase::Succeeded,
+            false,
             0,
             3,
             now,
@@ -6968,6 +7137,7 @@ spec:
             &ExecutionMode::OneShot,
             Some("0 3 * * *"),
             &v1beta1::PlayPhase::Failed,
+            false,
             1,
             3,
             now,
@@ -6996,6 +7166,7 @@ spec:
                 &ExecutionMode::Recurring,
                 Some("0 3 * * *"),
                 &outcome,
+                false,
                 0,
                 2,
                 now,
@@ -7019,6 +7190,7 @@ spec:
             &ExecutionMode::Recurring,
             Some("0 3 * * *"),
             &v1beta1::PlayPhase::Failed,
+            false,
             0,
             2,
             now,
@@ -7037,6 +7209,7 @@ spec:
             &ExecutionMode::OneShot,
             None,
             &v1beta1::PlayPhase::Unknown,
+            false,
             0,
             2,
             now,
@@ -7052,6 +7225,7 @@ spec:
             &ExecutionMode::Recurring,
             None,
             &v1beta1::PlayPhase::Succeeded,
+            false,
             0,
             2,
             now,
@@ -7060,6 +7234,7 @@ spec:
             &ExecutionMode::Recurring,
             None,
             &v1beta1::PlayPhase::Failed,
+            false,
             0,
             2,
             now,
