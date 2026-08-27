@@ -22,7 +22,7 @@ pub struct ResolvedHosts {
 ///
 /// `Serialize` is not for persistence — no `Play` or status stores these — but for
 /// `reconciler::preparation_fingerprint`, which hashes the serialized form to detect that the
-/// resolved inventory an attempt was prepared against has moved on.
+/// resolved inventory a run was prepared against has moved on.
 #[derive(Clone, Debug, Serialize)]
 pub enum ResolvedInventoryGroup {
     ManagedSsh {
