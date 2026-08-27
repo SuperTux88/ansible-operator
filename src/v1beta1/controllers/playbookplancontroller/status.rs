@@ -469,9 +469,37 @@ mod tests {
         assert_eq!(ready.reason.as_deref(), Some("RecapUnavailable"));
     }
 
+    /// A new attempt flips `Running` in place and leaves the previous run's `Ready` verdict exactly
+    /// as it was. `Ready` is a printer column that nothing else rewrites between runs, so blanking
+    /// or restating it at the start of a run would replace the last known state of the hosts with
+    /// "unknown" for the whole of that run — and a restated one would also move
+    /// `lastTransitionTime` for a verdict that did not transition.
     #[test]
     fn set_running_condition_marks_the_plan_as_running() {
         let mut status = PlaybookPlanStatus::default();
+        apply_terminal_play_status(
+            &hash(),
+            &PlayStatus {
+                phase: PlayPhase::Succeeded,
+                host_count: 1,
+                hosts: BTreeMap::from([(
+                    "host-1".into(),
+                    crate::v1beta1::PlayHostResult {
+                        outcome: HostOutcome::Succeeded,
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+            &mut status,
+        );
+        let ready_before = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Ready")
+            .cloned()
+            .expect("a finished run leaves a Ready verdict behind");
+
         set_running_condition(&mut status);
 
         let running = status
@@ -480,9 +508,27 @@ mod tests {
             .find(|c| c.type_ == "Running")
             .unwrap();
         assert_eq!(running.status, "True");
-        assert!(
-            status.conditions.iter().all(|c| c.type_ != "Ready"),
-            "Ready shouldn't be evaluated while the job is still running"
+        assert_eq!(
+            status
+                .conditions
+                .iter()
+                .filter(|c| c.type_ == "Running")
+                .count(),
+            1,
+            "the previous run's Running=False must be replaced in place, not appended to"
+        );
+
+        let ready_after = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Ready")
+            .expect("Ready shouldn't be withdrawn while the job is still running");
+        assert_eq!(ready_after.status, ready_before.status);
+        assert_eq!(ready_after.reason, ready_before.reason);
+        assert_eq!(ready_after.message, ready_before.message);
+        assert_eq!(
+            ready_after.last_transition_time, ready_before.last_transition_time,
+            "Ready shouldn't be re-evaluated while the job is still running"
         );
     }
 
