@@ -465,6 +465,17 @@ async fn reconcile(
         }
     }
 
+    // After both finalization paths, because each ends in a retention pass of its own and running
+    // one here as well would list and delete the same history twice on the tick a run completes.
+    // Restricted to an *idle* plan for the reason in `prune_history`: retention only ever gains work
+    // when a run finishes, and a plan with an attempt in flight is polled every few seconds, so
+    // listing its history on each of those ticks is a steady apiserver cost that can find nothing to
+    // do. A deletion that failed is retried on the first tick without a run, which is exactly the
+    // state the standalone pass exists for.
+    if !finalized_run && resource_status.active_run.is_none() {
+        retry_prune = prune_history(&context, &object).await;
+    }
+
     // Steps 0 and 0b: resolve the plan's inventories and clamp them to what NodeAccessPolicy grants
     // this namespace. One fallible step with one error site, because they fail the same way — the
     // desired inputs could not be read — and a recovered attempt's fate depends on which kind of
@@ -829,8 +840,11 @@ async fn reconcile(
         resource_status.next_run = None;
     }
 
-    patch_status(&api, &object, resource_status).await?;
+    if retry_prune {
+        requeue_after = prune_retry_after(requeue_after);
+    }
 
+    patch_status(&api, &object, resource_status).await?;
     Ok(Action::requeue(requeue_after))
 }
 
@@ -2036,6 +2050,52 @@ async fn report_failed_finalization(
     error
 }
 
+/// The history-retention pass, run either as the last step of [`finalize_finished_run`] or — on a
+/// tick that finalized nothing and has no run in flight — standalone from `reconcile`. The two are
+/// mutually exclusive, so the tick a run completes does not also list and delete the same history
+/// standalone.
+///
+/// That is not the same as "once per tick", and it is worth not claiming it is. One tick can finalize
+/// *two* runs — a terminal record queued behind a live attempt is drained first, and the attempt it
+/// was queued behind can reach its own terminal state in the same tick — and each finalization prunes
+/// after acknowledging its own result. The second pass is a redundant list on a rare tick rather than
+/// a correctness problem: the pass is idempotent, and it has to follow acknowledgement, so it cannot
+/// simply be hoisted out of finalization and run once at the end.
+///
+/// It has to be reachable from an ordinary reconcile and not only from finalization: a terminal
+/// Play is acknowledged *before* the pass that would delete it, so a deletion that fails leaves an
+/// idle plan with no event that would ever retry it.
+///
+/// That is also the whole of what the standalone pass is for, which is why the caller runs it only
+/// while nothing is in flight. Retention gains work only when a run finishes, and a plan with an
+/// attempt in flight is requeued every 5-15s — listing its history on each of those ticks is a
+/// steady, unindexed apiserver read that can only ever find the same nothing. Deferring a failed
+/// deletion until the run ends costs a few retained records for the length of one run; the record it
+/// would have deleted is acknowledged history and owns nothing.
+///
+/// Failures are reported by return value rather than by `?`. Retention is bookkeeping — by the time
+/// it runs, the run's result is already on the plan and its record acknowledged — so it must not
+/// fail a tick whose real work succeeded, and must not be reported as one of the teardown failures
+/// [`report_failed_finalization`] describes. The caller only shortens the requeue so the deletion is
+/// tried again soon.
+async fn prune_history(context: &ReconciliationContext, object: &PlaybookPlan) -> bool {
+    let Some(namespace) = object.metadata.namespace.as_deref() else {
+        return false;
+    };
+    if let Err(error) = play_history::prune(&context.client, namespace, object).await {
+        warn!(
+            "Could not prune Play history for {:?}/{:?}: {error}",
+            object.metadata.namespace, object.metadata.name
+        );
+        return true;
+    }
+    false
+}
+
+fn prune_retry_after(current: std::time::Duration) -> std::time::Duration {
+    current.min(std::time::Duration::from_secs(15))
+}
+
 /// Reports on the plan that its desired inputs could not be read, for a tick with no attempt in
 /// flight to hold open.
 ///
@@ -2963,8 +3023,7 @@ async fn finalize_finished_run(
         )
         .await?;
     }
-    play_history::prune(&context.client, namespace, object).await?;
-    Ok(false)
+    Ok(prune_history(context, object).await)
 }
 
 /// Folds a finished run's revision bookkeeping into the plan.
@@ -4385,6 +4444,18 @@ mod tests {
             plan_name
         );
         assert!(selector.ends_with(&plan_name));
+    }
+
+    #[test]
+    fn failed_pruning_wins_over_a_distant_schedule() {
+        assert_eq!(
+            prune_retry_after(std::time::Duration::from_secs(3600)),
+            std::time::Duration::from_secs(15)
+        );
+        assert_eq!(
+            prune_retry_after(std::time::Duration::from_secs(5)),
+            std::time::Duration::from_secs(5)
+        );
     }
 
     #[test]
