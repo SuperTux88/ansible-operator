@@ -43,7 +43,7 @@ schedule onto, plus read/write access to Secrets in its **enrolled** namespaces
 |---|-------|----------------|
 | A1 | **Root on cluster nodes** (via proxy pods) | The ultimate target. Node-root ⇒ container escape, kubelet credential theft, cluster takeover. |
 | A2 | **The operator's SSH CA private key** (in-memory only, held in the operator process) | Signs *both* host and client certs. Whoever holds it can mint a client cert with principal `root` and SSH into any proxy pod → A1. Never persisted to the cluster; an operator restart rotates it. No in-process rotation or revocation. |
-| A3 | **Per-attempt client-cert Secret** (`managed-ssh-client-<run-id>`, plan ns) | A live credential trusted by every proxy pod of that attempt. Created in the plan namespace so the Job pod can mount it (pods only mount same-namespace Secrets); owner-referenced to the PlaybookPlan and deleted by name at run completion. |
+| A3 | **Per-run client-cert Secret** (`managed-ssh-client-<run-id>`, plan ns) | A live credential trusted by every proxy pod of that run. Created in the plan namespace so the Job pod can mount it (pods only mount same-namespace Secrets); owner-referenced to the PlaybookPlan and deleted by name at run completion. |
 | A4 | **NodeAccessPolicy resources** (cluster-scoped) | The admin-authored ceiling that decides which namespace may target which nodes. Cluster-scoped, so authoring one needs cluster RBAC. Tampering = privilege escalation to more nodes. |
 | A5 | **Tenant Secrets** referenced by PlaybookPlans (vars, files, StaticInventory SSH keys) | Contain credentials the playbook uses; the operator can read Secrets in its enrolled namespaces (operator ns ∪ `watchNamespaces`), not cluster-wide. |
 | A6 | **Playbook content & execution integrity** | The playbook runs as root on nodes. Tampering with it = arbitrary node code execution. |
@@ -209,13 +209,13 @@ managed-SSH/SSH wiring.
 ### Repudiation
 
 **T-REP-1 — No attribution of which principal caused a given node-root session.**
-- *Mitigation:* client cert principal carries the per-attempt run ID; proxy pods, Secrets,
+- *Mitigation:* client cert principal carries the run ID; proxy pods, Secrets,
   Jobs, and NetworkPolicies are labelled with `PLAYBOOKPLAN_HASH`, `RUN_ID`, and the applicable
   plan/host/component labels.
   `warn!` is emitted when NAP excludes nodes.
 - *Residual:* no audit trail ties a proxy-pod session back to a *human*; sshd session
   logging inside the proxy is not persisted. The run-ID principal is enforced by sshd but identifies
-  the attempt, not the human who authored it. K8s audit logs (if enabled) capture object
+  the run, not the human who authored it. K8s audit logs (if enabled) capture object
   creation but not in-session commands.
 - *Severity:* Medium for forensics; consider shipping proxy sshd logs.
 
@@ -246,7 +246,7 @@ operator's own namespace ∪ the chart's `watchNamespaces`. `jobs: create,delete
   execution the same compromise already grants on nodes those namespaces may target.
 
 **T-INFO-1b — `Play` records expose a run's target inventory in the tenant namespace.**
-Each `Play` records the `inventory` its attempt targeted — the plan's groups with the host names they
+Each `Play` records the `inventory` its run targeted — the plan's groups with the host names they
 resolved to — so the recap can be reported per host after the Job is gone.
 - *Mitigation:* it carries no Secret **material** and no plan configuration: `inventory` is group
   names and host names, nothing else. The records are namespaced to the plan and owner-referenced to
@@ -263,7 +263,7 @@ resolved to — so the recap can be reported per host after the Job is gone.
   no Secret, nothing in etcd, never logged; only the private→public and signing operations
   are exposed in code (`ca.rs`). An operator restart rotates the CA.
 - *Residual:* the attack surface is the running operator process itself — operator RCE or
-  a process-memory read obtains A2 ⇒ mint a client cert bearing a live attempt's run-ID principal ⇒
+  a process-memory read obtains A2 ⇒ mint a client cert bearing a live run's run-ID principal ⇒
   node-root on that run's reachable nodes. `get secret` in the operator namespace and
   etcd-at-rest do not disclose it. No in-process rotation/revocation: a leaked CA can keep
   minting certs for as long as the operator process runs (a restart rotates it).
@@ -274,9 +274,9 @@ resolved to — so the recap can be reported per host after the Job is gone.
 Every proxy pod trusts the *same* CA, so a CA-signed client cert is not, on its own, bound
 to a single run.
 - *Mitigation (primary, cryptographic):* each proxy pod's sshd is configured with an
-  `AuthorizedPrincipalsFile` listing **only its own per-attempt run ID** (`build_secret`),
+  `AuthorizedPrincipalsFile` listing **only its own run ID** (`build_secret`),
   and each run's client cert carries that ID as a principal (`ensure_client_cert`). sshd
-  therefore rejects a cert whose run-ID principal doesn't match the proxy's attempt — a stray/leaked
+  therefore rejects a cert whose run-ID principal doesn't match the proxy's run — a stray/leaked
   client cert from another run is refused at the cert layer, independent of network reach
   (verified end-to-end against the prod proxy sshd image by `managed_ssh::container_tests`).
 - *Mitigation (defense in depth):* `build_network_policy` additionally restricts proxy-pod
@@ -292,9 +292,9 @@ to a single run.
 
 When an old-credential proxy pod is stuck terminating on a Node whose kubelet is unavailable, recovery
 waits only for the configured heartbeat-aware grace period. It never adopts that proxy and deletes the
-attempt's client-cert Secret during cleanup, but Kubernetes cannot guarantee the already-running
+run's client-cert Secret during cleanup, but Kubernetes cannot guarantee the already-running
 container has exited until the kubelet returns. This is a residual availability and stale-process risk
-on the unreachable Node, not a path for a new attempt to authenticate to that proxy.
+on the unreachable Node, not a path for a new run to authenticate to that proxy.
 
 ### Denial of service
 
@@ -390,11 +390,11 @@ The proxy image is pulled into a **node-root** pod.
 
 **T-ESC-6 — Execution-hash collision affecting security-relevant naming/labels.**
 `ExecutionHash` (XxHash3_64, non-cryptographic) identifies desired content and contributes to the
-per-attempt run ID used by resource naming, cleanup, and certificate principals.
-- *Residual:* a deliberate collision still affects drift detection. Attempt isolation mixes the plan
+run ID used by resource naming, cleanup, and certificate principals.
+- *Residual:* a deliberate collision still affects drift detection. Run isolation mixes the plan
   UID, a process-local counter and a nanosecond clock reading into a separate run ID, so equal
   execution hashes do not share proxy resources or SSH principals. That run ID is minted once and
-  never re-derived, so no attempt can *recompute* another's; two concurrently live attempts colliding
+  never re-derived, so no run can *recompute* another's; two concurrently live runs colliding
   on one is a remote accident (a 64-bit hash truncated to 10 symbols) rather than something an
   author can steer, since the inputs that dominate it are not tenant-controlled.
 - *Severity:* Low (hard to weaponize today), but note it is **not** a security boundary.
@@ -418,18 +418,18 @@ any of that namespace's ServiceAccounts' API RBAC.
   privileged the namespace's ServiceAccounts are.
 
 **T-ESC-8 — Tampering with a `Play` record to steer a run in progress.**
-A `Play` is no longer only history: recovery reads it back to decide whether an unlaunched attempt
-may still be resumed, and to re-derive what that attempt runs. Anyone with `update` on `plays` in an
+A `Play` is no longer only history: recovery reads it back to decide whether an unlaunched run
+may still be resumed, and to re-derive what that run executes. Anyone with `update` on `plays` in an
 enrolled namespace could therefore try to rewrite what a committed run does.
 - *Reduced attack surface:* the record stores neither the plan spec, nor the resolved inventory
   groups, nor the Job blueprint. All three are re-derived from **live** cluster state at resume time,
   so there is no stored copy of any of them to rewrite. What the record holds instead is a
-  `preparationFingerprint` over exactly those inputs, and an attempt is resumed only while that
+  `preparationFingerprint` over exactly those inputs, and a run is resumed only while that
   fingerprint still matches what is re-derived. Editing the plan to change what a committed run
-  executes does not redirect that run — it abandons the attempt and starts a new one under a new
+  executes does not redirect that run — it abandons the run and starts a new one under a new
   identity.
 - *Mitigation (identity):* the CRD carries `self == oldSelf` on `spec`, freezing plan UID, execution
-  hash, run ID, attempt, target inventory, schedule slot and the preparation
+  hash, run ID, run number, target inventory, schedule slot and the preparation
   fingerprint. Because the inputs were reduced to that one hash, **every** field in the spec is
   typed — there is no `x-kubernetes-preserve-unknown-fields` corner that CEL cannot see into, so the
   rule covers the whole record rather than most of it. A unit test fails if a schemaless field is
@@ -462,7 +462,7 @@ This design is **only** as strong as the environment it runs in. The following a
 
 1. **A NetworkPolicy-enforcing CNI is strongly recommended (defense in depth).** Cross-run
    isolation is enforced primarily at the sshd cert layer — each proxy accepts only its own
-   attempt's run-ID principal via `AuthorizedPrincipalsFile` (T-INFO-3) — so a non-enforcing CNI does
+   run's run-ID principal via `AuthorizedPrincipalsFile` (T-INFO-3) — so a non-enforcing CNI does
    not collapse it. NetworkPolicy still limits reachability to node-root proxy pods and blocks
    non-cert traffic; keep it on for multi-tenant.
 2. **Deploy a `NodeAccessPolicy` for the operator namespace before/at rollout.**
@@ -470,7 +470,7 @@ This design is **only** as strong as the environment it runs in. The following a
    zero nodes (T-DOS-2). See the `cluster-admins` doc in
    [`examples/v1beta1/node-access-policy.yaml`](examples/v1beta1/node-access-policy.yaml).
 3. **Lock down the operator namespace.** It runs the node-root proxy pods and the Tier-0
-   operator ServiceAccount, and holds their per-host Secrets and NetworkPolicies. Per-attempt client
+   operator ServiceAccount, and holds their per-host Secrets and NetworkPolicies. Per-run client
    certificates live in enrolled plan namespaces (A3), while the CA itself is in-memory only (A2).
    Operator compromise still yields it. Restrict RBAC,
    enable etcd encryption at rest, and treat this namespace as Tier-0.
@@ -497,11 +497,11 @@ This design is **only** as strong as the environment it runs in. The following a
 - **INV-3b — Every run re-authorizes before it creates proxy pods.** `ensure_infra_and_launch` MUST
   derive its managed-SSH node set from the groups it is about to render and re-run
   `node_access::enforce` over that set **before** `ensure_proxy_infra` — that set is what proxy pods
-  are actually created from. Fresh and resumed attempts share that one code path precisely so a
+  are actually created from. Fresh and resumed runs share that one code path precisely so a
   resume cannot take a laxer route than the tick it interrupted, and deriving the set live is what
   keeps a stale or tampered record from standing in for it (T-ESC-8).
 - **INV-4 — Cross-run isolation is enforced at the cert layer, with NetworkPolicy as backup.**
-  Each proxy pod's `AuthorizedPrincipalsFile` MUST list **only its own per-attempt run ID**
+  Each proxy pod's `AuthorizedPrincipalsFile` MUST list **only its own run ID**
   (never `root` or a wildcard); adding `root` there re-opens cross-run cert reuse (T-INFO-3). The
   per-run NetworkPolicy MUST still accompany proxy pods (ingress restricted to the matching Job
   pod; podSelector/hash + `RUN_ID` label wiring on the Job pod template MUST match — job_builder
@@ -530,7 +530,7 @@ From [`clusterrole.yaml`](chart/templates/clusterrole.yaml) (cluster-wide) and
 | jobs | get,list,watch,create,delete | **enrolled ns only** | One Job per run in the plan ns, not cluster-wide. `delete` cancels the run of a deleted plan explicitly, rather than leaving the pod to the deleting client's propagation policy; finished Jobs are reaped by their TTL. The operator deletes only a Job it has validated as its own run's (UID precondition included), but RBAC cannot scope `delete` to Jobs it created, so the grant covers every Job in an enrolled namespace. |
 | pods | get,list,watch | **enrolled ns only** | Read termination message, not cluster-wide. |
 | playbookplans | patch | **enrolled ns only** | Adds and removes the `ansible.cloudbending.dev/run-cleanup` finalizer, which holds a plan deleted mid-run open until its node-root proxy pods and host Leases are released (nothing else can reach them — they live in the operator ns, where an OwnerReference cannot follow). The finalizer is the only field the operator writes here, but RBAC cannot restrict `patch` to `metadata.finalizers`: the grant permits writing the spec and metadata of any plan in an enrolled namespace. Kept out of the `ClusterRole`, which stays read-only for plans, so plan writes are confined to namespaces already trusted to run node-root playbooks. |
-| plays | get,list,create,delete | **enrolled ns only** | Operator-authored recovery/history records. The spec carries plan UID, execution hash, per-attempt run ID, preparation fingerprint, target inventory, attempt, and schedule slot; Jobs and pod templates are correlated to the Play UID. It stores no copy of the plan spec, resolved connection configuration or the Job — those are re-derived from live cluster state. Every field is typed, so the CRD's CEL rule freezes the whole spec (T-ESC-8). Contains no Secret material. |
+| plays | get,list,create,delete | **enrolled ns only** | Operator-authored recovery/history records. The spec carries plan UID, execution hash, run ID, preparation fingerprint, target inventory, run number, and schedule slot; Jobs and pod templates are correlated to the Play UID. It stores no copy of the plan spec, resolved connection configuration or the Job — those are re-derived from live cluster state. Every field is typed, so the CRD's CEL rule freezes the whole spec (T-ESC-8). Contains no Secret material. |
 | plays/status | get,update,patch | **enrolled ns only** | Advances the operator-owned Prepared → Starting → Launching → Running → terminal state machine and acknowledges that terminal results reached PlaybookPlan status. Resource-version-checked replacements prevent stale writers from reverting terminal state or racing authorization cleanup against committed Job creation. |
 | pods | create,delete,deletecollection | operator ns | **Creates node-root proxy pods.** |
 | networkpolicies | get,list,watch,create,delete,deletecollection | operator ns | Run isolation. |
@@ -590,11 +590,11 @@ fully implemented and carries no open tail; see T-INFO-1 and §8.)
   (`CertificateAuthority::generate` in `main.rs`), never persisted; a restart rotates it.
 - Per **proxy pod**: a fresh host keypair, host cert signed for principal `<hostname>`,
   valid 2h. Presented to clients; clients trust via `@cert-authority *`.
-- Per **attempt**: one client keypair, client cert signed for principals `["root", "<run-id>"]`,
+- Per **run**: one client keypair, client cert signed for principals `["root", "<run-id>"]`,
   valid 2h, trusted by every proxy pod via `TrustedUserCAKeys`. `<run-id>` is the *enforced*
   principal (see below); `root` is retained for `PermitRootLogin yes` / the default username check.
 - Scoping of a client to "its own" proxies is **cert-level**: each proxy pod's sshd sets
-  `AuthorizedPrincipalsFile` to a file containing only that attempt's `<run-id>`, so it accepts only
+  `AuthorizedPrincipalsFile` to a file containing only that run's `<run-id>`, so it accepts only
   this run's client cert. The per-run NetworkPolicy is defense in depth on top — see T-INFO-3 / R3.
 - Because the principal is run-scoped and the proxy pods (and the client-cert Secret) are deleted
   on run completion (`cleanup_proxy_infra`), a client cert is inert once its run ends — nothing on

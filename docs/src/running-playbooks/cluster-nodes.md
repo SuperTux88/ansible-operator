@@ -89,18 +89,18 @@ For each targeted Node in a run, the operator:
    granted just enough privilege (`hostPID`, a host `/proc` mount, `CAP_SYS_ADMIN` +
    `CAP_SYS_PTRACE`) that each SSH session can `nsenter` into the Node's host namespaces, making the
    session `root` on the Node. The pod does not use `privileged: true`, `hostNetwork`, or `hostIPC`.
-2. Mints a fresh SSH **host certificate** for that attempt from the operator's in-memory certificate
-   authority, and a matching **client certificate** for the Job. Certificates are per-attempt and
-   short-lived, so an attempt can authenticate only to *its own* proxy pods — even a retry of the
-   same run cannot reach the pods of the attempt it replaced.
-3. Locks each proxy pod's ingress to that attempt's Job with a NetworkPolicy.
+2. Mints a fresh SSH **host certificate** for that run from the operator's in-memory certificate
+   authority, and a matching **client certificate** for the Job. Certificates are per-run and
+   short-lived, so a run can authenticate only to *its own* proxy pods — even a re-run of the
+   same unchanged plan cannot reach the pods of the run it replaced.
+3. Locks each proxy pod's ingress to that run's Job with a NetworkPolicy.
 4. Renders the inventory so Ansible dials the proxy pod and verifies the Node's host certificate.
 5. Holds the Job back, in a `managed-ssh-preflight` init container, until every proxy actually
    answers. See [Preflight connectivity check](#preflight-connectivity-check).
 6. Tears the proxy pods, their Secrets, and the NetworkPolicy down when the run finishes.
 
 There is **no standing agent or DaemonSet** on your Nodes: proxy pods exist only for the duration of
-a run. The security properties of this path — per-attempt certificate isolation, the in-memory CA,
+a run. The security properties of this path — per-run certificate isolation, the in-memory CA,
 and why `NodeAccessPolicy` is mandatory — are covered in
 [Security model](../cluster-operators/security.md).
 
@@ -143,7 +143,7 @@ has been unreachable (see [Deployment](../cluster-operators/deployment.md)).
 
 The same bounded wait applies when a proxy from an interrupted credential reset is still terminating.
 It is never reused, even if Kubernetes still reports it `Ready`; after the deadline the Node is marked
-unreachable for that run rather than holding the attempt and its host locks indefinitely.
+unreachable for that run rather than holding the run and its host locks indefinitely.
 
 ## Requirements and limitations
 
