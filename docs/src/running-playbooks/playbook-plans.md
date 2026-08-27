@@ -175,7 +175,19 @@ operator can release.
 
 > **Do not strip the finalizer to force a deletion.** Removing `ansible.cloudbending.dev/run-cleanup`
 > by hand makes the plan disappear immediately and strands exactly the resources it protects: a
-> node-root proxy pod that keeps running, and a host Lease held by a run that no longer exists. If you
-> have to do it, clean the run up afterwards with the
-> [manual procedure](./results-and-troubleshooting.md#the-plan-is-stuck-in-applying), which works from
-> the run's own labels.
+> node-root proxy pod that keeps running, and a host Lease held by a run that no longer exists.
+>
+> If you have to do it, **write the run's identity down first**. The plan's `Play` records and its
+> Job are owned by the plan and are deleted with it, so the moment it disappears there is nothing
+> left in its namespace that names the run — while the proxy pods and Leases in the operator's
+> namespace are found by exactly those values:
+>
+> ```sh
+> kubectl get playbookplan my-plan -n my-team -o jsonpath='{.status.activeRun}'
+> ```
+>
+> Keep the `runId`, `executionHash` and `jobName` it prints, along with the plan's name and
+> namespace, and clean the run up afterwards with the [manual
+> procedure](./results-and-troubleshooting.md#the-plan-is-stuck-in-applying). If the plan is already
+> gone and nothing was captured, see [orphaned run resources with no
+> plan](./results-and-troubleshooting.md#orphaned-run-resources-with-no-plan).
