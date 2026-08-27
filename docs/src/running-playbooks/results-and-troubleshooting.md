@@ -201,6 +201,15 @@ an idle `OneShot` plan whose hosts are still current restores `Succeeded` and it
 it does not need a spec or Secret change to recover its visible status. While the inputs are
 unavailable, `Ready=False` with reason `InputsUnavailable` makes that temporary uncertainty explicit.
 
+That reason is retired on the first tick that reads the inputs cleanly, in every mode, and `Ready`
+goes back to describing the hosts: `True`/`HostsUpToDate` when every eligible host is at the current
+revision, `False`/`HostsOutdated` counting how many are, with the message `n/m hosts on the current
+revision`. That is deliberately not the wording a finished run uses — nothing ran, so it does not
+claim anything completed, and it covers the whole plan rather than the subset one run targeted. A
+plan that had not yet run when the outage started is left without a `Ready` condition, as it was
+before. This matters most for `Recurring` plans, which have no idle verdict to restore and would
+otherwise advertise a resolved outage in their `READY` column until their next slot finished.
+
 ### A plan is not starting and its `Blocked` condition is `True`
 
 Another run is holding a lock on a host this plan targets, so the plan is waiting its turn — host

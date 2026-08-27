@@ -574,6 +574,12 @@ async fn reconcile(
     let outdated_hosts = find_outdated_hosts(&resource_status, &execution_hash);
     let all_hosts = find_all_hosts(&resource_status);
 
+    // Both desired-input reads got this far, so the readiness overlay they may have left behind is
+    // stale. Retired here, after the hash has settled, because that is what decides which hosts are
+    // current and therefore what the restated verdict is. A `Ready` written from a terminal `Play`
+    // earlier in this tick is not the overlay and is left alone.
+    status::clear_inputs_unavailable_condition(&mut resource_status, outdated_hosts.len());
+
     let hosts_to_trigger = match object.spec.mode {
         ExecutionMode::OneShot => outdated_hosts.clone(),
         ExecutionMode::Recurring => all_hosts.clone(),
@@ -747,6 +753,20 @@ async fn reconcile(
                 requeue_after = requeue;
             }
         }
+    } else if resource_status.active_run.is_none()
+        && matches!(object.spec.mode, ExecutionMode::OneShot)
+        && outdated_hosts.is_empty()
+        && resource_status.hosts_status.is_some()
+        && resource_status.phase == Phase::Pending
+    {
+        // A failed input read clears the visible terminal state, but not the per-host results. Once
+        // the inputs recover, restore the idle verdict instead of waiting for a hash change.
+        let total_count: usize = resource_status
+            .eligible_hosts
+            .iter()
+            .map(|group| group.hosts.len())
+            .sum();
+        restore_idle_oneshot_status(&mut resource_status, total_count);
     } else if eligible_to_start && resource_status.active_run.is_none() {
         match timing {
             Timing::Delayed(until) => {
@@ -2780,6 +2800,16 @@ pub(crate) fn playbookplan_owner_ref(
             .into(),
         ..Default::default()
     })
+}
+
+fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usize) {
+    if status.phase != Phase::Pending || status.hosts_status.is_none() {
+        return;
+    }
+
+    status.phase = Phase::Succeeded;
+    status.next_run = None;
+    status.summary = Some(format!("{total_count}/{total_count} up-to-date"));
 }
 
 /// Puts a recovered attempt back onto the plan's status: the run itself, the `Applying` phase it
@@ -4897,6 +4927,99 @@ spec:
             "cannot resolve the plan's inventories: nope".into(),
         );
         assert_eq!(applying.phase, Phase::Applying);
+    }
+
+    /// An outage reported while an unlaunched attempt is being decided has to survive that decision.
+    /// `handle_unlaunched_input_error` sets the overlay before branching, and every branch below it
+    /// ends in `clear_attempt_conditions` (via `abandon_run`) — which must keep clearing only the
+    /// per-attempt conditions, never the readiness verdict that outlives the attempt.
+    #[test]
+    fn clearing_attempt_conditions_leaves_the_input_outage_standing() {
+        let mut status = PlaybookPlanStatus::default();
+        status::set_blocked_condition(
+            &mut status,
+            Some(&locking::BlockedBy {
+                host: "worker-1".into(),
+                holder: None,
+            }),
+        );
+        status::set_inputs_unavailable_condition(
+            &mut status,
+            "cannot resolve the plan's inventories: nope",
+        );
+
+        status::clear_attempt_conditions(&mut status);
+
+        let ready = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Ready")
+            .unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason.as_deref(), Some("InputsUnavailable"));
+        assert_eq!(
+            status
+                .conditions
+                .iter()
+                .find(|condition| condition.type_ == "Blocked")
+                .unwrap()
+                .status,
+            "False"
+        );
+    }
+
+    /// Once desired inputs are readable again, an idle OneShot plan with no outdated hosts restores
+    /// the successful status it had before the read failure.
+    #[test]
+    fn a_recovered_idle_oneshot_restores_its_successful_verdict() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            phase: Phase::Succeeded,
+            summary: Some("1/1 up-to-date".into()),
+            eligible_hosts: vec![ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["worker-1".into()],
+            }],
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".into(),
+                v1beta1::HostStatus {
+                    last_applied_hash: hash.to_string(),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+
+        record_input_failure(
+            &mut status,
+            "cannot read referenced Secrets: temporary failure".into(),
+        );
+        assert_eq!(status.phase, Phase::Pending);
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("cannot read referenced Secrets: temporary failure")
+        );
+
+        let outdated = find_outdated_hosts(&status, &hash);
+        assert!(outdated.is_empty());
+        status::clear_inputs_unavailable_condition(&mut status, outdated.len());
+        restore_idle_oneshot_status(&mut status, 1);
+
+        assert_eq!(status.phase, Phase::Succeeded);
+        assert_eq!(status.next_run, None);
+        assert_eq!(status.summary.as_deref(), Some("1/1 up-to-date"));
+        let ready = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Ready")
+            .unwrap();
+        assert_eq!(ready.status, "True");
+        assert_eq!(ready.reason.as_deref(), Some("HostsUpToDate"));
+        assert_eq!(
+            ready.message.as_deref(),
+            Some("1/1 hosts on the current revision")
+        );
     }
 
     #[test]

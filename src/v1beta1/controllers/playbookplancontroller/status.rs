@@ -227,6 +227,67 @@ pub fn set_inputs_unavailable_condition(status: &mut PlaybookPlanStatus, message
     );
 }
 
+/// Retires the [`set_inputs_unavailable_condition`] overlay once the desired inputs read cleanly
+/// again, restating `Ready` from the plan's own per-host results.
+///
+/// Needed for every mode, not only the one that can also restore a phase: `Ready` is a printer
+/// column, and nothing else rewrites it between runs. A `Recurring` plan would advertise a resolved
+/// outage until its next slot completed, which for a daily schedule is a day of a false negative.
+///
+/// The results are the ones [`apply_terminal_play_status`] already folded into the plan: a host is
+/// current exactly when its last run succeeded at this revision, which is what `outdated_count`
+/// counts the complement of. A plan that has never run has no verdict to restate — and carried no
+/// `Ready` condition before the outage — so it gets none back rather than an invented one.
+///
+/// It is deliberately said in its **own** reason and wording rather than borrowed from
+/// [`apply_terminal_play_status`], because the two count different populations and only one of them
+/// is about a run. That function reports the hosts *one run* targeted, which in `OneShot` is just the
+/// ones that were outdated when it started; this reports every host the plan is responsible for.
+/// Sharing `AllHostsSucceeded`/`SomeHostsDidNotSucceed` and "N/M hosts completed successfully"
+/// across both made the same condition change its numbers — a plan whose last run applied 2 of 10
+/// hosts and failed one read "1/2 hosts completed successfully", then "9/10 hosts completed
+/// successfully" once an unrelated input outage cleared, with nothing having run in between. Nothing
+/// *did* complete in between, which is why this no longer claims it did.
+pub fn clear_inputs_unavailable_condition(status: &mut PlaybookPlanStatus, outdated_count: usize) {
+    let overlaid = status.conditions.iter().any(|condition| {
+        condition.type_ == "Ready" && condition.reason.as_deref() == Some("InputsUnavailable")
+    });
+    if !overlaid {
+        return;
+    }
+
+    if status.hosts_status.is_none() {
+        status
+            .conditions
+            .retain(|condition| condition.type_ != "Ready");
+        return;
+    }
+
+    let total: usize = status
+        .eligible_hosts
+        .iter()
+        .map(|group| group.hosts.len())
+        .sum();
+    let current = total.saturating_sub(outdated_count);
+    let now = chrono::Local::now().fixed_offset();
+    let condition = PlaybookPlanCondition {
+        type_: "Ready".into(),
+        status: if outdated_count == 0 { "True" } else { "False" }.into(),
+        reason: Some(
+            if outdated_count == 0 {
+                "HostsUpToDate"
+            } else {
+                "HostsOutdated"
+            }
+            .into(),
+        ),
+        message: Some(format!("{current}/{total} hosts on the current revision")),
+        last_transition_time: Some(now),
+    };
+
+    upsert_condition(&mut status.conditions, condition);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,6 +561,207 @@ mod tests {
         assert_eq!(
             second.last_transition_time, first.last_transition_time,
             "the status did not change, so this is not a transition"
+        );
+    }
+
+    fn plan_with_results(hosts: &[(&str, HostOutcome)], applied: &str) -> PlaybookPlanStatus {
+        PlaybookPlanStatus {
+            eligible_hosts: vec![crate::v1beta1::ResolvedHosts {
+                name: "workers".into(),
+                hosts: hosts.iter().map(|(host, _)| (*host).into()).collect(),
+            }],
+            hosts_status: Some(
+                hosts
+                    .iter()
+                    .map(|(host, outcome)| {
+                        (
+                            (*host).to_string(),
+                            crate::v1beta1::HostStatus {
+                                last_applied_hash: match outcome {
+                                    HostOutcome::Succeeded => applied.to_string(),
+                                    _ => String::new(),
+                                },
+                                last_outcome: outcome.clone(),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// The overlay is retired for every mode, not only the one whose phase can also be restored: a
+    /// `Recurring` plan between slots has no terminal `Play` to rewrite `Ready` for it.
+    #[test]
+    fn recovered_inputs_restate_the_verdict_from_recorded_results() {
+        let mut status = plan_with_results(&[("worker-1", HostOutcome::Succeeded)], "1");
+        set_inputs_unavailable_condition(&mut status, "cannot read referenced Secrets: nope");
+
+        clear_inputs_unavailable_condition(&mut status, 0);
+
+        let ready = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Ready")
+            .unwrap();
+        assert_eq!(ready.status, "True");
+        assert_eq!(ready.reason.as_deref(), Some("HostsUpToDate"));
+        assert_eq!(
+            ready.message.as_deref(),
+            Some("1/1 hosts on the current revision")
+        );
+    }
+
+    /// The restatement counts every host the plan is responsible for, while a terminal `Play` counts
+    /// the ones one run targeted. They are said in different words for that reason: sharing them let
+    /// the same condition change its numbers on a tick where nothing ran.
+    #[test]
+    fn a_restated_verdict_is_not_worded_as_a_run_result() {
+        // A OneShot plan with four hosts whose last run applied only the two that were outdated,
+        // and failed one of them.
+        let mut status = plan_with_results(
+            &[
+                ("worker-1", HostOutcome::Succeeded),
+                ("worker-2", HostOutcome::Succeeded),
+                ("worker-3", HostOutcome::Succeeded),
+                ("worker-4", HostOutcome::Failed),
+            ],
+            "1",
+        );
+        apply_terminal_play_status(
+            &hash(),
+            &PlayStatus {
+                phase: PlayPhase::Failed,
+                host_count: 2,
+                hosts: BTreeMap::from([
+                    (
+                        "worker-3".into(),
+                        crate::v1beta1::PlayHostResult {
+                            outcome: HostOutcome::Succeeded,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "worker-4".into(),
+                        crate::v1beta1::PlayHostResult {
+                            outcome: HostOutcome::Failed,
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+                ..Default::default()
+            },
+            &mut status,
+        );
+        let ran = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Ready")
+            .unwrap()
+            .clone();
+        assert_eq!(ran.reason.as_deref(), Some("SomeHostsDidNotSucceed"));
+        assert_eq!(
+            ran.message.as_deref(),
+            Some("1/2 hosts completed successfully"),
+            "a run reports the hosts it targeted"
+        );
+
+        // An input outage and its recovery, with nothing having run in between.
+        set_inputs_unavailable_condition(&mut status, "cannot read referenced Secrets: nope");
+        clear_inputs_unavailable_condition(&mut status, 1);
+
+        let restated = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Ready")
+            .unwrap();
+        assert_eq!(restated.reason.as_deref(), Some("HostsOutdated"));
+        assert_eq!(
+            restated.message.as_deref(),
+            Some("3/4 hosts on the current revision"),
+            "the restatement covers the whole plan and must not claim anything completed"
+        );
+    }
+
+    /// Recovering the inputs says nothing about the hosts: one that is not at this revision leaves
+    /// the plan not ready, for the reason that is actually true of it.
+    #[test]
+    fn recovered_inputs_do_not_claim_success_for_outdated_hosts() {
+        let mut status = plan_with_results(
+            &[
+                ("worker-1", HostOutcome::Succeeded),
+                ("worker-2", HostOutcome::Failed),
+            ],
+            "1",
+        );
+        set_inputs_unavailable_condition(
+            &mut status,
+            "cannot resolve the plan's inventories: nope",
+        );
+
+        clear_inputs_unavailable_condition(&mut status, 1);
+
+        let ready = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Ready")
+            .unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason.as_deref(), Some("HostsOutdated"));
+        assert_eq!(
+            ready.message.as_deref(),
+            Some("1/2 hosts on the current revision")
+        );
+    }
+
+    /// A plan that never ran carried no `Ready` at all before the outage, so it gets none back —
+    /// inventing `True` would advertise a success that never happened, and leaving `False` standing
+    /// is the stale overlay this clears.
+    #[test]
+    fn recovered_inputs_leave_a_plan_that_never_ran_without_a_verdict() {
+        let mut status = PlaybookPlanStatus::default();
+        set_inputs_unavailable_condition(
+            &mut status,
+            "cannot resolve the plan's inventories: nope",
+        );
+
+        clear_inputs_unavailable_condition(&mut status, 0);
+
+        assert!(status.conditions.iter().all(|c| c.type_ != "Ready"));
+    }
+
+    /// Only the overlay is retired. A verdict a terminal `Play` wrote earlier in the same tick is
+    /// the real one and must survive.
+    #[test]
+    fn recovered_inputs_do_not_overwrite_a_real_verdict() {
+        let mut status = PlaybookPlanStatus::default();
+        let play_status = PlayStatus {
+            phase: PlayPhase::Failed,
+            host_count: 2,
+            hosts: BTreeMap::from([(
+                "worker-1".into(),
+                crate::v1beta1::PlayHostResult {
+                    outcome: HostOutcome::Failed,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        apply_terminal_play_status(&hash(), &play_status, &mut status);
+
+        clear_inputs_unavailable_condition(&mut status, 0);
+
+        let ready = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Ready")
+            .unwrap();
+        assert_eq!(ready.reason.as_deref(), Some("SomeHostsDidNotSucceed"));
+        assert_eq!(
+            ready.message.as_deref(),
+            Some("0/2 hosts completed successfully")
         );
     }
 }
