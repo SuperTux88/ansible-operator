@@ -307,7 +307,7 @@ async fn reconcile(
     // Set when the tick drained a finished run's result but the plan still has a live attempt behind
     // it: the plan is emphatically not finished, so the terminal classification below is skipped,
     // and the schedule window that attempt holds is what the plan records.
-    let mut surviving_attempt: Option<Box<RecordedRun>> = None;
+    let mut surviving_attempt: Option<Box<SurvivingAttempt>> = None;
     let mut finalized_run = false;
     if let Some(recovered) = recovered {
         match recovered {
@@ -345,7 +345,7 @@ async fn reconcile(
                 // It also settles what `finalize_finished_run` may give up — the mirror now names a
                 // different run than the one finishing, which is exactly when it keeps it.
                 if let Some(surviving) = &surviving {
-                    adopt_recovered_attempt(&mut resource_status, &surviving.mirror);
+                    adopt_recovered_attempt(&mut resource_status, &surviving.run.mirror);
                 }
                 match finalize_finished_run(
                     &context,
@@ -2601,10 +2601,9 @@ async fn finalize_finished_run(
 /// window", so it has to describe the newest attempt of the desired revision the plan is holding:
 /// stamping the finished run's window over a live attempt's would describe a run that is already
 /// over. That is taken from the surviving attempt's own record rather than from whatever the last
-/// status write left behind, because the two can disagree — an attempt that has not reached its Job
-/// yet has not had its slot written to the plan at all, and a tick that failed between creating the
-/// Job and patching the plan leaves the *previous* run's slot standing. A surviving attempt with no
-/// slot of its own consumed none, so the finished run's remains the newest window there was.
+/// status write left behind, because a tick that failed between marking the run `Running` and
+/// patching the plan leaves the *previous* run's slot standing. A surviving attempt with no slot of
+/// its own consumed none, so the finished run's remains the newest window there was.
 ///
 /// The attempt number is claimed either way, because it answers a different question: it reserves a
 /// name against every later attempt, and a finished run holds its number whatever else is in flight.
@@ -2612,7 +2611,7 @@ fn sync_desired_hash_after_finished_run(
     status: &mut PlaybookPlanStatus,
     desired_hash: &ExecutionHash,
     finished: &RecordedRun,
-    surviving: Option<&RecordedRun>,
+    surviving: Option<&SurvivingAttempt>,
 ) {
     // Clears the slot when the desired revision has moved on, so the replacement can start inside
     // the window the finished run used. When it hasn't, the slot is re-recorded below instead, which
@@ -2621,8 +2620,10 @@ fn sync_desired_hash_after_finished_run(
     // Only an attempt applying the desired revision may claim the window: one still running a
     // superseded revision must not suppress the run the new revision is owed inside it.
     let surviving_slot = surviving
-        .filter(|surviving| surviving.execution_hash == *desired_hash)
-        .and_then(|surviving| surviving.mirror.triggered_slot);
+        .filter(|surviving| {
+            consumed_its_slot(&surviving.phase) && surviving.run.execution_hash == *desired_hash
+        })
+        .and_then(|surviving| surviving.run.mirror.triggered_slot);
     if finished.execution_hash == *desired_hash {
         record_triggered_slot(status, surviving_slot.or(finished.mirror.triggered_slot));
         status.retry_count = status.retry_count.max(finished.mirror.attempt);
@@ -2708,9 +2709,7 @@ async fn recover_active_run(
             return Ok(Some(RecoveredRun::Finished {
                 finished: recorded_run_from_play(play)?,
                 status: play_status.clone(),
-                surviving: surviving
-                    .map(|live| recorded_run_from_play(live).map(Box::new))
-                    .transpose()?,
+                surviving: surviving.map(surviving_attempt_from_play).transpose()?,
             }));
         }
         Some(RecoverableRecord::Live(play)) => play,
@@ -2818,8 +2817,42 @@ enum RecoveredRun {
         /// mirror, which is both the handle every later tick recovers it by and the only way its
         /// Leases and proxy pods can still be released if its record is deleted while it runs.
         /// Boxed to keep this variant from dominating the size of every recovery result.
-        surviving: Option<Box<RecordedRun>>,
+        surviving: Option<Box<SurvivingAttempt>>,
     },
+}
+
+/// The attempt that outlives a drained terminal result: its run, and the phase its record was found
+/// in. The phase travels with it because the two things the tick does with the attempt need
+/// different evidence — adopting its mirror is right in every phase, while crediting it with the
+/// schedule window its record names is only right once its Job exists.
+struct SurvivingAttempt {
+    run: RecordedRun,
+    phase: v1beta1::PlayPhase,
+}
+
+/// Whether an attempt has actually consumed the schedule window its record names.
+///
+/// `Running` is the only phase that proves the Job was created — and the only one no later tick
+/// re-records the slot for, which is what this restore exists for. Every earlier phase is credited
+/// by the tick that gives it a Job instead ([`resume_launching_run`]'s adoption and the
+/// `ResumePreparing` path), and `Aborted` never had one: `play_history::abort_unlaunched` only
+/// accepts an unlaunched record, and from `Launching` only once its Job is known to be absent.
+/// Crediting those here would let an attempt that is then abandoned — suspended, or left with no
+/// hosts to trigger — burn a window nothing ever ran in, since no abandon path clears the marker.
+///
+/// Pure so the line stays pinned: a new phase landing on the wrong side of it breaks a test rather
+/// than silently suppressing a scheduled run.
+fn consumed_its_slot(phase: &v1beta1::PlayPhase) -> bool {
+    match phase {
+        v1beta1::PlayPhase::Running => true,
+        v1beta1::PlayPhase::Prepared
+        | v1beta1::PlayPhase::Starting
+        | v1beta1::PlayPhase::Launching
+        | v1beta1::PlayPhase::Aborted
+        | v1beta1::PlayPhase::Succeeded
+        | v1beta1::PlayPhase::Failed
+        | v1beta1::PlayPhase::Unknown => false,
+    }
 }
 
 /// What a recoverable `Play` is to recovery. Pure so the one line that actually matters here stays
@@ -2967,6 +3000,20 @@ fn recorded_run_from_play(play: &Play) -> Result<RecordedRun, ReconcileError> {
         },
         execution_hash,
     })
+}
+
+fn surviving_attempt_from_play(play: &Play) -> Result<Box<SurvivingAttempt>, ReconcileError> {
+    let phase = play
+        .status
+        .as_ref()
+        .map(|status| status.phase.clone())
+        .ok_or(ReconcileError::PreconditionFailed(
+            "an in-flight Play has no status",
+        ))?;
+    Ok(Box::new(SurvivingAttempt {
+        run: recorded_run_from_play(play)?,
+        phase,
+    }))
 }
 
 fn preparation_fingerprint(
@@ -5485,18 +5532,32 @@ spec:
         assert_eq!(status.last_triggered_run, Some(slot));
     }
 
-    fn surviving_attempt(hash: ExecutionHash, slot: Option<DateTime<FixedOffset>>) -> RecordedRun {
-        RecordedRun {
-            execution_hash: hash,
-            mirror: ActiveRun {
-                execution_hash: hash.to_string(),
-                run_id: "run-2".into(),
-                job_name: "apply-plan-1-4".into(),
-                play_uid: "surviving-play-uid".into(),
-                hosts: vec!["worker-1".into()],
-                attempt: 4,
-                triggered_slot: slot,
+    fn surviving_attempt(
+        hash: ExecutionHash,
+        slot: Option<DateTime<FixedOffset>>,
+    ) -> SurvivingAttempt {
+        surviving_attempt_in(v1beta1::PlayPhase::Running, hash, slot)
+    }
+
+    fn surviving_attempt_in(
+        phase: v1beta1::PlayPhase,
+        hash: ExecutionHash,
+        slot: Option<DateTime<FixedOffset>>,
+    ) -> SurvivingAttempt {
+        SurvivingAttempt {
+            run: RecordedRun {
+                execution_hash: hash,
+                mirror: ActiveRun {
+                    execution_hash: hash.to_string(),
+                    run_id: "run-2".into(),
+                    job_name: "apply-plan-1-4".into(),
+                    play_uid: "surviving-play-uid".into(),
+                    hosts: vec!["worker-1".into()],
+                    attempt: 4,
+                    triggered_slot: slot,
+                },
             },
+            phase,
         }
     }
 
@@ -5588,6 +5649,53 @@ spec:
 
         assert_eq!(status.last_triggered_run, Some(finished_slot));
         assert_eq!(status.retry_count, 3);
+    }
+
+    /// An attempt that has not launched a Job has consumed nothing, whatever its record says about
+    /// the window it was created for. Crediting it would let an attempt that is then abandoned — a
+    /// plan suspended and resumed inside the window, or one left with no hosts to trigger — mark a
+    /// window as used that nothing ever ran in, and no abandon path clears the marker again. The
+    /// tick that gives such an attempt a Job records the slot itself, so nothing is lost by waiting.
+    #[test]
+    fn an_attempt_without_a_job_claims_no_window() {
+        let finished_slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let live_slot = "2025-08-12T21:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let unlaunched = [
+            v1beta1::PlayPhase::Prepared,
+            v1beta1::PlayPhase::Starting,
+            v1beta1::PlayPhase::Launching,
+            v1beta1::PlayPhase::Aborted,
+        ];
+
+        for phase in unlaunched {
+            assert!(!consumed_its_slot(&phase), "{phase:?} has no Job");
+
+            let mut status = PlaybookPlanStatus {
+                current_hash: hash.to_string(),
+                ..Default::default()
+            };
+            sync_desired_hash_after_finished_run(
+                &mut status,
+                &hash,
+                &finished_run(hash, 3, finished_slot),
+                Some(&surviving_attempt_in(phase.clone(), hash, Some(live_slot))),
+            );
+
+            assert_eq!(
+                status.last_triggered_run,
+                Some(finished_slot),
+                "{phase:?} must not claim the window its record names"
+            );
+        }
+
+        // The one phase that proves the Job was created, and the only one no later tick records a
+        // slot for — which is what this restore is for.
+        assert!(consumed_its_slot(&v1beta1::PlayPhase::Running));
     }
 
     /// An attempt still applying a superseded revision must not claim the window: the edit is owed a
