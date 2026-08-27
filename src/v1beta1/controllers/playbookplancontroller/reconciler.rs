@@ -307,7 +307,7 @@ async fn reconcile(
     // Set when the tick drained a finished run's result but the plan still has a live attempt behind
     // it: the plan is emphatically not finished, so the terminal classification below is skipped,
     // and the schedule window that attempt holds is what the plan records.
-    let mut surviving_attempt: Option<SurvivingAttempt> = None;
+    let mut surviving_attempt: Option<Box<RecordedRun>> = None;
     let mut finalized_run = false;
     if let Some(recovered) = recovered {
         match recovered {
@@ -339,6 +339,14 @@ async fn reconcile(
                     &status,
                     &mut resource_status,
                 );
+                // Adopted *before* the result is persisted, so the plan never goes a tick describing
+                // an attempt it is holding with no `activeRun` to reach it by: the mirror is the only
+                // handle `finalize_lost_run` has if that attempt's record is deleted while it runs.
+                // It also settles what `finalize_finished_run` may give up — the mirror now names a
+                // different run than the one finishing, which is exactly when it keeps it.
+                if let Some(surviving) = &surviving {
+                    adopt_recovered_attempt(&mut resource_status, &surviving.mirror);
+                }
                 match finalize_finished_run(
                     &context,
                     &object,
@@ -566,7 +574,7 @@ async fn reconcile(
             &mut resource_status,
             &execution_hash,
             finished,
-            surviving_attempt.as_ref(),
+            surviving_attempt.as_deref(),
         );
     } else {
         update_desired_hash(&mut resource_status, &execution_hash);
@@ -2549,6 +2557,8 @@ impl RecordedRun {
 /// that is genuinely in flight — and that mirror is what lets the operator release a run whose `Play`
 /// is deleted out from under it (`finalize_lost_run`). Clearing it for a run it does not describe
 /// would leave that attempt's host Leases and node-root proxy pods with nothing pointing at them.
+/// The drain path adopts the surviving attempt before calling this, so an absent mirror there means
+/// there is genuinely nothing left in flight rather than a plan that has not caught up.
 async fn finalize_finished_run(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -2602,7 +2612,7 @@ fn sync_desired_hash_after_finished_run(
     status: &mut PlaybookPlanStatus,
     desired_hash: &ExecutionHash,
     finished: &RecordedRun,
-    surviving: Option<&SurvivingAttempt>,
+    surviving: Option<&RecordedRun>,
 ) {
     // Clears the slot when the desired revision has moved on, so the replacement can start inside
     // the window the finished run used. When it hasn't, the slot is re-recorded below instead, which
@@ -2611,8 +2621,8 @@ fn sync_desired_hash_after_finished_run(
     // Only an attempt applying the desired revision may claim the window: one still running a
     // superseded revision must not suppress the run the new revision is owed inside it.
     let surviving_slot = surviving
-        .filter(|surviving| surviving.execution_hash == desired_hash.to_string())
-        .and_then(|surviving| surviving.triggered_slot);
+        .filter(|surviving| surviving.execution_hash == *desired_hash)
+        .and_then(|surviving| surviving.mirror.triggered_slot);
     if finished.execution_hash == *desired_hash {
         record_triggered_slot(status, surviving_slot.or(finished.mirror.triggered_slot));
         status.retry_count = status.retry_count.max(finished.mirror.attempt);
@@ -2698,10 +2708,9 @@ async fn recover_active_run(
             return Ok(Some(RecoveredRun::Finished {
                 finished: recorded_run_from_play(play)?,
                 status: play_status.clone(),
-                surviving: surviving.map(|live| SurvivingAttempt {
-                    execution_hash: live.spec.execution_hash.clone(),
-                    triggered_slot: live.spec.triggered_slot,
-                }),
+                surviving: surviving
+                    .map(|live| recorded_run_from_play(live).map(Box::new))
+                    .transpose()?,
             }));
         }
         Some(RecoverableRecord::Live(play)) => play,
@@ -2803,16 +2812,14 @@ enum RecoveredRun {
         /// handed over ahead of anything live, so the plan is *not* finished when this is set, and
         /// the tick must not classify it as such — nor let the finished run's schedule window
         /// overwrite the one this attempt holds.
-        surviving: Option<SurvivingAttempt>,
+        ///
+        /// Carried whole, and rebuilt from the attempt's own immutable record rather than read off
+        /// a plan status that may not have caught up with it: the tick adopts it as the plan's
+        /// mirror, which is both the handle every later tick recovers it by and the only way its
+        /// Leases and proxy pods can still be released if its record is deleted while it runs.
+        /// Boxed to keep this variant from dominating the size of every recovery result.
+        surviving: Option<Box<RecordedRun>>,
     },
-}
-
-/// What the tick that drains a finished result needs to know about the attempt that outlives it,
-/// read off that attempt's own immutable record rather than off the plan status it may not have
-/// reached yet.
-struct SurvivingAttempt {
-    execution_hash: String,
-    triggered_slot: Option<DateTime<FixedOffset>>,
 }
 
 /// What a recoverable `Play` is to recovery. Pure so the one line that actually matters here stays
@@ -4376,6 +4383,20 @@ mod tests {
             !mirrors_run(&mirroring(Some(&run("other-play-uid"))), &this_run),
             "a mirror describing another attempt is that attempt's only recovery handle"
         );
+
+        // What the drain path relies on: adopting the attempt that outlives the result is what turns
+        // the "give it up" answer into "keep it". Without the adoption the plan would be persisted as
+        // `Applying` with no `activeRun` at all, and an attempt whose record is deleted in that state
+        // has nothing left to release its host Leases and node-root proxy pods by.
+        let mut status = mirroring(None);
+        let surviving = run("other-play-uid");
+        adopt_recovered_attempt(&mut status, &surviving.mirror);
+        assert!(!mirrors_run(&status, &this_run));
+        assert_eq!(status.phase, Phase::Applying);
+        assert_eq!(
+            status.active_run.as_ref().map(|run| run.play_uid.as_str()),
+            Some("other-play-uid")
+        );
     }
 
     #[test]
@@ -5464,13 +5485,18 @@ spec:
         assert_eq!(status.last_triggered_run, Some(slot));
     }
 
-    fn surviving_attempt(
-        hash: ExecutionHash,
-        slot: Option<DateTime<FixedOffset>>,
-    ) -> SurvivingAttempt {
-        SurvivingAttempt {
-            execution_hash: hash.to_string(),
-            triggered_slot: slot,
+    fn surviving_attempt(hash: ExecutionHash, slot: Option<DateTime<FixedOffset>>) -> RecordedRun {
+        RecordedRun {
+            execution_hash: hash,
+            mirror: ActiveRun {
+                execution_hash: hash.to_string(),
+                run_id: "run-2".into(),
+                job_name: "apply-plan-1-4".into(),
+                play_uid: "surviving-play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                attempt: 4,
+                triggered_slot: slot,
+            },
         }
     }
 
