@@ -184,8 +184,12 @@ comments (they encode hard-won runtime facts: BusyBox `nsenter` short-option qui
 
 - `OneShot` (default): only outdated hosts run; once every host is current, `Succeeded`/`Failed`
   and it goes quiet until the hash changes.
-- `Recurring`: *all* hosts run every schedule tick; reschedules via `forecast_next_run` back to
-  `Phase::Scheduled`.
+- `Recurring`: *all* hosts run every schedule tick; keeps the finished run's `Succeeded`/`Failed`
+  and forecasts the next slot into `next_run` via `forecast_next_run`.
+
+Either way the phase of a finished run comes from that run's own `Play` verdict
+(`phase_for_finished_run`), never from the plan's drift state: a failed `Recurring` run leaves every
+host on the hash an earlier run applied, so drift would report it as a success.
 
 ### Run records and recovery (`Play`)
 
