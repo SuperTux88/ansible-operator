@@ -2,7 +2,7 @@
 
 This page summarises what you are trusting when you install the operator, and the mechanisms that
 bound that trust. The full analysis — every threat, its mitigation, and the numbered invariants
-(INV-1…INV-7) enforced by unit tests — is `THREAT_MODEL.md` in the repository. **If this page and
+enforced by unit tests — is `THREAT_MODEL.md` in the repository. **If this page and
 `THREAT_MODEL.md` disagree, `THREAT_MODEL.md` is correct.**
 
 ## Managed SSH is node-root
@@ -152,10 +152,11 @@ cannot reach:
 
 ## Invariants
 
-The properties above are pinned by seven invariants (INV-1…INV-7 in `THREAT_MODEL.md` §7), enforced by
+The properties above are pinned by the numbered invariants in `THREAT_MODEL.md` §7, enforced by
 unit tests. In brief: fail-closed selectors (INV-1); enforcement is intersection-only and can only
-remove hosts (INV-2); it runs before any proxy infra, every reconcile (INV-3); cross-run isolation is
-per-run cert principals (INV-4); the Node allow-set is a live read (INV-5); the CA private key never
-leaves the process (INV-6); proxy pods are labelled so cleanup can never sweep the ansible Job pod
-(INV-7). If you are modifying the operator, do not regress these without an explicit, deliberate
+remove hosts (INV-2); it runs before any proxy infra, every reconcile (INV-3), and every fresh or
+resumed attempt re-authorizes the exact set before creating proxies (INV-3b); cross-run isolation is
+per-attempt cert principals (INV-4); the Node allow-set is a live read (INV-5); the CA private key
+never leaves the process (INV-6); proxy pods are labelled so cleanup can never sweep the ansible Job
+pod (INV-7). If you are modifying the operator, do not regress these without an explicit, deliberate
 decision.

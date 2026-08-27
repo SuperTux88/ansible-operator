@@ -489,6 +489,12 @@ This design is **only** as strong as the environment it runs in. The following a
 - **INV-3 — Enforcement runs before proxy infra.** NodeAccessPolicy clamping MUST happen at
   inventory resolve time (step 0b), before any proxy pod/Secret/NetworkPolicy is created,
   and on **every** reconcile (re-clamps drift).
+- **INV-3b — Every run re-authorizes before it creates proxy pods.** `ensure_infra_and_launch` MUST
+  derive its managed-SSH node set from the groups it is about to render and re-run
+  `node_access::enforce` over that set **before** `ensure_proxy_infra` — that set is what proxy pods
+  are actually created from. Fresh and resumed attempts share that one code path precisely so a
+  resume cannot take a laxer route than the tick it interrupted, and deriving the set live is what
+  keeps a stale or tampered record from standing in for it (T-ESC-8).
 - **INV-4 — Cross-run isolation is enforced at the cert layer, with NetworkPolicy as backup.**
   Each proxy pod's `AuthorizedPrincipalsFile` MUST list **only its own per-attempt run ID**
   (never `root` or a wildcard); adding `root` there re-opens cross-run cert reuse (T-INFO-3). The

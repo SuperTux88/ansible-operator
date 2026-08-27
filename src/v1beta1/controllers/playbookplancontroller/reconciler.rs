@@ -28,7 +28,7 @@ use crate::v1beta1::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
         locking, managed_ssh,
         triggers::{Timing, evaluate_schedule, forecast_next_run},
-        workspace::{self, render_secret},
+        workspace::render_secret,
     },
 };
 use crate::{
@@ -84,20 +84,24 @@ struct ReconciliationContext {
     workload_egress_policies: WorkloadEgressPolicies,
 }
 
-/// Per-tick identifiers shared by `try_start_run` and `advance_applying_run`: the resource's
-/// namespace/name, which hosts this run targets (flat, plus the same set grouped as `run_groups`),
-/// its execution hash, and the Lease holder identity derived from them. Kube `Api<T>` handles are
-/// deliberately *not* here — those are plumbing built on demand from `ReconciliationContext::client`
-/// plus `namespace`, not run identity.
+/// What `try_start_run` needs to name and record a new attempt: the resource's namespace/name, the
+/// execution hash, the schedule slot being consumed, and the run's resolved inventory. Kube `Api<T>`
+/// handles are deliberately *not* here — those are plumbing built on demand from
+/// `ReconciliationContext::client` plus `namespace`, not run identity.
 struct RunContext<'a> {
     namespace: &'a str,
     name: &'a str,
     execution_hash: ExecutionHash,
-    hosts_to_trigger: &'a [String],
-    /// This run's resolved inventory filtered to `hosts_to_trigger`, preserving the user's groups.
-    /// Shared so the Job/proxy/render path and the Play history record see the same grouped set.
+    /// This run's resolved inventory filtered to the hosts being triggered, preserving the user's
+    /// groups. The single source of the run's host set: the Job, the proxy pods, the rendered
+    /// inventory and the `Play` record all derive from this one value, so they cannot disagree.
     run_groups: &'a [ResolvedInventoryGroup],
-    holder_identity: &'a str,
+    /// The fingerprint of `run_groups` plus the live plan spec, computed once per tick by the
+    /// caller — which also compares it against a recovered attempt's recorded one. Passed in rather
+    /// than recomputed here so the value a fresh attempt records is provably the same one a resume
+    /// is later judged against.
+    preparation_fingerprint: &'a str,
+    triggered_slot: Option<DateTime<FixedOffset>>,
 }
 
 pub fn new(
@@ -440,14 +444,19 @@ async fn reconcile(
     // Job/proxy/render path and the Play history record share one grouped view.
     let run_groups = filter_groups_to_hosts(&target_groups, &hosts_to_trigger);
 
-    let holder_identity = format!("{namespace}/{name}/{execution_hash}");
-    let run = RunContext {
+    // Plain `?`, unlike the desired-input reads above: this hashes two already-deserialized values,
+    // so it has no cluster state to fail against and nothing to hold a recovered attempt open for.
+    // Computed once and used for both jobs it has: recording a fresh attempt's fingerprint, and
+    // judging whether a recovered one's still matches.
+    let live_preparation_fingerprint = preparation_fingerprint(&object, &run_groups)?;
+
+    let base_run = RunContext {
         namespace,
         name,
         execution_hash,
-        hosts_to_trigger: &hosts_to_trigger,
         run_groups: &run_groups,
-        holder_identity: &holder_identity,
+        preparation_fingerprint: &live_preparation_fingerprint,
+        triggered_slot: None,
     };
 
     let eligible_to_start = is_eligible_to_start(
@@ -478,23 +487,29 @@ async fn reconcile(
                         requeue_after = (next - now()).to_std().unwrap_or_default();
                         resource_status.next_run = Some(next.fixed_offset());
                     }
-                } else if let Some(d) =
-                    try_start_run(&context, &run, &object, &mut resource_status).await?
-                {
-                    requeue_after = d;
                 } else {
-                    // `try_start_run` ran to completion (the Job was created or an active one
-                    // adopted, so `phase` is now `Applying`). Record this slot so it can't
-                    // re-trigger inside its grace window. `None` for unscheduled plans, which have
-                    // no slot and are never suppressed.
-                    resource_status.last_triggered_run = this_slot;
+                    let run = RunContext {
+                        triggered_slot: this_slot,
+                        ..base_run
+                    };
+                    if let Some(d) =
+                        try_start_run(&context, &run, &object, &mut resource_status, None).await?
+                    {
+                        requeue_after = d;
+                    } else {
+                        // `try_start_run` ran to completion (the Job was created or an active one
+                        // adopted, so `phase` is now `Applying`). Record this slot so it can't
+                        // re-trigger inside its grace window. `None` for unscheduled plans, which
+                        // have no slot and are never suppressed.
+                        resource_status.last_triggered_run = this_slot;
+                    }
                 }
             }
         };
     }
 
     if resource_status.phase == Phase::Applying
-        && let Some(d) = advance_applying_run(&context, &run, &object, &mut resource_status).await?
+        && let Some(d) = advance_applying_run(&context, &base_run, &object, &mut resource_status).await?
     {
         requeue_after = d;
     }
@@ -554,26 +569,83 @@ fn is_eligible_to_start(
         }
 }
 
-/// Steps 2-5: acquire this run's per-host locks (all-or-nothing, renewed every tick for as long
-/// as the run is in progress), ensure managed-ssh proxy infra is Ready, ensure the workspace
-/// secret reflects this run, then ensure the one Job exists. Each guard clause returns early with
-/// a short requeue the moment a precondition isn't met yet; `None` means it ran to completion
-/// (the Job either already existed or was just created — see `spawn_ansible_job`).
+/// Steps 2-5: name the attempt (or adopt the one a `Play` already records), acquire its per-host
+/// locks (all-or-nothing, renewed every tick for as long as the run is in progress), then hand off
+/// to [`ensure_infra_and_launch`]. Each guard clause returns early with a short requeue the moment a
+/// precondition isn't met yet; `None` means it ran to completion and the Job now exists.
+///
+/// A fresh attempt and one resumed from a `Prepared`/`Starting` record both come through here. They
+/// differ only in `prepared`: a resumed attempt keeps the identity its `Play` recorded, while a
+/// fresh one mints it and writes the record. Everything after the locks is identical, so it lives in
+/// one place — an operator restart mid-setup must not take a different code path than the tick it
+/// interrupted.
 async fn try_start_run(
     context: &ReconciliationContext,
     run: &RunContext<'_>,
     object: &PlaybookPlan,
     resource_status: &mut PlaybookPlanStatus,
+    prepared: Option<&UnlaunchedRun>,
 ) -> Result<Option<std::time::Duration>, ReconcileError> {
-    let secrets_api = Api::<Secret>::namespaced(context.client.clone(), run.namespace);
-    let jobs_api = Api::<Job>::namespaced(context.client.clone(), run.namespace);
     let leases_api = Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
 
     let run_groups = run.run_groups;
+    let active_run = match prepared {
+        // Recomputing the identity for a resume would silently re-derive resource names the record
+        // already baked in, so it is read back verbatim. Only the Job blueprint is re-derived, and
+        // only because `create_job_blueprint` is a pure function of inputs the caller has already
+        // shown unchanged (`preparation_fingerprint`).
+        Some(recorded) => recorded.run.clone(),
+        None => {
+            let jobs_api = Api::<Job>::namespaced(context.client.clone(), run.namespace);
+            let selected = select_job(
+                &context.client,
+                &jobs_api,
+                run.execution_hash,
+                object,
+                resource_status.retry_count,
+            )
+            .await?;
+            let run_id = run_id(object, &run.execution_hash)?;
+            // The recorded inventory — not `hosts_to_trigger` — is what every later step reads the
+            // run's host set back from, so it is also what the initial host count is taken from.
+            let inventory = flatten_hosts(run_groups);
+            let play = play_history::record_prepared(
+                &context.client,
+                run.namespace,
+                &play_history::PlayRef {
+                    plan: object,
+                    job_name: &selected.job_name,
+                    hash: &run.execution_hash,
+                    run_id: &run_id,
+                    preparation_fingerprint: run.preparation_fingerprint,
+                    attempt: selected.attempt,
+                    inventory: &inventory,
+                    triggered_slot: run.triggered_slot,
+                },
+            )
+            .await?;
+            recorded_run_from_play(&play)?
+        }
+    };
 
-    if let Some(blocked) =
-        locking::ensure_locks(&leases_api, run.hosts_to_trigger, run.holder_identity).await?
+    let holder_identity = format!("{}/{}/{}", run.namespace, run.name, run.execution_hash);
+    resource_status.retry_count = active_run.mirror.attempt;
+    resource_status.current_job_name = Some(active_run.mirror.job_name.clone());
+    resource_status.phase = Phase::Applying;
+    resource_status.summary = Some(format!("applying run {}", active_run.mirror.job_name));
+    resource_status.next_run = None;
+    resource_status.active_run = Some(active_run.mirror.clone());
+
+    if prepared.is_some_and(|run| run.phase == v1beta1::PlayPhase::Starting) {
+        // A resumed `Starting` attempt already holds its locks, so this re-asserts them rather than
+        // acquiring a set it may have lost — and only an *observed* takeover gives the attempt up.
+        let _outcome =
+            locking::renew_locks(&leases_api, &active_run.mirror.hosts, &holder_identity).await?;
+    } else if let Some(blocked) =
+        locking::ensure_locks(&leases_api, &active_run.mirror.hosts, &holder_identity).await?
     {
+        // Acquisition is all-or-nothing and took nothing this tick, so there is nothing to give up:
+        // the attempt waits its turn and stays supersedable meanwhile.
         warn!(
             "PlaybookPlan {}/{} is blocked: host '{}' is locked by {}",
             run.namespace,
@@ -583,36 +655,118 @@ async fn try_start_run(
         );
         status::set_blocked_condition(resource_status, Some(&blocked));
         return Ok(Some(std::time::Duration::from_secs(15)));
+    } else {
+        // Locks are ours this tick — clear any stale Blocked condition from a previous contended tick.
+        status::set_blocked_condition(resource_status, None);
     }
-    // Locks are ours this tick — clear any stale Blocked condition from a previous contended tick.
-    status::set_blocked_condition(resource_status, None);
 
-    let (managed_ssh_hosts, tolerations) = managed_ssh_hosts_and_tolerations(run_groups);
+    // Leave `Prepared` only once the locks are held: everything up to here is abortable, so a run
+    // that can't take its locks stays supersedable by a newer revision (or by `suspend`) instead of
+    // launching a stale one later. Idempotent, so resuming an already-`Starting` attempt is a no-op.
+    play_history::commit_starting(
+        &context.client,
+        run.namespace,
+        &active_run.mirror.job_name,
+        &active_run.mirror.play_uid,
+    )
+    .await?;
 
-    // Owns the plan-namespace client-cert Secret so K8s GC reaps it if the plan is deleted before
-    // cleanup runs (the explicit per-run delete in `cleanup_proxy_infra` is the primary path).
-    let plan_owner = playbookplan_owner_ref(object)?;
+    ensure_infra_and_launch(
+        context,
+        object,
+        &active_run,
+        run_groups,
+        v1beta1::PlayPhase::Starting,
+        resource_status,
+    )
+    .await
+}
 
-    // This attempt's run ID — the identity every run-scoped resource is keyed on.
-    let run_id = run_id(object, &run.execution_hash)?;
+/// Everything between "this attempt holds its host Leases and its record says `Starting`" and "its
+/// Job exists": live node authorization, the managed-ssh proxy infrastructure, the workspace Secret,
+/// the playbook NetworkPolicy, the `Launching` commit, the Job itself, and `Running`.
+///
+/// Shared verbatim by a fresh attempt and one resumed after a restart. That sharing is the point:
+/// these are the node-root steps, and having a resumed run walk a second, subtly different
+/// implementation of them is exactly how an invariant gets lost on the path nobody exercises daily.
+///
+/// Returns `Some(requeue)` when it stopped short of the Job — proxy pods aren't Ready yet, or the
+/// attempt's nodes lost their grant — and `None` once the Job exists and the record says `Running`.
+async fn ensure_infra_and_launch(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    run: &RecordedRun,
+    run_groups: &[ResolvedInventoryGroup],
+    unlaunched_phase: v1beta1::PlayPhase,
+    resource_status: &mut PlaybookPlanStatus,
+) -> Result<Option<std::time::Duration>, ReconcileError> {
+    let (namespace, name) = namespace_and_name(object)?;
+    let (managed_hosts, tolerations) = managed_ssh_hosts_and_tolerations(run_groups);
+
+    // INV-3/INV-3b: proxy pods are node root, so the set about to get them — derived from the groups
+    // this tick will actually render, never read back from the record — is what has to be authorized,
+    // and it has to be authorized *before* the pods exist. Step 0b already clamped this tick's
+    // groups; this re-read closes the window between that clamp and the pods, on the resumed path
+    // just as much as the fresh one.
+    if !managed_hosts_still_allowed(context, object, &managed_hosts).await? {
+        warn!(
+            "PlaybookPlan {namespace}/{name}: aborting run {} — its nodes are no longer granted to this namespace",
+            run.mirror.job_name
+        );
+        // Released here rather than left for the next tick to pick up as an `Aborted` record: the
+        // attempt may already hold host Leases and proxy pods, and a grant live policy has just
+        // refused is not worth holding those for a moment longer than the cleanup itself takes. The
+        // record still outlives the cleanup, so a failure part-way through is retried as before.
+        //
+        // This is the one abandon of a `Launching` attempt that does not route through
+        // `resume_launching_run` and so does not re-read the Job — see that function's doc for why
+        // the exception is safe here and must not be copied elsewhere.
+        let api = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace);
+        abandon_unlaunched_run(
+            context,
+            object,
+            &api,
+            run,
+            unlaunched_phase,
+            "aborted the run: its nodes are no longer granted to this namespace".to_string(),
+            resource_status,
+        )
+        .await?;
+        return Ok(Some(std::time::Duration::from_secs(1)));
+    }
+
+    // Discards half-built infrastructure this attempt owns that the *current* CA cannot authenticate
+    // against — i.e. a resume across an operator restart. A no-op (one `get_opt`) for an attempt that
+    // has not built anything yet.
+    managed_ssh::reset_incomplete_run(
+        &context.client,
+        &context.operator_namespace,
+        namespace,
+        &run.mirror.run_id,
+        &managed_hosts,
+        &context.ca,
+    )
+    .await?;
 
     let proxy_readiness = managed_ssh::ensure_proxy_infra(
         &context.client,
         &context.operator_namespace,
-        run.namespace,
+        namespace,
         &run.execution_hash,
-        &run_id,
-        &managed_ssh_hosts,
+        &run.mirror.run_id,
+        &managed_hosts,
         tolerations.as_deref(),
         &context.proxy_grace,
         &context.ca,
         &context.proxy_image,
         context.workload_egress_policies.managed_ssh.clone(),
-        &plan_owner,
+        // Owns the plan-namespace client-cert Secret so K8s GC reaps it if the plan is deleted
+        // before cleanup runs (the per-run delete in `cleanup_proxy_infra` is the primary path).
+        &playbookplan_owner_ref(object)?,
     )
     .await?;
 
-    let (proxy_infos, unreachable_hosts) = match proxy_readiness {
+    let (ready, unreachable) = match proxy_readiness {
         managed_ssh::ProxyReadiness::Pending { waiting } => {
             debug!("Waiting for managed-ssh proxy pods to become Ready on {waiting:?}");
             status::set_waiting_for_nodes_condition(resource_status, Some(&waiting));
@@ -624,31 +778,85 @@ async fn try_start_run(
         }
     };
 
-    if !unreachable_hosts.is_empty() {
+    if !unreachable.is_empty() {
         warn!(
-            "PlaybookPlan {}/{}: proceeding without node(s) {:?} — their managed-ssh proxy pods never became Ready within the grace window; Ansible will report them unreachable, and they'll be retried on the next run",
-            run.namespace, run.name, unreachable_hosts,
+            "PlaybookPlan {namespace}/{name}: proceeding without node(s) {unreachable:?} — their managed-ssh proxy pods never became Ready within the grace window; Ansible will report them unreachable, and they'll be retried on the next run",
         );
     }
 
-    let mut managed_ssh_hosts_map: BTreeMap<String, ansible::ManagedSshHostInfo> = proxy_infos
+    // Proxy pod IPs are fresh every time a run's infrastructure is (re)built, so this is rendered
+    // unconditionally rather than on a generation change: the workspace Secret has to describe the
+    // pods that exist right now, not the plan revision it was last written for.
+    let secrets_api = Api::<Secret>::namespaced(context.client.clone(), namespace);
+    debug!("Rendering playbook to secret");
+    upsert_workspace_secret(
+        &secrets_api,
+        name,
+        render_secret(
+            object,
+            run_groups,
+            &managed_ssh_host_map(ready, unreachable),
+        )?,
+    )
+    .await?;
+    resource_status.last_rendered_generation = object.metadata.generation;
+
+    if let Some(network_policy_egress) = context.workload_egress_policies.playbook.clone() {
+        job_builder::ensure_job_network_policy(
+            context.client.clone(),
+            &context.operator_namespace,
+            &run.execution_hash,
+            &run.mirror.run_id,
+            run_groups,
+            object,
+            network_policy_egress,
+        )
+        .await?;
+    }
+
+    play_history::commit_launching(
+        &context.client,
+        namespace,
+        &run.mirror.job_name,
+        &run.mirror.play_uid,
+    )
+    .await?;
+    let jobs_api = Api::<Job>::namespaced(context.client.clone(), namespace);
+    launch_recorded_job(&jobs_api, object, run, run_groups).await?;
+    play_history::record_running(
+        &context.client,
+        namespace,
+        &run.mirror.job_name,
+        &run.mirror.play_uid,
+    )
+    .await?;
+
+    Ok(None)
+}
+
+/// The Ansible-facing view of this run's proxy pods: the Ready ones at their live pod IP, plus the
+/// ones whose proxy never came up pointed at the unroutable sentinel (with a short connect timeout,
+/// see `inventory_renderer`) so Ansible records them unreachable instead of hanging.
+fn managed_ssh_host_map(
+    ready: Vec<managed_ssh::ProxyPodInfo>,
+    unreachable: Vec<String>,
+) -> BTreeMap<String, ansible::ManagedSshHostInfo> {
+    let mut hosts: BTreeMap<String, ansible::ManagedSshHostInfo> = ready
         .into_iter()
-        .map(|p| {
+        .map(|proxy| {
             (
-                p.host,
+                proxy.host,
                 ansible::ManagedSshHostInfo {
-                    pod_ip: p.pod_ip,
-                    port: p.port,
+                    pod_ip: proxy.pod_ip,
+                    port: proxy.port,
                     unreachable: false,
                 },
             )
         })
         .collect();
 
-    // Hosts whose proxy never became Ready in time have no pod IP; point Ansible at the unroutable
-    // sentinel (with a short connect timeout, see inventory_renderer) so it records them unreachable.
-    for host in unreachable_hosts {
-        managed_ssh_hosts_map.insert(
+    for host in unreachable {
+        hosts.insert(
             host,
             ansible::ManagedSshHostInfo {
                 pod_ip: managed_ssh::UNREACHABLE_SENTINEL_IP.to_string(),
@@ -658,63 +866,7 @@ async fn try_start_run(
         );
     }
 
-    // Proxy pod IPs are fresh every run even with an unchanged spec, so rendering is also
-    // triggered on "a run is starting now", not generation alone.
-    if workspace::is_missing(&secrets_api, run.name).await? || workspace::is_outdated(object, true)
-    {
-        debug!("Rendering playbook to secret");
-        upsert_workspace_secret(
-            &secrets_api,
-            run.name,
-            render_secret(object, run_groups, &managed_ssh_hosts_map)?,
-        )
-        .await?;
-        resource_status.last_rendered_generation = object.metadata.generation;
-    }
-
-    if let Some(network_policy_egress) = context.workload_egress_policies.playbook.clone() {
-        job_builder::ensure_job_network_policy(
-            context.client.clone(),
-            &context.operator_namespace,
-            &run.execution_hash,
-            &run_id,
-            run_groups,
-            object,
-            network_policy_egress,
-        )
-        .await?;
-    }
-
-    spawn_ansible_job(
-        &jobs_api,
-        run.execution_hash,
-        &run_id,
-        run_groups,
-        object,
-        resource_status,
-    )
-    .await?;
-
-    // Record this attempt as a Play (history), named after the Job spawn just settled on. The
-    // attempt number is `retry_count`, which `spawn_ansible_job` set for exactly this Job.
-    if let Some(job_name) = resource_status.current_job_name.as_deref() {
-        let inventory = flatten_hosts(run.run_groups);
-        play_history::record_running(
-            &context.client,
-            run.namespace,
-            &play_history::PlayRef {
-                plan: object,
-                job_name,
-                hash: &run.execution_hash,
-                attempt: resource_status.retry_count,
-                inventory: &inventory,
-                hosts: run.hosts_to_trigger,
-            },
-        )
-        .await?;
-    }
-
-    Ok(None)
+    hosts
 }
 
 /// Narrows what was found at a run's record name to what is actually *this run's* record.
@@ -1102,8 +1254,8 @@ async fn upsert_workspace_secret(
 /// Deliberately excludes the workspace secret itself — its content legitimately differs on every
 /// run even with an unchanged spec (managed-ssh proxy pod IPs are baked into inventory.yml), so
 /// including it here would make `execution_hash` unstable across otherwise-identical runs and
-/// break naming consistency for proxy infra/Job labels/lock identity mid-run. Workspace-secret
-/// staleness is handled independently via `workspace::is_outdated`/`is_missing`.
+/// break naming consistency for proxy infra/Job labels/lock identity mid-run. The workspace is
+/// rendered unconditionally in `ensure_infra_and_launch` after current proxy endpoints are known.
 fn get_related_secrets(playbookplan: &PlaybookPlan) -> Vec<&String> {
     job_builder::extract_secret_names_for_variables(playbookplan)
         .chain(job_builder::extract_secret_names_for_files(playbookplan))
@@ -1481,6 +1633,39 @@ fn host_names(inventory: &[ResolvedHosts]) -> Vec<String> {
         .collect()
 }
 
+async fn managed_hosts_still_allowed(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    managed_hosts: &[String],
+) -> Result<bool, ReconcileError> {
+    if managed_hosts.is_empty() {
+        return Ok(true);
+    }
+    let (namespace, _) = namespace_and_name(object)?;
+    let mut groups = vec![ResolvedInventoryGroup::ManagedSsh {
+        hosts: ResolvedHosts {
+            name: "recovery-authorization".into(),
+            hosts: managed_hosts.to_vec(),
+        },
+        tolerations: None,
+        variables: None,
+    }];
+    node_access::enforce(
+        &context.client,
+        &context.node_access_policies,
+        namespace,
+        &mut groups,
+    )
+    .await?;
+    let allowed: std::collections::HashSet<&str> = groups
+        .iter()
+        .flat_map(|group| group.hosts().hosts.iter().map(String::as_str))
+        .collect();
+    Ok(managed_hosts
+        .iter()
+        .all(|host| allowed.contains(host.as_str())))
+}
+
 /// What one reconcile found for a plan's run.
 enum RecoveredRun {
     Active(RecordedRun),
@@ -1619,6 +1804,80 @@ fn recorded_run_from_play(play: &Play) -> Result<RecordedRun, ReconcileError> {
     })
 }
 
+fn preparation_fingerprint(
+    plan: &PlaybookPlan,
+    run_groups: &[ResolvedInventoryGroup],
+) -> Result<String, ReconcileError> {
+    let mut hasher = twox_hash::XxHash3_64::new();
+    use std::hash::{Hash as _, Hasher as _};
+    serde_json::to_string(&plan.spec)?.hash(&mut hasher);
+    serde_json::to_string(run_groups)?.hash(&mut hasher);
+    Ok(format!("{:x}", hasher.finish()))
+}
+
+/// How many characters [`run_id`] mints.
+///
+/// Long enough that concurrent attempts cannot collide on it, short enough to leave room for a node
+/// name inside the object names it feeds. Every name budget that depends on it — the proxy pods and
+/// Secrets in `managed_ssh::resource_name`, the egress policy in
+/// `job_builder::job_network_policy_name` — is pinned by a test that mints an ID of exactly this
+/// length, so raising it fails in all of them at once rather than at the apiserver.
+pub(super) const RUN_ID_LENGTH: usize = 10;
+
+/// Mints this attempt's run ID — the identity that scopes its Leases, proxy resources, client
+/// certificate principal and cleanup.
+///
+/// Deliberately *not* a function of (plan, hash, attempt): an aborted attempt frees its number
+/// again, so a derived ID would be reused by the retry while the aborted attempt's proxy pods are
+/// still terminating, and the retry would adopt those dying pods under the same names. A counter
+/// separates the IDs minted by one process and the clock separates them across restarts; the run ID
+/// never has to be recomputed, since it is recorded in the `Play` before anything is named after it.
+fn run_id(plan: &PlaybookPlan, execution_hash: &ExecutionHash) -> Result<String, ReconcileError> {
+    use kube::runtime::reflector::Lookup as _;
+    use std::hash::{Hash as _, Hasher as _};
+    static MINTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let mut hasher = twox_hash::XxHash3_64::new();
+    plan.uid()
+        .ok_or(ReconcileError::PreconditionFailed("uid not set"))?
+        .hash(&mut hasher);
+    execution_hash.to_string().hash(&mut hasher);
+    MINTED
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .hash(&mut hasher);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ReconcileError::PreconditionFailed("system clock is before the epoch"))?
+        .as_nanos()
+        .hash(&mut hasher);
+    Ok(crate::utils::generate_id_with_length(
+        hasher.finish(),
+        RUN_ID_LENGTH,
+    ))
+}
+
+/// Creates a recorded attempt's backing Job from inputs already checked against its fingerprint.
+async fn launch_recorded_job(
+    jobs_api: &Api<Job>,
+    object: &PlaybookPlan,
+    run: &RecordedRun,
+    run_groups: &[ResolvedInventoryGroup],
+) -> Result<(), ReconcileError> {
+    let mut job = job_builder::create_job_blueprint(
+        &run.execution_hash,
+        run.mirror.attempt,
+        &run.mirror.run_id,
+        run_groups,
+        object,
+    )?;
+    job_builder::correlate_job_to_play(&mut job, &run.mirror.play_uid);
+    let selected = SelectedJob {
+        job_name: run.mirror.job_name.clone(),
+        attempt: run.mirror.attempt,
+    };
+    spawn_ansible_job(jobs_api, object, &selected, &run.mirror.play_uid, job).await
+}
+
 fn play_belongs_to_plan(play: &Play, plan_name: &str, plan_uid: &str) -> bool {
     play.spec.playbook_plan == plan_name && play.spec.playbook_plan_uid == plan_uid
 }
@@ -1697,47 +1956,6 @@ fn namespace_and_name(object: &PlaybookPlan) -> Result<(&str, &str), ReconcileEr
         .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
 
     Ok((namespace, name))
-}
-
-/// How many characters [`run_id`] mints.
-///
-/// Long enough that concurrent attempts cannot collide on it, short enough to leave room for a node
-/// name inside the object names it feeds. Every name budget that depends on it — the proxy pods and
-/// Secrets in `managed_ssh::resource_name`, the egress policy in
-/// `job_builder::job_network_policy_name` — is pinned by a test that mints an ID of exactly this
-/// length, so raising it fails in all of them at once rather than at the apiserver.
-pub(super) const RUN_ID_LENGTH: usize = 10;
-
-/// Mints this attempt's run ID — the identity that scopes its Leases, proxy resources, client
-/// certificate principal and cleanup.
-///
-/// Deliberately *not* a function of (plan, hash, attempt): an aborted attempt frees its number
-/// again, so a derived ID would be reused by the retry while the aborted attempt's proxy pods are
-/// still terminating, and the retry would adopt those dying pods under the same names. A counter
-/// separates the IDs minted by one process and the clock separates them across restarts; the run ID
-/// never has to be recomputed, since it is recorded in the `Play` before anything is named after it.
-fn run_id(plan: &PlaybookPlan, execution_hash: &ExecutionHash) -> Result<String, ReconcileError> {
-    use kube::runtime::reflector::Lookup as _;
-    use std::hash::{Hash as _, Hasher as _};
-    static MINTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    let mut hasher = twox_hash::XxHash3_64::new();
-    plan.uid()
-        .ok_or(ReconcileError::PreconditionFailed("uid not set"))?
-        .hash(&mut hasher);
-    execution_hash.to_string().hash(&mut hasher);
-    MINTED
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        .hash(&mut hasher);
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| ReconcileError::PreconditionFailed("system clock is before the epoch"))?
-        .as_nanos()
-        .hash(&mut hasher);
-    Ok(crate::utils::generate_id_with_length(
-        hasher.finish(),
-        RUN_ID_LENGTH,
-    ))
 }
 
 struct SelectedJob {
@@ -2240,6 +2458,68 @@ mod tests {
         ];
 
         assert_eq!(host_names(&overlapping), vec!["a", "b", "c"]);
+    }
+
+    /// The fingerprint is the whole change detector: it is what lets a record be recognized without
+    /// storing a copy of the inputs it was prepared from, so it has to move whenever either of them
+    /// does. The execution hash is deliberately not enough on its own — it covers only the playbook
+    /// text plus referenced Secret contents, so an `image`/`tolerations`/`verbosity` edit, or node
+    /// churn under the plan's inventory, reaches the fingerprint and nothing else.
+    #[test]
+    fn preparation_fingerprint_covers_the_plan_spec_and_the_resolved_groups() {
+        let mut plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("uid".into());
+        plan.spec.image = "ansible:2.18".into();
+        let groups = vec![managed_ssh_group("nodes", &["a"], None)];
+
+        let baseline = preparation_fingerprint(&plan, &groups).unwrap();
+        assert_eq!(
+            baseline,
+            preparation_fingerprint(&plan, &groups).unwrap(),
+            "the same inputs must fingerprint identically across calls"
+        );
+
+        // An edit that never touches the playbook, so the execution hash cannot see it.
+        let mut retagged = plan.clone();
+        retagged.spec.image = "ansible:2.19".into();
+        assert_ne!(
+            baseline,
+            preparation_fingerprint(&retagged, &groups).unwrap(),
+            "an image change must move the fingerprint"
+        );
+
+        // The resolved node set is not derivable from the plan, which is why it is fingerprinted
+        // alongside it.
+        let relabelled = vec![managed_ssh_group("nodes", &["a", "b"], None)];
+        assert_ne!(
+            baseline,
+            preparation_fingerprint(&plan, &relabelled).unwrap(),
+            "a change in the resolved node set must move the fingerprint"
+        );
+    }
+
+    /// The load-bearing property behind dropping the Job snapshot from the `Play`: rebuilding the
+    /// blueprint from the plan reproduces the prepared bytes exactly. `create_job_blueprint` must
+    /// stay a pure function of the recorded identity plus the plan and groups the fingerprint
+    /// covers — if anything time- or environment-dependent ever leaks into it, a resumed
+    /// `Launching` run would create a Job that differs from the one it committed to.
+    #[test]
+    fn a_rebuilt_blueprint_reproduces_the_one_prepared_for_the_same_run() {
+        let mut plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+        plan.metadata.namespace = Some("team".into());
+        plan.metadata.uid = Some("plan-uid".into());
+        let groups = vec![managed_ssh_group("nodes", &["a", "b"], None)];
+        let hash = ExecutionHash::from_hex("1").unwrap();
+
+        let prepared =
+            job_builder::create_job_blueprint(&hash, 2, "run-1", &groups, &plan).unwrap();
+        let rebuilt = job_builder::create_job_blueprint(&hash, 2, "run-1", &groups, &plan).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&prepared).unwrap(),
+            serde_json::to_value(&rebuilt).unwrap(),
+            "the same recorded identity and inputs must rebuild byte-identically"
+        );
     }
 
     /// Every attempt number anything still on the cluster claims — this plan's Jobs for the hash

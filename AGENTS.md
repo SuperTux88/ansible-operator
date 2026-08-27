@@ -14,7 +14,7 @@ controllers running concurrently in `main.rs` via `tokio::join!`
 
 ## Security invariants — do NOT regress without an explicit instruction
 
-These are `THREAT_MODEL.md` §7 (INV-1…INV-7), enforced by unit tests. They are the
+These are the numbered invariants in `THREAT_MODEL.md` §7, enforced by unit tests. They are the
 whole point of the design. If a change would weaken one, stop and surface it; do not
 "simplify" or "clean up" past them unless the user explicitly asks.
 
@@ -27,6 +27,10 @@ whole point of the design. If a change would weaken one, stop and surface it; do
 - **INV-3 — Enforcement runs before proxy infra.** NAP clamping happens at inventory
   resolve time (reconcile "step 0b"), on **every** reconcile, before any proxy pod/Secret/
   NetworkPolicy is created.
+- **INV-3b — Every attempt re-authorizes before proxy creation.** Fresh and resumed absent-Job
+  attempts share `ensure_infra_and_launch`, which derives the node set from the groups it is about
+  to render and re-authorizes *that* set live before `ensure_proxy_infra`, never a set read back
+  from the record.
 - **INV-4 — Cross-run isolation is at the cert layer.** Each proxy pod's
   `AuthorizedPrincipalsFile` lists **only its own per-attempt run ID** (`build_secret`) —
   never `root`, never a wildcard. The client cert carries that run ID as a principal. The

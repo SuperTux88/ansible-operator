@@ -342,6 +342,12 @@ pub struct PlaybookPlanStatus {
     /// whose `Play` was deleted out from under it.
     pub active_run: Option<ActiveRun>,
     pub eligible_hosts: Vec<ResolvedHosts>,
+    /// The plan generation the workspace Secret was last rendered from — informational only.
+    ///
+    /// It is deliberately *not* a "needs re-render" gate: the workspace embeds the live proxy pod
+    /// IPs, which are fresh every time a run's infrastructure is built, so it is rewritten whenever
+    /// a run reaches that point regardless of whether the spec changed. Reintroducing a gate here
+    /// would let a run mount an inventory pointing at a previous run's pods.
     pub last_rendered_generation: Option<i64>,
     pub conditions: Vec<PlaybookPlanCondition>,
     pub hosts_status: Option<BTreeMap<String, HostStatus>>,

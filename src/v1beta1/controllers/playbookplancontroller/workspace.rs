@@ -8,28 +8,6 @@ use crate::v1beta1::{
     playbookplancontroller::paths,
 };
 
-/// Whether the workspace secret needs to be (re)rendered — on a generation change (spec edit),
-/// or whenever `run_starting`, since managed-ssh proxy pod IPs are fresh every run.
-pub fn is_outdated(object: &PlaybookPlan, run_starting: bool) -> bool {
-    let generation = object
-        .metadata
-        .generation
-        .expect(".metdata.generation must be set at this point");
-
-    let generation_changed = object
-        .status
-        .as_ref()
-        .and_then(|s| s.last_rendered_generation)
-        .map(|g| g < generation)
-        .unwrap_or(true);
-
-    generation_changed || run_starting
-}
-
-pub async fn is_missing(secrets_api: &kube::Api<Secret>, name: &str) -> Result<bool, kube::Error> {
-    Ok(secrets_api.get_opt(name).await?.is_none())
-}
-
 /// Creates a Kubernetes secret that contains an inventory.yml, a playbook.yml, the operator's
 /// recap callback plugin, and any static-variables*.yaml for a given PlaybookPlan so that the
 /// playbook can be executed afterwards. The workspace is host-agnostic.
