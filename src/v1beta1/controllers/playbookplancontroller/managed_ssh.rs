@@ -1034,6 +1034,50 @@ mod tests {
         }
     }
 
+    /// The proxy pod is the node-root primitive, so the privileges it does *and does not* ask for are
+    /// part of the threat model rather than an implementation detail (THREAT_MODEL §T-ESC-1).
+    #[test]
+    fn build_pod_pins_the_node_root_privileges_and_targets_its_own_node() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+
+        let hash = calculate_execution_hash("playbook", std::iter::empty());
+        let pod = build_pod(
+            "ansible-sshd-worker-1-run-1",
+            "ansible-sshd-worker-1-run-1",
+            &hash,
+            "run-1",
+            "worker-1",
+            None,
+            "proxy:latest",
+        );
+        let spec = pod.spec.as_ref().unwrap();
+
+        // Scheduled onto the exact node it proxies — the pod IS the node's access path. Pinned by
+        // `nodeSelector` rather than `nodeName` so normal scheduling (taints, tolerations) still
+        // applies; see `merge_default_tolerations`.
+        assert_eq!(
+            spec.node_selector.as_ref().unwrap()["kubernetes.io/hostname"],
+            "worker-1"
+        );
+
+        // hostPID is required (nsenter needs a host process to enter); the rest must stay off.
+        assert_eq!(spec.host_pid, Some(true));
+        assert_ne!(spec.host_network, Some(true));
+        assert_ne!(spec.host_ipc, Some(true));
+
+        let container = &spec.containers[0];
+        assert_eq!(container.image.as_deref(), Some("proxy:latest"));
+        let security = container.security_context.as_ref().unwrap();
+        assert_ne!(
+            security.privileged,
+            Some(true),
+            "capabilities are granted explicitly, never via blanket privileged"
+        );
+        let added = security.capabilities.as_ref().unwrap().add.clone().unwrap();
+        assert!(added.contains(&"SYS_ADMIN".to_string()));
+        assert!(added.contains(&"SYS_PTRACE".to_string()));
+    }
+
     #[test]
     fn proxy_network_policy_adds_egress_only_when_configured() {
         use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
