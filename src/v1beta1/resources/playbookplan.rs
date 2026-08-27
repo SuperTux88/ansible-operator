@@ -117,9 +117,11 @@ pub struct PlaybookPlanSpec {
     pub inventory_refs: Vec<InventoryRef>,
 
     /// How long a finished run's Job (and its pod) is kept before Kubernetes' TTL controller
-    /// reaps it. The operator never deletes the Job itself, so this governs the ansible pod's
-    /// lifetime. Values below 60 seconds are silently raised to 60; unset uses the operator's
-    /// default.
+    /// reaps it. Reaping a finished run is left entirely to that controller, so this governs the
+    /// ansible pod's lifetime. The one Job the operator deletes itself is the Job of a run still in
+    /// flight when its plan is deleted, which is cancelled rather than left running; such a run
+    /// never reaches this TTL. Values below 60 seconds are silently raised to 60; unset uses the
+    /// operator's default.
     pub ttl_seconds_after_finished: Option<i32>,
 
     /// How many successful `Play` history records to keep for this plan before the oldest are

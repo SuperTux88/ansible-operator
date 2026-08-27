@@ -28,9 +28,11 @@ use kube::{
 /// `/dev/termination-log` carries the recap the reconciler reads back (see `advance_active_run`).
 pub const ANSIBLE_CONTAINER_NAME: &str = "ansible-playbook";
 
-/// `ttlSecondsAfterFinished` for the ansible Job: the operator never deletes the Job or its pod
-/// itself, it leaves cleanup to Kubernetes' TTL controller so finished runs stay around briefly for
-/// inspection, then get reaped instead of accumulating forever.
+/// `ttlSecondsAfterFinished` for the ansible Job: reaping a *finished* run is left to Kubernetes'
+/// TTL controller, so finished runs stay around briefly for inspection and then get reaped instead
+/// of accumulating forever. The operator deletes a Job only to cancel one that is still running when
+/// its plan is deleted (`cancel_run_job`), which is a different lifecycle — such a run never
+/// finishes, so this TTL never applies to it.
 ///
 /// Default `ttlSecondsAfterFinished` when a `PlaybookPlan` doesn't set `spec.ttlSecondsAfterFinished`.
 ///
@@ -520,7 +522,8 @@ fn create_job_skeleton(
 
     let job_spec = batch::v1::JobSpec {
         backoff_limit: Some(0), // todo: maybe configurable
-        // Cleanup is Kubernetes' job (the TTL controller), not the operator's — see `effective_job_ttl`.
+        // Reaping a finished run is Kubernetes' job (the TTL controller), not the operator's — see
+        // `effective_job_ttl`.
         ttl_seconds_after_finished: Some(effective_job_ttl(plan)),
         template: pod_template,
         ..Default::default()
