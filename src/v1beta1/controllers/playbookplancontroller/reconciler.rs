@@ -21,9 +21,9 @@ use std::{collections::BTreeMap, sync::Arc};
 use tracing::{debug, error, info, warn};
 
 use crate::v1beta1::{
-    AnsibleInventory, ClusterInventory, ExecutionMode, GenericMap, NodeAccessPolicy, Phase,
-    PlaybookPlanStatus, ResolvedHosts, ResolvedInventoryGroup, StaticInventory, Toleration,
-    ansible, flatten_hosts, labels,
+    ActiveRun, AnsibleInventory, ClusterInventory, ExecutionMode, GenericMap, NodeAccessPolicy,
+    Phase, Play, PlaybookPlanStatus, ResolvedHosts, ResolvedInventoryGroup, StaticInventory,
+    Toleration, ansible, flatten_hosts, labels,
     playbookplancontroller::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
         locking, managed_ssh,
@@ -272,11 +272,96 @@ async fn reconcile(
         return Ok(Action::await_change());
     }
 
-
     let secrets_api = Api::<Secret>::namespaced(context.client.clone(), namespace);
 
     let mut requeue_after = std::time::Duration::from_secs(3600);
+    let mut retry_prune = false;
     let mut resource_status = object.status.clone().unwrap_or_default();
+    // An attempt recovered before its Job exists, with the phase it was found in. It is dispatched
+    // after inventory resolution rather than here, because deciding whether it may still be resumed
+    // needs the resolved, policy-clamped groups its fingerprint covers.
+    let mut unlaunched_run: Option<UnlaunchedRun> = None;
+    let mut finished_active_run: Option<RecordedRun> = None;
+    // Recovery drives the privileged parts of a run (Job creation, proxy infra, locks), so a failure
+    // here aborts the tick before the final `patch_status`. Report it on the plan first, otherwise a
+    // run that can't be recovered — a rejected Job, a revoked node grant — is only ever visible in
+    // the operator's log. History retention is separate and is retried below even when no run needs
+    // recovery.
+    let recovered = match recover_active_run(&context, &object).await {
+        Ok(recovered) => recovered,
+        Err(error) => {
+            resource_status.summary = Some(format!("run recovery failed: {error}"));
+            if let Err(patch_error) = patch_status(&api, &object, resource_status).await {
+                warn!("Could not report the recovery failure on {namespace}/{name}: {patch_error}");
+            }
+            return Err(error);
+        }
+    };
+    // Set when the tick drained a finished run's result but the plan still has a live attempt behind
+    // it: the plan is emphatically not finished, so the terminal classification below is skipped,
+    // and the schedule window that attempt holds is what the plan records.
+    let mut surviving_attempt: Option<SurvivingAttempt> = None;
+    let mut finalized_run = false;
+    if let Some(recovered) = recovered {
+        match recovered {
+            RecoveredRun::Active(run) => {
+                adopt_recovered_attempt(&mut resource_status, &run.mirror);
+            }
+            RecoveredRun::Unlaunched(unlaunched) => {
+                adopt_recovered_attempt(&mut resource_status, &unlaunched.run.mirror);
+                unlaunched_run = Some(unlaunched);
+            }
+            RecoveredRun::Aborted(run) => {
+                abandon_run(
+                    &context,
+                    &object,
+                    &api,
+                    &run,
+                    format!("released the abandoned run {}", run.mirror.job_name),
+                    &mut resource_status,
+                )
+                .await?;
+            }
+            RecoveredRun::Finished {
+                finished,
+                status,
+                surviving,
+            } => {
+                status::apply_terminal_play_status(
+                    &finished.execution_hash,
+                    &status,
+                    &mut resource_status,
+                );
+                match finalize_finished_run(
+                    &context,
+                    &object,
+                    &api,
+                    &finished,
+                    // Drained straight off its own record, which is therefore still there to
+                    // acknowledge — that acknowledgement is what stops it being drained again.
+                    TerminalRecord::Present,
+                    &mut resource_status,
+                )
+                .await
+                {
+                    Ok(prune_failed) => retry_prune |= prune_failed,
+                    Err(error) => {
+                        return Err(report_failed_finalization(
+                            &api,
+                            &object,
+                            &finished,
+                            &mut resource_status,
+                            error,
+                        )
+                        .await);
+                    }
+                }
+                finalized_run = true;
+                finished_active_run = Some(finished);
+                surviving_attempt = surviving;
+            }
+        }
+    }
 
     // Step 0: resolve inventory (kept separate per-resource, not flattened — connection
     // mechanism is implicit by which resource produced a group).
@@ -630,6 +715,52 @@ async fn try_start_run(
     }
 
     Ok(None)
+}
+
+/// Narrows what was found at a run's record name to what is actually *this run's* record.
+///
+/// A different object under the name is the same fact as no object at all — the recorded run is gone
+/// — so both answer `None` and both reach `finalize_lost_run`, which reconstructs the result from the
+/// plan's own copy of the run. Pure so the equivalence stays pinned: it is what keeps a replacement
+/// attempt from being finalized, acknowledged or pruned as though it were the run it replaced.
+fn own_record(found: Option<Play>, expected_uid: &str) -> Option<Play> {
+    found.filter(|play| play.metadata.uid.as_deref() == Some(expected_uid))
+}
+
+/// Whether the plan's `activeRun` mirror is `run`'s — the question both paths that *stop* driving a
+/// run have to answer before clearing it ([`finalize_finished_run`], [`abandon_run`]).
+///
+/// An absent mirror answers yes: the tick that finishes a run clears it before either path is reached
+/// (`advance_active_run`), and that case still has to reset the phase. What the guard excludes is a mirror
+/// describing a *different* attempt, which is genuinely in flight and is the only thing that would
+/// bring it to [`finalize_lost_run`] if its `Play` were deleted. Clearing that would leave its host
+/// Leases and node-root proxy pods with nothing pointing at them.
+///
+/// Pure, and shared, so the two paths cannot drift: the guard was only ever reasoned about on the
+/// finalize side, while `abandon_run` reaches the same fields from `recover_active_run`'s `Aborted`
+/// branch — the one path that adopts no attempt first.
+fn mirrors_run(status: &PlaybookPlanStatus, run: &RecordedRun) -> bool {
+    status
+        .active_run
+        .as_ref()
+        .is_none_or(|mirrored| mirrored.play_uid == run.mirror.play_uid)
+}
+
+/// Whether this run's record has reached `Running`, the only phase that may enter Job finalization.
+/// Earlier phases belong to absent-Job recovery, including when a tick just drained another run's
+/// terminal result while the plan status mirrors this one.
+///
+/// The UID is checked by the caller rather than here, because a record that no longer carries it is
+/// not a wrong *phase* — it is a different object at the same name, which says the recorded run is
+/// gone.
+fn play_is_running_attempt(play: &Play) -> Result<bool, ReconcileError> {
+    let status = play
+        .status
+        .as_ref()
+        .ok_or(ReconcileError::PreconditionFailed(
+            "active Play has no status",
+        ))?;
+    Ok(status.phase == v1beta1::PlayPhase::Running)
 }
 
 /// Steps 6-7: once this run's Job (recorded as `current_job_name`) is `Complete`/`Failed`, parses
@@ -1174,6 +1305,166 @@ pub(crate) fn playbookplan_owner_ref(
     })
 }
 
+/// Puts a recovered attempt back onto the plan's status: the run itself, the `Applying` phase it
+/// implies, and — only while the attempt applies the currently desired revision — the retry number
+/// it reached, which is what stops a later attempt from reusing its name.
+fn adopt_recovered_attempt(status: &mut PlaybookPlanStatus, active_run: &ActiveRun) {
+    if status.current_hash == active_run.execution_hash {
+        status.retry_count = status.retry_count.max(active_run.attempt);
+    }
+    status.current_job_name = Some(active_run.job_name.clone());
+    status.phase = Phase::Applying;
+    status.summary = Some(format!("applying run {}", active_run.job_name));
+    status.active_run = Some(active_run.clone());
+}
+
+/// A run the operator is driving this tick: the mirror the plan's status carries for it, plus the
+/// execution hash parsed back out of that mirror once.
+///
+/// `ActiveRun` is a status type, so it stores the hash as the canonical lowercase-hex string the CRD
+/// holds, while every step that names a resource after the run wants the typed value. Parsing it
+/// where a run *enters* the tick — out of its `Play`, or out of the status mirror — is what keeps
+/// that conversion, and its single "the status was hand-edited" failure, in one place rather than at
+/// each of the steps that consume it.
+#[derive(Clone)]
+struct RecordedRun {
+    /// What the plan's status mirrors about this run — see [`ActiveRun`].
+    mirror: ActiveRun,
+    /// The revision this run applies, typed. Always round-trips: `ActiveRun` is only ever built
+    /// from an `ExecutionHash`.
+    execution_hash: ExecutionHash,
+}
+
+impl RecordedRun {
+    /// Reconstructs a run from the plan status' mirror of it — the one path that does not start
+    /// from a `Play`, and so the one place a hand-edited status is caught.
+    fn from_mirror(mirror: ActiveRun) -> Result<Self, ReconcileError> {
+        let execution_hash = ExecutionHash::from_hex(&mirror.execution_hash).ok_or(
+            ReconcileError::PreconditionFailed("run has an invalid execution hash"),
+        )?;
+        Ok(Self {
+            mirror,
+            execution_hash,
+        })
+    }
+}
+
+/// Recovers only records created by the current Prepared-before-Job protocol. Statusless objects
+/// never crossed the operator-owned status boundary and are deleted; old untracked Jobs and Plays
+/// are deliberately ignored because this project has no released state to migrate.
+///
+/// A plan has at most one run *in flight*, so at most one record can describe one. That is an
+/// invariant of the protocol rather than something this function tolerates: if a second one shows
+/// up, the tick refuses to do anything instead of picking one and silently orphaning the other —
+/// which would leave the loser's node-root proxy pods unswept with nothing left pointing at them.
+/// (Their host Leases are renewed first, so refusing is safe; see `renew_contested_locks`.)
+///
+/// A terminal record whose result has not reached the plan yet does *not* count towards that
+/// invariant and is drained ahead of it: it owns no cluster resources any more, and handing its
+/// recap over is what allows the plan to move on at all.
+async fn recover_active_run(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+) -> Result<Option<RecoveredRun>, ReconcileError> {
+    let client = &context.client;
+    let (namespace, plan_name) = namespace_and_name(object)?;
+    let plays_api = Api::<Play>::namespaced(client.clone(), namespace);
+    let plays = plays_api
+        .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
+        .await?;
+    let recoverable = recoverable_plays_for_plan(&plays.items, object);
+
+    // Sort the records by kind, so the one-run invariant below is checked over what is genuinely in
+    // flight and nothing else.
+    let mut live = Vec::new();
+    let mut unacknowledged = Vec::new();
+    for play in recoverable {
+        match classify_record(play) {
+            RecordKind::Uninitialized => {
+                play_history::delete_uninitialized(client, namespace, play).await?
+            }
+            RecordKind::Unacknowledged => unacknowledged.push(play),
+            RecordKind::InFlight => live.push(play),
+        }
+    }
+
+    // Hand a finished result over before looking at anything in flight: it is the only copy of that
+    // run's recap, the plan cannot start a replacement until it has been applied, and draining it is
+    // a pure status write that never touches the cluster resources a live run owns. `recoverable`
+    // comes back oldest-first, so several (if they ever do queue up) drain in the order they ran.
+    if let Some(play) = unacknowledged.first() {
+        let play_status = play
+            .status
+            .as_ref()
+            .expect("a record needing recovery has a status");
+        return Ok(Some(RecoveredRun::Finished {
+            finished: recorded_run_from_play(play)?,
+            status: play_status.clone(),
+            // The one-run invariant is checked below, on the tick that goes on to advance what is
+            // live; here the first record is enough to say the plan is still holding an attempt.
+            surviving: live.first().map(|live| SurvivingAttempt {
+                execution_hash: live.spec.execution_hash.clone(),
+                triggered_slot: live.spec.triggered_slot,
+            }),
+        }));
+    }
+
+    let play = match sole_active_record(&live) {
+        Ok(None) => return Ok(None),
+        Ok(Some(play)) => play,
+        Err(error) => {
+            let names: Vec<&str> = live
+                .iter()
+                .filter_map(|play| play.metadata.name.as_deref())
+                .collect();
+            error!(
+                "PlaybookPlan {namespace}/{plan_name} has {} recoverable Plays ({names:?}); refusing to recover any of them",
+                live.len()
+            );
+            // Refusing must not also drop the node protection. Every one of these records may own a
+            // live Job and node-root proxy pods, and none of them will be advanced this tick, so
+            // their host Leases would otherwise lapse and let an unrelated plan start on the same
+            // hosts while they are still running. Renew them all and *then* fail loudly.
+            renew_contested_locks(context, object, &live).await;
+            return Err(error);
+        }
+    };
+
+    let play_status = play
+        .status
+        .as_ref()
+        .expect("statusless records were filtered out above");
+    let run = recorded_run_from_play(play)?;
+
+    match play_status.phase.clone() {
+        // Deferred rather than decided here: whether an absent-Job attempt may still be resumed
+        // needs the resolved, policy-clamped inventory this step runs ahead of. The reconciler
+        // resolves `Launching` Job existence and `suspend` before that dependency, and preserves
+        // this record's locks if resolving the remaining inputs fails.
+        phase @ (v1beta1::PlayPhase::Prepared
+        | v1beta1::PlayPhase::Starting
+        | v1beta1::PlayPhase::Launching) => Ok(Some(RecoveredRun::Unlaunched(UnlaunchedRun {
+            run,
+            phase,
+            preparation_fingerprint: play.spec.preparation_fingerprint.clone(),
+        }))),
+        // `advance_active_run` owns Job validation because it can distinguish an unfinished foreign
+        // Job (wait while renewing locks) from a finished one (finalize without trusting its recap).
+        v1beta1::PlayPhase::Running => Ok(Some(RecoveredRun::Active(run))),
+        // An acknowledged terminal record is filtered out by `recoverable_plays_for_plan`, and an
+        // unacknowledged one was drained above — so reaching here means those two filters and
+        // `classify_record` have drifted apart. That is a bug to fix, but a controller task is the
+        // wrong place to assert it: failing the tick reports it on the plan and retries, while a
+        // panic takes the whole reconcile loop down for every plan.
+        v1beta1::PlayPhase::Succeeded
+        | v1beta1::PlayPhase::Failed
+        | v1beta1::PlayPhase::Unknown => Err(ReconcileError::PreconditionFailed(
+            "a terminal Play was classified as in flight",
+        )),
+        v1beta1::PlayPhase::Aborted => Ok(Some(RecoveredRun::Aborted(run))),
+    }
+}
+
 /// The distinct hosts a run's recorded inventory targets, in first-seen order.
 ///
 /// Deduplicated because a host reachable through two inventory groups is still one host, and this
@@ -1188,6 +1479,148 @@ fn host_names(inventory: &[ResolvedHosts]) -> Vec<String> {
         .filter(|host| seen.insert(host.as_str()))
         .cloned()
         .collect()
+}
+
+/// What one reconcile found for a plan's run.
+enum RecoveredRun {
+    Active(RecordedRun),
+    Unlaunched(UnlaunchedRun),
+    Aborted(RecordedRun),
+    Finished {
+        finished: RecordedRun,
+        status: v1beta1::PlayStatus,
+        /// The attempt still in flight behind the drained result, if any. A terminal result is
+        /// handed over ahead of anything live, so the plan is *not* finished when this is set, and
+        /// the tick must not classify it as such — nor let the finished run's schedule window
+        /// overwrite the one this attempt holds.
+        surviving: Option<SurvivingAttempt>,
+    },
+}
+
+/// What the tick that drains a finished result needs to know about the attempt that outlives it,
+/// read off that attempt's own immutable record rather than off the plan status it may not have
+/// reached yet.
+struct SurvivingAttempt {
+    execution_hash: String,
+    triggered_slot: Option<DateTime<FixedOffset>>,
+}
+
+/// What a recoverable `Play` is to recovery. Pure so the one line that actually matters here stays
+/// pinned: a terminal record whose result has not reached the plan is **not** in flight, so it can
+/// never make a genuinely live run look like a second one and fail `sole_active_record` — which
+/// would wedge the plan on the very record it needs to drain to move on.
+#[derive(Debug, PartialEq, Eq)]
+enum RecordKind {
+    /// No status: it never crossed the operator-owned status boundary, so it describes nothing.
+    Uninitialized,
+    /// Terminal, but its result has not been folded into the plan yet.
+    Unacknowledged,
+    /// Somewhere between `Prepared` and `Running`, or `Aborted` with cleanup outstanding.
+    InFlight,
+}
+
+fn classify_record(play: &Play) -> RecordKind {
+    if play.status.is_none() {
+        RecordKind::Uninitialized
+    } else if play_history::needs_recovery(play) {
+        RecordKind::Unacknowledged
+    } else {
+        RecordKind::InFlight
+    }
+}
+
+/// The one in-flight record that may describe this plan's run, or `None` when it has none.
+///
+/// Pure so the invariant is testable: a plan runs at most one attempt at a time, and every path
+/// that creates a record does so only when no other is in flight. Two therefore means something
+/// outside this protocol wrote one, and picking either would leave the other's node-root proxy pods
+/// unswept with nothing left pointing at them. Refusing is recoverable by an operator (delete the
+/// stray record); silently choosing is not. The caller renews *every* candidate's host Leases before
+/// it acts on the refusal, so failing this way never also unprotects the hosts those runs hold.
+///
+/// Terminal records awaiting acknowledgement are *not* in flight and are handled before this — they
+/// can legitimately queue up behind a live run after an outage.
+fn sole_active_record<'a>(live: &[&'a Play]) -> Result<Option<&'a Play>, ReconcileError> {
+    match live {
+        [] => Ok(None),
+        [play] => Ok(Some(play)),
+        _ => Err(ReconcileError::PreconditionFailed(
+            "more than one Play claims to be this plan's active run",
+        )),
+    }
+}
+
+/// An attempt recovered before its Job exists, reduced to what deciding its fate needs: its
+/// identity, the phase it was found in, and the fingerprint of the inputs it was prepared against.
+///
+/// The `Play` itself is deliberately not carried further: the fingerprint is the only thing about
+/// the record that the resume decision consults, and everything else the attempt needs is re-derived
+/// from live cluster state.
+struct UnlaunchedRun {
+    run: RecordedRun,
+    phase: v1beta1::PlayPhase,
+    preparation_fingerprint: String,
+}
+
+fn recoverable_plays_for_plan<'a>(plays: &'a [Play], plan: &PlaybookPlan) -> Vec<&'a Play> {
+    let (Some(plan_name), Some(uid)) =
+        (plan.metadata.name.as_deref(), plan.metadata.uid.as_deref())
+    else {
+        return Vec::new();
+    };
+    let mut recoverable: Vec<&Play> = plays
+        .iter()
+        .filter(|play| {
+            play_belongs_to_plan(play, plan_name, uid)
+                && (play.status.as_ref().is_none_or(|status| {
+                    matches!(
+                        status.phase,
+                        v1beta1::PlayPhase::Prepared
+                            | v1beta1::PlayPhase::Starting
+                            | v1beta1::PlayPhase::Launching
+                            | v1beta1::PlayPhase::Running
+                            | v1beta1::PlayPhase::Aborted
+                    )
+                }) || play_history::needs_recovery(play))
+        })
+        .collect();
+    recoverable.sort_by_key(|play| play.metadata.creation_timestamp.as_ref().map(|time| time.0));
+    recoverable
+}
+
+fn recorded_run_from_play(play: &Play) -> Result<RecordedRun, ReconcileError> {
+    let execution_hash = ExecutionHash::from_hex(&play.spec.execution_hash).ok_or(
+        ReconcileError::PreconditionFailed("active Play has an invalid execution hash"),
+    )?;
+    let job_name = play
+        .metadata
+        .name
+        .clone()
+        .ok_or(ReconcileError::PreconditionFailed(
+            "active Play has no name",
+        ))?;
+    let play_uid = play
+        .metadata
+        .uid
+        .clone()
+        .ok_or(ReconcileError::PreconditionFailed("active Play has no UID"))?;
+
+    Ok(RecordedRun {
+        mirror: ActiveRun {
+            execution_hash: execution_hash.to_string(),
+            run_id: play.spec.run_id.clone(),
+            job_name,
+            play_uid,
+            hosts: host_names(&play.spec.inventory),
+            attempt: play.spec.attempt,
+            triggered_slot: play.spec.triggered_slot,
+        },
+        execution_hash,
+    })
+}
+
+fn play_belongs_to_plan(play: &Play, plan_name: &str, plan_uid: &str) -> bool {
+    play.spec.playbook_plan == plan_name && play.spec.playbook_plan_uid == plan_uid
 }
 
 /// Whether a plan's name fits where the run protocol has to put it: a Kubernetes **label value**, on
@@ -1391,7 +1824,7 @@ async fn spawn_ansible_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v1beta1::{PlaybookPlanSpec, ResolvedHosts, SecretRef, SshConfig};
+    use crate::v1beta1::{PlaySpec, PlaybookPlanSpec, ResolvedHosts, SecretRef, SshConfig};
 
     fn managed_ssh_group(
         name: &str,
@@ -1634,6 +2067,167 @@ mod tests {
         assert_eq!(host_names(&overlapping), vec!["a", "b", "c"]);
     }
 
+    /// The one-run-at-a-time invariant the whole protocol rests on. Two in-flight records mean
+    /// something outside this operator wrote one; recovering either would silently orphan the other
+    /// — nothing would renew its host Leases or sweep its node-root proxy pods — so the tick refuses
+    /// instead, which an operator can resolve by deleting the stray record.
+    /// A finished run whose recap has not reached the plan yet must not be mistaken for a second
+    /// live run: it owns nothing on the cluster any more, and it is exactly the record the plan has
+    /// to drain before it can start anything else. Counting it would make the pair wedge the plan on
+    /// `sole_active_record` forever.
+    #[test]
+    fn an_unacknowledged_result_is_not_in_flight() {
+        let record = |phase: Option<v1beta1::PlayPhase>, acknowledged: bool| {
+            let mut play = Play::new(
+                "apply-web-abc-1",
+                PlaySpec {
+                    playbook_plan: "web".into(),
+                    playbook_plan_uid: "plan-uid".into(),
+                    ..PlaySpec::default()
+                },
+            );
+            play.status = phase.map(|phase| v1beta1::PlayStatus {
+                phase,
+                plan_status_recorded: acknowledged,
+                ..Default::default()
+            });
+            play
+        };
+
+        assert_eq!(
+            classify_record(&record(None, false)),
+            RecordKind::Uninitialized
+        );
+        assert_eq!(
+            classify_record(&record(Some(v1beta1::PlayPhase::Succeeded), false)),
+            RecordKind::Unacknowledged
+        );
+        assert_eq!(
+            classify_record(&record(Some(v1beta1::PlayPhase::Unknown), false)),
+            RecordKind::Unacknowledged
+        );
+        for phase in [
+            v1beta1::PlayPhase::Prepared,
+            v1beta1::PlayPhase::Starting,
+            v1beta1::PlayPhase::Launching,
+            v1beta1::PlayPhase::Running,
+            v1beta1::PlayPhase::Aborted,
+        ] {
+            assert_eq!(
+                classify_record(&record(Some(phase), false)),
+                RecordKind::InFlight
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_recorded_running_play_enters_job_finalization() {
+        let play = |phase| {
+            let mut play = Play::new("apply-web-abc-1", PlaySpec::default());
+            play.metadata.uid = Some("play-uid".into());
+            play.status = Some(v1beta1::PlayStatus {
+                phase,
+                ..Default::default()
+            });
+            play
+        };
+
+        assert!(play_is_running_attempt(&play(v1beta1::PlayPhase::Running)).unwrap());
+        for phase in [
+            v1beta1::PlayPhase::Prepared,
+            v1beta1::PlayPhase::Starting,
+            v1beta1::PlayPhase::Launching,
+            v1beta1::PlayPhase::Aborted,
+            v1beta1::PlayPhase::Succeeded,
+        ] {
+            assert!(!play_is_running_attempt(&play(phase)).unwrap());
+        }
+
+        // A statusless record never crossed the operator-owned boundary, so it describes no phase to
+        // act on — distinct from a record whose UID says it is not this run at all, which the caller
+        // filters out before ever getting here.
+        let mut statusless = play(v1beta1::PlayPhase::Running);
+        statusless.status = None;
+        assert!(play_is_running_attempt(&statusless).is_err());
+    }
+
+    /// A replacement `Play` at the same name is not this run's record, and has to be indistinguishable
+    /// from finding nothing there. Both send the run to `finalize_lost_run`, which reports it
+    /// `TerminalRecord::Lost` — and that is what stops finalization from acknowledging the
+    /// replacement object, a version-checked write that would fail as "Play UID changed" and report a
+    /// teardown problem for a run that is complete.
+    #[test]
+    fn a_replacement_play_at_the_same_name_is_not_this_runs_record() {
+        let play = |uid: &str| {
+            let mut play = Play::new("apply-web-abc-1", PlaySpec::default());
+            play.metadata.uid = Some(uid.into());
+            play
+        };
+
+        assert!(own_record(Some(play("play-uid")), "play-uid").is_some());
+        assert!(own_record(Some(play("other-uid")), "play-uid").is_none());
+        assert!(own_record(None, "play-uid").is_none());
+
+        // A record with no UID at all is nobody's, least of all this run's.
+        let mut anonymous = play("play-uid");
+        anonymous.metadata.uid = None;
+        assert!(own_record(Some(anonymous), "play-uid").is_none());
+
+        // Only `Present` acknowledges; the lost path must never reach that write.
+        assert_ne!(TerminalRecord::Lost, TerminalRecord::Present);
+    }
+
+    /// The guard both `finalize_finished_run` and `abandon_run` clear the mirror behind. A mirror
+    /// naming a *different* attempt is the one thing that must survive: it is genuinely in flight,
+    /// and it is the only handle `finalize_lost_run` has for releasing its host Leases and node-root
+    /// proxy pods if its `Play` is deleted. An absent mirror still answers yes, because the tick that
+    /// finishes a run clears it before either path runs and the phase reset still has to happen.
+    #[test]
+    fn only_the_mirror_describing_this_run_is_given_up_with_it() {
+        let run = |play_uid: &str| RecordedRun {
+            execution_hash: ExecutionHash::from_hex("1").unwrap(),
+            mirror: ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-1".into(),
+                job_name: "apply-web-abc-1".into(),
+                play_uid: play_uid.into(),
+                hosts: vec!["worker-1".into()],
+                attempt: 1,
+                triggered_slot: None,
+            },
+        };
+        let mirroring = |mirrored: Option<&RecordedRun>| PlaybookPlanStatus {
+            active_run: mirrored.map(|run| run.mirror.clone()),
+            ..Default::default()
+        };
+
+        let this_run = run("play-uid");
+        assert!(mirrors_run(&mirroring(Some(&this_run)), &this_run));
+        assert!(
+            mirrors_run(&mirroring(None), &this_run),
+            "an already-cleared mirror still has to reach the phase reset"
+        );
+        assert!(
+            !mirrors_run(&mirroring(Some(&run("other-play-uid"))), &this_run),
+            "a mirror describing another attempt is that attempt's only recovery handle"
+        );
+    }
+
+    #[test]
+    fn sole_active_record_refuses_to_pick_between_two_in_flight_runs() {
+        let play = |name: &str| Play::new(name, PlaySpec::default());
+        let (first, second) = (play("apply-web-abc-1"), play("apply-web-abc-2"));
+
+        assert!(sole_active_record(&[]).unwrap().is_none());
+        assert_eq!(
+            sole_active_record(&[&first])
+                .unwrap()
+                .and_then(|play| play.metadata.name.as_deref()),
+            Some("apply-web-abc-1")
+        );
+        assert!(sole_active_record(&[&first, &second]).is_err());
+    }
+
     #[test]
     fn slot_already_triggered_suppresses_only_a_repeat_of_the_same_slot() {
         let slot = |s: &str| Some(s.parse::<DateTime<FixedOffset>>().unwrap());
@@ -1754,6 +2348,47 @@ mod tests {
         assert!(selector.ends_with(&plan_name));
     }
 
+    /// A recovered attempt is put back onto the plan whole, but its retry number only counts towards
+    /// the revision it belongs to — carrying it onto a plan that has since moved on would make the
+    /// replacement's first attempt skip numbers for no reason.
+    #[test]
+    fn a_recovered_attempt_is_readopted_and_keeps_its_number_only_for_its_own_revision() {
+        let active_run = ActiveRun {
+            execution_hash: "1".into(),
+            run_id: "run-1".into(),
+            job_name: "apply-plan-1-4".into(),
+            play_uid: "play-uid".into(),
+            hosts: vec!["worker-1".into()],
+            attempt: 4,
+            triggered_slot: None,
+        };
+        let mut matching = PlaybookPlanStatus {
+            current_hash: "1".into(),
+            retry_count: 1,
+            ..Default::default()
+        };
+        adopt_recovered_attempt(&mut matching, &active_run);
+        assert_eq!(matching.retry_count, 4);
+        assert_eq!(matching.phase, Phase::Applying);
+        assert_eq!(matching.current_job_name.as_deref(), Some("apply-plan-1-4"));
+        assert_eq!(
+            matching
+                .active_run
+                .as_ref()
+                .map(|run| run.play_uid.as_str()),
+            Some("play-uid")
+        );
+
+        let mut replacement = PlaybookPlanStatus {
+            current_hash: "2".into(),
+            retry_count: 0,
+            ..Default::default()
+        };
+        adopt_recovered_attempt(&mut replacement, &active_run);
+        assert_eq!(replacement.retry_count, 0);
+        assert!(replacement.active_run.is_some());
+    }
+
     #[test]
     fn run_ids_are_minted_fresh_and_stay_short_enough_for_resource_names() {
         let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
@@ -1768,6 +2403,169 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.len(), RUN_ID_LENGTH);
         assert!(first.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn recoverable_plays_use_immutable_plan_identity_and_operator_status() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference, Time};
+        use k8s_openapi::jiff::Timestamp;
+
+        fn play(
+            name: &str,
+            owner_uid: &str,
+            created_secs: i64,
+            phase: Option<v1beta1::PlayPhase>,
+        ) -> Play {
+            let mut play = Play::new(
+                name,
+                v1beta1::PlaySpec {
+                    playbook_plan: "plan".into(),
+                    playbook_plan_uid: owner_uid.into(),
+                    execution_hash: "1a".into(),
+                    run_id: "run-1".into(),
+                    preparation_fingerprint: "fingerprint".into(),
+                    attempt: 1,
+                    inventory: vec![ResolvedHosts {
+                        name: "workers".into(),
+                        hosts: vec!["worker-1".into()],
+                    }],
+                    triggered_slot: None,
+                },
+            );
+            play.metadata = ObjectMeta {
+                name: Some(name.into()),
+                creation_timestamp: Some(Time(Timestamp::from_second(created_secs).unwrap())),
+                owner_references: Some(vec![OwnerReference {
+                    kind: "PlaybookPlan".into(),
+                    name: "plan".into(),
+                    uid: owner_uid.into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            };
+            play.status = phase.map(|phase| v1beta1::PlayStatus {
+                phase,
+                ..Default::default()
+            });
+            play
+        }
+
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+        plan.metadata.namespace = Some("default".into());
+        let mut acknowledged = play(
+            "acknowledged",
+            "plan-uid",
+            350,
+            Some(v1beta1::PlayPhase::Succeeded),
+        );
+        acknowledged.status.as_mut().unwrap().plan_status_recorded = true;
+        let plays = vec![
+            play("legacy", "plan-uid", 100, Some(v1beta1::PlayPhase::Running)),
+            play(
+                "other-owner",
+                "other-uid",
+                200,
+                Some(v1beta1::PlayPhase::Running),
+            ),
+            play(
+                "finished",
+                "plan-uid",
+                300,
+                Some(v1beta1::PlayPhase::Succeeded),
+            ),
+            acknowledged,
+            play("prepared", "plan-uid", 400, None),
+            play(
+                "running",
+                "plan-uid",
+                500,
+                Some(v1beta1::PlayPhase::Running),
+            ),
+        ];
+
+        let names: Vec<&str> = recoverable_plays_for_plan(&plays, &plan)
+            .into_iter()
+            .filter_map(|play| play.metadata.name.as_deref())
+            .collect();
+
+        assert_eq!(names, vec!["legacy", "finished", "prepared", "running"]);
+    }
+
+    /// Recovery reads a run's revision back out of two persisted, hand-editable places — the `Play`
+    /// spec and the Job's hash label — and both go through `ExecutionHash::from_hex`. Each has to
+    /// canonicalize what it accepts, so the value compares equal to a freshly computed hash however
+    /// it was written down, and each has to refuse a value that is not a hash at all rather than
+    /// silently scoping a run's resources to something else.
+    #[test]
+    fn a_persisted_execution_hash_is_canonicalized_or_refused() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+        let mut play = Play::new(
+            "apply-plan-abc-2",
+            v1beta1::PlaySpec {
+                playbook_plan: "plan".into(),
+                playbook_plan_uid: "plan-uid".into(),
+                execution_hash: "00001A".into(),
+                run_id: "run-2".into(),
+                preparation_fingerprint: "fingerprint".into(),
+                attempt: 2,
+                inventory: vec![ResolvedHosts {
+                    name: "workers".into(),
+                    hosts: vec!["worker-1".into(), "worker-2".into()],
+                }],
+                triggered_slot: None,
+            },
+        );
+        play.metadata.uid = Some("play-uid".into());
+
+        let run = recorded_run_from_play(&play).unwrap();
+
+        // Parsed once on the way in, and mirrored in the canonical form the status stores.
+        assert_eq!(run.execution_hash, ExecutionHash::from_hex("1a").unwrap());
+        assert_eq!(run.mirror.execution_hash, "1a");
+        assert_eq!(run.mirror.job_name, "apply-plan-abc-2");
+        assert_eq!(run.mirror.play_uid, "play-uid");
+        assert_eq!(run.mirror.hosts, vec!["worker-1", "worker-2"]);
+        assert_eq!(run.mirror.attempt, 2);
+
+        // The record is only a run's identity if it can be tied back to a specific object.
+        let mut uidless = play.clone();
+        uidless.metadata.uid = None;
+        assert!(recorded_run_from_play(&uidless).is_err());
+
+        play.spec.execution_hash = "not-a-hash".into();
+        assert!(matches!(
+            recorded_run_from_play(&play),
+            Err(ReconcileError::PreconditionFailed(
+                "active Play has an invalid execution hash"
+            ))
+        ));
+
+        let mut job = Job {
+            metadata: ObjectMeta {
+                labels: Some(BTreeMap::from([(
+                    labels::PLAYBOOKPLAN_HASH.into(),
+                    "00001A".into(),
+                )])),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(job_execution_hash(&job).unwrap().to_string(), "1a");
+
+        job.metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(labels::PLAYBOOKPLAN_HASH.into(), "not-a-hash".into());
+        assert!(matches!(
+            job_execution_hash(&job),
+            Err(ReconcileError::PreconditionFailed(
+                "active Job has no valid execution hash"
+            ))
+        ));
     }
 
     #[test]
