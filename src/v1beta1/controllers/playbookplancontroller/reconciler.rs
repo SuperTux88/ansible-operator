@@ -319,7 +319,7 @@ async fn reconcile(
             .into(),
     );
     let timing = evaluate_schedule(object.spec.schedule.as_deref(), now(), time_window);
-    let outdated_hosts = find_outdated_hosts(&resource_status, &execution_hash)?;
+    let outdated_hosts = find_outdated_hosts(&resource_status, &execution_hash);
     let all_hosts = find_all_hosts(&resource_status);
 
     let hosts_to_trigger = match object.spec.mode {
@@ -712,7 +712,7 @@ async fn advance_applying_run(
         .iter()
         .map(|g| g.hosts.len())
         .sum();
-    let outdated_count = find_outdated_hosts(resource_status, &run.execution_hash)?.len();
+    let outdated_count = find_outdated_hosts(resource_status, &run.execution_hash).len();
 
     // Recurring with no schedule can't reschedule; the eligibility gate normally stops such a plan
     // from ever starting, so reaching here means the schedule was removed mid-run. Log the anomaly —
