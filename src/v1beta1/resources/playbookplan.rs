@@ -397,6 +397,18 @@ impl Condition for PlaybookPlanCondition {
     fn reason(&self) -> Option<&str> {
         self.reason.as_deref()
     }
+
+    fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+
+    fn last_transition_time(&self) -> Option<DateTime<FixedOffset>> {
+        self.last_transition_time
+    }
+
+    fn set_last_transition_time(&mut self, value: Option<DateTime<FixedOffset>>) {
+        self.last_transition_time = value;
+    }
 }
 
 impl PlaybookPlan {
