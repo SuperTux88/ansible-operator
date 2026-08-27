@@ -110,7 +110,8 @@ pub struct PlayStatus {
     #[schemars(with = "Option<String>")]
     pub finished_at: Option<DateTime<FixedOffset>>,
 
-    /// Number of hosts this run targeted (mirrors `spec.hosts.len()`, surfaced as a column).
+    /// Number of distinct hosts this run targeted (the total across `spec.inventory`, surfaced as
+    /// a column).
     #[schemars(with = "UnsignedInt")]
     pub host_count: u32,
 

@@ -116,13 +116,21 @@ fn prepared_status(play: &PlayRef<'_>) -> PlayStatus {
     PlayStatus {
         phase: PlayPhase::Prepared,
         job_name: Some(play.job_name.to_string()),
-        host_count: play
-            .inventory
-            .iter()
-            .flat_map(|group| group.hosts.iter())
-            .count() as u32,
+        host_count: distinct_host_count(play.inventory),
         ..Default::default()
     }
+}
+
+/// How many *distinct* hosts an inventory targets. Counted distinctly to match `terminal_status`,
+/// which reports per host: a node reachable through two inventory groups appears in the flat list
+/// twice but is one host to Ansible, so a count that said otherwise would make a clean run look
+/// partially failed for as long as the record stayed non-terminal.
+fn distinct_host_count(inventory: &[ResolvedHosts]) -> u32 {
+    inventory
+        .iter()
+        .flat_map(|group| group.hosts.iter())
+        .collect::<std::collections::HashSet<&String>>()
+        .len() as u32
 }
 
 /// Marks a prepared run as running after its exact Job has been created or independently observed.
@@ -616,12 +624,17 @@ fn build_play(play: &PlayRef<'_>) -> Result<Play, ReconcileError> {
 ///   - no recap at all (`None`) -> `Unknown` for the run and every host;
 ///   - every targeted host present and not a failure -> `Succeeded`;
 ///   - otherwise `Failed` (a failed/unreachable host, or one Ansible never reached).
+///
+/// Counted over the *distinct* hosts, not over `hosts` itself: a node listed by two inventory groups
+/// is flattened into that slice twice, and comparing a deduplicated success count against the raw
+/// length would report a clean run as `Failed` — leaving its hosts outdated and re-running forever.
 fn terminal_status(
     job_name: &str,
     hosts: &[String],
     parsed: Option<&CallbackOutput>,
 ) -> PlayStatus {
     let host_results = host_results(parsed, hosts);
+    let host_count = host_results.len();
     let succeeded = host_results
         .values()
         .filter(|r| r.outcome == HostOutcome::Succeeded)
@@ -629,7 +642,7 @@ fn terminal_status(
 
     let phase = match parsed {
         None => PlayPhase::Unknown,
-        Some(_) if succeeded == hosts.len() && !hosts.is_empty() => PlayPhase::Succeeded,
+        Some(_) if succeeded == host_count && host_count != 0 => PlayPhase::Succeeded,
         Some(_) => PlayPhase::Failed,
     };
 
@@ -638,8 +651,8 @@ fn terminal_status(
         plan_status_recorded: false,
         job_name: Some(job_name.to_string()),
         finished_at: Some(chrono::Local::now().fixed_offset()),
-        host_count: hosts.len() as u32,
-        failed_host_count: (hosts.len() - succeeded) as u32,
+        host_count: host_count as u32,
+        failed_host_count: (host_count - succeeded) as u32,
         recap: sum_recap(parsed),
         hosts: host_results,
     }
@@ -1091,6 +1104,36 @@ mod tests {
         assert_eq!(s.phase, PlayPhase::Unknown);
         assert_eq!(s.hosts["a"].outcome, HostOutcome::Unknown);
         assert_eq!(s.failed_host_count, 2);
+    }
+
+    /// A node listed by two inventory groups is flattened into the targeted-host slice twice. The
+    /// per-host results deduplicate it, so the tallies must be taken over those rather than over the
+    /// raw slice — otherwise a clean run reports `Failed` and its hosts never come up to date.
+    #[test]
+    fn terminal_status_counts_a_host_listed_by_two_groups_once() {
+        let hosts = vec!["a".to_string(), "a".to_string(), "b".to_string()];
+        let clean = output(&[
+            (
+                "a",
+                HostStats {
+                    ok: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "b",
+                HostStats {
+                    ok: 1,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let status = terminal_status("job", &hosts, Some(&clean));
+
+        assert_eq!(status.phase, PlayPhase::Succeeded);
+        assert_eq!(status.host_count, 2);
+        assert_eq!(status.failed_host_count, 0);
     }
 
     /// Each protocol step may be replayed after its write landed but before the operator observed
