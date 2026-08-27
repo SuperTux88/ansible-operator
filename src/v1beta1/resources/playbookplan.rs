@@ -123,12 +123,15 @@ pub struct PlaybookPlanSpec {
     pub ttl_seconds_after_finished: Option<i32>,
 
     /// How many successful `Play` history records to keep for this plan before the oldest are
-    /// pruned. Unlike the Job's short TTL, Plays are the durable run history. Defaults to 3.
+    /// pruned. Unlike the Job's short TTL, Plays are the durable run history. A terminal result is
+    /// temporarily exempt until it reaches the plan status. Defaults to 3.
     #[schemars(with = "Option<UnsignedInt>")]
     pub successful_plays_history_limit: Option<u32>,
 
     /// How many failed (or outcome-unknown) `Play` history records to keep for this plan. Kept
-    /// larger than the successful limit so failures stay visible longer. Defaults to 10.
+    /// larger than the successful limit so failures stay visible longer. A terminal result is
+    /// temporarily exempt until it reaches the plan status; an aborted attempt is deleted only
+    /// after its resources are cleaned up. Defaults to 10.
     #[schemars(with = "Option<UnsignedInt>")]
     pub failed_plays_history_limit: Option<u32>,
 

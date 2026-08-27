@@ -110,8 +110,21 @@ Retention is per plan and split by outcome, so failures stay visible longer than
 | `spec.successfulPlaysHistoryLimit` | 3 | most recent **succeeded** Plays |
 | `spec.failedPlaysHistoryLimit` | 10 | most recent **failed / unknown** Plays |
 
-Plays beyond these limits are pruned automatically as new runs finish. Deleting the `PlaybookPlan`
-removes all of its Plays.
+Plays beyond these limits are pruned automatically as new runs finish. The operator also retries the
+retention pass on ordinary reconciles if a deletion fails, so a temporary API error does not
+permanently leave old records behind. Deleting the `PlaybookPlan` removes all of its Plays.
+
+Only *finished* Plays are counted against the history limits, and a finished one is temporarily kept
+until its result has been folded into the plan — so the limits can never discard the only surviving
+copy of a run's recap. Once acknowledged, an old record whose deletion failed remains eligible for
+the next retention pass, including when a history limit is zero. An `Aborted` record is deleted after
+its resources are cleaned up rather than by history pruning. If cleanup keeps failing, the record
+deliberately remains as the retry handle for resources that may still be privileged. Deleting a Play by
+hand is safe once its
+`.status.planStatusRecorded` is `true`, which is the operator's own marker that the run's results have
+reached the plan. Deleting one that still describes a live run — or a finished one whose results have
+not been folded in yet — is not, because that record is the only thing the run can be recovered from.
+See [The plan is stuck in `Applying`](#the-plan-is-stuck-in-applying).
 
 ## Troubleshooting
 
