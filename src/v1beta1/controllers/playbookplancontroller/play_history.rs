@@ -133,7 +133,10 @@ fn distinct_host_count(inventory: &[ResolvedHosts]) -> u32 {
         .len() as u32
 }
 
-/// Marks a prepared run as running after its exact Job has been created or independently observed.
+/// Marks a `Launching` run as running after its exact Job has been created or independently
+/// observed. A record that has not yet committed to start (`Prepared`, `Starting`) is rejected: the
+/// point of `commit_launching` is that live authorization passed *before* a Job could exist, so a
+/// caller holding one that skipped it is describing a Job this protocol never allowed.
 /// Terminal status is monotonic: a stale starter never changes a finished Play back to `Running`.
 pub async fn record_running(
     client: &kube::Client,
