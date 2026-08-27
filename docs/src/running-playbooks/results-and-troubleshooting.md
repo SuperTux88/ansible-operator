@@ -88,7 +88,8 @@ plan (so they are removed when you delete it). Once a run launches, its `Play` c
 exactly one Job; a run abandoned during preparation never creates one. Unlike a launched run's
 Job, which Kubernetes reaps shortly after it finishes (`spec.ttlSecondsAfterFinished`), a `Play` keeps
 the recap for as long as retention allows. Its spec preserves the plan UID, execution hash,
-run ID, target inventory, preparation-input fingerprint, run number, and schedule slot, and
+run ID, target inventory, preparation-input fingerprint, run number, attempt number, and schedule
+slot, and
 is rejected for update once written. It records the run's *identity*, not a copy of the plan: what the
 run executes is re-derived from the plan and its inventories, and the fingerprint is what tells the
 operator whether those are still the same ones the run was prepared for. The operator creates this
@@ -103,8 +104,9 @@ kubectl get plays -n my-team
 ```
 
 The columns mirror the Ansible **recap**, summed across every host the run targeted. `kubectl get
-plays -o wide` adds the less-common counters (`rescued`, `skipped`, `ignored`) and the run
-number. Each `Play`'s `.status` also carries the per-host recap and outcome plus `finishedAt`:
+plays -o wide` adds the less-common counters (`rescued`, `skipped`, `ignored`), the run number and
+the `Try` column — which try of its execution that run was, in the sense
+[Retries](./scheduling-and-modes.md#retries) gives it. Each `Play`'s `.status` also carries the per-host recap and outcome plus `finishedAt`:
 
 ```sh
 kubectl get play apply-web-config-a1b2c3-2 -n my-team -o yaml
@@ -222,8 +224,8 @@ locks are cluster-wide, and a Node is applied to by one run at a time (see
 [Host locks](./scheduling-and-modes.md#host-locks)). `kubectl describe playbookplan <name>` shows the
 host and the run holding it, and the operator logs a matching warning. This is normal when two plans
 share hosts: the run proceeds once the other finishes. If it never clears, look at the run named as
-the holder — a plan that runs very often (a `Recurring` plan on a tight schedule, or a `OneShot` that
-keeps failing and retrying) can keep an overlapping plan waiting for a long time.
+the holder — a plan that runs very often (a `Recurring` plan on a tight schedule, or one retrying a
+failed run) can keep an overlapping plan waiting for a long time.
 
 ### The plan is stuck in `Applying`
 
@@ -529,3 +531,12 @@ Check the `schedule`/`timeZone` and `.status.nextRun`. Remember that `OneShot` g
 host is current — that is success, not a hang. A `Recurring` plan with no `schedule` has nothing
 telling it when to fire. If the `Blocked` condition is `True`, it is waiting on host locks held by
 another run — see above.
+
+### A `OneShot` plan is `Failed` and stops trying
+
+It has spent its [attempt budget](./scheduling-and-modes.md#retries): `.status.retryCount` has
+reached `spec.maxAttempts` (3 by default), so the plan holds its `Failed` result instead of applying
+a playbook its hosts have already refused that many times. Fix the cause and edit the playbook or a
+referenced Secret — the new execution hash starts a fresh budget — or raise `maxAttempts` to let it
+try again with the inputs unchanged. The failed runs are still in the plan's
+[run history](#run-history), which is where the recap of each attempt is.
