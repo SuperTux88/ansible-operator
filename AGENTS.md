@@ -111,29 +111,50 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    the Job, its pod template and the run's NetworkPolicy) is refused with `Phase::Failed` and
    `await_change`. The CRD rejects it at admission too; the reconciler re-checks it for clusters
    that don't evaluate validation rules.
-2. **Step 0 — resolve inventory.** `resolve_inventory` → `Vec<ResolvedInventoryGroup>`
-   (`ClusterInventory` ⇒ `ManagedSsh`, `StaticInventory` ⇒ `Ssh`), preserving which resource
-   each group came from.
-3. **Step 0b — NodeAccessPolicy enforcement (INV-2/3/5).** `node_access::enforce` clamps
-   managed-ssh nodes to the fail-closed intersection of the plan namespace's allowed nodes;
-   `warn!`s excluded nodes; sets `status.eligible_hosts`.
+2. **Step 0a — `recover_active_run`.** Runs *first*, before inventory is even resolved: lists
+   this plan's `Play`s, keeps the ones it owns (`spec.playbookPlan` + `spec.playbookPlanUid`,
+   not the label), deletes any statusless record (it never crossed the operator-owned status
+   boundary, so nothing may be derived from it), and dispatches on `PlayPhase` —
+   `Prepared`/`Starting`/`Launching` ⇒ **deferred** to after inventory resolution (deciding
+   whether they may still be resumed needs the resolved, policy-clamped groups the fingerprint
+   covers), `Running` ⇒ carry on, `Aborted` ⇒ `abandon_run`, terminal-but-unacknowledged ⇒
+   apply its result to the plan.
+   A recovery failure is reported on the plan (`summary`) *before* the tick aborts.
+3. **Steps 0 + 0b — resolve inventory, then clamp it (INV-2/3/5).**
+   `resolve_authorized_inventory` runs `resolve_inventory` → `Vec<ResolvedInventoryGroup>`
+   (`ClusterInventory` ⇒ `ManagedSsh`, `StaticInventory` ⇒ `Ssh`, preserving which resource each
+   group came from) and then `node_access::enforce`, which clamps managed-ssh nodes to the
+   fail-closed intersection of the plan namespace's allowed nodes. One step on purpose: nothing may
+   observe the unclamped result. `warn!`s excluded nodes; sets `status.eligible_hosts`.
 4. **Execution hash.** `ExecutionHash` over the playbook text + contents of every referenced
    Secret (variables + files), order-insensitive; deliberately **excludes** the workspace
    Secret (its content — proxy IPs — legitimately changes each run). Hash change ⇒
-   `Phase::Pending`, reset `retry_count`, clear `last_triggered_run`.
+   `retry_count` reset to 0, `last_triggered_run` cleared (so an edit can start inside the
+   window its predecessor used, and a revert is just another change), and `Phase::Pending`
+   **only when there is no `active_run`** — an in-flight run keeps `Applying` and its own hash
+   (which lives in its `Play`), and the new revision waits for it.
 5. **Step 1 — schedule + outdated hosts.** `triggers::evaluate_schedule` in the plan's
    timezone within a 15s window; `hosts_to_trigger` = outdated hosts (`OneShot`) or all hosts
    (`Recurring`).
-6. **`try_start_run` (steps 2–5)** when eligible: acquire per-host **Leases** (`locking.rs`),
-   ensure **managed-ssh proxy infra** is Ready (`managed_ssh::ensure_proxy_infra`: proxy
-   pods + per-host Secrets + NetworkPolicy in the operator ns, client-cert Secret in the plan
-   ns), render/refresh the **workspace Secret** with the live proxy pod IPs, then ensure the
-   **one Job** exists (`spawn_ansible_job`: list by hash label, adopt an active Job or create
-   the next `retry_count`-numbered one).
-7. **`advance_applying_run` (steps 6–7)** once the Job is terminal: parse the per-host recap
+6. **`try_start_run` (steps 2–5)** when eligible and nothing is active: `select_job` numbers
+   the attempt one past everything still claiming a name (Jobs *and* retained `Play`s — it
+   never adopts a running Job, see below), `play_history::record_prepared` writes the
+   immutable record, then acquire per-host **Leases** (`locking.rs`) and `commit_starting`.
+   From there `ensure_infra_and_launch` does the rest: re-authorize the nodes (INV-3b),
+   `reset_incomplete_run` (drops half-built infra the current CA can't authenticate against),
+   ensure **managed-ssh proxy infra** is Ready (`managed_ssh::ensure_proxy_infra`: proxy pods
+   + per-host Secrets + NetworkPolicy in the operator ns, client-cert Secret in the plan ns),
+   render the **workspace Secret** with the live proxy pod IPs, `commit_launching`, create the
+   **one Job** and `record_running`. A resumed `Prepared`/`Starting` attempt re-enters
+   `try_start_run` with its recorded identity. A `Launching` attempt first checks whether the Job
+   already exists; an absent Job re-enters `ensure_infra_and_launch`, while an existing one is
+   adopted without depending on the newly desired inventory.
+7. **`advance_active_run`** once the Job is terminal: parse the per-host recap
    from the pod's **termination message** (`callback_output.rs`, written by the callback
-   plugin — not from logs, no `pods/log` access), record host outcomes, `cleanup_proxy_infra`,
-   release Leases, set the terminal `Phase` (or reschedule for `Recurring`).
+   plugin — not from logs, no `pods/log` access), `cleanup_proxy_infra`, release Leases,
+   `record_finished` on the `Play`, fold it into the plan via
+   `status::apply_terminal_play_status`, then `finalize_finished_run` (persist, acknowledge,
+   prune) and set the terminal `Phase` (or reschedule for `Recurring`).
    This is also where a run whose `Play` is gone is `finalize_lost_run`'d (infra released, hosts
    `Unknown`) — not in step 0a: recovery has no record left to dispatch on, so it is the *mirror*
    in `status.activeRun` that brings the run here to be released.
@@ -175,6 +196,14 @@ handful of decisions that are easy to undo by accident:
   resolved groups, which is exactly what `preparationFingerprint` covers; `create_job_blueprint` is
   deterministic, so a resumed rebuild is byte-identical. An unlaunched run whose inputs changed is
   deliberately *not* finished.
+- **Only `Prepared` is gated on the schedule window** and the rest of `has_work_to_start`.
+  `Starting`/`Launching` wait on proxy pods, which routinely outlasts `startingDeadlineSeconds`;
+  gating them would leave a scheduled plan unable to launch.
+- **`spec.suspend` is decided before the inventory is read** (`resolve_unlaunched_before_inputs`),
+  for every phase — dropping an unlaunched attempt needs no inventory, and deferring it would leave a
+  suspended plan sitting on its host Leases behind a read that may never succeed. That is why
+  `has_work_to_start` excludes it and `decide_unlaunched_action` may assume it is not set; folding it
+  back in there looks like a simplification and is a second, later decision.
 - **The result reaches the plan first and the `Play` second** (`finalize_finished_run`), so a crash
   between them replays idempotently. `plays_to_prune` therefore never prunes an unacknowledged
   terminal record, nor an `Aborted` one.

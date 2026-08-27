@@ -367,6 +367,23 @@ async fn reconcile(
         }
     }
 
+    let unlaunched_run = if let Some(unlaunched) = unlaunched_run {
+        match resolve_unlaunched_before_inputs(
+            &context,
+            &object,
+            &api,
+            &unlaunched,
+            &mut resource_status,
+        )
+        .await?
+        {
+            true => Some(unlaunched),
+            false => None,
+        }
+    } else {
+        None
+    };
+
     // Step 0: resolve inventory (kept separate per-resource, not flattened — connection
     // mechanism is implicit by which resource produced a group).
     let mut target_groups = resolve_inventory(&context, &object).await?;
@@ -459,14 +476,94 @@ async fn reconcile(
         triggered_slot: None,
     };
 
-    let eligible_to_start = is_eligible_to_start(
-        object.spec.suspend,
+    let has_work_to_start = has_work_to_start(
         &object.spec.mode,
         object.spec.schedule.is_some(),
         !hosts_to_trigger.is_empty(),
     );
+    let eligible_to_start = !object.spec.suspend && has_work_to_start;
 
-    if eligible_to_start && resource_status.phase != Phase::Applying {
+    // Whether a recorded attempt's preparation inputs are still the desired ones. While this holds,
+    // the plan spec, resolved groups and Job blueprint are re-derivable from live state; once it
+    // stops holding, the absent-Job attempt is superseded.
+    let inputs_unchanged = |unlaunched: &UnlaunchedRun| -> bool {
+        unlaunched.run.mirror.execution_hash == execution_hash.to_string()
+            && live_preparation_fingerprint == unlaunched.preparation_fingerprint
+    };
+
+    if let Some(unlaunched) = unlaunched_run {
+        requeue_after = std::time::Duration::from_secs(15);
+        let slot_is_current = matches!(
+            timing,
+            Timing::Now(start)
+                if start.map(|slot| slot.fixed_offset()) == unlaunched.run.mirror.triggered_slot
+        );
+        match decide_unlaunched_action(
+            &unlaunched.phase,
+            inputs_unchanged(&unlaunched),
+            has_work_to_start,
+            slot_is_current,
+        ) {
+            UnlaunchedAction::Abandon => {
+                info!(
+                    "PlaybookPlan {namespace}/{name}: abandoning run {} — it may no longer start (the desired revision changed or it missed its schedule window)",
+                    unlaunched.run.mirror.job_name
+                );
+                abandon_unlaunched_run(
+                    &context,
+                    &object,
+                    &api,
+                    &unlaunched.run,
+                    unlaunched.phase,
+                    "aborted the run: it may no longer start (the desired revision changed \
+                     or it missed its schedule window)"
+                        .to_string(),
+                    &mut resource_status,
+                )
+                .await?;
+                requeue_after = std::time::Duration::from_secs(1);
+            }
+            UnlaunchedAction::ResumeLaunching { may_proceed } => {
+                let resume_with = may_proceed.then_some(run_groups.as_slice());
+                let (_action, requeue) = resume_launching_run(
+                    &context,
+                    &object,
+                    &api,
+                    &unlaunched.run,
+                    resume_with,
+                    &mut resource_status,
+                )
+                .await?;
+                if let Some(requeue) = requeue {
+                    requeue_after = requeue;
+                } else if resource_status.active_run.is_some() {
+                    resource_status.last_triggered_run = unlaunched.run.mirror.triggered_slot;
+                }
+            }
+            UnlaunchedAction::ResumePreparing => {
+                let resumed = RunContext {
+                    triggered_slot: unlaunched.run.mirror.triggered_slot,
+                    ..base_run
+                };
+                if let Some(requeue) = try_start_run(
+                    &context,
+                    &resumed,
+                    &object,
+                    &mut resource_status,
+                    Some(&unlaunched),
+                )
+                .await?
+                {
+                    requeue_after = requeue;
+                } else {
+                    // The Job exists now, so this attempt has consumed its slot — recorded here and
+                    // not only on the tick that first prepared it, since an attempt that spent
+                    // several ticks waiting on locks or proxy pods never got that far.
+                    resource_status.last_triggered_run = unlaunched.run.mirror.triggered_slot;
+                }
+            }
+        }
+    } else if eligible_to_start && resource_status.phase != Phase::Applying {
         match timing {
             Timing::Delayed(until) => {
                 requeue_after = (until - now()).to_std().unwrap();
@@ -540,14 +637,10 @@ fn slot_already_triggered(
     start.is_some() && start == last_triggered_run
 }
 
-/// Whether a run is eligible to *start* this tick, from whether the plan is suspended plus the mode,
-/// whether a schedule is set, and whether any hosts still need triggering. Pure so the gating is
-/// unit-testable — in particular the invariants that a suspended plan never starts and that a
-/// schedule-less Recurring plan is never eligible.
+/// Whether the plan has work a run could start this tick, from the mode, whether a schedule is set,
+/// and whether any hosts still need triggering. Pure so the gating is unit-testable — in particular
+/// the invariant that a schedule-less Recurring plan is never eligible.
 ///
-///   - `suspend` is an operator override (`spec.suspend`, CronJob-style): while set, nothing starts,
-///     regardless of mode/schedule/hosts. It only gates *starting* — an in-flight run finishes on
-///     its own path (`advance_applying_run`), which is not routed through here.
 ///   - OneShot keeps applying until every host is on the current hash, then goes quiet — so it's
 ///     gated purely on there being outdated hosts left (which is exactly `has_hosts_to_trigger`).
 ///   - Recurring runs on every schedule tick regardless of host hashes (a successful run marks all
@@ -555,18 +648,252 @@ fn slot_already_triggered(
 ///     on having a schedule to tick on; slot dedup via `last_triggered_run` is what stops a single
 ///     tick from starting more than one run, and without a schedule there'd be no slot to dedup
 ///     against — it would busy-loop. That's why the schedule check lives here.
-fn is_eligible_to_start(
-    suspended: bool,
-    mode: &ExecutionMode,
-    has_schedule: bool,
-    has_hosts_to_trigger: bool,
-) -> bool {
-    !suspended
-        && has_hosts_to_trigger
+///
+/// Deliberately excludes `spec.suspend`. Suspending has to drop an attempt that has not launched
+/// yet, and that decision is made *before* the inventory is resolved
+/// ([`resolve_unlaunched_before_inputs`]) — dropping such an attempt needs no inventory, and
+/// deferring it would leave a suspended plan holding host Leases behind a failing inventory read.
+/// Starting a *new* run is gated on `!suspend && has_work_to_start` at the one call site that does
+/// so; see [`decide_unlaunched_action`] for why the resume path must not fold `suspend` in again.
+fn has_work_to_start(mode: &ExecutionMode, has_schedule: bool, has_hosts_to_trigger: bool) -> bool {
+    has_hosts_to_trigger
         && match mode {
             ExecutionMode::OneShot => true,
             ExecutionMode::Recurring => has_schedule,
         }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum UnlaunchedAction {
+    Abandon,
+    ResumePreparing,
+    ResumeLaunching { may_proceed: bool },
+}
+
+/// Decides a recovered absent-Job attempt after its desired inputs have been resolved. `Prepared`
+/// remains subject to the normal start and schedule gates; `Starting` has already acquired its
+/// locks, so from here on only an input change supersedes it. `Launching` always goes through
+/// `resume_launching_run`, which adopts an existing Job even when `may_proceed` is false.
+///
+/// Reached **only for a plan that is not suspended**: [`resolve_unlaunched_before_inputs`] resolves
+/// every phase's fate under `spec.suspend` before the inventory is read, so an attempt that gets
+/// this far has already survived that gate. `has_work_to_start` is therefore the suspend-free half
+/// of the start gate — folding `spec.suspend` back in here would add a condition that can never be
+/// false, and reading like a second, independent suspend decision.
+fn decide_unlaunched_action(
+    phase: &v1beta1::PlayPhase,
+    inputs_unchanged: bool,
+    has_work_to_start: bool,
+    slot_is_current: bool,
+) -> UnlaunchedAction {
+    let may_proceed = inputs_unchanged
+        && (phase != &v1beta1::PlayPhase::Prepared || (has_work_to_start && slot_is_current));
+    match phase {
+        v1beta1::PlayPhase::Launching => UnlaunchedAction::ResumeLaunching { may_proceed },
+        v1beta1::PlayPhase::Prepared | v1beta1::PlayPhase::Starting if may_proceed => {
+            UnlaunchedAction::ResumePreparing
+        }
+        _ => UnlaunchedAction::Abandon,
+    }
+}
+
+/// What to do with a recovered attempt once its Job has been looked for.
+#[derive(Debug, PartialEq, Eq)]
+enum JobPresenceAction {
+    /// This attempt's own Job exists: take the started run over and let it finish.
+    Adopt,
+    /// Its Job is absent and the attempt is still wanted: carry on with it.
+    Proceed,
+    /// Its Job is absent and the attempt is no longer wanted: release and delete it.
+    Abandon,
+    /// A Job this attempt did not create holds its name. Neither adopted nor given up — see
+    /// [`decide_job_presence`].
+    Contested,
+}
+
+/// The rule [`resume_launching_run`] follows, from whether the attempt is still wanted and what is
+/// actually sitting at its Job name. Pure so it stays pinned in one place and unit-testable.
+///
+/// This attempt's *own* Job always wins, whatever `may_proceed` says: a started run is never killed
+/// by an edit or by `suspend`, and its results belong to the revision it actually ran. Only when the
+/// name is free does anything else get a say — which is why what is there is established with a
+/// direct apiserver read rather than a watch-cache one.
+///
+/// **A foreign Job is neither adopted nor a reason to give up.** Name collisions are made unlikely
+/// rather than impossible (`job_builder::job_name`), so the name is a hint and the identity check is
+/// the boundary. Adopting on the strength of the name would move this attempt's record to `Running`
+/// for work it did not commission and later write the run off as `Unknown`. Abandoning instead may
+/// look safe — a foreign Job means this attempt has none of its own, since the name is deterministic
+/// — but it inverts the risk: if the identity check ever rejected a Job that genuinely *was* ours,
+/// abandoning would release the host Leases while that Job kept running, which is the double-apply
+/// the Leases exist to prevent. Waiting has no such failure mode, and it resolves on its own once
+/// the foreign Job is reaped by its `ttlSecondsAfterFinished`, after which the name is free and the
+/// attempt proceeds normally.
+fn decide_job_presence(may_proceed: bool, job: RecordedJob) -> JobPresenceAction {
+    match (may_proceed, job) {
+        (_, RecordedJob::Own) => JobPresenceAction::Adopt,
+        (_, RecordedJob::Foreign) => JobPresenceAction::Contested,
+        (true, RecordedJob::Absent) => JobPresenceAction::Proceed,
+        (false, RecordedJob::Absent) => JobPresenceAction::Abandon,
+    }
+}
+
+/// What is actually sitting at a recorded attempt's Job name, read straight from the apiserver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedJob {
+    /// The Job this attempt created: every identity field `validate_selected_job` checks matches.
+    Own,
+    /// A Job this attempt did not create holds the name.
+    Foreign,
+    /// The name is free.
+    Absent,
+}
+
+/// Reads what holds this attempt's Job name and checks whether it is the attempt's own Job.
+///
+/// Existence is deliberately *not* treated as identity. The name is derived, and derived names are
+/// bounded and therefore lossy, so the only thing that establishes ownership is the identity
+/// `validate_selected_job` compares: the plan's owner reference, the execution hash, the attempt
+/// number, the per-attempt run ID and the `Play` UID — on the Job *and* on its pod template.
+async fn job_at_recorded_name(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    run: &RecordedRun,
+) -> Result<RecordedJob, ReconcileError> {
+    let (namespace, _) = namespace_and_name(object)?;
+    let jobs_api = Api::<Job>::namespaced(context.client.clone(), namespace);
+    let Some(job) = jobs_api.get_opt(&run.mirror.job_name).await? else {
+        return Ok(RecordedJob::Absent);
+    };
+    Ok(
+        match validate_selected_job(
+            &job,
+            object,
+            run.execution_hash,
+            run.mirror.attempt,
+            &run.mirror.run_id,
+            &run.mirror.play_uid,
+        ) {
+            Ok(()) => RecordedJob::Own,
+            Err(_) => RecordedJob::Foreign,
+        },
+    )
+}
+
+/// Everything that can be decided about a recovered absent-Job attempt *before* the live desired
+/// inputs are read. Returns `true` when the attempt survives and the remaining gates need those
+/// inputs after all — which is also what makes this the sole owner of the two decisions below, and
+/// lets [`decide_unlaunched_action`] assume the plan is not suspended.
+///
+///   - **`spec.suspend`, in every phase.** Dropping an attempt that has not launched needs no
+///     inventory, so it is decided here rather than after resolution: a suspended plan must not sit
+///     on its host Leases waiting for an inventory read that may never succeed.
+///   - **Whether a `Launching` attempt's own Job exists.** Checked before input resolution so an
+///     existing Job cannot be hidden behind a broken replacement inventory. Only the attempt's own
+///     Job short-circuits here; anything else at the name falls through to
+///     [`resume_launching_run`], which owns that decision and can report it.
+async fn resolve_unlaunched_before_inputs(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    api: &Api<PlaybookPlan>,
+    unlaunched: &UnlaunchedRun,
+    resource_status: &mut PlaybookPlanStatus,
+) -> Result<bool, ReconcileError> {
+    // Only `Launching` straddles Job creation; the earlier phases cannot have one, so `suspend` is
+    // the whole decision for them.
+    if unlaunched.phase != v1beta1::PlayPhase::Launching {
+        if object.spec.suspend {
+            abandon_unlaunched_run(
+                context,
+                object,
+                api,
+                &unlaunched.run,
+                unlaunched.phase.clone(),
+                "aborted the run: the plan was suspended before its Job was created".to_string(),
+                resource_status,
+            )
+            .await?;
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+
+    if object.spec.suspend {
+        // Its outcome and requeue hint are dropped deliberately: whichever way it went, a suspended
+        // plan has nothing to start next, so there is nothing to come back promptly for.
+        let _outcome =
+            resume_launching_run(context, object, api, &unlaunched.run, None, resource_status)
+                .await?;
+        return Ok(false);
+    }
+
+    // Not suspended: this attempt's own Job is adopted *now* rather than after inventory resolution,
+    // which is what keeps a started run from losing its locks behind a broken replacement inventory.
+    // Anything else — a free name, or a Job this attempt did not create — falls through to the
+    // fingerprint and eligibility gates, and from there back to `resume_launching_run` for the real
+    // decision, which is also the one place that reports a contested name.
+    if job_at_recorded_name(context, object, &unlaunched.run).await? == RecordedJob::Own {
+        adopt_started_run(context, object, &unlaunched.run).await?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Takes over a run whose Job exists: renews its host Leases and moves its record to `Running`, so
+/// the rest of the tick advances it like any other in-flight run.
+async fn adopt_started_run(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    run: &RecordedRun,
+) -> Result<(), ReconcileError> {
+    let (namespace, name) = namespace_and_name(object)?;
+    let leases_api = Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
+    // The outcome is discarded: the Job is already out there, so a host this run no longer protects
+    // has nothing safe left to do about it beyond `renew_locks`' own `warn!`.
+    let _outcome = locking::renew_locks(
+        &leases_api,
+        &run.mirror.hosts,
+        &holder_identity(namespace, name, run),
+    )
+    .await?;
+    play_history::record_running(
+        &context.client,
+        namespace,
+        &run.mirror.job_name,
+        &run.mirror.play_uid,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Gives up an attempt whose Job does not exist, from the phase the caller observed it in.
+///
+/// The record is moved to `Aborted` **first**, so it outlives the cleanup that follows and keeps it
+/// retryable; `abandon_run` then releases everything, persists a plan status that no longer mentions
+/// the attempt, and finally deletes the record.
+///
+/// `reason` is the caller's one-line explanation, and it is a parameter rather than something the
+/// caller sets beforehand so that giving an attempt up and saying why cannot come apart — see
+/// [`abandon_run`].
+async fn abandon_unlaunched_run(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    api: &Api<PlaybookPlan>,
+    run: &RecordedRun,
+    observed_phase: v1beta1::PlayPhase,
+    reason: String,
+    resource_status: &mut PlaybookPlanStatus,
+) -> Result<(), ReconcileError> {
+    let (namespace, _) = namespace_and_name(object)?;
+    play_history::abort_unlaunched(
+        &context.client,
+        namespace,
+        &run.mirror.job_name,
+        &run.mirror.play_uid,
+        observed_phase,
+    )
+    .await?;
+    abandon_run(context, object, api, run, reason, resource_status).await
 }
 
 /// Steps 2-5: name the attempt (or adopt the one a `Play` already records), acquire its per-host
@@ -1058,6 +1385,137 @@ async fn advance_applying_run(
     resource_status.next_run = outcome.next_run;
 
     Ok(outcome.requeue)
+}
+
+/// Completes a run whose Job creation was already committed — and the **only** place that decides
+/// the fate of a `Launching` attempt.
+///
+/// `Launching` is the one phase where "abandon the superseded attempt" is not unconditionally
+/// available, because the Job may already be out there doing node-root work under this attempt's
+/// identity. `resume_with` says which it is: `Some(groups)` when the attempt may still launch — the
+/// groups are the inputs to converge it against — and `None` when it may not, because the desired
+/// revision moved on, the plan was suspended, or those inputs could not be read at all.
+/// [`decide_job_presence`] turns that, plus what [`job_at_recorded_name`] found, into the action —
+/// which is also returned, so a caller that has to describe the outcome reads it rather than
+/// inferring it from what the status happens to look like afterwards.
+///
+/// The read is a direct `get_opt` against the apiserver rather than a watch-cache one, and it is
+/// repeated here even when `resolve_unlaunched_before_inputs` already did one. That matters: a
+/// `create` whose response was lost still leaves a real Job, everything between the two reads is a
+/// window for it to become visible, and a stale answer would tear infrastructure down out from under
+/// a live run. Every path that abandons a `Launching` attempt *because the plan moved on* routes
+/// through here for exactly that reason — including `suspend`, which has no inventory to converge
+/// against and so arrives with `resume_with` of `None`.
+///
+/// There is one deliberate exception, and it is not a "the plan moved on" abandon:
+/// `ensure_infra_and_launch` gives an attempt up on the spot when live policy has just revoked its
+/// nodes, without coming back here. Re-reading the Job would change nothing — the attempt is only
+/// there because this function *just* read it as absent, and nothing between the two reads creates
+/// Jobs — while routing it back would recurse. Do not copy the shortcut into a path where the
+/// intervening work can span a Job creation.
+async fn resume_launching_run(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    api: &Api<PlaybookPlan>,
+    run: &RecordedRun,
+    resume_with: Option<&[ResolvedInventoryGroup]>,
+    resource_status: &mut PlaybookPlanStatus,
+) -> Result<(JobPresenceAction, Option<std::time::Duration>), ReconcileError> {
+    let (namespace, name) = namespace_and_name(object)?;
+    let found = job_at_recorded_name(context, object, run).await?;
+
+    let action = decide_job_presence(resume_with.is_some(), found);
+    let requeue = match action {
+        JobPresenceAction::Proceed => {
+            let Some(run_groups) = resume_with else {
+                unreachable!("`Proceed` is only reachable while `resume_with` is `Some`")
+            };
+            let leases_api =
+                Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
+            let holder_identity = holder_identity(namespace, name, run);
+            let outcome =
+                locking::renew_locks(&leases_api, &run.mirror.hosts, &holder_identity).await?;
+            if let Some(requeue) = resolve_contended_locks(
+                context,
+                object,
+                api,
+                run,
+                v1beta1::PlayPhase::Launching,
+                outcome,
+                resource_status,
+            )
+            .await?
+            {
+                Some(requeue)
+            } else {
+                ensure_infra_and_launch(
+                    context,
+                    object,
+                    run,
+                    run_groups,
+                    v1beta1::PlayPhase::Launching,
+                    resource_status,
+                )
+                .await?
+            }
+        }
+        JobPresenceAction::Adopt => {
+            info!(
+                "PlaybookPlan {namespace}/{name}: Job {} appeared while recovery was resolving its inputs; adopting the started run",
+                run.mirror.job_name
+            );
+            adopt_started_run(context, object, run).await?;
+            None
+        }
+        JobPresenceAction::Abandon => {
+            info!(
+                "PlaybookPlan {namespace}/{name}: abandoning run {} — it may no longer launch and its Job was never created",
+                run.mirror.job_name
+            );
+            abandon_unlaunched_run(
+                context,
+                object,
+                api,
+                run,
+                v1beta1::PlayPhase::Launching,
+                "aborted the run: it may no longer launch and its Job was never created"
+                    .to_string(),
+                resource_status,
+            )
+            .await?;
+            // A short requeue, matching every other abandon path: nothing of this attempt is left,
+            // so the replacement revision should be prepared promptly rather than after the
+            // caller's Job-polling interval.
+            Some(std::time::Duration::from_secs(1))
+        }
+        JobPresenceAction::Contested => {
+            warn!(
+                "PlaybookPlan {namespace}/{name}: run {} cannot launch — a Job it did not create holds its name",
+                run.mirror.job_name
+            );
+            // The attempt keeps its host Leases while it waits. It reached `Launching`, so it may
+            // already own node-root proxy pods on these hosts, and it is not giving up — so the
+            // protection has to stay. The renewal outcome is discarded for the same reason
+            // `advance_active_run` discards it against a foreign Job: a host this attempt no longer
+            // holds may be occupied by work it does not control, and there is nothing safe left to
+            // do about that from here.
+            let leases_api =
+                Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
+            let _outcome = locking::renew_locks(
+                &leases_api,
+                &run.mirror.hosts,
+                &holder_identity(namespace, name, run),
+            )
+            .await?;
+            resource_status.summary = Some(format!(
+                "waiting for Job {}, which does not carry this run's identity",
+                run.mirror.job_name
+            ));
+            Some(std::time::Duration::from_secs(15))
+        }
+    };
+
+    Ok((action, requeue))
 }
 
 /// The terminal-state decision for a finished run: what the plan's `phase`, `next_run`, `summary`,
@@ -3195,79 +3653,53 @@ spec:
     }
 
     #[test]
-    fn is_eligible_to_start_oneshot_gates_only_on_outdated_hosts() {
+    fn has_work_to_start_oneshot_gates_only_on_outdated_hosts() {
         // OneShot with work to do starts whether or not a schedule is set.
-        assert!(is_eligible_to_start(
-            false,
-            &ExecutionMode::OneShot,
-            false,
-            true
-        ));
-        assert!(is_eligible_to_start(
-            false,
-            &ExecutionMode::OneShot,
-            true,
-            true
-        ));
+        assert!(has_work_to_start(&ExecutionMode::OneShot, false, true));
+        assert!(has_work_to_start(&ExecutionMode::OneShot, true, true));
         // Nothing outdated -> goes quiet.
-        assert!(!is_eligible_to_start(
-            false,
-            &ExecutionMode::OneShot,
-            true,
-            false
-        ));
+        assert!(!has_work_to_start(&ExecutionMode::OneShot, true, false));
     }
 
     #[test]
-    fn is_eligible_to_start_recurring_requires_a_schedule() {
+    fn has_work_to_start_recurring_requires_a_schedule() {
         // The busy-loop guard: Recurring with hosts but no schedule must NOT start — there's no
         // slot to dedup against, so it would re-trigger on every tick.
-        assert!(!is_eligible_to_start(
-            false,
-            &ExecutionMode::Recurring,
-            false,
-            true
-        ));
+        assert!(!has_work_to_start(&ExecutionMode::Recurring, false, true));
         // With a schedule it's eligible...
-        assert!(is_eligible_to_start(
-            false,
-            &ExecutionMode::Recurring,
-            true,
-            true
-        ));
+        assert!(has_work_to_start(&ExecutionMode::Recurring, true, true));
         // ...but still only when there are hosts to trigger.
-        assert!(!is_eligible_to_start(
-            false,
-            &ExecutionMode::Recurring,
-            true,
-            false
-        ));
+        assert!(!has_work_to_start(&ExecutionMode::Recurring, true, false));
     }
 
+    /// The one rule shared by every "may this attempt still go on?" site: the attempt's *own* Job is
+    /// always adopted, whatever the plan now says, and only a free name may be abandoned. Getting
+    /// this backwards would tear a live run's node-root infrastructure down underneath it.
+    ///
+    /// A Job that is not this attempt's is neither, in either direction. Adopting it would put this
+    /// attempt's record behind work it did not commission; abandoning would release the host Leases
+    /// on the strength of an identity check, and a check that ever rejected a Job which genuinely was
+    /// ours would then let a second run start on hosts the first is still applying to.
     #[test]
-    fn is_eligible_to_start_suspended_never_starts() {
-        // `spec.suspend` overrides everything else: whatever the mode/schedule/host state would
-        // otherwise permit, a suspended plan starts nothing.
-        assert!(!is_eligible_to_start(
-            true,
-            &ExecutionMode::OneShot,
-            true,
-            true
-        ));
-        assert!(!is_eligible_to_start(
-            true,
-            &ExecutionMode::Recurring,
-            true,
-            true
-        ));
-        // Sanity: identical inputs with suspend cleared *would* be eligible, so it's the flag doing
-        // the gating here and nothing else.
-        assert!(is_eligible_to_start(
-            false,
-            &ExecutionMode::OneShot,
-            true,
-            true
-        ));
+    fn only_the_attempts_own_job_is_adopted_and_only_a_free_name_abandoned() {
+        for may_proceed in [true, false] {
+            assert_eq!(
+                decide_job_presence(may_proceed, RecordedJob::Own),
+                JobPresenceAction::Adopt
+            );
+            assert_eq!(
+                decide_job_presence(may_proceed, RecordedJob::Foreign),
+                JobPresenceAction::Contested
+            );
+        }
+        assert_eq!(
+            decide_job_presence(true, RecordedJob::Absent),
+            JobPresenceAction::Proceed
+        );
+        assert_eq!(
+            decide_job_presence(false, RecordedJob::Absent),
+            JobPresenceAction::Abandon
+        );
     }
 
     /// The identity check that classifies what holds a run's name, exercised at the boundary that
@@ -3354,6 +3786,53 @@ spec:
             "the Job metadata must carry the component label"
         );
     }
+
+    /// Every argument here is deliberately suspend-free: `resolve_unlaunched_before_inputs` has
+    /// already resolved `spec.suspend` for every phase by the time this runs, which is what lets
+    /// `Starting` and `Launching` ignore the start gate entirely. Folding `spec.suspend` back into
+    /// the gate — the obvious-looking "simplification" — would silently make the last two
+    /// assertions here decide a suspended plan's fate a second time, after the inventory read that
+    /// the first decision exists to stay in front of.
+    #[test]
+    fn only_a_prepared_attempt_is_gated_on_its_schedule_window() {
+        // Still waiting for its locks: the window (and the rest of the start gate) still applies.
+        assert_eq!(
+            decide_unlaunched_action(&v1beta1::PlayPhase::Prepared, true, true, false),
+            UnlaunchedAction::Abandon
+        );
+        assert_eq!(
+            decide_unlaunched_action(&v1beta1::PlayPhase::Prepared, true, false, true),
+            UnlaunchedAction::Abandon
+        );
+
+        // Already building node-root infrastructure: waiting on proxy pods is not a reason to drop
+        // the run, so neither the window nor the start gate is consulted any more.
+        assert_eq!(
+            decide_unlaunched_action(&v1beta1::PlayPhase::Starting, true, false, false),
+            UnlaunchedAction::ResumePreparing
+        );
+        assert_eq!(
+            decide_unlaunched_action(&v1beta1::PlayPhase::Launching, true, false, false),
+            UnlaunchedAction::ResumeLaunching { may_proceed: true }
+        );
+    }
+
+    /// A superseded attempt is dropped from every unlaunched phase, `suspend` or not — that check is
+    /// what keeps a stale revision from being launched once its locks or proxy pods come free.
+    #[test]
+    fn changed_inputs_stop_an_unlaunched_attempt_in_every_phase() {
+        for phase in [v1beta1::PlayPhase::Prepared, v1beta1::PlayPhase::Starting] {
+            assert_eq!(
+                decide_unlaunched_action(&phase, false, true, true),
+                UnlaunchedAction::Abandon
+            );
+        }
+        assert_eq!(
+            decide_unlaunched_action(&v1beta1::PlayPhase::Launching, false, true, true),
+            UnlaunchedAction::ResumeLaunching { may_proceed: false }
+        );
+    }
+
 
     #[test]
     fn decide_terminal_oneshot_all_current_succeeds() {

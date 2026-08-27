@@ -106,6 +106,10 @@ catch `Aborted`: the internal cleanup phase of an attempt that was given up befo
 Such a record is deleted once its resources are released, so a superseded attempt is never left behind
 as a failed or unknown execution.
 
+Which attempts can be given up that way — and which are always left to finish — is one rule, covered
+in [Editing a plan while a run is in
+flight](./scheduling-and-modes.md#editing-a-plan-while-a-run-is-in-flight).
+
 ### How many are kept
 
 Retention is per plan and split by outcome, so failures stay visible longer than successes:
@@ -233,6 +237,34 @@ keeps failing and retrying) can keep an overlapping plan waiting for a long time
   its own proxy resources and Leases. If the plan remains stuck after the foreign Job is gone, inspect
   the new `.status.summary` and operator logs rather than deleting the `Play`; it may be reporting a
   separate cleanup or API-permission problem.
+- **"aborted the run: its nodes are no longer granted to this namespace"** — the run's
+  `NodeAccessPolicy` grant was withdrawn while it was being set up, so it was abandoned before its
+  playbook could reach those nodes. Its locks and proxy pods are released and the plan re-evaluates.
+  See [Node access policies](../cluster-operators/node-access-policies.md).
+- **"aborted the run: it may no longer start (the desired revision changed or it missed its schedule
+  window)"** and **"aborted the run: it may no longer launch and its Job was never created"** — the
+  ordinary supersede path: the plan was edited (or its resolved nodes changed) while an attempt was
+  still preparing. The second wording is the same decision for an attempt that had already committed
+  to launching, once the API server confirmed its Job was never created. See [Editing a plan while a
+  run is in flight](./scheduling-and-modes.md#editing-a-plan-while-a-run-is-in-flight).
+- **"aborted the run: the plan was suspended before its Job was created"** — `spec.suspend` was set
+  while an attempt was still preparing, so it was dropped rather than left to launch whenever it
+  became able to. Unlike the other "aborted the run…" messages this one is a *resting* state: the
+  plan goes to `Pending` and stays there until you resume it. See [Suspending a
+  plan](./scheduling-and-modes.md#suspending-a-plan).
+- **"released the abandoned run …"** — cleanup of an attempt abandoned by an earlier tick has now
+  finished. Only seen after a "could not release the abandoned run …" below, or after a restart
+  interrupted a teardown; the plan re-evaluates immediately.
+- **"recorded a finished run; another attempt is still in flight"** — after an outage, more than one
+  finished result can be waiting to be written to the plan. The operator applies them one tick at a
+  time, oldest first, and says so rather than reporting the plan finished while a later attempt is
+  still going. It clears on its own.
+
+With the sole exception of the `suspend` one, every "aborted the run…" message above is a transient
+state rather than a resting one: the attempt is gone and the plan re-evaluates immediately, so if the
+plan stays `Applying` on one of them the *next* tick has usually already replaced it with something
+else. A run that is merely pausing *before* it launches reports that through a condition instead:
+`Blocked` for a contended host lock, or `WaitingForNodes` for proxy pods that are not `Ready` yet.
 
 ### Hosts show `NotReached`
 
