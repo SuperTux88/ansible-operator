@@ -687,7 +687,17 @@ async fn reconcile(
                 .await?;
                 if let Some(requeue) = requeue {
                     requeue_after = requeue;
-                } else if resource_status.active_run.is_some() {
+                } else if resource_status.active_run.is_some()
+                    // `resume_launching_run` returned without asking for another tick, so this
+                    // attempt's Job exists — adopted or created just now — and its record has been
+                    // marked `Running`. Whether that consumes the window is then the same question
+                    // the drain path asks, and a superseded attempt adopted here answers it no.
+                    && consumed_its_slot(
+                        &v1beta1::PlayPhase::Running,
+                        &unlaunched.run.execution_hash,
+                        &execution_hash,
+                    )
+                {
                     record_triggered_slot(
                         &mut resource_status,
                         unlaunched.run.mirror.triggered_slot,
@@ -2617,11 +2627,13 @@ fn sync_desired_hash_after_finished_run(
     // the window the finished run used. When it hasn't, the slot is re-recorded below instead, which
     // is what stops a run that completes inside its own grace window from re-triggering itself.
     update_desired_hash(status, desired_hash);
-    // Only an attempt applying the desired revision may claim the window: one still running a
-    // superseded revision must not suppress the run the new revision is owed inside it.
     let surviving_slot = surviving
         .filter(|surviving| {
-            consumed_its_slot(&surviving.phase) && surviving.run.execution_hash == *desired_hash
+            consumed_its_slot(
+                &surviving.phase,
+                &surviving.run.execution_hash,
+                desired_hash,
+            )
         })
         .and_then(|surviving| surviving.run.mirror.triggered_slot);
     if finished.execution_hash == *desired_hash {
@@ -2830,20 +2842,33 @@ struct SurvivingAttempt {
     phase: v1beta1::PlayPhase,
 }
 
-/// Whether an attempt has actually consumed the schedule window its record names.
+/// Whether an attempt has actually consumed the schedule window its record names — the one rule
+/// `lastTriggeredRun` is written by, wherever the write happens.
 ///
-/// `Running` is the only phase that proves the Job was created — and the only one no later tick
-/// re-records the slot for, which is what this restore exists for. Every earlier phase is credited
-/// by the tick that gives it a Job instead ([`resume_launching_run`]'s adoption and the
-/// `ResumePreparing` path), and `Aborted` never had one: `play_history::abort_unlaunched` only
-/// accepts an unlaunched record, and from `Launching` only once its Job is known to be absent.
-/// Crediting those here would let an attempt that is then abandoned — suspended, or left with no
-/// hosts to trigger — burn a window nothing ever ran in, since no abandon path clears the marker.
+/// Both halves have to hold.
 ///
-/// Pure so the line stays pinned: a new phase landing on the wrong side of it breaks a test rather
-/// than silently suppressing a scheduled run.
-fn consumed_its_slot(phase: &v1beta1::PlayPhase) -> bool {
-    match phase {
+///   - **Its Job must exist**, and `Running` is the only phase that says so — it is also the only
+///     one no later tick re-records a slot for. Every earlier phase is credited by the tick that
+///     gives it a Job instead ([`resume_launching_run`]'s adoption and the `ResumePreparing` path),
+///     and `Aborted` never had one: `play_history::abort_unlaunched` only accepts an unlaunched
+///     record, and from `Launching` only once its Job is known to be absent. Crediting those would
+///     let an attempt that is then abandoned — suspended, or left with no hosts to trigger — burn a
+///     window nothing ever ran in, since no abandon path clears the marker.
+///   - **It must apply the revision the plan currently wants.** A superseded attempt whose Job
+///     already exists is adopted and allowed to finish, but the window belongs to the revision that
+///     replaced it: `update_desired_hash` cleared the marker precisely so the edit can run inside
+///     the window it was made in, and the replacement is what will claim it. Nothing takes a
+///     wrongly-claimed window back — the finished superseded run does not clear it either, because
+///     its own hash no longer matches the desired one.
+///
+/// Pure so the rule stays pinned in one place: a new phase landing on the wrong side of it, or a
+/// caller forgetting the revision, breaks a test rather than silently suppressing a scheduled run.
+fn consumed_its_slot(
+    phase: &v1beta1::PlayPhase,
+    attempt_hash: &ExecutionHash,
+    desired_hash: &ExecutionHash,
+) -> bool {
+    let job_exists = match phase {
         v1beta1::PlayPhase::Running => true,
         v1beta1::PlayPhase::Prepared
         | v1beta1::PlayPhase::Starting
@@ -2852,7 +2877,8 @@ fn consumed_its_slot(phase: &v1beta1::PlayPhase) -> bool {
         | v1beta1::PlayPhase::Succeeded
         | v1beta1::PlayPhase::Failed
         | v1beta1::PlayPhase::Unknown => false,
-    }
+    };
+    job_exists && attempt_hash == desired_hash
 }
 
 /// What a recoverable `Play` is to recovery. Pure so the one line that actually matters here stays
@@ -5673,7 +5699,10 @@ spec:
         ];
 
         for phase in unlaunched {
-            assert!(!consumed_its_slot(&phase), "{phase:?} has no Job");
+            assert!(
+                !consumed_its_slot(&phase, &hash, &hash),
+                "{phase:?} has no Job, even on the desired revision"
+            );
 
             let mut status = PlaybookPlanStatus {
                 current_hash: hash.to_string(),
@@ -5695,7 +5724,46 @@ spec:
 
         // The one phase that proves the Job was created, and the only one no later tick records a
         // slot for — which is what this restore is for.
-        assert!(consumed_its_slot(&v1beta1::PlayPhase::Running));
+        assert!(consumed_its_slot(
+            &v1beta1::PlayPhase::Running,
+            &hash,
+            &hash
+        ));
+    }
+
+    /// The other half of the same rule, and the one an adopted `Launching` attempt runs into: its
+    /// own Job exists, so it is allowed to finish, but the window is the replacement revision's.
+    /// `update_desired_hash` cleared the marker for exactly that reason, and nothing would clear it
+    /// a second time — the superseded run's own finalization leaves it standing, because its hash no
+    /// longer matches the desired one.
+    #[test]
+    fn an_adopted_superseded_run_claims_no_window() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let old_hash = ExecutionHash::from_hex("1").unwrap();
+        let new_hash = ExecutionHash::from_hex("2").unwrap();
+
+        assert!(!consumed_its_slot(
+            &v1beta1::PlayPhase::Running,
+            &old_hash,
+            &new_hash
+        ));
+
+        // What the plan is left with once that run finishes: the marker `update_desired_hash`
+        // cleared stays cleared, so the replacement revision may run inside the same window.
+        let mut status = PlaybookPlanStatus {
+            current_hash: new_hash.to_string(),
+            ..Default::default()
+        };
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &new_hash,
+            &finished_run(old_hash, 3, slot),
+            None,
+        );
+
+        assert_eq!(status.last_triggered_run, None);
     }
 
     /// An attempt still applying a superseded revision must not claim the window: the edit is owed a
