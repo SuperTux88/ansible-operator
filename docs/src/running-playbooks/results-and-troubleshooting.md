@@ -422,6 +422,12 @@ proxy pods and its host Leases. Normally that takes a few seconds. It lasts long
   operator log names the run it is waiting on; look at the Job's pod (`kubectl get pods -n
   <plan-namespace> -l ansible.cloudbending.dev/run-id=<runId>`) and at anything blocking its
   termination, such as a long `terminationGracePeriod` or a stuck finalizer on the pod itself.
+- **the node running the run's pod is unreachable.** The pod's phase then reads `Unknown`, which
+  says the node stopped reporting, not that the playbook stopped — a partitioned node keeps running
+  its containers, and the hosts the run is applying to are usually other nodes entirely. The
+  operator therefore keeps waiting and keeps renewing the run's host locks. Recovering the node
+  resolves it; so does removing the `Node` object, after which Kubernetes deletes the pods bound to
+  it and the teardown finishes on its own.
 - **the operator is not running.** Nothing releases the run until it comes back; the plan waits
   rather than leaking. Restore the operator and the deletion completes on its own.
 - **the plan's namespace was un-enrolled while the run was in flight.** The operator can then neither
