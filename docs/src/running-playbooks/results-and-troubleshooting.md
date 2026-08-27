@@ -411,6 +411,27 @@ plan stays `Applying` on one of them the *next* tick has usually already replace
 else. A run that is merely pausing *before* it launches reports that through a condition instead:
 `Blocked` for a contended host lock, or `WaitingForNodes` for proxy pods that are not `Ready` yet.
 
+### The plan is stuck in `Terminating`
+
+A deleted plan is held by the `ansible.cloudbending.dev/run-cleanup` finalizer until the operator has
+cancelled its run and released the resources that outlive the plan's namespace — its managed-ssh
+proxy pods and its host Leases. Normally that takes a few seconds. It lasts longer when:
+
+- **the run's pod will not stop.** The operator waits for it deliberately, renewing the run's host
+  locks meanwhile, so that no other plan starts against a host while Ansible may still be on it. The
+  operator log names the run it is waiting on; look at the Job's pod (`kubectl get pods -n
+  <plan-namespace> -l ansible.cloudbending.dev/run-id=<runId>`) and at anything blocking its
+  termination, such as a long `terminationGracePeriod` or a stuck finalizer on the pod itself.
+- **the operator is not running.** Nothing releases the run until it comes back; the plan waits
+  rather than leaking. Restore the operator and the deletion completes on its own.
+- **the plan's namespace was un-enrolled while the run was in flight.** The operator can then neither
+  release the run nor remove its own finalizer. Re-enrol the namespace and it finishes the teardown;
+  see [Deployment → enrolled namespaces](../cluster-operators/deployment.md#enrolled-namespaces).
+
+Removing the finalizer by hand ends the wait but strands the run's proxy pods and host Leases — see
+the manual cleanup procedure under [The plan is stuck in `Applying`](#the-plan-is-stuck-in-applying),
+which applies unchanged to a run whose plan is already gone.
+
 ### Hosts show `NotReached`
 
 Expected when a play stops early — for example a `serial` batch that failed before reaching later

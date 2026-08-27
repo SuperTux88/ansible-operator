@@ -118,6 +118,20 @@ Two consequences to plan for:
   **dedicated to Ansible ops**, not general-purpose application namespaces, so this power covers as
   few unrelated Secrets as possible. See
   [Security model → the blast radius you accept](./security.md#blast-radius).
+- **Un-enrol a namespace only while its plans are idle.** A plan with a run in flight carries the
+  `ansible.cloudbending.dev/run-cleanup` finalizer, and the `patch` permission that lets the operator
+  remove it again is granted per enrolled namespace. Removing the namespace from `watchNamespaces`
+  while a run is active therefore leaves any plan deleted afterwards stuck in `Terminating`: the
+  operator can no longer release the run *or* drop its own finalizer. Recovering means re-enrolling
+  the namespace (the operator then finishes the teardown on its own), or removing the finalizer by
+  hand and cleaning the run up with the
+  [manual procedure](../running-playbooks/results-and-troubleshooting.md#the-plan-is-stuck-in-applying).
+  Check for active runs before un-enrolling:
+
+  ```sh
+  kubectl get playbookplan -n <namespace> \
+    -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,RUN:.status.activeRun.jobName
+  ```
 
 Under the hood this is driven by a small TOML config (`watch_namespaces`, `proxy_image`) that the
 chart renders into a mounted ConfigMap. For local development you can point the binary at a config

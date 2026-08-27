@@ -143,3 +143,35 @@ that already succeeded on the current hash is skipped. See
 
 `Applying` covers the whole active attempt, including waiting for host locks and proxy readiness.
 The `Running` condition distinguishes the narrower period when the Job itself is active.
+
+## Deleting a plan
+
+Deleting a plan **cancels** the run it has in flight — the run is not allowed to finish first. The
+plan object then stays in `Terminating` for a moment while the operator tears the run down, because
+it holds a `ansible.cloudbending.dev/run-cleanup` finalizer:
+
+1. the run's Job is cancelled, and the operator waits for its pod to actually stop;
+2. the run's managed-ssh proxy pods, their NetworkPolicy and Secret are deleted;
+3. the run's host Leases are released;
+4. the finalizer is removed and the plan disappears.
+
+The wait in step 1 is what makes this safe: the run's host locks keep being renewed until its pod is
+gone, so no other plan can start against a host while a playbook may still be talking to it. A plan
+that stays `Terminating` for a long time is therefore usually a pod that will not stop — look at the
+Job's pod, and at the operator log, which names the run it is waiting on.
+
+The finalizer is only present while a plan actually holds a run. Deleting an idle plan is immediate,
+and a plan that has never run is not affected by an operator outage.
+
+Everything a run creates in the plan's own namespace (its Job, `Play` records, workspace Secret,
+client-certificate Secret and egress NetworkPolicy) is owned by the plan and would be removed by
+Kubernetes anyway. The finalizer exists for what lives in the **operator's** namespace — proxy pods
+and host Leases — which no owner reference can reach across namespaces, and which nothing but this
+operator can release.
+
+> **Do not strip the finalizer to force a deletion.** Removing `ansible.cloudbending.dev/run-cleanup`
+> by hand makes the plan disappear immediately and strands exactly the resources it protects: a
+> node-root proxy pod that keeps running, and a host Lease held by a run that no longer exists. If you
+> have to do it, clean the run up afterwards with the
+> [manual procedure](./results-and-troubleshooting.md#the-plan-is-stuck-in-applying), which works from
+> the run's own labels.
