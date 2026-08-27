@@ -225,7 +225,7 @@ async fn reconcile(
         return Ok(Action::await_change());
     }
 
-    let (namespace, name, _) = extract_resource_info(&object)?;
+    let (namespace, name) = namespace_and_name(&object)?;
 
     let api = Api::<v1beta1::PlaybookPlan>::namespaced(context.client.clone(), namespace);
 
@@ -1133,7 +1133,26 @@ pub(crate) fn playbookplan_owner_ref(
     })
 }
 
-fn extract_resource_info(object: &PlaybookPlan) -> Result<(&str, &str, i64), ReconcileError> {
+/// The distinct hosts a run's recorded inventory targets, in first-seen order.
+///
+/// Deduplicated because a host reachable through two inventory groups is still one host, and this
+/// list is what the run's Leases are acquired, renewed and released against — leaving the repeat in
+/// would spend an extra round of Lease calls on it every tick for as long as the run lasts. The
+/// terminal recap counts distinctly for the same reason (see `play_history::terminal_status`).
+fn host_names(inventory: &[ResolvedHosts]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    inventory
+        .iter()
+        .flat_map(|group| group.hosts.iter())
+        .filter(|host| seen.insert(host.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The plan's namespace and name — the two things almost every step needs to address its resources.
+/// One helper so the pair is read (and refused) identically everywhere rather than being re-derived
+/// with slightly different error handling at each site.
+fn namespace_and_name(object: &PlaybookPlan) -> Result<(&str, &str), ReconcileError> {
     let namespace = object
         .metadata
         .namespace
@@ -1146,12 +1165,7 @@ fn extract_resource_info(object: &PlaybookPlan) -> Result<(&str, &str, i64), Rec
         .as_deref()
         .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
 
-    let generation = object
-        .metadata
-        .generation
-        .ok_or(ReconcileError::PreconditionFailed("generation not set"))?;
-
-    Ok((namespace, name, generation))
+    Ok((namespace, name))
 }
 
 /// Picks the most recently created Job that hasn't reached a terminal state — the "still active"
@@ -1483,6 +1497,39 @@ mod tests {
         );
     }
 
+    /// The run's lock set. Group order is preserved so the list reads like the inventory, and a host
+    /// two groups both reach appears once — it is one host to Ansible and one Lease to the operator,
+    /// so repeating it would only buy an extra round of Lease calls per tick.
+    #[test]
+    fn host_names_lists_each_targeted_host_once_in_inventory_order() {
+        let inventory = vec![
+            ResolvedHosts {
+                name: "nodes".into(),
+                hosts: vec!["a".into(), "b".into()],
+            },
+            ResolvedHosts {
+                name: "external".into(),
+                hosts: vec!["c".into()],
+            },
+        ];
+
+        assert_eq!(host_names(&inventory), vec!["a", "b", "c"]);
+        assert!(host_names(&[]).is_empty());
+
+        let overlapping = vec![
+            ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["a".into(), "b".into()],
+            },
+            ResolvedHosts {
+                name: "database".into(),
+                hosts: vec!["b".into(), "c".into()],
+            },
+        ];
+
+        assert_eq!(host_names(&overlapping), vec!["a", "b", "c"]);
+    }
+
     #[test]
     fn slot_already_triggered_suppresses_only_a_repeat_of_the_same_slot() {
         let slot = |s: &str| Some(s.parse::<DateTime<FixedOffset>>().unwrap());
@@ -1514,32 +1561,23 @@ mod tests {
     }
 
     #[test]
-    fn extract_resource_info_requires_namespace_name_and_generation() {
+    fn namespace_and_name_requires_both() {
         let mut pp = PlaybookPlan::new("placeholder", PlaybookPlanSpec::default());
         pp.metadata.name = None;
 
         assert!(matches!(
-            extract_resource_info(&pp),
+            namespace_and_name(&pp),
             Err(ReconcileError::PreconditionFailed("namespace not set"))
         ));
 
         pp.metadata.namespace = Some("default".into());
         assert!(matches!(
-            extract_resource_info(&pp),
+            namespace_and_name(&pp),
             Err(ReconcileError::PreconditionFailed("name not set"))
         ));
 
         pp.metadata.name = Some("an-example".into());
-        assert!(matches!(
-            extract_resource_info(&pp),
-            Err(ReconcileError::PreconditionFailed("generation not set"))
-        ));
-
-        pp.metadata.generation = Some(3);
-        assert_eq!(
-            extract_resource_info(&pp).unwrap(),
-            ("default", "an-example", 3)
-        );
+        assert_eq!(namespace_and_name(&pp).unwrap(), ("default", "an-example"));
     }
 
     #[test]
