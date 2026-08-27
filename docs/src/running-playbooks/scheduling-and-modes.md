@@ -33,6 +33,18 @@ pinned to a maintenance window.
 The plan's `.status.nextRun` shows the next computed fire time, and the `Next run` printer column
 surfaces it in `kubectl get playbookplan`.
 
+### One tick, one run per revision
+
+Because a run may start anywhere inside that window, the operator has to remember that the window has
+already been used — otherwise a run finishing inside its own window would immediately re-trigger
+itself. `.status.lastTriggeredRun` records the tick a run was last started for, and a tick that
+matches it is skipped.
+
+That memory is per revision, not per window: any change to the [execution hash](#drift-detection)
+clears `lastTriggeredRun`, so an edit made moments after a run started takes effect right away rather
+than waiting for the next tick. Reverting to an earlier revision is a change like any other and runs
+again too.
+
 ## Suspending a plan
 
 Set `spec.suspend: true` to stop the operator starting new runs, the same idea as a CronJob's

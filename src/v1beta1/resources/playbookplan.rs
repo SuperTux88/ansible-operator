@@ -361,8 +361,8 @@ pub struct PlaybookPlanStatus {
     /// The start of the schedule slot (`Timing::Now`'s window start) that a run was last started
     /// for. The trigger gate compares the current slot against this so a run that completes inside
     /// its grace window isn't immediately re-triggered by the next reconcile within that same
-    /// window. Reset whenever `current_hash` changes; `None` for unscheduled plans (no slot to
-    /// dedupe against).
+    /// window. Cleared whenever `currentHash` changes, so an edit takes effect inside the window it
+    /// was made in; `None` for unscheduled plans (no slot to dedupe against).
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub last_triggered_run: Option<DateTime<FixedOffset>>,
@@ -519,8 +519,6 @@ mod tests {
             "the message has to say why, or the cap reads as arbitrary"
         );
     }
-
-
 
     #[test]
     fn test_serialization() {

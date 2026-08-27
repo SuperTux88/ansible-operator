@@ -550,17 +550,21 @@ async fn reconcile(
         }
     };
 
-    if resource_status.current_hash != execution_hash.to_string() {
-        resource_status.phase = Phase::Pending;
-        resource_status.current_hash = execution_hash.to_string();
-        // A new spec version starts retry counting over from scratch.
-        resource_status.retry_count = 0;
-        // ...and may legitimately need to run in the same slot the old version already used, so
-        // forget which slot was last triggered.
-        resource_status.last_triggered_run = None;
+    if let Some(finished) = &finished_active_run {
+        sync_desired_hash_after_finished_run(
+            &mut resource_status,
+            &execution_hash,
+            finished,
+            surviving_attempt.as_ref(),
+        );
+    } else {
+        update_desired_hash(&mut resource_status, &execution_hash);
+    }
+    if resource_status.active_run.is_some() {
+        resource_status.phase = Phase::Applying;
     }
 
-    // Step 1: compute outdated hosts / evaluate schedule — unchanged from before.
+    // Step 1: compute outdated hosts and evaluate the schedule.
     let tz = object.timezone().unwrap();
     let now = || Utc::now().with_timezone(&tz);
     let time_window = chrono::Duration::seconds(
@@ -665,7 +669,10 @@ async fn reconcile(
                 if let Some(requeue) = requeue {
                     requeue_after = requeue;
                 } else if resource_status.active_run.is_some() {
-                    resource_status.last_triggered_run = unlaunched.run.mirror.triggered_slot;
+                    record_triggered_slot(
+                        &mut resource_status,
+                        unlaunched.run.mirror.triggered_slot,
+                    );
                 }
             }
             UnlaunchedAction::ResumePreparing => {
@@ -687,7 +694,10 @@ async fn reconcile(
                     // The Job exists now, so this attempt has consumed its slot — recorded here and
                     // not only on the tick that first prepared it, since an attempt that spent
                     // several ticks waiting on locks or proxy pods never got that far.
-                    resource_status.last_triggered_run = unlaunched.run.mirror.triggered_slot;
+                    record_triggered_slot(
+                        &mut resource_status,
+                        unlaunched.run.mirror.triggered_slot,
+                    );
                 }
             }
         }
@@ -802,7 +812,7 @@ async fn reconcile(
                         // adopted, so `phase` is now `Applying`). Record this slot so it can't
                         // re-trigger inside its grace window. `None` for unscheduled plans, which
                         // have no slot and are never suppressed.
-                        resource_status.last_triggered_run = this_slot;
+                        record_triggered_slot(&mut resource_status, this_slot);
                     }
                 }
             }
@@ -828,6 +838,10 @@ async fn reconcile(
 /// for it, per the persisted `last_triggered_run`. Unscheduled ticks carry no slot (`None`) and are
 /// never suppressed — there is nothing to dedupe against. `DateTime` equality compares instants, so
 /// the offset the two timestamps carry is irrelevant.
+///
+/// The slot alone is the whole dedupe key: `update_desired_hash` clears it whenever the desired
+/// revision moves, so an edit takes effect inside the window it was made in, and reverting to an
+/// earlier revision is a change like any other and runs again.
 fn slot_already_triggered(
     start: Option<DateTime<FixedOffset>>,
     last_triggered_run: Option<DateTime<FixedOffset>>,
@@ -2802,6 +2816,23 @@ pub(crate) fn playbookplan_owner_ref(
     })
 }
 
+fn update_desired_hash(status: &mut PlaybookPlanStatus, execution_hash: &ExecutionHash) {
+    if status.current_hash == execution_hash.to_string() {
+        return;
+    }
+
+    status.current_hash = execution_hash.to_string();
+    status.retry_count = 0;
+    // Clearing the slot is what lets an edit take effect inside the very window it was made in: the
+    // dedupe exists to stop one revision re-triggering itself, not to stop a different one from
+    // running. Reverting to an earlier revision is a change like any other, so it runs again too.
+    status.last_triggered_run = None;
+    if status.active_run.is_none() {
+        status.phase = Phase::Pending;
+        status.current_job_name = None;
+    }
+}
+
 fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usize) {
     if status.phase != Phase::Pending || status.hosts_status.is_none() {
         return;
@@ -2906,6 +2937,50 @@ async fn finalize_finished_run(
     }
     play_history::prune(&context.client, namespace, object).await?;
     Ok(false)
+}
+
+/// Folds a finished run's revision bookkeeping into the plan.
+///
+/// `surviving` is the *different* attempt the plan still holds behind this result, if any — a
+/// terminal record is drained ahead of anything live, so a tick can apply one run's outcome while
+/// another is genuinely running. `lastTriggeredRun` is the sole dedupe key for "one run per schedule
+/// window", so it has to describe the newest attempt of the desired revision the plan is holding:
+/// stamping the finished run's window over a live attempt's would describe a run that is already
+/// over. That is taken from the surviving attempt's own record rather than from whatever the last
+/// status write left behind, because the two can disagree — an attempt that has not reached its Job
+/// yet has not had its slot written to the plan at all, and a tick that failed between creating the
+/// Job and patching the plan leaves the *previous* run's slot standing. A surviving attempt with no
+/// slot of its own consumed none, so the finished run's remains the newest window there was.
+///
+/// The attempt number is claimed either way, because it answers a different question: it reserves a
+/// name against every later attempt, and a finished run holds its number whatever else is in flight.
+fn sync_desired_hash_after_finished_run(
+    status: &mut PlaybookPlanStatus,
+    desired_hash: &ExecutionHash,
+    finished: &RecordedRun,
+    surviving: Option<&SurvivingAttempt>,
+) {
+    // Clears the slot when the desired revision has moved on, so the replacement can start inside
+    // the window the finished run used. When it hasn't, the slot is re-recorded below instead, which
+    // is what stops a run that completes inside its own grace window from re-triggering itself.
+    update_desired_hash(status, desired_hash);
+    // Only an attempt applying the desired revision may claim the window: one still running a
+    // superseded revision must not suppress the run the new revision is owed inside it.
+    let surviving_slot = surviving
+        .filter(|surviving| surviving.execution_hash == desired_hash.to_string())
+        .and_then(|surviving| surviving.triggered_slot);
+    if finished.execution_hash == *desired_hash {
+        record_triggered_slot(status, surviving_slot.or(finished.mirror.triggered_slot));
+        status.retry_count = status.retry_count.max(finished.mirror.attempt);
+    } else {
+        record_triggered_slot(status, surviving_slot);
+    }
+}
+
+fn record_triggered_slot(status: &mut PlaybookPlanStatus, slot: Option<DateTime<FixedOffset>>) {
+    if let Some(slot) = slot {
+        status.last_triggered_run = Some(slot);
+    }
 }
 
 /// Recovers only records created by the current Prepared-before-Job protocol. Statusless objects
@@ -4284,281 +4359,6 @@ mod tests {
         assert!(selector.ends_with(&plan_name));
     }
 
-    /// A recovered attempt is put back onto the plan whole, but its retry number only counts towards
-    /// the revision it belongs to — carrying it onto a plan that has since moved on would make the
-    /// replacement's first attempt skip numbers for no reason.
-    #[test]
-    fn a_recovered_attempt_is_readopted_and_keeps_its_number_only_for_its_own_revision() {
-        let active_run = ActiveRun {
-            execution_hash: "1".into(),
-            run_id: "run-1".into(),
-            job_name: "apply-plan-1-4".into(),
-            play_uid: "play-uid".into(),
-            hosts: vec!["worker-1".into()],
-            attempt: 4,
-            triggered_slot: None,
-        };
-        let mut matching = PlaybookPlanStatus {
-            current_hash: "1".into(),
-            retry_count: 1,
-            ..Default::default()
-        };
-        adopt_recovered_attempt(&mut matching, &active_run);
-        assert_eq!(matching.retry_count, 4);
-        assert_eq!(matching.phase, Phase::Applying);
-        assert_eq!(matching.current_job_name.as_deref(), Some("apply-plan-1-4"));
-        assert_eq!(
-            matching
-                .active_run
-                .as_ref()
-                .map(|run| run.play_uid.as_str()),
-            Some("play-uid")
-        );
-
-        let mut replacement = PlaybookPlanStatus {
-            current_hash: "2".into(),
-            retry_count: 0,
-            ..Default::default()
-        };
-        adopt_recovered_attempt(&mut replacement, &active_run);
-        assert_eq!(replacement.retry_count, 0);
-        assert!(replacement.active_run.is_some());
-    }
-
-    #[test]
-    fn run_ids_are_minted_fresh_and_stay_short_enough_for_resource_names() {
-        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
-        plan.metadata.uid = Some("plan-uid".into());
-        let hash = ExecutionHash::from_hex("1a").unwrap();
-
-        let first = run_id(&plan, &hash).unwrap();
-        let second = run_id(&plan, &hash).unwrap();
-
-        // Same plan, same revision, same attempt number: an aborted attempt's retry must still not
-        // land on the identity whose proxy pods may still be terminating.
-        assert_ne!(first, second);
-        assert_eq!(first.len(), RUN_ID_LENGTH);
-        assert!(first.chars().all(|c| c.is_ascii_alphanumeric()));
-    }
-
-    #[test]
-    fn recoverable_plays_use_immutable_plan_identity_and_operator_status() {
-        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference, Time};
-        use k8s_openapi::jiff::Timestamp;
-
-        fn play(
-            name: &str,
-            owner_uid: &str,
-            created_secs: i64,
-            phase: Option<v1beta1::PlayPhase>,
-        ) -> Play {
-            let mut play = Play::new(
-                name,
-                v1beta1::PlaySpec {
-                    playbook_plan: "plan".into(),
-                    playbook_plan_uid: owner_uid.into(),
-                    execution_hash: "1a".into(),
-                    run_id: "run-1".into(),
-                    preparation_fingerprint: "fingerprint".into(),
-                    attempt: 1,
-                    inventory: vec![ResolvedHosts {
-                        name: "workers".into(),
-                        hosts: vec!["worker-1".into()],
-                    }],
-                    triggered_slot: None,
-                },
-            );
-            play.metadata = ObjectMeta {
-                name: Some(name.into()),
-                creation_timestamp: Some(Time(Timestamp::from_second(created_secs).unwrap())),
-                owner_references: Some(vec![OwnerReference {
-                    kind: "PlaybookPlan".into(),
-                    name: "plan".into(),
-                    uid: owner_uid.into(),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            };
-            play.status = phase.map(|phase| v1beta1::PlayStatus {
-                phase,
-                ..Default::default()
-            });
-            play
-        }
-
-        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
-        plan.metadata.uid = Some("plan-uid".into());
-        plan.metadata.namespace = Some("default".into());
-        let mut acknowledged = play(
-            "acknowledged",
-            "plan-uid",
-            350,
-            Some(v1beta1::PlayPhase::Succeeded),
-        );
-        acknowledged.status.as_mut().unwrap().plan_status_recorded = true;
-        let plays = vec![
-            play("legacy", "plan-uid", 100, Some(v1beta1::PlayPhase::Running)),
-            play(
-                "other-owner",
-                "other-uid",
-                200,
-                Some(v1beta1::PlayPhase::Running),
-            ),
-            play(
-                "finished",
-                "plan-uid",
-                300,
-                Some(v1beta1::PlayPhase::Succeeded),
-            ),
-            acknowledged,
-            play("prepared", "plan-uid", 400, None),
-            play(
-                "running",
-                "plan-uid",
-                500,
-                Some(v1beta1::PlayPhase::Running),
-            ),
-        ];
-
-        let names: Vec<&str> = recoverable_plays_for_plan(&plays, &plan)
-            .into_iter()
-            .filter_map(|play| play.metadata.name.as_deref())
-            .collect();
-
-        assert_eq!(names, vec!["legacy", "finished", "prepared", "running"]);
-    }
-
-    /// Recovery reads a run's revision back out of two persisted, hand-editable places — the `Play`
-    /// spec and the Job's hash label — and both go through `ExecutionHash::from_hex`. Each has to
-    /// canonicalize what it accepts, so the value compares equal to a freshly computed hash however
-    /// it was written down, and each has to refuse a value that is not a hash at all rather than
-    /// silently scoping a run's resources to something else.
-    #[test]
-    fn a_persisted_execution_hash_is_canonicalized_or_refused() {
-        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-
-        let mut play = Play::new(
-            "apply-plan-abc-2",
-            v1beta1::PlaySpec {
-                playbook_plan: "plan".into(),
-                playbook_plan_uid: "plan-uid".into(),
-                execution_hash: "00001A".into(),
-                run_id: "run-2".into(),
-                preparation_fingerprint: "fingerprint".into(),
-                attempt: 2,
-                inventory: vec![ResolvedHosts {
-                    name: "workers".into(),
-                    hosts: vec!["worker-1".into(), "worker-2".into()],
-                }],
-                triggered_slot: None,
-            },
-        );
-        play.metadata.uid = Some("play-uid".into());
-
-        let run = recorded_run_from_play(&play).unwrap();
-
-        // Parsed once on the way in, and mirrored in the canonical form the status stores.
-        assert_eq!(run.execution_hash, ExecutionHash::from_hex("1a").unwrap());
-        assert_eq!(run.mirror.execution_hash, "1a");
-        assert_eq!(run.mirror.job_name, "apply-plan-abc-2");
-        assert_eq!(run.mirror.play_uid, "play-uid");
-        assert_eq!(run.mirror.hosts, vec!["worker-1", "worker-2"]);
-        assert_eq!(run.mirror.attempt, 2);
-
-        // The record is only a run's identity if it can be tied back to a specific object.
-        let mut uidless = play.clone();
-        uidless.metadata.uid = None;
-        assert!(recorded_run_from_play(&uidless).is_err());
-
-        play.spec.execution_hash = "not-a-hash".into();
-        assert!(matches!(
-            recorded_run_from_play(&play),
-            Err(ReconcileError::PreconditionFailed(
-                "active Play has an invalid execution hash"
-            ))
-        ));
-
-        let mut job = Job {
-            metadata: ObjectMeta {
-                labels: Some(BTreeMap::from([(
-                    labels::PLAYBOOKPLAN_HASH.into(),
-                    "00001A".into(),
-                )])),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        assert_eq!(job_execution_hash(&job).unwrap().to_string(), "1a");
-
-        job.metadata
-            .labels
-            .as_mut()
-            .unwrap()
-            .insert(labels::PLAYBOOKPLAN_HASH.into(), "not-a-hash".into());
-        assert!(matches!(
-            job_execution_hash(&job),
-            Err(ReconcileError::PreconditionFailed(
-                "active Job has no valid execution hash"
-            ))
-        ));
-    }
-
-    #[test]
-    fn selected_job_requires_the_prepared_play_uid() {
-        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
-        plan.metadata.uid = Some("plan-uid".into());
-        plan.metadata.namespace = Some("default".into());
-        let hash = ExecutionHash::from_hex("1a").unwrap();
-        let mut job = job_builder::create_job_blueprint(&hash, 1, "run-1", &[], &plan).unwrap();
-        job_builder::correlate_job_to_play(&mut job, "play-uid");
-
-        assert!(validate_selected_job(&job, &plan, hash, 1, "run-1", "play-uid").is_ok());
-
-        // A Job created for a different attempt of the same revision is not this run's Job, even
-        // though it shares the plan, the execution hash and the attempt number.
-        assert!(matches!(
-            validate_selected_job(&job, &plan, hash, 1, "run-2", "play-uid"),
-            Err(ReconcileError::PreconditionFailed(
-                "existing Job does not belong to the selected run"
-            ))
-        ));
-
-        // The pod template's correlation has to hold too: a Job whose pods aren't tied to this Play
-        // can't have its termination message trusted as this run's recap.
-        let mut tampered = job.clone();
-        tampered
-            .spec
-            .as_mut()
-            .unwrap()
-            .template
-            .metadata
-            .as_mut()
-            .unwrap()
-            .annotations
-            .as_mut()
-            .unwrap()
-            .insert(labels::PLAY_UID_ANNOTATION.into(), "another-play".into());
-        assert!(matches!(
-            validate_selected_job(&tampered, &plan, hash, 1, "run-1", "play-uid"),
-            Err(ReconcileError::PreconditionFailed(
-                "existing Job does not belong to the selected run"
-            ))
-        ));
-
-        job.metadata
-            .annotations
-            .as_mut()
-            .unwrap()
-            .insert(labels::PLAY_UID_ANNOTATION.into(), "another-play".into());
-        assert!(matches!(
-            validate_selected_job(&job, &plan, hash, 1, "run-1", "play-uid"),
-            Err(ReconcileError::PreconditionFailed(
-                "existing Job does not belong to the selected run"
-            ))
-        ));
-    }
-
     #[test]
     fn get_related_secrets_collects_variable_and_file_secrets_but_not_inline_or_image_sources() {
         let yaml = r#"
@@ -4859,6 +4659,62 @@ spec:
         ));
     }
 
+    #[test]
+    fn desired_hash_change_resets_revision_state_without_disturbing_an_active_run() {
+        let old_hash = ExecutionHash::from_hex("1").unwrap();
+        let new_hash = ExecutionHash::from_hex("2").unwrap();
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let mut status = PlaybookPlanStatus {
+            active_run: Some(ActiveRun {
+                execution_hash: old_hash.to_string(),
+                run_id: "run-1".into(),
+                job_name: "apply-plan-1-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                attempt: 1,
+                triggered_slot: Some(slot),
+            }),
+            current_hash: old_hash.to_string(),
+            current_job_name: Some("apply-plan-1-1".into()),
+            phase: Phase::Applying,
+            retry_count: 1,
+            last_triggered_run: Some(slot),
+            ..Default::default()
+        };
+
+        update_desired_hash(&mut status, &new_hash);
+
+        assert_eq!(status.current_hash, new_hash.to_string());
+        assert_eq!(status.phase, Phase::Applying);
+        assert_eq!(status.retry_count, 0);
+        assert_eq!(status.last_triggered_run, None);
+        assert_eq!(status.current_job_name.as_deref(), Some("apply-plan-1-1"));
+        assert_eq!(
+            status.active_run.as_ref().unwrap().execution_hash,
+            old_hash.to_string()
+        );
+        assert_eq!(
+            status.active_run.as_ref().unwrap().triggered_slot,
+            Some(slot)
+        );
+
+        let mut idle = PlaybookPlanStatus {
+            current_hash: old_hash.to_string(),
+            current_job_name: Some("old-job".into()),
+            phase: Phase::Succeeded,
+            retry_count: 3,
+            last_triggered_run: Some(slot),
+            ..Default::default()
+        };
+        update_desired_hash(&mut idle, &new_hash);
+        assert_eq!(idle.phase, Phase::Pending);
+        assert_eq!(idle.current_job_name, None);
+        assert_eq!(idle.retry_count, 0);
+        assert_eq!(idle.last_triggered_run, None);
+    }
+
     /// A plan that cannot read its own inputs must not keep advertising the last run's verdict. The
     /// summary alone is not enough — `phase` and `nextRun` are the other two printer columns, and a
     /// `Succeeded`/`Scheduled` plan pointing at a slot that will never fire reads as healthy.
@@ -5001,6 +4857,7 @@ spec:
             Some("cannot read referenced Secrets: temporary failure")
         );
 
+        update_desired_hash(&mut status, &hash);
         let outdated = find_outdated_hosts(&status, &hash);
         assert!(outdated.is_empty());
         status::clear_inputs_unavailable_condition(&mut status, outdated.len());
@@ -5020,6 +4877,473 @@ spec:
             ready.message.as_deref(),
             Some("1/1 hosts on the current revision")
         );
+    }
+
+    /// A recovered attempt is put back onto the plan whole, but its retry number only counts towards
+    /// the revision it belongs to — carrying it onto a plan that has since moved on would make the
+    /// replacement's first attempt skip numbers for no reason.
+    #[test]
+    fn a_recovered_attempt_is_readopted_and_keeps_its_number_only_for_its_own_revision() {
+        let active_run = ActiveRun {
+            execution_hash: "1".into(),
+            run_id: "run-1".into(),
+            job_name: "apply-plan-1-4".into(),
+            play_uid: "play-uid".into(),
+            hosts: vec!["worker-1".into()],
+            attempt: 4,
+            triggered_slot: None,
+        };
+        let mut matching = PlaybookPlanStatus {
+            current_hash: "1".into(),
+            retry_count: 1,
+            ..Default::default()
+        };
+        adopt_recovered_attempt(&mut matching, &active_run);
+        assert_eq!(matching.retry_count, 4);
+        assert_eq!(matching.phase, Phase::Applying);
+        assert_eq!(matching.current_job_name.as_deref(), Some("apply-plan-1-4"));
+        assert_eq!(
+            matching
+                .active_run
+                .as_ref()
+                .map(|run| run.play_uid.as_str()),
+            Some("play-uid")
+        );
+
+        let mut replacement = PlaybookPlanStatus {
+            current_hash: "2".into(),
+            retry_count: 0,
+            ..Default::default()
+        };
+        adopt_recovered_attempt(&mut replacement, &active_run);
+        assert_eq!(replacement.retry_count, 0);
+        assert!(replacement.active_run.is_some());
+    }
+
+    #[test]
+    fn run_ids_are_minted_fresh_and_stay_short_enough_for_resource_names() {
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+
+        let first = run_id(&plan, &hash).unwrap();
+        let second = run_id(&plan, &hash).unwrap();
+
+        // Same plan, same revision, same attempt number: an aborted attempt's retry must still not
+        // land on the identity whose proxy pods may still be terminating.
+        assert_ne!(first, second);
+        assert_eq!(first.len(), RUN_ID_LENGTH);
+        assert!(first.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn recoverable_plays_use_immutable_plan_identity_and_operator_status() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference, Time};
+        use k8s_openapi::jiff::Timestamp;
+
+        fn play(
+            name: &str,
+            owner_uid: &str,
+            created_secs: i64,
+            phase: Option<v1beta1::PlayPhase>,
+        ) -> Play {
+            let mut play = Play::new(
+                name,
+                v1beta1::PlaySpec {
+                    playbook_plan: "plan".into(),
+                    playbook_plan_uid: owner_uid.into(),
+                    execution_hash: "1a".into(),
+                    run_id: "run-1".into(),
+                    preparation_fingerprint: "fingerprint".into(),
+                    attempt: 1,
+                    inventory: vec![ResolvedHosts {
+                        name: "workers".into(),
+                        hosts: vec!["worker-1".into()],
+                    }],
+                    triggered_slot: None,
+                },
+            );
+            play.metadata = ObjectMeta {
+                name: Some(name.into()),
+                creation_timestamp: Some(Time(Timestamp::from_second(created_secs).unwrap())),
+                owner_references: Some(vec![OwnerReference {
+                    kind: "PlaybookPlan".into(),
+                    name: "plan".into(),
+                    uid: owner_uid.into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            };
+            play.status = phase.map(|phase| v1beta1::PlayStatus {
+                phase,
+                ..Default::default()
+            });
+            play
+        }
+
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+        plan.metadata.namespace = Some("default".into());
+        let mut acknowledged = play(
+            "acknowledged",
+            "plan-uid",
+            350,
+            Some(v1beta1::PlayPhase::Succeeded),
+        );
+        acknowledged.status.as_mut().unwrap().plan_status_recorded = true;
+        let plays = vec![
+            play("legacy", "plan-uid", 100, Some(v1beta1::PlayPhase::Running)),
+            play(
+                "other-owner",
+                "other-uid",
+                200,
+                Some(v1beta1::PlayPhase::Running),
+            ),
+            play(
+                "finished",
+                "plan-uid",
+                300,
+                Some(v1beta1::PlayPhase::Succeeded),
+            ),
+            acknowledged,
+            play("prepared", "plan-uid", 400, None),
+            play(
+                "running",
+                "plan-uid",
+                500,
+                Some(v1beta1::PlayPhase::Running),
+            ),
+        ];
+
+        let names: Vec<&str> = recoverable_plays_for_plan(&plays, &plan)
+            .into_iter()
+            .filter_map(|play| play.metadata.name.as_deref())
+            .collect();
+
+        assert_eq!(names, vec!["legacy", "finished", "prepared", "running"]);
+    }
+
+    /// Recovery reads a run's revision back out of two persisted, hand-editable places — the `Play`
+    /// spec and the Job's hash label — and both go through `ExecutionHash::from_hex`. Each has to
+    /// canonicalize what it accepts, so the value compares equal to a freshly computed hash however
+    /// it was written down, and each has to refuse a value that is not a hash at all rather than
+    /// silently scoping a run's resources to something else.
+    #[test]
+    fn a_persisted_execution_hash_is_canonicalized_or_refused() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+        let mut play = Play::new(
+            "apply-plan-abc-2",
+            v1beta1::PlaySpec {
+                playbook_plan: "plan".into(),
+                playbook_plan_uid: "plan-uid".into(),
+                execution_hash: "00001A".into(),
+                run_id: "run-2".into(),
+                preparation_fingerprint: "fingerprint".into(),
+                attempt: 2,
+                inventory: vec![ResolvedHosts {
+                    name: "workers".into(),
+                    hosts: vec!["worker-1".into(), "worker-2".into()],
+                }],
+                triggered_slot: None,
+            },
+        );
+        play.metadata.uid = Some("play-uid".into());
+
+        let run = recorded_run_from_play(&play).unwrap();
+
+        // Parsed once on the way in, and mirrored in the canonical form the status stores.
+        assert_eq!(run.execution_hash, ExecutionHash::from_hex("1a").unwrap());
+        assert_eq!(run.mirror.execution_hash, "1a");
+        assert_eq!(run.mirror.job_name, "apply-plan-abc-2");
+        assert_eq!(run.mirror.play_uid, "play-uid");
+        assert_eq!(run.mirror.hosts, vec!["worker-1", "worker-2"]);
+        assert_eq!(run.mirror.attempt, 2);
+
+        // The record is only a run's identity if it can be tied back to a specific object.
+        let mut uidless = play.clone();
+        uidless.metadata.uid = None;
+        assert!(recorded_run_from_play(&uidless).is_err());
+
+        play.spec.execution_hash = "not-a-hash".into();
+        assert!(matches!(
+            recorded_run_from_play(&play),
+            Err(ReconcileError::PreconditionFailed(
+                "active Play has an invalid execution hash"
+            ))
+        ));
+
+        let mut job = Job {
+            metadata: ObjectMeta {
+                labels: Some(BTreeMap::from([(
+                    labels::PLAYBOOKPLAN_HASH.into(),
+                    "00001A".into(),
+                )])),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(job_execution_hash(&job).unwrap().to_string(), "1a");
+
+        job.metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(labels::PLAYBOOKPLAN_HASH.into(), "not-a-hash".into());
+        assert!(matches!(
+            job_execution_hash(&job),
+            Err(ReconcileError::PreconditionFailed(
+                "active Job has no valid execution hash"
+            ))
+        ));
+    }
+
+    #[test]
+    fn selected_job_requires_the_prepared_play_uid() {
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+        plan.metadata.namespace = Some("default".into());
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+        let mut job = job_builder::create_job_blueprint(&hash, 1, "run-1", &[], &plan).unwrap();
+        job_builder::correlate_job_to_play(&mut job, "play-uid");
+
+        assert!(validate_selected_job(&job, &plan, hash, 1, "run-1", "play-uid").is_ok());
+
+        // A Job created for a different attempt of the same revision is not this run's Job, even
+        // though it shares the plan, the execution hash and the attempt number.
+        assert!(matches!(
+            validate_selected_job(&job, &plan, hash, 1, "run-2", "play-uid"),
+            Err(ReconcileError::PreconditionFailed(
+                "existing Job does not belong to the selected run"
+            ))
+        ));
+
+        // The pod template's correlation has to hold too: a Job whose pods aren't tied to this Play
+        // can't have its termination message trusted as this run's recap.
+        let mut tampered = job.clone();
+        tampered
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .metadata
+            .as_mut()
+            .unwrap()
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(labels::PLAY_UID_ANNOTATION.into(), "another-play".into());
+        assert!(matches!(
+            validate_selected_job(&tampered, &plan, hash, 1, "run-1", "play-uid"),
+            Err(ReconcileError::PreconditionFailed(
+                "existing Job does not belong to the selected run"
+            ))
+        ));
+
+        job.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(labels::PLAY_UID_ANNOTATION.into(), "another-play".into());
+        assert!(matches!(
+            validate_selected_job(&job, &plan, hash, 1, "run-1", "play-uid"),
+            Err(ReconcileError::PreconditionFailed(
+                "existing Job does not belong to the selected run"
+            ))
+        ));
+    }
+
+    fn finished_run(hash: ExecutionHash, attempt: u32, slot: DateTime<FixedOffset>) -> RecordedRun {
+        RecordedRun {
+            execution_hash: hash,
+            mirror: ActiveRun {
+                execution_hash: hash.to_string(),
+                run_id: "run-1".into(),
+                job_name: "apply-plan-1-3".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                attempt,
+                triggered_slot: Some(slot),
+            },
+        }
+    }
+
+    #[test]
+    fn finishing_the_same_revision_restores_its_slot_and_attempt() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            retry_count: 0,
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &finished_run(hash, 3, slot),
+            None,
+        );
+
+        assert_eq!(status.retry_count, 3);
+        // Still the desired revision, so the slot it consumed keeps it from re-triggering itself
+        // inside its own grace window.
+        assert_eq!(status.last_triggered_run, Some(slot));
+    }
+
+    fn surviving_attempt(
+        hash: ExecutionHash,
+        slot: Option<DateTime<FixedOffset>>,
+    ) -> SurvivingAttempt {
+        SurvivingAttempt {
+            execution_hash: hash.to_string(),
+            triggered_slot: slot,
+        }
+    }
+
+    /// A terminal result is drained ahead of anything live, so a tick can apply one run's outcome
+    /// while a *different* attempt is still going. `lastTriggeredRun` is the only thing standing
+    /// between a schedule window and a second run inside it, so it must describe the attempt the
+    /// plan is actually holding — not the one that has already finished.
+    #[test]
+    fn a_finished_run_does_not_claim_the_slot_of_an_attempt_still_in_flight() {
+        let finished_slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let live_slot = "2025-08-12T21:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            retry_count: 0,
+            last_triggered_run: Some(live_slot),
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &finished_run(hash, 3, finished_slot),
+            Some(&surviving_attempt(hash, Some(live_slot))),
+        );
+
+        assert_eq!(
+            status.last_triggered_run,
+            Some(live_slot),
+            "the slot must keep describing the attempt still in flight"
+        );
+        // The number is still claimed: it reserves a name against every later attempt, which is
+        // true of a finished run whatever else the plan is holding.
+        assert_eq!(status.retry_count, 3);
+    }
+
+    /// The surviving attempt's window is taken from its own record, so a plan status that has not
+    /// caught up with it — the tick that created its Job failed before patching the plan, leaving
+    /// the *previous* run's slot standing — is corrected rather than trusted.
+    #[test]
+    fn draining_a_result_records_the_surviving_attempt_over_a_stale_marker() {
+        let finished_slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let live_slot = "2025-08-12T21:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            last_triggered_run: Some(finished_slot),
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &finished_run(hash, 3, finished_slot),
+            Some(&surviving_attempt(hash, Some(live_slot))),
+        );
+
+        assert_eq!(status.last_triggered_run, Some(live_slot));
+    }
+
+    /// An unscheduled attempt consumed no window, so it has none to record. The finished run's is
+    /// then the newest window the plan has used, and leaving the marker behind it would let its own
+    /// grace window trigger a second run once the attempt is out of the way.
+    #[test]
+    fn an_unscheduled_surviving_attempt_leaves_the_finished_window_standing() {
+        let finished_slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &finished_run(hash, 3, finished_slot),
+            Some(&surviving_attempt(hash, None)),
+        );
+
+        assert_eq!(status.last_triggered_run, Some(finished_slot));
+        assert_eq!(status.retry_count, 3);
+    }
+
+    /// An attempt still applying a superseded revision must not claim the window: the edit is owed a
+    /// run inside the window it was made in, which is exactly what clearing the marker allows.
+    #[test]
+    fn a_surviving_attempt_on_an_obsolete_revision_claims_no_window() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let old_hash = ExecutionHash::from_hex("1").unwrap();
+        let new_hash = ExecutionHash::from_hex("2").unwrap();
+        let mut status = PlaybookPlanStatus {
+            current_hash: old_hash.to_string(),
+            last_triggered_run: Some(slot),
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &new_hash,
+            &finished_run(old_hash, 3, slot),
+            Some(&surviving_attempt(old_hash, Some(slot))),
+        );
+
+        assert_eq!(status.last_triggered_run, None);
+    }
+
+    #[test]
+    fn finishing_an_obsolete_revision_clears_its_slot() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let old_hash = ExecutionHash::from_hex("1").unwrap();
+        let new_hash = ExecutionHash::from_hex("2").unwrap();
+        let mut status = PlaybookPlanStatus {
+            current_hash: old_hash.to_string(),
+            retry_count: 3,
+            last_triggered_run: Some(slot),
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &new_hash,
+            &finished_run(old_hash, 3, slot),
+            None,
+        );
+
+        assert_eq!(status.current_hash, new_hash.to_string());
+        assert_eq!(status.retry_count, 0);
+        // The replacement revision may start straight away, in the same window.
+        assert_eq!(status.last_triggered_run, None);
     }
 
     #[test]
