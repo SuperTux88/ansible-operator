@@ -9,7 +9,7 @@ use k8s_openapi::{
 use kube::{Api, api::PostParams};
 use tracing::{debug, warn};
 
-use crate::v1beta1::controllers::reconcile_error::ReconcileError;
+use crate::v1beta1::controllers::reconcile_error::{ReconcileError, is_conflict};
 
 /// How long a Lease is considered valid without being renewed. Deliberately short and renewed
 /// every reconcile tick (not sized to a run's total length) so a crashed operator only leaves a
@@ -120,10 +120,6 @@ fn build_lease(name: &str, holder_identity: &str, now: DateTime<Utc>) -> Lease {
             ..Default::default()
         }),
     }
-}
-
-fn is_conflict(err: &kube::Error) -> bool {
-    matches!(err, kube::Error::Api(status) if status.code == 409)
 }
 
 /// A deterministic global order for acquiring per-host Leases, keyed by the (hashed) lease name so

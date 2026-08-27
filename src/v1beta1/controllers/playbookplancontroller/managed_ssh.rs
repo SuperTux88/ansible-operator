@@ -29,7 +29,7 @@ use crate::{
         ca::CertificateAuthority,
         controllers::{
             playbookplancontroller::execution_evaluator::ExecutionHash,
-            reconcile_error::ReconcileError,
+            reconcile_error::{ReconcileError, is_not_found},
         },
         labels,
         resources::Toleration,

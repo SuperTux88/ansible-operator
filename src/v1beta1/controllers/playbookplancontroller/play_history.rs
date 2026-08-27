@@ -15,7 +15,7 @@ use tracing::debug;
 use crate::v1beta1::{
     HostOutcome, Play, PlayHostResult, PlayPhase, PlayRecap, PlaySpec, PlayStatus, PlaybookPlan,
     ResolvedHosts,
-    controllers::reconcile_error::ReconcileError,
+    controllers::reconcile_error::{ReconcileError, is_conflict, is_not_found},
     labels,
     playbookplancontroller::{
         callback_output::{CallbackOutput, HostStats},
@@ -324,14 +324,6 @@ fn post_params() -> PostParams {
         field_manager: Some(FIELD_MANAGER.to_string()),
         ..Default::default()
     }
-}
-
-fn is_conflict(err: &kube::Error) -> bool {
-    matches!(err, kube::Error::Api(status) if status.code == 409)
-}
-
-fn is_not_found(err: &kube::Error) -> bool {
-    matches!(err, kube::Error::Api(status) if status.code == 404)
 }
 
 #[cfg(test)]

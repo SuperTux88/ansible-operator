@@ -36,7 +36,7 @@ use crate::{
     v1beta1::{
         self, PlaybookPlan,
         ca::CertificateAuthority,
-        controllers::reconcile_error::ReconcileError,
+        controllers::reconcile_error::{ReconcileError, is_conflict, is_not_found},
         playbookplancontroller::{
             callback_output,
             execution_evaluator::{self, find_outdated_hosts},
@@ -1270,10 +1270,6 @@ async fn spawn_ansible_job(
     Ok(())
 }
 
-fn is_conflict(err: &kube::Error) -> bool {
-    matches!(err, kube::Error::Api(status) if status.code == 409)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1387,21 +1383,6 @@ mod tests {
         let (_, tolerations) = managed_ssh_hosts_and_tolerations(&groups);
 
         assert_eq!(tolerations, Some(first));
-    }
-
-    #[test]
-    fn is_conflict_matches_only_409() {
-        let conflict = kube::Error::Api(Box::new(kube::core::Status {
-            code: 409,
-            ..Default::default()
-        }));
-        let not_found = kube::Error::Api(Box::new(kube::core::Status {
-            code: 404,
-            ..Default::default()
-        }));
-
-        assert!(is_conflict(&conflict));
-        assert!(!is_conflict(&not_found));
     }
 
     #[test]
