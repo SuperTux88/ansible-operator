@@ -53,6 +53,33 @@ Cross-run isolation is enforced at the **certificate** layer, not merely by netw
 - Proxy pods, their Secrets, and the NetworkPolicy are **torn down when the run ends** — there is no
   standing SSH surface on your Nodes between runs.
 
+Run recovery has its own trust boundary. Each attempt is written down as a `Play` before anything is
+created for it, and a CRD validation rule freezes that record's spec for its lifetime. The record
+identifies a run rather than copying what it executes: no plan spec, no connection configuration, no
+Job blueprint — those are re-derived from live cluster state and guarded by a fingerprint, so there
+is no stored copy of them for anyone to rewrite. Advancing a record requires `update` on
+`plays/status`, which should be granted to the operator alone. A record's spec is written once at
+creation and never edited, so the chart grants the operator no `update` on `plays` at all — only
+`get`, `list`, `create` and `delete`. Kubernetes RBAC is additive, though, so that grant cannot deny
+the verb to anyone else: make sure no untrusted principal receives `update` on `plays` from another
+`Role`, `ClusterRole` or binding.
+`T-ESC-8` in the threat model is the full analysis, including what a `plays` writer can and cannot
+still do.
+
+That rule is a CRD validation rule, which the chart requires via its minimum Kubernetes version. On a
+cluster that does not evaluate such rules it would be silently absent rather than rejected, so verify
+it holds before relying on it:
+
+```sh
+kubectl patch play <name> -n my-team --type merge -p '{"spec":{"attempt":99}}'
+# expected: Play spec is immutable
+```
+
+A `Play` does disclose the **resolved inventory** of the run it records — the host names each of the
+plan's inventory groups expanded to. It carries no Secret material and no plan configuration, but
+that host list is enough that `get plays` should be treated as equivalent to `get playbookplans` for
+the namespace.
+
 ## Privileges the proxy pods hold
 
 Proxy pods take the **minimum** that makes `nsenter`-to-host work: `hostPID: true`, a host `/proc`

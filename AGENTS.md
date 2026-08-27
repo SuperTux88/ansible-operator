@@ -76,6 +76,7 @@ src/v1beta1/
     node_access.rs                   NodeAccessPolicy enforcement: fail-closed intersection clamp (INV-2/3/5)
     managed_ssh.rs                   proxy pods (hostPID + nsenter = NODE ROOT), per-attempt sshd config/certs/principals, NetworkPolicy, cleanup (INV-4/7)
     locking.rs                       per-host Leases (operator ns) for run mutual-exclusion
+    play_history.rs                  writes/prunes the immutable Play run records; its module doc is the authoritative PlayPhase state machine
     job_builder.rs                   builds the one Job per run (volumes, client-cert mount, callback env, node anti-affinity)
     workspace.rs                     renders the per-plan workspace Secret (playbook.yml/inventory.yml/recap plugin/vars), owner-ref'd to the plan
     execution_evaluator.rs           ExecutionHash over playbook + referenced Secrets (excludes the self-rendered workspace Secret)
@@ -152,6 +153,36 @@ comments (they encode hard-won runtime facts: BusyBox `nsenter` short-option qui
   and it goes quiet until the hash changes.
 - `Recurring`: *all* hosts run every schedule tick; reschedules via `forecast_next_run` back to
   `Phase::Scheduled`.
+
+### Run records and recovery (`Play`)
+
+Every attempt is written down **before** anything is created for it, as a `Play` in the plan's
+namespace whose spec is immutable (a CEL `self == oldSelf` rule). **The authoritative descriptions
+live in the code**: `play_history.rs`'s module doc for the `PlayPhase` protocol, `play.rs` for the
+spec and why every field is typed, `reconciler.rs`'s `resume_launching_run` for the Job-existence
+boundary. Keep those correct rather than restating them here. What belongs at this level is the
+handful of decisions that are easy to undo by accident:
+
+- **Do not reintroduce snapshots of the plan spec, resolved connection config or the Job blueprint**
+  "so a run can finish what it started". They are pure functions of the live plan and the live
+  resolved groups, which is exactly what `preparationFingerprint` covers; `create_job_blueprint` is
+  deterministic, so a resumed rebuild is byte-identical. An unlaunched run whose inputs changed is
+  deliberately *not* finished.
+- **The result reaches the plan first and the `Play` second** (`finalize_finished_run`), so a crash
+  between them replays idempotently. `plays_to_prune` therefore never prunes an unacknowledged
+  terminal record, nor an `Aborted` one.
+- **`recover_active_run` enforces one-run-at-a-time rather than assuming it.** More than one *in
+  flight* record fails the tick loudly (`sole_active_record`) instead of orphaning the loser's
+  node-root proxy pods — after `renew_contested_locks` has kept every candidate's hosts protected. It
+  deliberately does *not* second-guess a `Running` record's Job: only `advance_active_run` can tell an
+  unfinished foreign Job (wait) from a finished one (finalize with no recap), and deciding it in
+  recovery wedged the plan forever.
+- **Do not make the run ID a function of (plan, hash, attempt)** to save recording it. An aborted
+  attempt frees its number again, so a derived ID would hand the retry that attempt's
+  still-terminating proxy pods — see `reconciler::run_id`.
+- **A contended lock is not automatically a lost one.** `locking::renew_locks` separates an observed
+  takeover (`Lost`) from a write race (`Unconfirmed`); only the first may abandon an attempt
+  (`resolve_contended_locks`). Collapsing them would let a transient 409 tear down node-root infra.
 
 ### Job naming and idempotency
 

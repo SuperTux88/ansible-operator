@@ -241,6 +241,19 @@ Secret access is granted per **enrolled** namespace via a `Role`/`RoleBinding`
   primitives only within the enrolled namespaces, not cluster-wide; the blast radius is bounded to the
   enrolled namespaces.
 
+**T-INFO-1b — `Play` records expose a run's target inventory in the tenant namespace.**
+Each `Play` records the `inventory` its attempt targeted — the plan's groups with the host names they
+resolved to — so the recap can be reported per host after the Job is gone.
+- *Mitigation:* it carries no Secret **material** and no plan configuration: `inventory` is group
+  names and host names, nothing else. The records are namespaced to the plan and owner-referenced to
+  it, so they are deleted with it.
+- *Residual:* it discloses which nodes a namespace resolved to, including nodes a later
+  `NodeAccessPolicy` change has since revoked. A principal granted `get plays` in an enrolled
+  namespace can read that even without `get playbookplans`, so treat `plays` read access as
+  equivalent to `playbookplans` read access for that namespace.
+- *Severity:* **Low** — same namespace, no Secret material, no inline plan configuration, and
+  enrolled namespaces are already expected to be dedicated to Ansible ops (R1).
+
 **T-INFO-2 — CA private key disclosure.**
 - *Mitigation:* the CA is generated in-memory at operator startup and **never persisted** —
   no Secret, nothing in etcd, never logged; only the private→public and signing operations
@@ -400,6 +413,42 @@ any of that namespace's ServiceAccounts' API RBAC.
 - *Severity:* Medium — within-namespace, opt-in, and bounded by the enrollment fence; scales with how
   privileged the namespace's ServiceAccounts are.
 
+**T-ESC-8 — Tampering with a `Play` record to steer a run in progress.**
+A `Play` is no longer only history: recovery reads it back to decide whether an unlaunched attempt
+may still be resumed, and to re-derive what that attempt runs. Anyone with `update` on `plays` in an
+enrolled namespace could therefore try to rewrite what a committed run does.
+- *Reduced attack surface:* the record stores neither the plan spec, nor the resolved inventory
+  groups, nor the Job blueprint. All three are re-derived from **live** cluster state at resume time,
+  so there is no stored copy of any of them to rewrite. What the record holds instead is a
+  `preparationFingerprint` over exactly those inputs, and an attempt is resumed only while that
+  fingerprint still matches what is re-derived. Editing the plan to change what a committed run
+  executes does not redirect that run — it abandons the attempt and starts a new one under a new
+  identity.
+- *Mitigation (identity):* the CRD carries `self == oldSelf` on `spec`, freezing plan UID, execution
+  hash, run ID, attempt, target inventory, schedule slot and the preparation
+  fingerprint. Because the inputs were reduced to that one hash, **every** field in the spec is
+  typed — there is no `x-kubernetes-preserve-unknown-fields` corner that CEL cannot see into, so the
+  rule covers the whole record rather than most of it. A unit test fails if a schemaless field is
+  ever reintroduced under the spec.
+- *Assumption:* this depends on CRD validation rules being evaluated, which the chart requires via
+  its `kubeVersion` constraint. On a cluster that does not evaluate them the rule is silently absent
+  rather than rejected, so verify it (see the `kubectl patch` check in the security guide) rather than
+  assuming it.
+- *Defense in depth:* independently of the rule, a resumed run derives its managed-SSH node set from
+  the groups it is about to render and re-runs live `NodeAccessPolicy` revalidation over that set
+  before any proxy pod exists — so no edit to a record can conjure a proxy pod on a node this
+  namespace was never granted (INV-3/INV-3b/INV-5).
+- *Residual:* a `plays` writer can still abort a run in its **own** namespace by making a record stop
+  matching — the same namespace where it can already delete the run's Job outright, so this is an
+  availability problem rather than an escalation one. A record's spec is written once at creation and
+  never edited, so the chart grants the operator no `update` on `plays` either (see the RBAC table in
+  §8 — it has `get,list,create,delete` on `plays`, and `update` only on `plays/status`). RBAC is
+  additive and no chart can take a verb away, so administrators must ensure no untrusted principal
+  receives it from another `Role`, `ClusterRole` or binding — and must verify that the CRD validation
+  rule above is actually evaluated, since on a cluster that skips it a separately authorized writer
+  can edit a spec the operator has no verb to repair.
+- *Severity:* Low.
+
 ---
 
 ## 6. Deployment assumptions & required controls
@@ -469,8 +518,8 @@ From [`clusterrole.yaml`](chart/templates/clusterrole.yaml) (cluster-wide) and
 | secrets | delete,deletecollection | operator ns | Run cleanup (per-host proxy Secrets). |
 | jobs | get,list,watch,create | **enrolled ns only** | One Job per run in the plan ns, not cluster-wide. |
 | pods | get,list,watch | **enrolled ns only** | Read termination message, not cluster-wide. |
-| plays | get,list,create,delete | **enrolled ns only** | Operator-authored run-history records, one per run attempt in the plan ns; listed and pruned to enforce the per-plan history limits. Owned by their PlaybookPlan, so cascade-deleted with it. Low sensitivity — they carry only recap tallies/outcomes, no Secret material. |
-| plays/status | get,update,patch | **enrolled ns only** | Writes the recap/outcome onto each Play. |
+| plays | get,list,create,delete | **enrolled ns only** | Operator-authored recovery/history records. The spec carries plan UID, execution hash, per-attempt run ID, preparation fingerprint, target inventory, attempt, and schedule slot; Jobs and pod templates are correlated to the Play UID. It stores no copy of the plan spec, resolved connection configuration or the Job — those are re-derived from live cluster state. Every field is typed, so the CRD's CEL rule freezes the whole spec (T-ESC-8). Contains no Secret material. |
+| plays/status | get,update,patch | **enrolled ns only** | Advances the operator-owned Prepared → Starting → Launching → Running → terminal state machine and acknowledges that terminal results reached PlaybookPlan status. Resource-version-checked replacements prevent stale writers from reverting terminal state or racing authorization cleanup against committed Job creation. |
 | pods | create,delete,deletecollection | operator ns | **Creates node-root proxy pods.** |
 | networkpolicies | get,list,watch,create,delete,deletecollection | operator ns | Run isolation. |
 | leases | full | operator ns | Per-node mutual exclusion. |

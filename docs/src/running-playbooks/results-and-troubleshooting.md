@@ -63,10 +63,17 @@ detection compares against) and `lastTransitionTime`.
 ## Run history
 
 The plan's `.status` only reflects the **current** run. For a durable, per-attempt history, the
-operator records a `Play` for every run attempt — one `Play` per Job, in the plan's namespace, owned
-by the plan (so they are removed when you delete it). Unlike the run's Job, which Kubernetes reaps
-shortly after it finishes (`spec.ttlSecondsAfterFinished`), a `Play` keeps the recap for as long as
-retention allows.
+operator records a `Play` before creating the attempt's Job, in the plan's namespace and owned by the
+plan (so they are removed when you delete it). Once an attempt launches, its `Play` corresponds to
+exactly one Job; an attempt abandoned during preparation never creates one. Unlike a launched run's
+Job, which Kubernetes reaps shortly after it finishes (`spec.ttlSecondsAfterFinished`), a `Play` keeps
+the recap for as long as retention allows. Its spec preserves the plan UID, execution hash,
+per-attempt run ID, target inventory, preparation-input fingerprint, attempt, and schedule slot, and
+is rejected for update once written. It records the run's *identity*, not a copy of the plan: what the
+run executes is re-derived from the plan and its inventories, and the fingerprint is what tells the
+operator whether those are still the same ones the run was prepared for. The operator creates this
+record before infrastructure and correlates the Job and pod back to the Play UID, so restart recovery
+does not infer run identity from mutable labels.
 
 ```sh
 kubectl get plays -n my-team
@@ -83,8 +90,16 @@ number. Each `Play`'s `.status` also carries the per-host recap and outcome plus
 kubectl get play apply-web-config-a1b2c3-2 -n my-team -o yaml
 ```
 
-A `Play`'s `.status.phase` is `Running`, `Succeeded`, `Failed`, or `Unknown` (the recap could not be
-read — same meaning as the per-host [`Unknown`](#hosts-show-unknown) outcome).
+A `Play`'s `.status.phase` is normally `Prepared`, `Starting`, `Launching`, `Running`, `Succeeded`,
+`Failed`, or `Unknown`. `Prepared` means the run identity has been recorded and the run is still
+waiting for its host locks — nothing has been created for it yet, so it stays abortable. `Starting`
+means the locks are held and the run's proxy infrastructure is being set up. `Launching` means Job
+creation was committed; if the Job is absent, recovery re-verifies the locks, proxy infrastructure,
+and live node authorization before creating it. `Unknown` means the Job ran but its recap could not be
+read — the same meaning as the per-host [`Unknown`](#hosts-show-unknown) outcome. You may also briefly
+catch `Aborted`: the internal cleanup phase of an attempt that was given up before its Job existed.
+Such a record is deleted once its resources are released, so a superseded attempt is never left behind
+as a failed or unknown execution.
 
 ### How many are kept
 

@@ -32,15 +32,17 @@ pub const DEFAULT_FAILED_PLAYS_HISTORY_LIMIT: u32 = 10;
 const FIELD_MANAGER: &str = "ansible-operator";
 
 /// Identifies one run attempt for the history calls: the plan it belongs to, the backing Job's name
-/// (which is also the Play's name), the execution hash, the attempt/retry number, the inventory it
-/// targeted (grouped, for the Play spec), and the flat host list (for per-host status).
+/// (which is also the Play's name), the execution hash, the attempt/retry number, and the inventory
+/// it targeted (grouped, for the Play spec).
 pub struct PlayRef<'a> {
     pub plan: &'a PlaybookPlan,
     pub job_name: &'a str,
     pub hash: &'a ExecutionHash,
+    pub run_id: &'a str,
+    pub preparation_fingerprint: &'a str,
     pub attempt: u32,
     pub inventory: &'a [ResolvedHosts],
-    pub hosts: &'a [String],
+    pub triggered_slot: Option<chrono::DateTime<chrono::FixedOffset>>,
 }
 
 /// Records that a run has started: creates the `Play` (phase `Running`) if it doesn't exist yet,
@@ -191,20 +193,28 @@ fn build_play(play: &PlayRef<'_>) -> Result<Play, ReconcileError> {
         .plan
         .name()
         .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
+    let plan_uid = play
+        .plan
+        .uid()
+        .ok_or(ReconcileError::PreconditionFailed("uid not set"))?;
 
     let mut object = Play::new(
         play.job_name,
         PlaySpec {
             playbook_plan: plan_name.to_string(),
+            playbook_plan_uid: plan_uid.to_string(),
             execution_hash: play.hash.to_string(),
+            run_id: play.run_id.to_string(),
+            preparation_fingerprint: play.preparation_fingerprint.to_string(),
             attempt: play.attempt,
             inventory: play.inventory.to_vec(),
+            triggered_slot: play.triggered_slot,
         },
     );
-    object.metadata.labels = Some(BTreeMap::from([(
-        labels::PLAYBOOKPLAN_NAME.to_string(),
-        plan_name.to_string(),
-    )]));
+    object.metadata.labels = Some(BTreeMap::from([
+        (labels::PLAYBOOKPLAN_NAME.to_string(), plan_name.to_string()),
+        (labels::PLAYBOOKPLAN_HASH.to_string(), play.hash.to_string()),
+    ]));
     object.metadata.owner_references = Some(vec![playbookplan_owner_ref(play.plan)?]);
 
     Ok(object)
@@ -339,6 +349,72 @@ mod tests {
                 .map(|(h, s)| (h.to_string(), s.clone()))
                 .collect(),
         }
+    }
+
+    /// A minimal plan with a name/UID, enough for `build_play`'s owner reference.
+    fn plan(name: &str, uid: &str) -> PlaybookPlan {
+        let mut plan = PlaybookPlan::new(name, Default::default());
+        plan.metadata.namespace = Some("team".into());
+        plan.metadata.uid = Some(uid.into());
+        plan
+    }
+
+    fn play_ref<'a>(
+        plan: &'a PlaybookPlan,
+        hash: &'a ExecutionHash,
+        run_id: &'a str,
+        fingerprint: &'a str,
+        attempt: u32,
+        inventory: &'a [ResolvedHosts],
+    ) -> PlayRef<'a> {
+        PlayRef {
+            plan,
+            job_name: "apply-web-abc-1",
+            hash,
+            run_id,
+            preparation_fingerprint: fingerprint,
+            attempt,
+            inventory,
+            triggered_slot: None,
+        }
+    }
+
+    fn hash() -> ExecutionHash {
+        crate::v1beta1::playbookplancontroller::execution_evaluator::calculate_execution_hash(
+            "- hosts: all",
+            std::iter::empty(),
+        )
+    }
+
+    #[test]
+    fn build_play_records_the_identity_recovery_reads_back() {
+        let plan = plan("web", "plan-uid");
+        let hash = hash();
+        let inventory = vec![ResolvedHosts {
+            name: "nodes".into(),
+            hosts: vec!["a".into(), "b".into()],
+        }];
+        let built = build_play(&play_ref(&plan, &hash, "run-1", "fp-1", 3, &inventory)).unwrap();
+
+        assert_eq!(built.metadata.name.as_deref(), Some("apply-web-abc-1"));
+        assert_eq!(built.spec.playbook_plan, "web");
+        assert_eq!(built.spec.playbook_plan_uid, "plan-uid");
+        assert_eq!(built.spec.run_id, "run-1");
+        assert_eq!(built.spec.preparation_fingerprint, "fp-1");
+        assert_eq!(built.spec.attempt, 3);
+        assert_eq!(built.spec.inventory, inventory);
+
+        // The plan-name label is what `prune` and the recovery scan list on.
+        let labels = built.metadata.labels.as_ref().unwrap();
+        assert_eq!(labels[labels::PLAYBOOKPLAN_NAME], "web");
+
+        // The owner reference is what makes the record cascade with its plan.
+        let owner = &built.metadata.owner_references.as_ref().unwrap()[0];
+        assert_eq!(owner.kind, "PlaybookPlan");
+        assert_eq!(owner.uid, "plan-uid");
+
+        // A create never persists a status; `record_prepared` initializes it separately.
+        assert!(built.status.is_none());
     }
 
     #[test]

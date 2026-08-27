@@ -7,7 +7,7 @@ pub trait AnsibleInventory {
     fn get_hosts(&self) -> Vec<ResolvedHosts>;
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedHosts {
     pub name: String,
