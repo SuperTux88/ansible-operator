@@ -224,8 +224,9 @@ managed-SSH/SSH wiring.
 **T-INFO-1 — Operator's Secret access (scoped to enrolled namespaces).**
 Secret access is granted per **enrolled** namespace via a `Role`/`RoleBinding`
 (`role.yaml`/`rolebinding.yaml`), **not** cluster-wide — the `ClusterRole` does not mention
-`secrets` (nor `jobs`/`pods`). The enrolled set = the operator's own namespace ∪ the chart's
-`watchNamespaces`. `jobs: create` and `pods: get,list,watch` are likewise scoped to the enrolled set.
+`secrets` (nor `jobs`/`pods`, and no write verb on `playbookplans`). The enrolled set = the
+operator's own namespace ∪ the chart's `watchNamespaces`. `jobs: create,delete`,
+`pods: get,list,watch` and `playbookplans: patch` are likewise scoped to the enrolled set.
 - *Mitigation:* the operator can read/write Secrets and create Jobs only in
   namespaces an admin has explicitly enrolled — enrolment is an intentional "this namespace may drive
   node-root runs" decision, authored in `watchNamespaces` (static Helm/GitOps config, no runtime
@@ -233,13 +234,16 @@ Secret access is granted per **enrolled** namespace via a `Role`/`RoleBinding`
   `status.phase = UnauthorizedNamespace` before any Secret/Job call (fail-closed; no "all namespaces"
   escape hatch). Distroless image, no shell.
 - *Residual:* within the enrolled namespaces the grant is still broad — operator compromise ⇒
-  disclosure of Secrets in *those* namespaces, plus Job-create and Secret-`delete` write primitives
-  *there* (the per-run client-cert Secret is created and reaped in the plan namespace, so `delete` is
-  granted per enrolled namespace, not just the operator's). Widening `watchNamespaces` widens the
-  blast radius accordingly; enrol conservatively.
-- *Severity:* **Medium** — compromise discloses Secrets and yields Job-create / Secret-delete
-  primitives only within the enrolled namespaces, not cluster-wide; the blast radius is bounded to the
-  enrolled namespaces.
+  disclosure of Secrets in *those* namespaces, plus Job-`create`, Job-`delete`, Secret-`delete` and
+  PlaybookPlan-`patch` write primitives *there* (the per-run client-cert Secret is created and reaped
+  in the plan namespace, so `delete` is granted per enrolled namespace, not just the operator's;
+  `jobs: delete` cancels a deleted plan's run and `playbookplans: patch` carries the run-cleanup
+  finalizer, and RBAC can narrow neither to the objects or fields the operator actually touches).
+  Widening `watchNamespaces` widens the blast radius accordingly; enrol conservatively.
+- *Severity:* **Medium** — compromise discloses Secrets and yields Job-create/-delete, Secret-delete
+  and plan-patch primitives only within the enrolled namespaces, not cluster-wide; the blast radius is
+  bounded to the enrolled namespaces. Those write primitives are strictly smaller than the node-root
+  execution the same compromise already grants on nodes those namespaces may target.
 
 **T-INFO-1b — `Play` records expose a run's target inventory in the tenant namespace.**
 Each `Play` records the `inventory` its attempt targeted — the plan's groups with the host names they
@@ -523,8 +527,9 @@ From [`clusterrole.yaml`](chart/templates/clusterrole.yaml) (cluster-wide) and
 |----------|-------|-------|-----------|
 | secrets | get,list,watch,create,patch,delete | **enrolled ns only** | Reads/writes Secrets only in enrolled namespaces, not cluster-wide. `delete` reaps the per-run managed-ssh client-cert Secret, created in the plan namespace so the Job pod can mount it. |
 | secrets | delete,deletecollection | operator ns | Run cleanup (per-host proxy Secrets). |
-| jobs | get,list,watch,create | **enrolled ns only** | One Job per run in the plan ns, not cluster-wide. |
+| jobs | get,list,watch,create,delete | **enrolled ns only** | One Job per run in the plan ns, not cluster-wide. `delete` cancels the run of a deleted plan explicitly, rather than leaving the pod to the deleting client's propagation policy; finished Jobs are reaped by their TTL. The operator deletes only a Job it has validated as its own run's (UID precondition included), but RBAC cannot scope `delete` to Jobs it created, so the grant covers every Job in an enrolled namespace. |
 | pods | get,list,watch | **enrolled ns only** | Read termination message, not cluster-wide. |
+| playbookplans | patch | **enrolled ns only** | Adds and removes the `ansible.cloudbending.dev/run-cleanup` finalizer, which holds a plan deleted mid-run open until its node-root proxy pods and host Leases are released (nothing else can reach them — they live in the operator ns, where an OwnerReference cannot follow). The finalizer is the only field the operator writes here, but RBAC cannot restrict `patch` to `metadata.finalizers`: the grant permits writing the spec and metadata of any plan in an enrolled namespace. Kept out of the `ClusterRole`, which stays read-only for plans, so plan writes are confined to namespaces already trusted to run node-root playbooks. |
 | plays | get,list,create,delete | **enrolled ns only** | Operator-authored recovery/history records. The spec carries plan UID, execution hash, per-attempt run ID, preparation fingerprint, target inventory, attempt, and schedule slot; Jobs and pod templates are correlated to the Play UID. It stores no copy of the plan spec, resolved connection configuration or the Job — those are re-derived from live cluster state. Every field is typed, so the CRD's CEL rule freezes the whole spec (T-ESC-8). Contains no Secret material. |
 | plays/status | get,update,patch | **enrolled ns only** | Advances the operator-owned Prepared → Starting → Launching → Running → terminal state machine and acknowledges that terminal results reached PlaybookPlan status. Resource-version-checked replacements prevent stale writers from reverting terminal state or racing authorization cleanup against committed Job creation. |
 | pods | create,delete,deletecollection | operator ns | **Creates node-root proxy pods.** |
@@ -536,12 +541,14 @@ From [`clusterrole.yaml`](chart/templates/clusterrole.yaml) (cluster-wide) and
 | playbookplans/clusterinventories/nodeaccesspolicies (/status) | get,update | cluster-wide | Status writes (incl. `UnauthorizedNamespace`); StaticInventory has no status-writing controller. |
 
 The *enrolled set* = the operator's own namespace (always) ∪ the chart's `watchNamespaces`. The
-`secrets`/`jobs`/`pods` grants live in a per-enrolled-namespace `Role`/`RoleBinding`, not the
-`ClusterRole` (see [`role.yaml`](chart/templates/role.yaml)).
+`secrets`/`jobs`/`pods` grants, and the `playbookplans: patch` grant behind the run-cleanup
+finalizer, live in a per-enrolled-namespace `Role`/`RoleBinding`, not the `ClusterRole` (see
+[`role.yaml`](chart/templates/role.yaml)); the `ClusterRole`'s access to plans is read-only.
 
 **Net:** the operator is **Tier-0** for node-root capability *on enrolled namespaces*. Operator
-compromise does not imply whole-cluster Secret disclosure or a cluster-wide Job-create/Secret-delete
-primitive — the blast radius is bounded to the enrolled namespaces. Node-root reach into only a few enrolled
+compromise does not imply whole-cluster Secret disclosure or a cluster-wide
+Job-create/-delete, Secret-delete or plan-patch primitive — the blast radius is bounded to the
+enrolled namespaces. Node-root reach into only a few enrolled
 tenant namespaces is materially smaller than "≈ cluster compromise."
 
 ---
