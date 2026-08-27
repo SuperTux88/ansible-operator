@@ -25,7 +25,7 @@ per-host status, and the summary line.
 |---|---|
 | `Pending` | Triggers not yet evaluated — the resting state right after creation or after the inputs changed. |
 | `Delayed` | Execution was deferred (e.g. waiting on proxy readiness). Transient. |
-| `Applying` | A Job is running the playbook right now. The `Running` condition is `True`. |
+| `Applying` | An attempt is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the Job itself is active. |
 | `Scheduled` | (`Recurring`) The run finished and the plan is waiting for the next schedule tick. |
 | `Succeeded` | (`OneShot`) Every host has succeeded on the current hash; the plan is quiet until the inputs change. |
 | `Failed` | (`OneShot`) The run finished but some host could not be brought current. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
@@ -36,12 +36,22 @@ per-host status, and the summary line.
 `.status.conditions` carries `True`/`False` conditions. `Ready` and `Running` are also surfaced as
 printer columns:
 
-- **`Ready`** — the plan is in a healthy, settled state.
+- **`Ready`** — the plan is in a healthy, settled state. Its `reason` says what it is reporting on,
+  because two different things write it. Just after a run, `AllHostsSucceeded` /
+  `SomeHostsDidNotSucceed` describe **that run**, counted over the hosts it targeted — in `OneShot`
+  that is only the hosts that were out of date when it started. Between runs, `HostsUpToDate` /
+  `HostsOutdated` describe **the whole plan**, counted over every eligible host. The two are worded
+  differently on purpose: `n/m hosts completed successfully` is a statement about an execution,
+  `n/m hosts on the current revision` about the plan's standing, and the second is not a claim that
+  anything ran.
 - **`Running`** — a Job is currently applying the playbook.
 - **`Blocked`** — the run is due but waiting on a per-host lock held by another run; the condition
   message names the host and the run holding it. This one is not a column — read it with `kubectl
   describe` or `-o yaml`. It clears on its own once every lock the run needs is free. See
   [Host locks](./scheduling-and-modes.md#host-locks).
+- **`WaitingForNodes`** — managed-SSH proxy pods are not `Ready` yet. The message names the pending
+  Nodes. It clears when the proxies become Ready or their wait expires. See
+  [NotReady nodes](./cluster-nodes.md#notready-nodes).
 
 `.status.summary` is a one-line human summary (also a column), and `.status.currentHash` is the
 current [execution hash](./scheduling-and-modes.md#drift-detection).
@@ -237,6 +247,21 @@ keeps failing and retrying) can keep an overlapping plan waiting for a long time
   its own proxy resources and Leases. If the plan remains stuck after the foreign Job is gone, inspect
   the new `.status.summary` and operator logs rather than deleting the `Play`; it may be reporting a
   separate cleanup or API-permission problem.
+- **"could not complete run …: …"** — the run's Job reached a terminal state, but the operator could
+  not finish handling it: releasing its proxy pods or host locks, writing the recap onto its `Play`,
+  or folding that result into the plan. The rest of the message is the underlying error, and every
+  step is idempotent, so the operator retries the whole sequence every tick and this clears on its
+  own once the underlying problem does. Until then the run's proxy pods may still be up — worth
+  looking at if the message persists, since these are node-root pods. The run's `Play` is deliberately
+  kept meanwhile: it is the handle the retry works from, so do not delete it to unstick the plan.
+- **"aborted the run: host '…' is now locked by …"** — while the attempt was still being set up,
+  another run was *observed* holding one of its host locks (its own lease lapsed during an operator
+  outage and the other run took it over). Rather than run two playbooks against the same host, it was
+  released and deleted; it starts again once the host is free.
+- **"could not confirm the lock on host '…'; retrying"** — the same check, but inconclusive: the
+  operator raced another writer on that Lease and cannot say who holds it. Nothing was seen taking
+  the lock over, so the attempt is deliberately *kept* and the question is asked again a second
+  later. If this persists, something outside the operator is writing to its Leases.
 - **"aborted the run: its nodes are no longer granted to this namespace"** — the run's
   `NodeAccessPolicy` grant was withdrawn while it was being set up, so it was abandoned before its
   playbook could reach those nodes. Its locks and proxy pods are released and the plan re-evaluates.

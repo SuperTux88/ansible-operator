@@ -25,7 +25,7 @@ use kube::{
 };
 
 /// Name of the Job pod's main container — the one running `ansible-playbook`, and the one whose
-/// `/dev/termination-log` carries the recap the reconciler reads back (see `advance_applying_run`).
+/// `/dev/termination-log` carries the recap the reconciler reads back (see `advance_active_run`).
 pub const ANSIBLE_CONTAINER_NAME: &str = "ansible-playbook";
 
 /// `ttlSecondsAfterFinished` for the ansible Job: the operator never deletes the Job or its pod
@@ -37,7 +37,7 @@ pub const ANSIBLE_CONTAINER_NAME: &str = "ansible-playbook";
 /// Should comfortably exceed the time the operator needs to consume a finished Job's result — the
 /// reconciler reads the run's outcome from the Job's own termination message, so a Job reaped
 /// before that (e.g. across a long operator outage) loses its recap. That no longer wedges the run
-/// — `advance_applying_run` treats a missing finished Job as `Unknown` and lets it retry — but it
+/// — `advance_active_run` treats a missing finished Job as `Unknown` and lets it retry — but it
 /// costs an unnecessary retry, so keep this generous. One hour is well clear of the seconds-scale
 /// consume latency.
 const DEFAULT_JOB_TTL_SECONDS_AFTER_FINISHED: i32 = 3600;

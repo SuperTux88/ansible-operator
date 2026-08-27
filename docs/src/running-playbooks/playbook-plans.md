@@ -140,3 +140,6 @@ execution hash over the playbook plus every referenced Secret marks hosts out of
 that already succeeded on the current hash is skipped. See
 [Scheduling and execution modes](./scheduling-and-modes.md) for the mechanics and
 [Reading results](./results-and-troubleshooting.md) for how to read the outcome.
+
+`Applying` covers the whole active attempt, including waiting for host locks and proxy readiness.
+The `Running` condition distinguishes the narrower period when the Job itself is active.

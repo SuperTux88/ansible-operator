@@ -1,15 +1,11 @@
-use std::collections::BTreeMap;
-
 use k8s_openapi::api::batch;
 
 use crate::{
     utils::upsert_condition,
-    v1beta1::{HostOutcome, PlaybookPlanCondition, PlaybookPlanStatus},
+    v1beta1::{HostOutcome, PlayPhase, PlayStatus, PlaybookPlanCondition, PlaybookPlanStatus},
 };
 
-use super::{
-    callback_output::CallbackOutput, execution_evaluator::ExecutionHash, locking::BlockedBy,
-};
+use super::{execution_evaluator::ExecutionHash, locking::BlockedBy};
 
 /// Whether this run's single Job has reached a terminal state — `Complete` or `Failed`.
 pub fn job_finished(job: &batch::v1::Job) -> bool {
@@ -24,37 +20,81 @@ pub fn job_finished(job: &batch::v1::Job) -> bool {
         .unwrap_or(false)
 }
 
-/// Updates `hosts_status` for every host targeted this run, from the parsed callback output (or
-/// `Unknown` for all of them if it couldn't be parsed). Only `Succeeded` outcomes bump
-/// `last_applied_hash`, which is what `find_outdated_hosts` reads for retry/idempotency.
-pub fn evaluate_host_outcomes(
-    target_hosts: &[String],
-    parsed: Option<&CallbackOutput>,
-    hash: &ExecutionHash,
+/// Applies the durable result of a finished `Play` to the owning plan. Normal completion and
+/// restart recovery both use this path so host state and conditions cannot diverge based on which
+/// side of the final plan-status write the operator stopped on.
+///
+/// A non-terminal `Play` is a no-op rather than a partial application: the phase is decided *before*
+/// anything is written, so a caller that ever passes one leaves the plan untouched instead of
+/// half-updated.
+pub fn apply_terminal_play_status(
+    execution_hash: &ExecutionHash,
+    play_status: &PlayStatus,
     status: &mut PlaybookPlanStatus,
 ) {
-    let hosts_status = status.hosts_status.get_or_insert_with(BTreeMap::new);
     let now = chrono::Local::now().fixed_offset();
-
-    for host in target_hosts {
-        let outcome = match parsed {
-            None => HostOutcome::Unknown,
-            Some(output) => match output.processed.get(host) {
-                None => HostOutcome::NotReached,
-                Some(stats) if stats.is_failure() => HostOutcome::Failed,
-                Some(_) => HostOutcome::Succeeded,
-            },
-        };
-
-        let entry = hosts_status.entry(host.clone()).or_default();
-
-        if outcome == HostOutcome::Succeeded {
-            entry.last_applied_hash = hash.to_string();
+    let succeeded = play_status
+        .hosts
+        .values()
+        .filter(|result| result.outcome == HostOutcome::Succeeded)
+        .count();
+    let total = play_status.host_count as usize;
+    let ready = match play_status.phase {
+        PlayPhase::Succeeded => PlaybookPlanCondition {
+            type_: "Ready".into(),
+            status: "True".into(),
+            reason: Some("AllHostsSucceeded".into()),
+            message: Some(format!("{succeeded}/{total} hosts completed successfully")),
+            last_transition_time: Some(now),
+        },
+        PlayPhase::Unknown => PlaybookPlanCondition {
+            type_: "Ready".into(),
+            status: "False".into(),
+            reason: Some("RecapUnavailable".into()),
+            message: Some("the operator could not recover per-host results for this run".into()),
+            last_transition_time: Some(now),
+        },
+        PlayPhase::Failed => PlaybookPlanCondition {
+            type_: "Ready".into(),
+            status: "False".into(),
+            reason: Some("SomeHostsDidNotSucceed".into()),
+            message: Some(format!("{succeeded}/{total} hosts completed successfully")),
+            last_transition_time: Some(now),
+        },
+        PlayPhase::Prepared
+        | PlayPhase::Starting
+        | PlayPhase::Launching
+        | PlayPhase::Running
+        | PlayPhase::Aborted => {
+            return;
         }
+    };
 
-        entry.last_outcome = outcome;
-        entry.last_transition_time = Some(now);
+    clear_attempt_conditions(status);
+    let hosts_status = status.hosts_status.get_or_insert_default();
+    for (host, result) in &play_status.hosts {
+        let entry = hosts_status.entry(host.clone()).or_default();
+        if result.outcome == HostOutcome::Succeeded {
+            entry.last_applied_hash = execution_hash.to_string();
+        }
+        entry.last_outcome = result.outcome.clone();
+        // The run's own finish time when the record carries one, so replaying a recovered result
+        // reports when it happened rather than when it was noticed. Falling back to `now` rather
+        // than to `None`, which would blank a timestamp the previous run had legitimately set.
+        entry.last_transition_time = play_status.finished_at.or(Some(now));
     }
+
+    upsert_condition(
+        &mut status.conditions,
+        PlaybookPlanCondition {
+            type_: "Running".into(),
+            status: "False".into(),
+            reason: None,
+            message: None,
+            last_transition_time: Some(now),
+        },
+    );
+    upsert_condition(&mut status.conditions, ready);
 }
 
 /// Sets the plan-level `Blocked` condition, which reports whether this run is currently waiting on
@@ -128,6 +168,31 @@ pub fn set_waiting_for_nodes_condition(
     upsert_condition(&mut status.conditions, condition);
 }
 
+pub fn clear_attempt_conditions(status: &mut PlaybookPlanStatus) {
+    set_blocked_condition(status, None);
+    set_waiting_for_nodes_condition(status, None);
+}
+
+/// Marks the plan as having a run in progress.
+///
+/// The counterpart for a completed run — clearing `Running` and computing `Ready` from its outcome —
+/// is only ever read off its terminal `Play`, by [`apply_terminal_play_status`]. Keeping a second
+/// implementation that recomputed the same conditions from a freshly parsed recap would be a way
+/// for a restart-recovered result and a normally-completed one to disagree. Input availability is a
+/// separate readiness overlay because it can fail before a run exists or while one is in flight.
+pub fn set_running_condition(status: &mut PlaybookPlanStatus) {
+    upsert_condition(
+        &mut status.conditions,
+        PlaybookPlanCondition {
+            type_: "Running".into(),
+            status: "True".into(),
+            reason: Some("JobRunning".into()),
+            message: Some("the run's Job is still active".into()),
+            last_transition_time: Some(chrono::Local::now().fixed_offset()),
+        },
+    );
+}
+
 /// Withdraws `Running` while the run's Job name is held by something that failed the identity check.
 ///
 /// An earlier tick may have seen this run's own Job and set `Running` from it; leaving that standing
@@ -146,92 +211,10 @@ pub fn set_job_identity_mismatch_condition(status: &mut PlaybookPlanStatus, job_
         },
     );
 }
-
-/// Recomputes the plan-level `Running`/`Ready` conditions from this run's host-outcome tally,
-/// using the parsed callback output as the only host-level signal (there's exactly one Job per
-/// run now, so there's nothing to count across Jobs).
-pub fn evaluate_playbookplan_conditions(
-    target_hosts: &[String],
-    job_is_finished: bool,
-    parsed: Option<&CallbackOutput>,
-    status: &mut PlaybookPlanStatus,
-) {
-    let now = chrono::Local::now().fixed_offset();
-
-    let running_condition = if !job_is_finished {
-        PlaybookPlanCondition {
-            type_: "Running".into(),
-            status: "True".into(),
-            reason: Some("JobRunning".into()),
-            message: Some("the run's Job is still active".into()),
-            last_transition_time: Some(now),
-        }
-    } else {
-        PlaybookPlanCondition {
-            type_: "Running".into(),
-            status: "False".into(),
-            reason: None,
-            message: None,
-            last_transition_time: Some(now),
-        }
-    };
-
-    upsert_condition(&mut status.conditions, running_condition);
-
-    if !job_is_finished {
-        return;
-    }
-
-    let ready_condition = match parsed {
-        None => PlaybookPlanCondition {
-            type_: "Ready".into(),
-            status: "False".into(),
-            reason: Some("RecapUnavailable".into()),
-            message: Some(
-                "the operator could not parse per-host results for this run's Job logs".into(),
-            ),
-            last_transition_time: Some(now),
-        },
-        Some(output) => {
-            let total = target_hosts.len();
-            let succeeded = target_hosts
-                .iter()
-                .filter(|host| {
-                    output
-                        .processed
-                        .get(*host)
-                        .map(|stats| !stats.is_failure())
-                        .unwrap_or(false)
-                })
-                .count();
-
-            if total > 0 && succeeded == total {
-                PlaybookPlanCondition {
-                    type_: "Ready".into(),
-                    status: "True".into(),
-                    reason: Some("AllHostsSucceeded".into()),
-                    message: Some(format!("{succeeded}/{total} hosts completed successfully")),
-                    last_transition_time: Some(now),
-                }
-            } else {
-                PlaybookPlanCondition {
-                    type_: "Ready".into(),
-                    status: "False".into(),
-                    reason: Some("SomeHostsDidNotSucceed".into()),
-                    message: Some(format!("{succeeded}/{total} hosts completed successfully")),
-                    last_transition_time: Some(now),
-                }
-            }
-        }
-    };
-
-    upsert_condition(&mut status.conditions, ready_condition);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v1beta1::controllers::playbookplancontroller::callback_output::HostStats;
+    use std::collections::BTreeMap;
 
     fn hash() -> ExecutionHash {
         crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash(
@@ -241,57 +224,41 @@ mod tests {
     }
 
     #[test]
-    fn succeeded_host_bumps_hash_others_do_not() {
-        let mut status = PlaybookPlanStatus::default();
-        let mut processed = BTreeMap::new();
-        processed.insert(
-            "host-1".to_string(),
-            HostStats {
-                ok: 1,
-                ..Default::default()
-            },
-        );
-        processed.insert(
-            "host-2".to_string(),
-            HostStats {
-                failed: 1,
-                ..Default::default()
-            },
-        );
-        let output = CallbackOutput { processed };
+    fn recovered_terminal_play_replaces_running_conditions() {
         let h = hash();
-
-        evaluate_host_outcomes(
-            &[
-                "host-1".to_string(),
-                "host-2".to_string(),
-                "host-3".to_string(),
-            ],
-            Some(&output),
-            &h,
-            &mut status,
-        );
-
-        let hosts_status = status.hosts_status.unwrap();
-        assert_eq!(hosts_status["host-1"].last_outcome, HostOutcome::Succeeded);
-        assert_eq!(hosts_status["host-1"].last_applied_hash, h.to_string());
-
-        assert_eq!(hosts_status["host-2"].last_outcome, HostOutcome::Failed);
-        assert_eq!(hosts_status["host-2"].last_applied_hash, "");
-
-        assert_eq!(hosts_status["host-3"].last_outcome, HostOutcome::NotReached);
-        assert_eq!(hosts_status["host-3"].last_applied_hash, "");
-    }
-
-    #[test]
-    fn missing_callback_output_marks_everything_unknown() {
         let mut status = PlaybookPlanStatus::default();
-        let h = hash();
+        set_running_condition(&mut status);
+        let play_status = PlayStatus {
+            phase: PlayPhase::Succeeded,
+            host_count: 1,
+            hosts: BTreeMap::from([(
+                "host-1".into(),
+                crate::v1beta1::PlayHostResult {
+                    outcome: HostOutcome::Succeeded,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
 
-        evaluate_host_outcomes(&["host-1".to_string()], None, &h, &mut status);
+        apply_terminal_play_status(&h, &play_status, &mut status);
 
-        let hosts_status = status.hosts_status.unwrap();
-        assert_eq!(hosts_status["host-1"].last_outcome, HostOutcome::Unknown);
+        let running = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Running")
+            .unwrap();
+        let ready = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Ready")
+            .unwrap();
+        assert_eq!(running.status, "False");
+        assert_eq!(ready.status, "True");
+        assert_eq!(
+            status.hosts_status.unwrap()["host-1"].last_applied_hash,
+            h.to_string()
+        );
     }
 
     #[test]
@@ -395,10 +362,26 @@ mod tests {
         assert_eq!(cleared.status, "False");
     }
 
+    /// A run whose recap could not be read is still reported through its terminal `Play`, not
+    /// through a second condition path — `Unknown` is what carries "the Job ran, the result is
+    /// lost" all the way to the plan.
     #[test]
-    fn ready_condition_false_when_callback_output_missing() {
+    fn ready_condition_false_when_the_recap_is_unavailable() {
         let mut status = PlaybookPlanStatus::default();
-        evaluate_playbookplan_conditions(&["host-1".to_string()], true, None, &mut status);
+        let play_status = PlayStatus {
+            phase: PlayPhase::Unknown,
+            host_count: 1,
+            hosts: BTreeMap::from([(
+                "host-1".into(),
+                crate::v1beta1::PlayHostResult {
+                    outcome: HostOutcome::Unknown,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        apply_terminal_play_status(&hash(), &play_status, &mut status);
 
         let ready = status
             .conditions
@@ -410,9 +393,9 @@ mod tests {
     }
 
     #[test]
-    fn running_condition_true_while_job_not_finished() {
+    fn set_running_condition_marks_the_plan_as_running() {
         let mut status = PlaybookPlanStatus::default();
-        evaluate_playbookplan_conditions(&["host-1".to_string()], false, None, &mut status);
+        set_running_condition(&mut status);
 
         let running = status
             .conditions

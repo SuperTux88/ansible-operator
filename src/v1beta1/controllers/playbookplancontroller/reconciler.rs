@@ -216,11 +216,14 @@ pub fn new(
 /// Reconciles one PlaybookPlan. Level-triggered/idempotent "ensure" style — every step re-derives
 /// what's needed from observed cluster state and short-circuits with a short `Action::requeue`
 /// rather than a persisted "current step" state machine. Pipeline (each step re-run every tick):
-///   0. resolve inventory, 1. compute outdated hosts/evaluate schedule, 2-5. `try_start_run`
-///   (locks, managed-ssh proxy infra, workspace secret, the one Job), 6-7. `advance_applying_run`
-///   (once the Job is finished: parse+record results, cleanup). A single tick can walk through
-///   both halves — e.g. Pending -> locks acquired -> proxy ready -> Job created -> immediately
-///   checked for completion — since nothing here is gated on a persisted step, only on `Phase`.
+///   0a. `recover_active_run` (what the plan's `Play` records say is in flight), 0/0b.
+///   `resolve_authorized_inventory` (resolve the inventories, then clamp them to what
+///   `NodeAccessPolicy` grants), 1. compute outdated hosts/evaluate
+///   schedule, 2-5. `try_start_run` (locks, managed-ssh proxy infra, workspace secret, the one Job),
+///   6-7. `advance_active_run` (once the Job is finished: read+record the recap, cleanup). A single
+///   tick can walk through both halves — e.g. Pending -> locks acquired -> proxy ready -> Job
+///   created -> immediately checked for completion — since the only persisted step is the run
+///   record's own phase, which exists to make the privileged steps crash-recoverable.
 async fn reconcile(
     object: Arc<v1beta1::PlaybookPlan>,
     context: Arc<ReconciliationContext>,
@@ -383,6 +386,72 @@ async fn reconcile(
     } else {
         None
     };
+
+    if unlaunched_run.is_none()
+        && let Some(mirror) = resource_status.active_run.clone()
+    {
+        let active_run = RecordedRun::from_mirror(mirror)?;
+        // Reported on the plan before the tick aborts, like recovery above: this is where a finished
+        // run's node-root proxy pods and host Leases are given back, so a teardown that will not
+        // complete has to be readable on the resource and not only in the operator's log.
+        let progress =
+            match advance_active_run(&context, &active_run, &object, &mut resource_status).await {
+                Ok(progress) => progress,
+                Err(error) => {
+                    return Err(report_failed_finalization(
+                        &api,
+                        &object,
+                        &active_run,
+                        &mut resource_status,
+                        error,
+                    )
+                    .await);
+                }
+            };
+        match progress {
+            ActiveRunProgress::Running(requeue) => requeue_after = requeue,
+            // The cached status was behind a tick that had already finished this run;
+            // `advance_active_run` replaced it with what the apiserver actually holds, so there is
+            // nothing left to advance and the refreshed status decides the rest of this tick.
+            ActiveRunProgress::AlreadyFinalized => {
+                requeue_after = std::time::Duration::from_secs(1);
+            }
+            ActiveRunProgress::Finished {
+                run: finished,
+                record,
+            } => {
+                resource_status.summary =
+                    Some("previous run finished; evaluating desired revision".to_string());
+                match finalize_finished_run(
+                    &context,
+                    &object,
+                    &api,
+                    &finished,
+                    record,
+                    &mut resource_status,
+                )
+                .await
+                {
+                    Ok(prune_failed) => retry_prune |= prune_failed,
+                    Err(error) => {
+                        return Err(report_failed_finalization(
+                            &api,
+                            &object,
+                            &finished,
+                            &mut resource_status,
+                            error,
+                        )
+                        .await);
+                    }
+                }
+                finalized_run = true;
+                finished_active_run = Some(finished);
+                // This *was* the attempt a drained result was still waiting behind, and it has now
+                // finished too, so the plan may be classified on its own terms after all.
+                surviving_attempt = None;
+            }
+        }
+    }
 
     // Step 0: resolve inventory (kept separate per-resource, not flattened — connection
     // mechanism is implicit by which resource produced a group).
@@ -563,7 +632,69 @@ async fn reconcile(
                 }
             }
         }
-    } else if eligible_to_start && resource_status.phase != Phase::Applying {
+    } else if let Some(finished) = &finished_active_run {
+        if surviving_attempt.is_some() {
+            // A terminal result is drained ahead of anything live (`recover_active_run`), so this
+            // tick applied one run's recap while another attempt is still going. Classifying the
+            // plan as `Succeeded`/`Scheduled` here would publish a verdict for a run that has not
+            // finished; the next tick recovers that attempt and reports it properly.
+            resource_status.phase = Phase::Applying;
+            resource_status.summary =
+                Some("recorded a finished run; another attempt is still in flight".to_string());
+            requeue_after = std::time::Duration::from_secs(1);
+        } else if finished.execution_hash != execution_hash {
+            resource_status.phase = Phase::Pending;
+            resource_status.next_run = None;
+            resource_status.summary =
+                Some("previous run finished; replacement revision is pending".to_string());
+            requeue_after = std::time::Duration::from_secs(1);
+        } else if matches!(
+            timing,
+            Timing::Now(Some(start))
+                if Some(start.fixed_offset()) != finished.mirror.triggered_slot
+                    && matches!(object.spec.mode, ExecutionMode::Recurring)
+        ) {
+            resource_status.phase = Phase::Scheduled;
+            resource_status.next_run = match timing {
+                Timing::Now(start) => start.map(|start| start.fixed_offset()),
+                Timing::Delayed(_) => unreachable!("the guard only accepts Timing::Now"),
+            };
+            // The recovery path reaches here without having passed the `advance_active_run` branch
+            // that reports a finished run, so this states it rather than leaving whatever the last
+            // tick said standing over a `Scheduled` plan.
+            resource_status.summary =
+                Some("previous run finished; the next scheduled run is already due".to_string());
+            requeue_after = std::time::Duration::from_secs(1);
+        } else {
+            let total_count: usize = resource_status
+                .eligible_hosts
+                .iter()
+                .map(|group| group.hosts.len())
+                .sum();
+            // Reaching here without a schedule means it was removed mid-run: the eligibility gate
+            // normally stops such a plan from ever starting one. Log the anomaly — `decide_terminal`
+            // deliberately leaves the plan in `Applying` for this case.
+            if matches!(object.spec.mode, ExecutionMode::Recurring)
+                && object.spec.schedule.is_none()
+            {
+                warn!("Mode is Recurring but schedule is not set!");
+            }
+            let outcome = decide_terminal(
+                &object.spec.mode,
+                object.spec.schedule.as_deref(),
+                outdated_hosts.len(),
+                total_count,
+                now(),
+            );
+
+            resource_status.summary = Some(outcome.summary);
+            resource_status.phase = outcome.phase;
+            resource_status.next_run = outcome.next_run;
+            if let Some(requeue) = outcome.requeue {
+                requeue_after = requeue;
+            }
+        }
+    } else if eligible_to_start && resource_status.active_run.is_none() {
         match timing {
             Timing::Delayed(until) => {
                 requeue_after = (until - now()).to_std().unwrap();
@@ -603,12 +734,6 @@ async fn reconcile(
                 }
             }
         };
-    }
-
-    if resource_status.phase == Phase::Applying
-        && let Some(d) = advance_applying_run(&context, &base_run, &object, &mut resource_status).await?
-    {
-        requeue_after = d;
     }
 
     // While suspended, don't advertise a next run: the start gate above already blocks new runs, so
@@ -866,6 +991,67 @@ async fn adopt_started_run(
     Ok(())
 }
 
+/// Applies a lock-renewal outcome to an attempt whose Job does not exist yet, reporting the
+/// contended host on the plan and deciding whether the attempt survives.
+///
+/// Returns `Some(requeue)` when the tick has to stop short, `None` when every lock is still this
+/// run's. The two contended outcomes are deliberately *not* the same:
+///
+///   - `Lost` is evidence — another holder was observed on the Lease. Two runs applying a playbook
+///     to the same host is what the Leases exist to prevent, and an attempt with no Job can still be
+///     given up cleanly, so it is.
+///   - `Unconfirmed` is the absence of evidence — a write race, with nobody seen taking the lock
+///     over. Tearing a healthy attempt's node-root infrastructure down on a transient 409 would be a
+///     far worse outcome than looking again a second later, so it is only retried.
+async fn resolve_contended_locks(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    api: &Api<PlaybookPlan>,
+    run: &RecordedRun,
+    observed_phase: v1beta1::PlayPhase,
+    outcome: locking::RenewalOutcome,
+    resource_status: &mut PlaybookPlanStatus,
+) -> Result<Option<std::time::Duration>, ReconcileError> {
+    let (namespace, name) = namespace_and_name(object)?;
+    status::set_blocked_condition(resource_status, outcome.contended());
+
+    match outcome {
+        locking::RenewalOutcome::Held => Ok(None),
+        locking::RenewalOutcome::Unconfirmed(blocked) => {
+            warn!(
+                "PlaybookPlan {namespace}/{name}: could not confirm run {}'s lock on host '{}' this tick; looking again before deciding its fate",
+                run.mirror.job_name, blocked.host
+            );
+            resource_status.summary = Some(format!(
+                "could not confirm the lock on host '{}'; retrying",
+                blocked.host
+            ));
+            Ok(Some(std::time::Duration::from_secs(1)))
+        }
+        locking::RenewalOutcome::Lost(blocked) => {
+            let holder = blocked.holder.as_deref().unwrap_or("another run");
+            warn!(
+                "PlaybookPlan {namespace}/{name}: abandoning run {} — host '{}' is now locked by {holder}",
+                run.mirror.job_name, blocked.host
+            );
+            abandon_unlaunched_run(
+                context,
+                object,
+                api,
+                run,
+                observed_phase,
+                format!(
+                    "aborted the run: host '{}' is now locked by {holder}",
+                    blocked.host
+                ),
+                resource_status,
+            )
+            .await?;
+            Ok(Some(std::time::Duration::from_secs(1)))
+        }
+    }
+}
+
 /// Gives up an attempt whose Job does not exist, from the phase the caller observed it in.
 ///
 /// The record is moved to `Aborted` **first**, so it outlives the cleanup that follows and keeps it
@@ -955,7 +1141,7 @@ async fn try_start_run(
         }
     };
 
-    let holder_identity = format!("{}/{}/{}", run.namespace, run.name, run.execution_hash);
+    let holder_identity = holder_identity(run.namespace, run.name, &active_run);
     resource_status.retry_count = active_run.mirror.attempt;
     resource_status.current_job_name = Some(active_run.mirror.job_name.clone());
     resource_status.phase = Phase::Applying;
@@ -966,8 +1152,22 @@ async fn try_start_run(
     if prepared.is_some_and(|run| run.phase == v1beta1::PlayPhase::Starting) {
         // A resumed `Starting` attempt already holds its locks, so this re-asserts them rather than
         // acquiring a set it may have lost — and only an *observed* takeover gives the attempt up.
-        let _outcome =
+        let outcome =
             locking::renew_locks(&leases_api, &active_run.mirror.hosts, &holder_identity).await?;
+        let plan_api = Api::<PlaybookPlan>::namespaced(context.client.clone(), run.namespace);
+        if let Some(requeue) = resolve_contended_locks(
+            context,
+            object,
+            &plan_api,
+            &active_run,
+            v1beta1::PlayPhase::Starting,
+            outcome,
+            resource_status,
+        )
+        .await?
+        {
+            return Ok(Some(requeue));
+        }
     } else if let Some(blocked) =
         locking::ensure_locks(&leases_api, &active_run.mirror.hosts, &holder_identity).await?
     {
@@ -1196,6 +1396,41 @@ fn managed_ssh_host_map(
     hosts
 }
 
+/// What one tick did with the run the plan's status names.
+///
+/// `Running` carries the requeue interval to wait on it with; `Finished` means the run reached a
+/// terminal state and its result now has to be persisted; `AlreadyFinalized` means there was no such
+/// run left to advance and the caller's status has been refreshed to say so.
+enum ActiveRunProgress {
+    Running(std::time::Duration),
+    Finished {
+        run: RecordedRun,
+        record: TerminalRecord,
+    },
+    /// The cached plan status named a run that the apiserver's copy no longer has — an earlier tick
+    /// finished it and the reflector had not caught up. Nothing was advanced, and `resource_status`
+    /// now holds the live status instead of the stale one.
+    AlreadyFinalized,
+}
+
+/// Whether a finished run still has its own `Play` behind it — the difference between a result that
+/// was *read* from the record and one that had to be reconstructed without it.
+///
+/// Only the first can be acknowledged. Acknowledgement is a version-checked write against the run's
+/// own record, so aiming it at a name whose object is gone (or is now somebody else's) is not a
+/// weaker version of the same operation but a different one, and it is right for it to fail. Carrying
+/// the distinction here keeps [`play_history::acknowledge_finished`] strict — a UID mismatch during
+/// ordinary finalization is still a real ownership error — while letting the one caller that already
+/// knows there is nothing to acknowledge skip it.
+#[derive(Debug, PartialEq, Eq)]
+enum TerminalRecord {
+    /// The run's `Play` carried the result and is waiting to be acknowledged.
+    Present,
+    /// The record is gone, or a different object now holds its name, so the result was reconstructed
+    /// from the plan's own copy of the run. There is nothing left to acknowledge.
+    Lost,
+}
+
 /// Narrows what was found at a run's record name to what is actually *this run's* record.
 ///
 /// A different object under the name is the same fact as no object at all — the recorded run is gone
@@ -1242,28 +1477,94 @@ fn play_is_running_attempt(play: &Play) -> Result<bool, ReconcileError> {
     Ok(status.phase == v1beta1::PlayPhase::Running)
 }
 
-/// Steps 6-7: once this run's Job (recorded as `current_job_name`) is `Complete`/`Failed`, parses
-/// its logs for per-host outcomes, records them, tears down this run's locks/proxy infra, and
-/// advances `phase` to whatever comes next for this `ExecutionMode`. Returns `None` if there's
-/// nothing to do yet (no Job recorded, or it hasn't reached a terminal state) or if advancing
-/// shouldn't change the requeue duration (e.g. a terminal `OneShot` outcome) — the caller only
-/// overrides its requeue duration when this returns `Some`.
-async fn advance_applying_run(
+/// Steps 6-7: once this run's Job is `Complete`/`Failed`, reads the per-host recap from its pod's
+/// termination message, records it on the run's `Play`, folds it into the plan, and tears down the
+/// run's locks and proxy infrastructure. While the Job is still active it renews the run's host
+/// Leases and reports `Running`.
+async fn advance_active_run(
     context: &ReconciliationContext,
-    run: &RunContext<'_>,
+    run: &RecordedRun,
     object: &PlaybookPlan,
     resource_status: &mut PlaybookPlanStatus,
-) -> Result<Option<std::time::Duration>, ReconcileError> {
-    let jobs_api = Api::<Job>::namespaced(context.client.clone(), run.namespace);
+) -> Result<ActiveRunProgress, ReconcileError> {
+    let (namespace, name) = namespace_and_name(object)?;
+    let jobs_api = Api::<Job>::namespaced(context.client.clone(), namespace);
     let leases_api = Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
+    let holder_identity = holder_identity(namespace, name, run);
+
+    let job_name = run.mirror.job_name.clone();
+    let plays_api = Api::<Play>::namespaced(context.client.clone(), namespace);
+    // A record that no longer carries this run's UID counts as absent, not as an error: a different
+    // object at the same name is the same fact as no object at all — the recorded run is gone. Both
+    // go to `finalize_lost_run`, which re-reads the live plan status and either adopts it (the usual
+    // case: an earlier tick already finished this run and the cache lagged) or releases the run. An
+    // error here instead would be the one recovery failure with no way out, since it precedes every
+    // step that could clear the mirror it disagrees with.
+    let Some(play) = own_record(plays_api.get_opt(&job_name).await?, &run.mirror.play_uid) else {
+        return finalize_lost_run(context, object, run, resource_status).await;
+    };
+    // Deliberately silent on the plan, and deliberately the slow interval. Two ticks reach here,
+    // and neither wants a message or a prompt return of its own:
+    //
+    //   - one that drained a queued terminal result while the mirror still named an attempt that
+    //     has not reached `Running`. That tick describes the situation itself, in terms this could
+    //     not improve on ("recorded a finished run; another attempt is still in flight"), and sets
+    //     its own one-second requeue afterwards — so a summary written here would only be
+    //     overwritten a few steps later, inviting a reader to reconcile two messages that always
+    //     disagree about which of the two runs the plan is waiting on.
+    //   - a suspended plan whose `Launching` attempt found a foreign Job at its name.
+    //     `resolve_unlaunched_before_inputs` has already reported that through
+    //     `resume_launching_run`, which keeps the mirror and asks for fifteen seconds; nothing
+    //     between here and the end of the tick will set the interval again, so returning one second
+    //     would poll a plan that is suspended *and* blocked once a second for as long as the
+    //     foreign Job survives — which can be indefinitely, since a contested name is never
+    //     abandoned.
+    //
+    // Fifteen seconds serves both: the first overrides it, and the second is exactly the cadence
+    // the contested path asked for.
+    if !play_is_running_attempt(&play)? {
+        return Ok(ActiveRunProgress::Running(std::time::Duration::from_secs(
+            15,
+        )));
+    }
 
     // Looked up by the exact recorded name, not the PLAYBOOKPLAN_HASH label — that label is
     // stable across every retry of an unchanged spec, so a label-only `list()` could return
     // an older, already-finished retry's Job instead of the one this run just created.
-    let Some(job_name) = resource_status.current_job_name.clone() else {
-        return Ok(None);
-    };
     let job = jobs_api.get_opt(&job_name).await?;
+    let job_is_trusted = match &job {
+        Some(job)
+            if validate_selected_job(
+                job,
+                object,
+                run.execution_hash,
+                run.mirror.attempt,
+                &run.mirror.run_id,
+                &run.mirror.play_uid,
+            )
+            .is_err() =>
+        {
+            if !status::job_finished(job) {
+                // Discarded as above: this run's hosts may be occupied by a Job we do not control,
+                // so there is nothing safe left to do about a lock it no longer holds.
+                let _outcome =
+                    locking::renew_locks(&leases_api, &run.mirror.hosts, &holder_identity).await?;
+                // The attempt is past setup, so a `Blocked`/`WaitingForNodes` left over from the
+                // tick that started it would otherwise stay on the plan for the whole wait.
+                status::clear_attempt_conditions(resource_status);
+                status::set_job_identity_mismatch_condition(resource_status, &job_name);
+                resource_status.summary = Some(format!(
+                    "waiting for Job {job_name}, which does not carry this run's identity"
+                ));
+                return Ok(ActiveRunProgress::Running(std::time::Duration::from_secs(
+                    15,
+                )));
+            }
+            false
+        }
+        Some(_) => true,
+        None => false,
+    };
 
     // Still running -> renew this run's host locks so a run that outlasts the lease duration keeps
     // them (they're acquired once at start and otherwise never touched again while Applying), then
@@ -1271,15 +1572,15 @@ async fn advance_applying_run(
     if let Some(job) = &job
         && !status::job_finished(job)
     {
+        // As above: the Job is already running, so a lost lock is reported and nothing more.
         let _outcome =
-            locking::renew_locks(&leases_api, run.hosts_to_trigger, run.holder_identity).await?;
-        status::evaluate_playbookplan_conditions(
-            run.hosts_to_trigger,
-            false,
-            None,
-            resource_status,
-        );
-        return Ok(Some(std::time::Duration::from_secs(15)));
+            locking::renew_locks(&leases_api, &run.mirror.hosts, &holder_identity).await?;
+        status::clear_attempt_conditions(resource_status);
+        status::set_running_condition(resource_status);
+        resource_status.summary = Some(format!("applying run {}", run.mirror.job_name));
+        return Ok(ActiveRunProgress::Running(std::time::Duration::from_secs(
+            15,
+        )));
     }
 
     // The Job either finished, or is already gone — reaped by Kubernetes' TTL controller (its result
@@ -1289,9 +1590,9 @@ async fn advance_applying_run(
     // a reaped run from wedging in `Applying` forever. The recap comes from the container's
     // termination message (what the callback wrote to /dev/termination-log), not logs — a dedicated
     // channel that isn't interleaved with playbook output and needs no `pods/log` access.
-    let parsed = match &job {
-        Some(_) => {
-            let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), run.namespace);
+    let parsed = match (&job, job_is_trusted) {
+        (Some(job), true) => {
+            let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
             pods_api
                 .list(&ListParams {
                     label_selector: Some(format!("job-name={job_name}")),
@@ -1300,91 +1601,101 @@ async fn advance_applying_run(
                 .await?
                 .items
                 .iter()
+                .filter(|pod| {
+                    annotation_value(&pod.metadata, labels::PLAY_UID_ANNOTATION)
+                        == Some(run.mirror.play_uid.as_str())
+                        && pod_belongs_to_job(pod, job)
+                })
                 .find_map(termination_message)
                 .as_deref()
                 .and_then(callback_output::parse_callback_output)
         }
-        None => None,
+        _ => None,
     };
 
-    status::evaluate_host_outcomes(
-        run.hosts_to_trigger,
-        parsed.as_ref(),
-        &run.execution_hash,
-        resource_status,
-    );
-    status::evaluate_playbookplan_conditions(
-        run.hosts_to_trigger,
-        true,
-        parsed.as_ref(),
-        resource_status,
-    );
+    release_run_infrastructure(context, object, run).await?;
 
-    // Stamp the terminal recap onto this attempt's Play (durable run history), then prune old ones.
-    let inventory = flatten_hosts(run.run_groups);
-    play_history::record_finished(
-        &context.client,
-        run.namespace,
-        &play_history::PlayRef {
-            plan: object,
-            job_name: &job_name,
-            hash: &run.execution_hash,
-            attempt: resource_status.retry_count,
-            inventory: &inventory,
-            hosts: run.hosts_to_trigger,
-        },
+    // A terminal Play is the durable marker that cleanup completed. If any step above fails, the
+    // Play remains Running and the next reconcile safely retries finalization.
+    let finished_play = play_history::record_finished(
+        &plays_api,
+        play,
+        &run.mirror.play_uid,
+        &run.mirror.hosts,
         parsed.as_ref(),
     )
     .await?;
-    play_history::prune(&context.client, run.namespace, object).await?;
+    status::apply_terminal_play_status(
+        &run.execution_hash,
+        finished_play
+            .status
+            .as_ref()
+            .ok_or(ReconcileError::PreconditionFailed(
+                "finished Play has no status",
+            ))?,
+        resource_status,
+    );
+    resource_status.active_run = None;
+    resource_status.current_job_name = None;
+    Ok(ActiveRunProgress::Finished {
+        run: run.clone(),
+        record: TerminalRecord::Present,
+    })
+}
 
-    // The attempt's run ID travels on the Job's labels for now; cleanup needs it to address this
-    // attempt's proxy resources. A reaped Job takes the ID with it — that sweep is then a no-op and
-    // the plan-owned client-cert Secret falls back to Kubernetes GC.
-    let job_run_id = job
+/// Finalizes a run whose `Play` is gone: its infrastructure is released and every targeted host is
+/// reported `Unknown`, because without the record nothing about the run can be recovered. Wedging in
+/// `Applying` on a record that is never coming back would hold this plan's host locks indefinitely.
+///
+/// First, though, it re-reads the plan **from the apiserver**. The run this is called for comes from
+/// the reflector-cached status, which lags this controller's own writes, so a tick that raced ahead
+/// of that cache can arrive here for a run a previous tick already finished, acknowledged and pruned
+/// (a `historyLimit` of 0 prunes it immediately). Reporting that run lost would overwrite a
+/// perfectly good recap with `Unknown` for every host. When the live status disagrees, it is adopted
+/// wholesale — it is strictly newer than the copy this tick started from — and nothing is finalized.
+async fn finalize_lost_run(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    run: &RecordedRun,
+    resource_status: &mut PlaybookPlanStatus,
+) -> Result<ActiveRunProgress, ReconcileError> {
+    let (namespace, name) = namespace_and_name(object)?;
+
+    let live_status = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace)
+        .get_status(name)
+        .await?
+        .status;
+    let still_active = live_status
         .as_ref()
-        .and_then(|job| job.metadata.labels.as_ref())
-        .and_then(|job_labels| job_labels.get(labels::RUN_ID))
-        .cloned()
-        .unwrap_or_default();
-    managed_ssh::cleanup_proxy_infra(
-        &context.client,
-        &context.operator_namespace,
-        run.namespace,
-        &run.execution_hash,
-        &job_run_id,
-        run.name,
-    )
-    .await?;
-    locking::release_locks(&leases_api, run.hosts_to_trigger, run.holder_identity).await?;
-
-    let total_count: usize = resource_status
-        .eligible_hosts
-        .iter()
-        .map(|g| g.hosts.len())
-        .sum();
-    let outdated_count = find_outdated_hosts(resource_status, &run.execution_hash).len();
-
-    // Recurring with no schedule can't reschedule; the eligibility gate normally stops such a plan
-    // from ever starting, so reaching here means the schedule was removed mid-run. Log the anomaly —
-    // `decide_terminal` deliberately leaves the plan in `Applying` for this case.
-    if matches!(object.spec.mode, ExecutionMode::Recurring) && object.spec.schedule.is_none() {
-        warn!("Mode is Recurring but schedule is not set!");
+        .and_then(|status| status.active_run.as_ref())
+        .is_some_and(|mirrored| mirrored.play_uid == run.mirror.play_uid);
+    if !still_active {
+        debug!(
+            "PlaybookPlan {namespace}/{name}: run {} was already finalized by an earlier tick; refreshing the cached status",
+            run.mirror.job_name
+        );
+        *resource_status = live_status.unwrap_or_default();
+        return Ok(ActiveRunProgress::AlreadyFinalized);
     }
 
-    let outcome = decide_terminal(
-        &object.spec.mode,
-        object.spec.schedule.as_deref(),
-        outdated_count,
-        total_count,
-        Utc::now().with_timezone(&object.timezone().unwrap()),
+    warn!(
+        "PlaybookPlan {namespace}/{name}: Play {} is gone; finalizing its run as lost",
+        run.mirror.job_name
     );
 
-    resource_status.summary = Some(outcome.summary);
-    resource_status.phase = outcome.phase;
-    resource_status.next_run = outcome.next_run;
+    release_run_infrastructure(context, object, run).await?;
 
-    Ok(outcome.requeue)
+    status::apply_terminal_play_status(
+        &run.execution_hash,
+        &play_history::lost_run_status(&run.mirror.job_name, &run.mirror.hosts),
+        resource_status,
+    );
+    resource_status.active_run = None;
+    resource_status.current_job_name = None;
+    Ok(ActiveRunProgress::Finished {
+        run: run.clone(),
+        record: TerminalRecord::Lost,
+    })
 }
 
 /// Completes a run whose Job creation was already committed — and the **only** place that decides
@@ -1516,6 +1827,210 @@ async fn resume_launching_run(
     };
 
     Ok((action, requeue))
+}
+
+/// Drops an `Aborted` run for good: releases everything it holds, persists a plan status that no
+/// longer references it, and only then deletes the record. Ordering matters — the record is what
+/// makes the cleanup retryable, so it must outlive every step that can fail.
+///
+/// `reason` becomes the plan's summary, and taking it as a parameter is what makes that
+/// unconditional. The phase this leaves behind (`Pending`) says only that nothing is happening, and
+/// a plan can rest there indefinitely — a suspended one, or a `OneShot` with nothing left to do —
+/// so an abandon that wrote no summary would leave whatever the last one happened to say standing
+/// as the explanation for a state it does not describe.
+///
+/// Both fallible steps report themselves on the plan before handing the error back. This is the path
+/// that gives up a run's node-root proxy pods and host Leases, so "it did not work" has to be
+/// readable on the resource too, not only in the operator's log.
+///
+/// The mirror is given up only when it is *this* run's, exactly as in [`finalize_finished_run`]: it
+/// is what lets the operator release a run whose `Play` was deleted out from under it
+/// ([`finalize_lost_run`]), so clearing it for a run it does not describe would leave that attempt's
+/// host Leases and node-root proxy pods with nothing pointing at them. Every caller reached through
+/// [`abandon_unlaunched_run`] has just written this run into the mirror, so the guard is only
+/// load-bearing on the `Aborted` recovery path, which adopts no attempt and inherits whatever the
+/// reflector cache held. Stating it here rather than relying on that reasoning keeps the abandon and
+/// finalize paths the same shape.
+async fn abandon_run(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    api: &Api<PlaybookPlan>,
+    run: &RecordedRun,
+    reason: String,
+    resource_status: &mut PlaybookPlanStatus,
+) -> Result<(), ReconcileError> {
+    let (namespace, _) = namespace_and_name(object)?;
+    resource_status.summary = Some(reason);
+    if let Err(error) = release_run_infrastructure(context, object, run).await {
+        return Err(report_failed_abandon(api, object, run, resource_status, error).await);
+    }
+
+    if mirrors_run(resource_status, run) {
+        resource_status.active_run = None;
+        resource_status.current_job_name = None;
+        resource_status.phase = Phase::Pending;
+        resource_status.next_run = None;
+    }
+    status::clear_attempt_conditions(resource_status);
+    patch_status(api, object, resource_status.clone()).await?;
+
+    if let Err(error) = play_history::delete_aborted(
+        &context.client,
+        namespace,
+        &run.mirror.job_name,
+        &run.mirror.play_uid,
+    )
+    .await
+    {
+        return Err(report_failed_abandon(api, object, run, resource_status, error).await);
+    }
+    Ok(())
+}
+
+/// Records why an abandon could not complete on the plan and hands the error straight back.
+///
+/// Best effort, and deliberately so: the reconcile fails on `error` either way, and a failure to
+/// report must not replace the diagnosis it was trying to surface. Same shape as the recovery
+/// failure path in `reconcile` and as `preserve_unlaunched_run_after_error`.
+async fn report_failed_abandon(
+    api: &Api<PlaybookPlan>,
+    object: &PlaybookPlan,
+    run: &RecordedRun,
+    resource_status: &mut PlaybookPlanStatus,
+    error: ReconcileError,
+) -> ReconcileError {
+    resource_status.summary = Some(format!(
+        "could not release the abandoned run {}: {error}",
+        run.mirror.job_name
+    ));
+    if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
+        warn!(
+            "Could not report the failed abandon of run {} on {:?}/{:?}: {patch_error}",
+            run.mirror.job_name, object.metadata.namespace, object.metadata.name
+        );
+    }
+    error
+}
+
+/// Records why a finished run could not be completed on the plan and hands the error straight back.
+///
+/// Covers everything between "the Job reached a terminal state" and "the record has been handed back
+/// to history": releasing the run's proxy pods and host Leases, stamping the recap onto its `Play`,
+/// persisting that to the plan, and acknowledging it. Until those succeed, the run still owns
+/// node-root resources — so the plan must say so rather than standing at "applying run …" while only
+/// the log knows. They are all retried through the run's recovery record.
+///
+/// Deliberately *not* reached by a failure of the retention pass that follows acknowledgement. By
+/// then the run is genuinely complete: its recap is on the plan and its record is acknowledged, so
+/// nothing here is still owed and every resource this message sends a reader looking for has already
+/// been released. [`prune_history`] reports that failure by return value instead, and the caller
+/// only shortens the requeue.
+///
+/// Best effort, and deliberately so, for the same reason as [`report_failed_abandon`]: the reconcile
+/// fails on `error` either way, and a failure to report must not replace the diagnosis it was trying
+/// to surface.
+async fn report_failed_finalization(
+    api: &Api<PlaybookPlan>,
+    object: &PlaybookPlan,
+    run: &RecordedRun,
+    resource_status: &mut PlaybookPlanStatus,
+    error: ReconcileError,
+) -> ReconcileError {
+    resource_status.summary = Some(format!(
+        "could not complete run {}: {error}",
+        run.mirror.job_name
+    ));
+    if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
+        warn!(
+            "Could not report the failed completion of run {} on {:?}/{:?}: {patch_error}",
+            run.mirror.job_name, object.metadata.namespace, object.metadata.name
+        );
+    }
+    error
+}
+
+/// Gives back a run's proxy infrastructure and then its host Leases. Cleanup failures propagate so
+/// the caller retains the Play as its retry handle; `cleanup_proxy_infra` documents the resource
+/// ordering and revocation details.
+async fn release_run_infrastructure(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    run: &RecordedRun,
+) -> Result<(), ReconcileError> {
+    let (namespace, name) = namespace_and_name(object)?;
+    managed_ssh::cleanup_proxy_infra(
+        &context.client,
+        &context.operator_namespace,
+        namespace,
+        &run.execution_hash,
+        &run.mirror.run_id,
+        name,
+    )
+    .await?;
+    let leases_api = Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
+    locking::release_locks(
+        &leases_api,
+        &run.mirror.hosts,
+        &holder_identity(namespace, name, run),
+    )
+    .await
+}
+
+/// The Lease holder identity for a run. Derived from the run ID rather than the execution hash, so
+/// two retries of an unchanged spec never claim each other's locks.
+fn holder_identity(namespace: &str, name: &str, run: &RecordedRun) -> String {
+    format!("{namespace}/{name}/{}", run.mirror.run_id)
+}
+
+/// Renews the host Leases of every record in `plays` whose run may still be executing, for the one
+/// case where a tick gives up without advancing any of them (`sole_active_record`'s refusal).
+///
+/// The set is exactly the phases that can have something running on a host. `Prepared` is excluded
+/// because it has not taken its locks yet, and `renew_locks` re-asserts a *missing* Lease, so
+/// renewing for it would acquire locks on a tick that is about to bail. `Aborted` is excluded for
+/// the same reason from the other end: it has no Job, so nothing is executing behind it, and an
+/// attempt aborted straight out of `Prepared` never held a lock to renew — while the refusal that
+/// brought us here can persist for a long time, pinning hosts against every other plan. Best effort
+/// by design: the caller is already returning an error, and a failure to renew here must not replace
+/// the diagnosis that explains why.
+async fn renew_contested_locks(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    plays: &[&Play],
+) {
+    let Ok((namespace, name)) = namespace_and_name(object) else {
+        return;
+    };
+    let leases_api = Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
+
+    for play in plays {
+        let holds_locks = play.status.as_ref().is_some_and(|status| {
+            matches!(
+                status.phase,
+                v1beta1::PlayPhase::Starting
+                    | v1beta1::PlayPhase::Launching
+                    | v1beta1::PlayPhase::Running
+            )
+        });
+        if !holds_locks {
+            continue;
+        }
+        let Ok(run) = recorded_run_from_play(play) else {
+            continue;
+        };
+        if let Err(error) = locking::renew_locks(
+            &leases_api,
+            &run.mirror.hosts,
+            &holder_identity(namespace, name, &run),
+        )
+        .await
+        {
+            warn!(
+                "Could not renew the host locks of contested run {} on {namespace}/{name}: {error}",
+                run.mirror.job_name
+            );
+        }
+    }
 }
 
 /// The terminal-state decision for a finished run: what the plan's `phase`, `next_run`, `summary`,
@@ -1957,6 +2472,58 @@ impl RecordedRun {
             execution_hash,
         })
     }
+}
+
+/// Persists a run's terminal result and hands its record back to history. Returns whether the
+/// closing retention pass failed and should be retried with a shortened requeue — see
+/// [`prune_history`] for why that is a return value rather than an error.
+///
+/// The plan is written **first** and the record acknowledged **second**, so a crash in between
+/// replays the (idempotent) result rather than losing it. History pruning follows acknowledgement and
+/// is also retried independently on ordinary reconciles once nothing is in flight, so a deletion
+/// failure cannot block the run's result from being durable or leave old records behind forever. Persisting before the caller goes on
+/// to resolve the replacement revision also means a broken new inventory cannot make the completed run
+/// look active again on the next tick. Both the tick that finishes a run and the tick that recovers an
+/// already-finished one come through here, so that ordering cannot drift between them.
+///
+/// The mirror is only given up when it is *this* run's. A terminal result is drained ahead of
+/// anything live (`recover_active_run`), so the plan may well still be mirroring a different attempt
+/// that is genuinely in flight — and that mirror is what lets the operator release a run whose `Play`
+/// is deleted out from under it (`finalize_lost_run`). Clearing it for a run it does not describe
+/// would leave that attempt's host Leases and node-root proxy pods with nothing pointing at them.
+async fn finalize_finished_run(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    api: &Api<PlaybookPlan>,
+    finished: &RecordedRun,
+    record: TerminalRecord,
+    resource_status: &mut PlaybookPlanStatus,
+) -> Result<bool, ReconcileError> {
+    let (namespace, _) = namespace_and_name(object)?;
+
+    if mirrors_run(resource_status, finished) {
+        resource_status.active_run = None;
+        resource_status.current_job_name = None;
+        resource_status.phase = Phase::Pending;
+        resource_status.next_run = None;
+    }
+    patch_status(api, object, resource_status.clone()).await?;
+
+    // A run finalized without its record has nothing to acknowledge, and must not try: the name may
+    // now hold a *replacement* attempt's `Play`, and a version-checked write aimed at that would fail
+    // as "Play UID changed" — reporting a teardown problem for a run that is complete, and delaying
+    // the replacement's own recovery by a tick. Retention still runs: the plan gained a result.
+    if record == TerminalRecord::Present {
+        play_history::acknowledge_finished(
+            &context.client,
+            namespace,
+            &finished.mirror.job_name,
+            &finished.mirror.play_uid,
+        )
+        .await?;
+    }
+    play_history::prune(&context.client, namespace, object).await?;
+    Ok(false)
 }
 
 /// Recovers only records created by the current Prepared-before-Job protocol. Statusless objects
