@@ -447,7 +447,6 @@ spec:
                 - Pending
                 - Delayed
                 - Applying
-                - Scheduled
                 - Failed
                 - Succeeded
                 - UnauthorizedNamespace
