@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::hash::{Hash as _, Hasher as _};
 
 use k8s_openapi::{
     api::{
@@ -22,6 +23,7 @@ use kube::{
 };
 
 use super::paths;
+use crate::utils;
 use crate::v1beta1::{
     ca::CertificateAuthority,
     controllers::{
@@ -303,19 +305,46 @@ fn merge_default_tolerations(
     merged
 }
 
-/// Deterministic, human-readable resource name for a (host, attempt) pair. The host is used verbatim
-/// (not hashed) since managed-ssh only targets `ClusterInventory` hosts, i.e. real Node names,
-/// which are already valid Kubernetes object name components. The attempt is identified by its run
-/// ID, so a delayed cleanup can never reach a retry's pods.
+/// Deterministic, human-readable resource name for a (host, attempt) pair. The attempt is identified
+/// by its run ID, so a delayed cleanup can never reach a retry's pods.
 ///
-/// Length budget, since nothing truncates here: the result names a Pod and a Secret, so it is bounded
-/// by `utils::MAX_DNS_SUBDOMAIN_LEN`. The host is separately bounded to `utils::MAX_DNS_LABEL_LEN`
-/// because it is also written as the `PLAYBOOKPLAN_HOST` **label value** (`run_labels`) — so the
-/// worst case is 13 + 63 + 1 + `reconciler::RUN_ID_LENGTH`, leaving well over 150 characters of
-/// headroom. A test pins that, so growing the run ID (or ever sourcing the host from something
-/// unlabelled) fails there rather than at the apiserver.
+/// Length budget: the result names a Pod and a Secret, so it is bounded by
+/// `utils::MAX_DNS_SUBDOMAIN_LEN`, and [`host_segment`] holds the host to
+/// `utils::MAX_DNS_LABEL_LEN` — the worst case is 13 + 63 + 1 + `reconciler::RUN_ID_LENGTH`, leaving
+/// well over 150 characters of headroom. A test pins that, so growing the run ID fails there rather
+/// than at the apiserver.
 fn resource_name(host: &str, run_id: &str) -> String {
-    format!("ansible-sshd-{host}-{run_id}")
+    format!("ansible-sshd-{}-{run_id}", host_segment(host))
+}
+
+/// The host as it appears in a proxy resource's *name* and in its `PLAYBOOKPLAN_HOST` **label
+/// value** — the two must agree, so both come from here.
+///
+/// A Node name is a DNS subdomain and may be up to 253 characters, while a label value stops at 63.
+/// A name that fits is therefore used exactly as it is: it is what an administrator matches on, and
+/// leaving it alone also means this changed nothing for any host that already worked. A longer one
+/// is truncated and given a hash of the *whole* name, so the value stays inside the limit, stays
+/// recognizable, and still tells two nodes apart that share a long prefix — which is common exactly
+/// where names get long, since the length usually comes from a shared cloud-provider suffix.
+///
+/// The hash is deterministic rather than random because this name is how the operator finds what it
+/// already created: `ensure_proxy_infra` re-derives it every tick to decide whether a proxy pod and
+/// its Secret exist, and `reset_incomplete_run` deletes by it. A value that differed between ticks
+/// would create a fresh node-root pod per host per tick and orphan the previous one.
+///
+/// The untruncated name is never lost: [`run_annotations`] records it verbatim.
+fn host_segment(host: &str) -> String {
+    if host.len() <= utils::MAX_DNS_LABEL_LEN {
+        return host.to_string();
+    }
+
+    let mut hasher = twox_hash::XxHash3_64::new();
+    host.hash(&mut hasher);
+    // Fixed width, unlike `utils::generate_id`: the budget below is only correct if the suffix
+    // cannot shrink, and a hash with leading zeros would silently widen the readable half.
+    let suffix = format!("-{:016x}", hasher.finish());
+    let budget = utils::MAX_DNS_LABEL_LEN.saturating_sub(suffix.len());
+    format!("{}{suffix}", utils::readable_name_segment(host, budget))
 }
 
 /// Name of this run's client-cert Secret, shared by `job_builder`'s mount and `ensure_client_cert`.
@@ -334,12 +363,23 @@ fn run_labels(
             execution_hash.to_string(),
         ),
         (labels::RUN_ID.to_string(), run_id.to_string()),
-        (labels::PLAYBOOKPLAN_HOST.to_string(), host.to_string()),
+        (labels::PLAYBOOKPLAN_HOST.to_string(), host_segment(host)),
         (
             labels::COMPONENT.to_string(),
             labels::MANAGED_SSH_PROXY_COMPONENT.to_string(),
         ),
     ])
+}
+
+/// The full, unbounded host a proxy resource serves, under the same key as the label.
+///
+/// An annotation has no length limit, so this is the one place a Node name is guaranteed to appear
+/// exactly as the cluster spells it — the label next to it may be a truncated form (`host_segment`),
+/// and the pod's `nodeSelector` is the only other verbatim copy. Deliberately written for every
+/// host, not only the truncated ones: an annotation that appears conditionally is one a reader
+/// cannot rely on, and a script that reads it should not have to know which case it is in.
+fn run_annotations(host: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([(labels::PLAYBOOKPLAN_HOST.to_string(), host.to_string())])
 }
 
 /// `ForceCommand` routes every session through `enter-host.sh` rather than `ChrootDirectory` —
@@ -450,6 +490,7 @@ fn build_secret(
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             labels: Some(run_labels(execution_hash, run_id, host)),
+            annotations: Some(run_annotations(host)),
             ..Default::default()
         },
         string_data: Some(string_data),
@@ -542,6 +583,7 @@ fn build_pod(
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             labels: Some(run_labels(execution_hash, run_id, host)),
+            annotations: Some(run_annotations(host)),
             ..Default::default()
         },
         spec: Some(PodSpec {
@@ -931,10 +973,11 @@ mod tests {
     use super::*;
 
     /// Pins the wire format of the per-attempt resource names, and the length budget behind
-    /// `resource_name` — see its doc comment for why nothing truncates there.
+    /// `resource_name` — the worst case is a Node name that has to be truncated, so the bound is
+    /// exercised through the longest name Kubernetes will accept rather than assumed.
     #[test]
     fn attempt_scoped_resource_names_keep_their_shape_and_fit() {
-        use crate::utils::{MAX_DNS_LABEL_LEN, MAX_DNS_SUBDOMAIN_LEN, generate_id_with_length};
+        use crate::utils::{MAX_DNS_SUBDOMAIN_LEN, generate_id_with_length};
         use crate::v1beta1::controllers::playbookplancontroller::reconciler::RUN_ID_LENGTH;
 
         assert_eq!(
@@ -943,14 +986,123 @@ mod tests {
         );
         assert_eq!(client_cert_secret_name("run-a"), "managed-ssh-client-run-a");
 
-        // The host is bounded by the label cap (it is also a label value), the whole name by the
-        // subdomain cap (it names a Pod and a Secret).
         let run_id = generate_id_with_length(u64::MAX, RUN_ID_LENGTH);
-        let name = resource_name(&"n".repeat(MAX_DNS_LABEL_LEN), &run_id);
+        let name = resource_name(&"n".repeat(MAX_DNS_SUBDOMAIN_LEN), &run_id);
         assert!(
             name.len() <= MAX_DNS_SUBDOMAIN_LEN,
             "worst-case proxy resource name is {} characters",
             name.len()
+        );
+    }
+
+    /// A Node name may be a 253-character DNS subdomain; the `PLAYBOOKPLAN_HOST` label value it is
+    /// written to stops at 63, and the pod name built from it has to stay a legal subdomain. The
+    /// bound is established here, not assumed by the callers.
+    #[test]
+    fn an_over_long_host_is_truncated_with_a_hash_and_a_short_one_is_left_alone() {
+        use crate::utils::MAX_DNS_LABEL_LEN;
+
+        // What every cluster in existence hits: nothing is rewritten, so a node's name is still
+        // exactly what an administrator selects and greps on — and nothing that works today moves.
+        for host in [
+            "worker-1",
+            "ip-10-0-1-23.eu-central-1.compute.internal",
+            &"n".repeat(MAX_DNS_LABEL_LEN),
+        ] {
+            assert_eq!(
+                host_segment(host),
+                host,
+                "a host that fits is used verbatim"
+            );
+        }
+
+        let long = format!("{}.nodes.example.com", "a".repeat(60));
+        let segment = host_segment(&long);
+        assert!(
+            segment.len() <= MAX_DNS_LABEL_LEN,
+            "a label value stops at {MAX_DNS_LABEL_LEN}, got {}",
+            segment.len()
+        );
+        assert!(
+            segment.starts_with("aaa") && segment.len() > 16,
+            "the readable half has to survive: {segment}"
+        );
+        assert_eq!(
+            segment,
+            host_segment(&long),
+            "the name is how the operator finds what it already created, so it cannot vary"
+        );
+
+        // Long names are long because of a shared suffix far more often than a shared prefix, so
+        // the hash has to be of the whole name, not of the part that was cut.
+        let sibling = format!("{}.nodes.example.com", "a".repeat(59) + "b");
+        assert_ne!(
+            host_segment(&long),
+            host_segment(&sibling),
+            "two nodes agreeing over the truncated prefix must not share a cleanup identity"
+        );
+
+        // Truncating onto a dot would otherwise leave the suffix opening a segment with a hyphen
+        // (`...aaa.-0123456789abcdef`), which the apiserver rejects in a Pod name.
+        let dotted = format!("{}.{}", "a".repeat(46), "b".repeat(30));
+        let name = resource_name(&dotted, "run-a");
+        assert!(
+            !name.contains(".-") && !name.contains("..") && !name.ends_with(['.', '-']),
+            "generated name must stay a legal DNS subdomain: {name}"
+        );
+    }
+
+    /// The label may be a truncated form, so the annotation is what still names the Node exactly.
+    #[test]
+    fn the_full_host_is_kept_in_an_annotation_next_to_the_bounded_label() {
+        use crate::utils::MAX_DNS_LABEL_LEN;
+        use crate::v1beta1::ca::CertificateAuthority;
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+
+        let long = format!("{}.nodes.example.com", "a".repeat(60));
+        let hash = calculate_execution_hash("playbook", std::iter::empty());
+        let name = resource_name(&long, "run-1");
+
+        let annotation_of = |annotations: Option<&BTreeMap<String, String>>| {
+            annotations
+                .and_then(|annotations| annotations.get(labels::PLAYBOOKPLAN_HOST))
+                .cloned()
+                .expect("a proxy resource must record the host it serves")
+        };
+
+        // Both objects, because both are what an administrator finds when looking for a node's proxy
+        // infrastructure, and the label on each may be the shortened form.
+        let pod = build_pod(&name, &name, &hash, "run-1", &long, None, "proxy:latest");
+        let secret = build_secret(
+            &name,
+            &hash,
+            "run-1",
+            &long,
+            &CertificateAuthority::generate().unwrap(),
+        )
+        .unwrap();
+
+        for annotations in [
+            pod.metadata.annotations.as_ref(),
+            secret.metadata.annotations.as_ref(),
+        ] {
+            let recorded = annotation_of(annotations);
+            assert_eq!(recorded, long, "the annotation is the exact Node name");
+            assert!(
+                recorded.len() > MAX_DNS_LABEL_LEN,
+                "the point of the annotation is that it is not subject to the label cap"
+            );
+        }
+
+        assert_eq!(
+            pod.metadata.labels.as_ref().unwrap()[labels::PLAYBOOKPLAN_HOST],
+            host_segment(&long),
+            "the label carries the bounded form the pod is named after"
+        );
+        assert_eq!(
+            run_annotations("worker-1")[labels::PLAYBOOKPLAN_HOST],
+            "worker-1",
+            "written for every host, not only the ones that had to be shortened"
         );
     }
 

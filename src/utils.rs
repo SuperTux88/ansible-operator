@@ -12,6 +12,28 @@ pub const MAX_DNS_LABEL_LEN: usize = 63;
 #[cfg(test)]
 pub const MAX_DNS_SUBDOMAIN_LEN: usize = 253;
 
+/// The readable half of a generated resource name or label value: at most `budget` characters, and
+/// safe to concatenate a `-`-prefixed suffix onto. The suffix that follows it is usually a
+/// [`generate_id`] short id or a hash, and the budget is usually what [`MAX_DNS_LABEL_LEN`] leaves
+/// after it.
+///
+/// The names this is built from are DNS *subdomains* — a plan's name, a Node's — so they may contain
+/// dots, and the names built from them are read as subdomains too, where a dot starts a new label.
+/// Truncating a dotted name can therefore land exactly on a dot and leave the suffix opening a label
+/// with a hyphen: `apply-my.-abcdefghij-1`, which the apiserver rejects even though the name it came
+/// from was perfectly valid. Dots are folded to hyphens *before* truncating, so the result is a
+/// single label whatever the cut removes, and any trailing hyphen is then trimmed so the join cannot
+/// produce a doubled separator. A label *value* has no segments to protect, but it does have to end
+/// alphanumeric, which the same trim gives it.
+pub fn readable_name_segment(name: &str, budget: usize) -> String {
+    name.chars()
+        .map(|character| if character == '.' { '-' } else { character })
+        .take(budget)
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_string()
+}
+
 pub async fn create_or_update<K>(
     api: &kube::Api<K>,
     field_manager: &str,
@@ -307,5 +329,34 @@ mod tests {
 
         assert_eq!(conditions.len(), 2);
         assert_eq!(conditions[1].type_, "Blocked");
+    }
+
+    /// The rule the whole helper exists for: a generated name is read as a DNS subdomain, so the
+    /// truncated half must never leave the `-`-prefixed suffix opening a segment.
+    #[test]
+    fn a_truncated_name_segment_stays_safe_to_append_a_suffix_to() {
+        assert_eq!(readable_name_segment("web", 63), "web");
+        assert_eq!(readable_name_segment("my-plan", 4), "my-p");
+
+        // Dots are folded rather than kept, so the cut cannot land between segments.
+        assert_eq!(
+            readable_name_segment("worker-1.eu-central-1.compute.internal", 63),
+            "worker-1-eu-central-1-compute-internal"
+        );
+
+        // Every prefix length of a dotted name: none may end on a separator, because the caller
+        // appends `-<id>` and `..-x` or `.-x` is not a legal subdomain.
+        let name = "a.bb.ccc.dddd";
+        for budget in 0..=name.len() {
+            let segment = readable_name_segment(name, budget);
+            assert!(
+                !segment.ends_with('-') && !segment.ends_with('.') && !segment.contains('.'),
+                "budget {budget} produced {segment:?}, which a suffix cannot be appended to"
+            );
+            assert!(segment.len() <= budget);
+        }
+
+        // A name that is nothing but separators leaves nothing behind rather than a bare hyphen.
+        assert_eq!(readable_name_segment("...", 3), "");
     }
 }
