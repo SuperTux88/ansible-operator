@@ -1710,9 +1710,9 @@ enum ActiveRunProgress {
 /// Only the first can be acknowledged. Acknowledgement is a version-checked write against the run's
 /// own record, so aiming it at a name whose object is gone (or is now somebody else's) is not a
 /// weaker version of the same operation but a different one, and it is right for it to fail. Carrying
-/// the distinction here keeps [`play_history::acknowledge_finished`] strict — a UID mismatch during
-/// ordinary finalization is still a real ownership error — while letting the one caller that already
-/// knows there is nothing to acknowledge skip it.
+/// the distinction here keeps [`play_history::acknowledge_finished`] strict — during ordinary
+/// finalization a vanished record and a UID mismatch are both real ownership errors — while letting
+/// the one caller that already knows there is nothing to acknowledge skip it.
 #[derive(Debug, PartialEq, Eq)]
 enum TerminalRecord {
     /// The run's `Play` carried the result and is waiting to be acknowledged.
