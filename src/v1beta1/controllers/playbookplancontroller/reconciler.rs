@@ -2638,8 +2638,10 @@ fn record_triggered_slot(status: &mut PlaybookPlanStatus, slot: Option<DateTime<
 /// (Their host Leases are renewed first, so refusing is safe; see `renew_contested_locks`.)
 ///
 /// A terminal record whose result has not reached the plan yet does *not* count towards that
-/// invariant and is drained ahead of it: it owns no cluster resources any more, and handing its
-/// recap over is what allows the plan to move on at all.
+/// invariant and is drained ahead of anything live: it owns no cluster resources any more, and
+/// handing its recap over is what allows the plan to move on at all. The invariant is still settled
+/// first, because the drain describes the attempt that outlives the result and so must not be taken
+/// from a live set that was never proved to hold one.
 async fn recover_active_run(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -2666,30 +2668,8 @@ async fn recover_active_run(
         }
     }
 
-    // Hand a finished result over before looking at anything in flight: it is the only copy of that
-    // run's recap, the plan cannot start a replacement until it has been applied, and draining it is
-    // a pure status write that never touches the cluster resources a live run owns. `recoverable`
-    // comes back oldest-first, so several (if they ever do queue up) drain in the order they ran.
-    if let Some(play) = unacknowledged.first() {
-        let play_status = play
-            .status
-            .as_ref()
-            .expect("a record needing recovery has a status");
-        return Ok(Some(RecoveredRun::Finished {
-            finished: recorded_run_from_play(play)?,
-            status: play_status.clone(),
-            // The one-run invariant is checked below, on the tick that goes on to advance what is
-            // live; here the first record is enough to say the plan is still holding an attempt.
-            surviving: live.first().map(|live| SurvivingAttempt {
-                execution_hash: live.spec.execution_hash.clone(),
-                triggered_slot: live.spec.triggered_slot,
-            }),
-        }));
-    }
-
-    let play = match sole_active_record(&live) {
-        Ok(None) => return Ok(None),
-        Ok(Some(play)) => play,
+    let selected = match select_recoverable_record(&live, &unacknowledged) {
+        Ok(selected) => selected,
         Err(error) => {
             let names: Vec<&str> = live
                 .iter()
@@ -2706,6 +2686,25 @@ async fn recover_active_run(
             renew_contested_locks(context, object, &live).await;
             return Err(error);
         }
+    };
+
+    let play = match selected {
+        None => return Ok(None),
+        Some(RecoverableRecord::Finished { play, surviving }) => {
+            let play_status = play
+                .status
+                .as_ref()
+                .expect("a record needing recovery has a status");
+            return Ok(Some(RecoveredRun::Finished {
+                finished: recorded_run_from_play(play)?,
+                status: play_status.clone(),
+                surviving: surviving.map(|live| SurvivingAttempt {
+                    execution_hash: live.spec.execution_hash.clone(),
+                    triggered_slot: live.spec.triggered_slot,
+                }),
+            }));
+        }
+        Some(RecoverableRecord::Live(play)) => play,
     };
 
     let play_status = play
@@ -2840,6 +2839,38 @@ fn classify_record(play: &Play) -> RecordKind {
     }
 }
 
+/// What a tick has to recover, chosen from the records a plan holds.
+enum RecoverableRecord<'a> {
+    /// A terminal result to hand over, together with the attempt that outlives it, if any.
+    Finished {
+        play: &'a Play,
+        surviving: Option<&'a Play>,
+    },
+    /// An attempt that is genuinely in flight.
+    Live(&'a Play),
+}
+
+/// Picks that record. Pure so the order the two kinds are considered in is testable.
+///
+/// A queued terminal result wins, because it is the only copy of its run's recap and the plan cannot
+/// start anything until it has been applied — but only once the live set has been proved to hold at
+/// most one attempt. Draining names the surviving attempt off that set and ends the tick there, so
+/// taking it unproved would let a second live record pass a whole tick without being advanced or
+/// having its host Leases renewed, which is precisely what the refusal exists to prevent.
+fn select_recoverable_record<'a>(
+    live: &[&'a Play],
+    unacknowledged: &[&'a Play],
+) -> Result<Option<RecoverableRecord<'a>>, ReconcileError> {
+    let live_run = sole_active_record(live)?;
+    Ok(match unacknowledged.first() {
+        Some(play) => Some(RecoverableRecord::Finished {
+            play,
+            surviving: live_run,
+        }),
+        None => live_run.map(RecoverableRecord::Live),
+    })
+}
+
 /// The one in-flight record that may describe this plan's run, or `None` when it has none.
 ///
 /// Pure so the invariant is testable: a plan runs at most one attempt at a time, and every path
@@ -2849,8 +2880,9 @@ fn classify_record(play: &Play) -> RecordKind {
 /// stray record); silently choosing is not. The caller renews *every* candidate's host Leases before
 /// it acts on the refusal, so failing this way never also unprotects the hosts those runs hold.
 ///
-/// Terminal records awaiting acknowledgement are *not* in flight and are handled before this — they
-/// can legitimately queue up behind a live run after an outage.
+/// Terminal records awaiting acknowledgement are *not* in flight and are kept out of `live` — they
+/// can legitimately queue up behind a live run after an outage, and are drained once this has
+/// established that the run they queued behind is a single one.
 fn sole_active_record<'a>(live: &[&'a Play]) -> Result<Option<&'a Play>, ReconcileError> {
     match live {
         [] => Ok(None),
@@ -4359,6 +4391,32 @@ mod tests {
             Some("apply-web-abc-1")
         );
         assert!(sole_active_record(&[&first, &second]).is_err());
+    }
+
+    /// A queued terminal result must not buy a contested live set a free tick. Draining one ends the
+    /// tick, so if the refusal were deferred until the result had been handed over, the live record
+    /// the plan is *not* mirroring would go unadvanced and unrenewed until the drain completed —
+    /// leaving its host Leases to lapse while its Job and proxy pods are still running.
+    #[test]
+    fn a_queued_result_does_not_defer_the_refusal_over_two_live_runs() {
+        let play = |name: &str| Play::new(name, PlaySpec::default());
+        let (first, second) = (play("apply-web-abc-1"), play("apply-web-abc-2"));
+        let finished = play("apply-web-abc-0");
+
+        assert!(select_recoverable_record(&[], &[]).unwrap().is_none());
+        assert!(matches!(
+            select_recoverable_record(&[&first], &[]).unwrap(),
+            Some(RecoverableRecord::Live(play)) if play.metadata.name.as_deref() == Some("apply-web-abc-1")
+        ));
+        // One live run behind a result: the result is still drained first, and names that run as the
+        // attempt outliving it.
+        assert!(matches!(
+            select_recoverable_record(&[&first], &[&finished]).unwrap(),
+            Some(RecoverableRecord::Finished { play, surviving: Some(live) })
+                if play.metadata.name.as_deref() == Some("apply-web-abc-0")
+                    && live.metadata.name.as_deref() == Some("apply-web-abc-1")
+        ));
+        assert!(select_recoverable_record(&[&first, &second], &[&finished]).is_err());
     }
 
     #[test]
