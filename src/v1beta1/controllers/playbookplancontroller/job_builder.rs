@@ -218,26 +218,10 @@ pub(super) fn job_name(
     let prefix = "apply-";
     let suffix = format!("-{}-{retry_count}", run_short_id(plan_uid, hash));
     let budget = utils::MAX_DNS_LABEL_LEN.saturating_sub(prefix.len() + suffix.len());
-    format!("{prefix}{}{suffix}", plan_name_segment(plan_name, budget))
-}
-
-/// The readable, plan-naming half of a generated resource name: at most `budget` characters, and
-/// safe to concatenate a `-`-prefixed suffix onto.
-///
-/// A plan name is a DNS *subdomain*, so it may contain dots; the names built from it are read as
-/// subdomains too, and a dot in them starts a new label. Truncating a dotted name can therefore land
-/// exactly on a dot and leave the suffix opening a label with a hyphen — `apply-my.-abcdefghij-1`,
-/// which the apiserver rejects even though the plan's own name was perfectly valid. Dots are folded to
-/// hyphens *before* truncating so the segment is a single label whatever the cut removes, and any
-/// trailing hyphen is then trimmed so the suffix cannot produce a doubled separator at the join.
-fn plan_name_segment(plan_name: &str, budget: usize) -> String {
-    plan_name
-        .chars()
-        .map(|character| if character == '.' { '-' } else { character })
-        .take(budget)
-        .collect::<String>()
-        .trim_end_matches('-')
-        .to_string()
+    format!(
+        "{prefix}{}{suffix}",
+        utils::readable_name_segment(plan_name, budget)
+    )
 }
 
 /// How many symbols [`run_short_id`] mints. Ten, matching `reconciler::RUN_ID_LENGTH`, rather than
@@ -374,7 +358,10 @@ pub(super) fn job_network_policy_name(plan_name: &str, run_id: &str) -> String {
     let suffix = format!("-{}-{}-egress", utils::generate_id(hasher.finish()), run_id);
     let prefix = "playbook-";
     let budget = utils::MAX_DNS_LABEL_LEN.saturating_sub(prefix.len() + suffix.len());
-    format!("{prefix}{}{suffix}", plan_name_segment(plan_name, budget))
+    format!(
+        "{prefix}{}{suffix}",
+        utils::readable_name_segment(plan_name, budget)
+    )
 }
 
 /// Creates a Kubernetes Job with everything needed for basic Ansible execution, without any

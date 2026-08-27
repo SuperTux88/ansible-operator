@@ -463,6 +463,11 @@ identified without the plan, because a run's `Play` record is written *before* i
 or builds any proxy infrastructure, and is only removed after that infrastructure has been released.
 So every run ID that still owns resources either has a `Play` somewhere or has no plan left at all.
 
+The Node a proxy serves is read from its `ansible.cloudbending.dev/target-host` **annotation**, which
+always spells the Node name out in full. The label of the same name is the selectable form and is
+shortened — truncated, with a hash appended — for a Node whose name does not fit in a label value's
+63 characters, as is the pod's own name.
+
 List what the operator namespace holds and the run IDs that are still accounted for:
 
 ```sh
@@ -470,7 +475,7 @@ OPERATOR_NAMESPACE=ansible-operator
 
 kubectl get pods -n "$OPERATOR_NAMESPACE" \
   -l ansible.cloudbending.dev/component=managed-ssh-proxy \
-  -o custom-columns='NAME:.metadata.name,RUN:.metadata.labels.ansible\.cloudbending\.dev/run-id,HASH:.metadata.labels.ansible\.cloudbending\.dev/hash'
+  -o custom-columns='NAME:.metadata.name,RUN:.metadata.labels.ansible\.cloudbending\.dev/run-id,HASH:.metadata.labels.ansible\.cloudbending\.dev/hash,NODE:.metadata.annotations.ansible\.cloudbending\.dev/target-host'
 
 kubectl get leases -n "$OPERATOR_NAMESPACE" \
   -o custom-columns=NAME:.metadata.name,HOLDER:.spec.holderIdentity
