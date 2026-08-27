@@ -5,7 +5,10 @@ use crate::{
     v1beta1::{HostOutcome, PlayPhase, PlayStatus, PlaybookPlanCondition, PlaybookPlanStatus},
 };
 
-use super::{execution_evaluator::ExecutionHash, locking::BlockedBy};
+use super::{
+    execution_evaluator::{ExecutionHash, distinct_host_count},
+    locking::BlockedBy,
+};
 
 /// Whether this run's single Job has reached a terminal state — `Complete` or `Failed`.
 pub fn job_finished(job: &batch::v1::Job) -> bool {
@@ -263,11 +266,7 @@ pub fn clear_inputs_unavailable_condition(status: &mut PlaybookPlanStatus, outda
         return;
     }
 
-    let total: usize = status
-        .eligible_hosts
-        .iter()
-        .map(|group| group.hosts.len())
-        .sum();
+    let total = distinct_host_count(&status.eligible_hosts);
     let current = total.saturating_sub(outdated_count);
     let now = chrono::Local::now().fixed_offset();
     let condition = PlaybookPlanCondition {
@@ -336,6 +335,67 @@ mod tests {
             status.hosts_status.unwrap()["host-1"].last_applied_hash,
             h.to_string()
         );
+    }
+
+    /// Only a host that actually succeeded is stamped with the revision. `lastAppliedHash` is the
+    /// sole input to `find_outdated_hosts`, so stamping a host that failed, was never reached, or
+    /// whose result could not be recovered would declare it current and retire it from every future
+    /// run of this revision — the plan would report the failure once and then never touch the host
+    /// again. The outcome and the timestamp are recorded for all of them regardless, because those
+    /// are what report the failure; it is only the revision claim that is withheld.
+    #[test]
+    fn only_a_succeeded_host_is_stamped_with_the_applied_revision() {
+        let h = hash();
+        let mut status = PlaybookPlanStatus {
+            hosts_status: Some(BTreeMap::from([(
+                "failed".into(),
+                crate::v1beta1::HostStatus {
+                    last_applied_hash: "previous-revision".into(),
+                    last_outcome: HostOutcome::Succeeded,
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        let result = |outcome: HostOutcome| crate::v1beta1::PlayHostResult {
+            outcome,
+            ..Default::default()
+        };
+        let play_status = PlayStatus {
+            phase: PlayPhase::Failed,
+            host_count: 4,
+            hosts: BTreeMap::from([
+                ("succeeded".into(), result(HostOutcome::Succeeded)),
+                ("failed".into(), result(HostOutcome::Failed)),
+                ("not-reached".into(), result(HostOutcome::NotReached)),
+                ("unknown".into(), result(HostOutcome::Unknown)),
+            ]),
+            ..Default::default()
+        };
+
+        apply_terminal_play_status(&h, &play_status, &mut status);
+
+        let hosts = status.hosts_status.unwrap();
+        assert_eq!(hosts["succeeded"].last_applied_hash, h.to_string());
+        assert_eq!(
+            hosts["failed"].last_applied_hash, "previous-revision",
+            "a failed host keeps the last revision it really applied"
+        );
+        assert_eq!(
+            hosts["not-reached"].last_applied_hash, "",
+            "a host Ansible never reached has applied nothing"
+        );
+        assert_eq!(
+            hosts["unknown"].last_applied_hash, "",
+            "an unrecoverable result is not evidence the revision landed"
+        );
+        for host in ["succeeded", "failed", "not-reached", "unknown"] {
+            assert_eq!(
+                hosts[host].last_outcome, play_status.hosts[host].outcome,
+                "{host} must still report what happened to it"
+            );
+            assert!(hosts[host].last_transition_time.is_some(), "{host}");
+        }
     }
 
     #[test]
@@ -469,9 +529,37 @@ mod tests {
         assert_eq!(ready.reason.as_deref(), Some("RecapUnavailable"));
     }
 
+    /// A new attempt flips `Running` in place and leaves the previous run's `Ready` verdict exactly
+    /// as it was. `Ready` is a printer column that nothing else rewrites between runs, so blanking
+    /// or restating it at the start of a run would replace the last known state of the hosts with
+    /// "unknown" for the whole of that run — and a restated one would also move
+    /// `lastTransitionTime` for a verdict that did not transition.
     #[test]
     fn set_running_condition_marks_the_plan_as_running() {
         let mut status = PlaybookPlanStatus::default();
+        apply_terminal_play_status(
+            &hash(),
+            &PlayStatus {
+                phase: PlayPhase::Succeeded,
+                host_count: 1,
+                hosts: BTreeMap::from([(
+                    "host-1".into(),
+                    crate::v1beta1::PlayHostResult {
+                        outcome: HostOutcome::Succeeded,
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+            &mut status,
+        );
+        let ready_before = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Ready")
+            .cloned()
+            .expect("a finished run leaves a Ready verdict behind");
+
         set_running_condition(&mut status);
 
         let running = status
@@ -480,9 +568,27 @@ mod tests {
             .find(|c| c.type_ == "Running")
             .unwrap();
         assert_eq!(running.status, "True");
-        assert!(
-            status.conditions.iter().all(|c| c.type_ != "Ready"),
-            "Ready shouldn't be evaluated while the job is still running"
+        assert_eq!(
+            status
+                .conditions
+                .iter()
+                .filter(|c| c.type_ == "Running")
+                .count(),
+            1,
+            "the previous run's Running=False must be replaced in place, not appended to"
+        );
+
+        let ready_after = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Ready")
+            .expect("Ready shouldn't be withdrawn while the job is still running");
+        assert_eq!(ready_after.status, ready_before.status);
+        assert_eq!(ready_after.reason, ready_before.reason);
+        assert_eq!(ready_after.message, ready_before.message);
+        assert_eq!(
+            ready_after.last_transition_time, ready_before.last_transition_time,
+            "Ready shouldn't be re-evaluated while the job is still running"
         );
     }
 

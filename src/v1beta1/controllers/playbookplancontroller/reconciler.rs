@@ -25,7 +25,7 @@ use crate::v1beta1::{
     Phase, Play, PlaybookPlanStatus, ResolvedHosts, ResolvedInventoryGroup, StaticInventory,
     Toleration, ansible, flatten_hosts, labels,
     playbookplancontroller::{
-        execution_evaluator::{ExecutionHash, find_all_hosts},
+        execution_evaluator::{ExecutionHash, distinct_host_count, find_all_hosts},
         locking, managed_ssh,
         triggers::{Timing, evaluate_schedule, forecast_next_run},
         workspace::render_secret,
@@ -502,24 +502,16 @@ async fn reconcile(
         match resolve_authorized_inventory(&context, &object).await {
             Ok(resolved) => resolved,
             Err(error) => {
-                let summary = format!("cannot resolve the plan's inventories: {error}");
-                if let Some(unlaunched) = unlaunched_run.as_ref() {
-                    handle_unlaunched_input_error(
-                        &context,
-                        &object,
-                        &api,
-                        unlaunched,
-                        &mut resource_status,
-                        &error,
-                        &summary,
-                    )
-                    .await?;
-                } else {
-                    // Nothing in flight to hold open, but the plan still has to say why it is not
-                    // running: a deleted inventory would otherwise leave the last successful run's
-                    // summary standing while every tick fails in the log only.
-                    report_input_failure(&api, &object, &mut resource_status, summary).await;
-                }
+                report_desired_input_error(
+                    &context,
+                    &object,
+                    &api,
+                    unlaunched_run.as_ref(),
+                    &mut resource_status,
+                    &error,
+                    format!("cannot resolve the plan's inventories: {error}"),
+                )
+                .await?;
                 return Err(error);
             }
         };
@@ -555,26 +547,20 @@ async fn reconcile(
     {
         Ok(hash) => hash,
         Err(error) => {
-            let summary = format!("cannot read referenced Secrets: {error}");
-            if let Some(unlaunched) = unlaunched_run.as_ref() {
-                // Same decision as the inventory read above, through the same function: a Secret
-                // that is merely unreadable holds the attempt open, a Secret that is gone supersedes
-                // it. Holding is safe here — the inventory resolved, so this attempt's hosts are
-                // still known-authorized — but it is not free: the hold renews their Leases every
-                // tick, and an indefinite one starves every other plan targeting those hosts.
-                handle_unlaunched_input_error(
-                    &context,
-                    &object,
-                    &api,
-                    unlaunched,
-                    &mut resource_status,
-                    &error,
-                    &summary,
-                )
-                .await?;
-            } else {
-                report_input_failure(&api, &object, &mut resource_status, summary).await;
-            }
+            // A held attempt is holding *host Leases* by this point — the inventory resolved, so
+            // its hosts are still known-authorized and the hold is safe, but it is not free: the
+            // hold renews those Leases every tick, and an indefinite one starves every other plan
+            // targeting the same hosts. That is what `input_error_supersedes_unlaunched` bounds.
+            report_desired_input_error(
+                &context,
+                &object,
+                &api,
+                unlaunched_run.as_ref(),
+                &mut resource_status,
+                &error,
+                format!("cannot read referenced Secrets: {error}"),
+            )
+            .await?;
             return Err(error);
         }
     };
@@ -774,11 +760,7 @@ async fn reconcile(
                 Some("previous run finished; the next scheduled run is already due".to_string());
             requeue_after = std::time::Duration::from_secs(1);
         } else {
-            let total_count: usize = resource_status
-                .eligible_hosts
-                .iter()
-                .map(|group| group.hosts.len())
-                .sum();
+            let total_count = distinct_host_count(&resource_status.eligible_hosts);
             // Reaching here without a schedule means it was removed mid-run: the eligibility gate
             // normally stops such a plan from ever starting one. Log the anomaly — `decide_terminal`
             // deliberately leaves the plan in `Applying` for this case.
@@ -810,11 +792,7 @@ async fn reconcile(
     {
         // A failed input read clears the visible terminal state, but not the per-host results. Once
         // the inputs recover, restore the idle verdict instead of waiting for a hash change.
-        let total_count: usize = resource_status
-            .eligible_hosts
-            .iter()
-            .map(|group| group.hosts.len())
-            .sum();
+        let total_count = distinct_host_count(&resource_status.eligible_hosts);
         restore_idle_oneshot_status(&mut resource_status, total_count);
     } else if eligible_to_start && resource_status.active_run.is_none() {
         match timing {
@@ -1434,7 +1412,6 @@ async fn try_start_run(
 
     let holder_identity = holder_identity(run.namespace, run.name, &active_run);
     resource_status.retry_count = active_run.mirror.attempt;
-    resource_status.current_job_name = Some(active_run.mirror.job_name.clone());
     resource_status.phase = Phase::Applying;
     resource_status.summary = Some(applying_summary(&active_run.mirror));
     resource_status.next_run = None;
@@ -1710,9 +1687,9 @@ enum ActiveRunProgress {
 /// Only the first can be acknowledged. Acknowledgement is a version-checked write against the run's
 /// own record, so aiming it at a name whose object is gone (or is now somebody else's) is not a
 /// weaker version of the same operation but a different one, and it is right for it to fail. Carrying
-/// the distinction here keeps [`play_history::acknowledge_finished`] strict — a UID mismatch during
-/// ordinary finalization is still a real ownership error — while letting the one caller that already
-/// knows there is nothing to acknowledge skip it.
+/// the distinction here keeps [`play_history::acknowledge_finished`] strict — during ordinary
+/// finalization a vanished record and a UID mismatch are both real ownership errors — while letting
+/// the one caller that already knows there is nothing to acknowledge skip it.
 #[derive(Debug, PartialEq, Eq)]
 enum TerminalRecord {
     /// The run's `Play` carried the result and is waiting to be acknowledged.
@@ -1927,7 +1904,6 @@ async fn advance_active_run(
         resource_status,
     );
     resource_status.active_run = None;
-    resource_status.current_job_name = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
         record: TerminalRecord::Present,
@@ -1982,7 +1958,6 @@ async fn finalize_lost_run(
         resource_status,
     );
     resource_status.active_run = None;
-    resource_status.current_job_name = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
         record: TerminalRecord::Lost,
@@ -2158,7 +2133,6 @@ async fn abandon_run(
 
     if mirrors_run(resource_status, run) {
         resource_status.active_run = None;
-        resource_status.current_job_name = None;
         resource_status.phase = Phase::Pending;
         resource_status.next_run = None;
     }
@@ -2377,6 +2351,47 @@ async fn preserve_unlaunched_run_after_error(
     }
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
         warn!("Could not report paused run recovery on {namespace}/{name}: {patch_error}");
+    }
+}
+
+/// Reports a failed desired-input read on the plan, whichever of the two reads it came from and
+/// whether or not an attempt is waiting behind it.
+///
+/// Both reads — the inventories and the referenced Secrets — fail the same way and are answered the
+/// same way, so the choice between the two reporting paths is made once here instead of at each
+/// call site. What differs between them is only the diagnostic, which the caller passes in.
+///
+/// The caller still returns the original error afterwards: this reports, it does not decide the
+/// tick's outcome.
+async fn report_desired_input_error(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    api: &Api<PlaybookPlan>,
+    unlaunched: Option<&UnlaunchedRun>,
+    resource_status: &mut PlaybookPlanStatus,
+    error: &ReconcileError,
+    summary: String,
+) -> Result<(), ReconcileError> {
+    match unlaunched {
+        Some(unlaunched) => {
+            handle_unlaunched_input_error(
+                context,
+                object,
+                api,
+                unlaunched,
+                resource_status,
+                error,
+                &summary,
+            )
+            .await
+        }
+        // Nothing in flight to hold open, but the plan still has to say why it is not running: a
+        // deleted inventory or Secret would otherwise leave the last successful run's summary
+        // standing while every tick fails in the log only.
+        None => {
+            report_input_failure(api, object, resource_status, summary).await;
+            Ok(())
+        }
     }
 }
 
@@ -2990,15 +3005,17 @@ fn update_desired_hash(status: &mut PlaybookPlanStatus, execution_hash: &Executi
     status.last_triggered_run = None;
     if status.active_run.is_none() {
         status.phase = Phase::Pending;
-        status.current_job_name = None;
     }
 }
 
+/// Restores the terminal verdict a `OneShot` plan had before a failed input read cleared it.
+///
+/// The conditions under which that is the right thing to do — idle, `OneShot`, no outdated hosts,
+/// per-host results still on the plan, and a phase that a read failure reset to `Pending` — are the
+/// caller's `else if`, and are not restated here. They have to be the caller's: they select this
+/// branch out of the chain that also decides scheduling, so a plan that fails them must fall
+/// through to the next arm rather than reach a function that quietly does nothing.
 fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usize) {
-    if status.phase != Phase::Pending || status.hosts_status.is_none() {
-        return;
-    }
-
     status.phase = Phase::Succeeded;
     status.next_run = None;
     status.summary = Some(format!("{total_count}/{total_count} up-to-date"));
@@ -3011,7 +3028,6 @@ fn adopt_recovered_attempt(status: &mut PlaybookPlanStatus, active_run: &ActiveR
     if status.current_hash == active_run.execution_hash {
         status.retry_count = status.retry_count.max(active_run.attempt);
     }
-    status.current_job_name = Some(active_run.job_name.clone());
     status.phase = Phase::Applying;
     status.summary = Some(applying_summary(active_run));
     status.active_run = Some(active_run.clone());
@@ -3105,7 +3121,6 @@ async fn finalize_finished_run(
 
     if mirrors_run(resource_status, finished) {
         resource_status.active_run = None;
-        resource_status.current_job_name = None;
         resource_status.phase = Phase::Pending;
         resource_status.next_run = None;
     }
@@ -5896,7 +5911,6 @@ spec:
                 triggered_slot: Some(slot),
             }),
             current_hash: old_hash.to_string(),
-            current_job_name: Some("apply-plan-1-1".into()),
             phase: Phase::Applying,
             retry_count: 1,
             last_triggered_run: Some(slot),
@@ -5909,10 +5923,14 @@ spec:
         assert_eq!(status.phase, Phase::Applying);
         assert_eq!(status.retry_count, 0);
         assert_eq!(status.last_triggered_run, None);
-        assert_eq!(status.current_job_name.as_deref(), Some("apply-plan-1-1"));
         assert_eq!(
             status.active_run.as_ref().unwrap().execution_hash,
             old_hash.to_string()
+        );
+        assert_eq!(
+            status.active_run.as_ref().unwrap().job_name,
+            "apply-plan-1-1",
+            "the run in flight keeps the Job it is reconciled through"
         );
         assert_eq!(
             status.active_run.as_ref().unwrap().triggered_slot,
@@ -5921,7 +5939,6 @@ spec:
 
         let mut idle = PlaybookPlanStatus {
             current_hash: old_hash.to_string(),
-            current_job_name: Some("old-job".into()),
             phase: Phase::Succeeded,
             retry_count: 3,
             last_triggered_run: Some(slot),
@@ -5929,7 +5946,6 @@ spec:
         };
         update_desired_hash(&mut idle, &new_hash);
         assert_eq!(idle.phase, Phase::Pending);
-        assert_eq!(idle.current_job_name, None);
         assert_eq!(idle.retry_count, 0);
         assert_eq!(idle.last_triggered_run, None);
     }
@@ -6120,7 +6136,6 @@ spec:
         adopt_recovered_attempt(&mut matching, &active_run);
         assert_eq!(matching.retry_count, 4);
         assert_eq!(matching.phase, Phase::Applying);
-        assert_eq!(matching.current_job_name.as_deref(), Some("apply-plan-1-4"));
         assert_eq!(
             matching
                 .active_run

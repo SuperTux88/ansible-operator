@@ -38,7 +38,7 @@ use crate::v1beta1::{
     labels,
     playbookplancontroller::{
         callback_output::{CallbackOutput, HostStats},
-        execution_evaluator::ExecutionHash,
+        execution_evaluator::{self, ExecutionHash},
         reconciler::playbookplan_owner_ref,
     },
 };
@@ -126,14 +126,13 @@ fn prepared_status(play: &PlayRef<'_>) -> PlayStatus {
 /// twice but is one host to Ansible, so a count that said otherwise would make a clean run look
 /// partially failed for as long as the record stayed non-terminal.
 fn distinct_host_count(inventory: &[ResolvedHosts]) -> u32 {
-    inventory
-        .iter()
-        .flat_map(|group| group.hosts.iter())
-        .collect::<std::collections::HashSet<&String>>()
-        .len() as u32
+    execution_evaluator::distinct_host_count(inventory) as u32
 }
 
-/// Marks a prepared run as running after its exact Job has been created or independently observed.
+/// Marks a `Launching` run as running after its exact Job has been created or independently
+/// observed. A record that has not yet committed to start (`Prepared`, `Starting`) is rejected: the
+/// point of `commit_launching` is that live authorization passed *before* a Job could exist, so a
+/// caller holding one that skipped it is describing a Job this protocol never allowed.
 /// Terminal status is monotonic: a stale starter never changes a finished Play back to `Running`.
 pub async fn record_running(
     client: &kube::Client,
@@ -358,6 +357,16 @@ pub fn needs_recovery(play: &Play) -> bool {
             .is_some_and(|status| !status.plan_status_recorded)
 }
 
+/// Marks a terminal record's result as folded into its plan, which is what stops it being drained a
+/// second time and what releases it to retention.
+///
+/// Strict about the record still being there: a caller only reaches this having read the result off
+/// that very record this tick, so a name that is now empty — or now holds a different object — means
+/// something outside the protocol removed the receipt for a privileged run between the read and the
+/// acknowledgement. That is worth one failed tick to say out loud. It costs no more than that: the
+/// plan's own status was already patched before this call, so the run is persisted and the retry
+/// finds nothing left to finalize. Callers that *know* there is nothing to acknowledge pass
+/// `TerminalRecord::Lost` and never come here.
 pub async fn acknowledge_finished(
     client: &kube::Client,
     namespace: &str,
@@ -365,9 +374,12 @@ pub async fn acknowledge_finished(
     play_uid: &str,
 ) -> Result<(), ReconcileError> {
     let api = Api::<Play>::namespaced(client.clone(), namespace);
-    let Some(object) = api.get_opt(play_name).await? else {
-        return Ok(());
-    };
+    let object = api
+        .get_opt(play_name)
+        .await?
+        .ok_or(ReconcileError::PreconditionFailed(
+            "finished Play disappeared before it could be acknowledged",
+        ))?;
     verify_play_uid(&object, play_uid)?;
     let status = object
         .status
