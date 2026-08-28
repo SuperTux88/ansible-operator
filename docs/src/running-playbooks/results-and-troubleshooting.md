@@ -162,9 +162,10 @@ retention pass on ordinary reconciles if a deletion fails, so a temporary API er
 permanently leave old records behind. Deleting the `PlaybookPlan` removes all of its Plays.
 
 Only *finished* Plays are counted against the history limits, and a finished one is temporarily kept
-until its result has been folded into the plan — so the limits can never discard the only surviving
-copy of a run's recap. Once acknowledged, an old record whose deletion failed remains eligible for
-the next retention pass, including when a history limit is zero. An `Aborted` record is deleted after
+until its complete result, including the terminal phase and retry status, has been persisted on the
+plan — so the limits can never discard the only surviving copy of a run's recap. Once acknowledged,
+an old record whose deletion failed remains eligible for the next retention pass, including when a
+history limit is zero. An `Aborted` record is deleted after
 its resources are cleaned up rather than by history pruning. If cleanup keeps failing, the record
 deliberately remains as the retry handle for resources that may still be privileged. Deleting a Play by
 hand is safe once its
