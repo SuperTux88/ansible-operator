@@ -402,6 +402,12 @@ instead, and `.status.activeRun` names the run it is waiting on:
   kubectl delete lease -n "$OPERATOR_NAMESPACE" <matching-lease-name> [...]
   ```
 
+  Re-read the holder identity of each Lease immediately before deleting it, and delete it only while
+  it still names this run. A host lock is the one thing another plan can take over between the two
+  commands: a lapsed Lease is acquired by whichever run wants that host next, and it keeps the same
+  Lease name. If the holder no longer matches, **stop** — the host now belongs to a live run, and
+  deleting its Lease hands the same host to a third run while Ansible is on it.
+
   Once those resources are gone, the operator can delete the `Aborted` Play itself on its next
   retry. Delete the Play by hand only after verifying the cleanup; deleting the recovery handle
   first can leave privileged resources with nothing identifying them for later cleanup.
@@ -453,6 +459,29 @@ hand, the manual cleanup procedure under [The plan is stuck in
 first block, which reads the same values from a `Play` that no longer exists, and set `RUN_ID`, `HASH`
 and `SELECTOR` from what you captured.
 
+That procedure is written for a run the operator had already given up, whose playbook is therefore no
+longer executing. Here it may still be — a pod that will not stop is the first reason to land in this
+section at all — so stop the run yourself before running any of it, in the order the operator itself
+uses. Deleting the plan reaps the Job too, but with the deleting client's propagation policy, which
+does not order the Job's removal after its pods; cancel it explicitly and wait:
+
+```sh
+JOB=<jobName>
+RUN_ID=<runId>
+
+kubectl delete job "$JOB" -n "$PLAN_NAMESPACE" --cascade=foreground --ignore-not-found
+kubectl get job "$JOB" -n "$PLAN_NAMESPACE"
+kubectl get pods -n "$PLAN_NAMESPACE" -l "ansible.cloudbending.dev/run-id=$RUN_ID"
+```
+
+Both reads must come back empty before you delete anything else. Foreground deletion keeps the Job
+until garbage collection has removed every pod of it, so a Job that is gone is proof that no pod of it
+survives; the pods are still listed afterwards because a pod outlives its Job object while it
+terminates, and it is the pod that holds the SSH session. Releasing the run's Leases before that
+hands its hosts to another plan while Ansible is still talking to them — which is the single outcome
+the whole locking design exists to prevent, and the reason the operator waits here rather than
+proceeding.
+
 If the plan is already gone and nothing was captured, use [orphaned run resources with no
 plan](#orphaned-run-resources-with-no-plan) below.
 
@@ -460,9 +489,17 @@ plan](#orphaned-run-resources-with-no-plan) below.
 
 Proxy pods and host Leases in the operator's namespace outlive a plan that was force-deleted, and
 they carry no plan name — only an execution hash, a run ID and a target host. They can still be
-identified without the plan, because a run's `Play` record is written *before* it takes any host lock
-or builds any proxy infrastructure, and is only removed after that infrastructure has been released.
-So every run ID that still owns resources either has a `Play` somewhere or has no plan left at all.
+identified without the plan, because a live run is always named by one of two records: its `Play`,
+written *before* it takes any host lock or builds any proxy infrastructure and removed by the operator
+only after that infrastructure has been released, and its plan's `status.activeRun`, which mirrors the
+same run for as long as the plan holds it.
+
+Both have to be checked, because neither alone is proof. A `Play` can be deleted out from under a
+live run — by hand, or by anything else with access to it — and the operator supports that: it
+releases the run from `status.activeRun` instead, and reports its hosts as `Unknown`. Until it gets
+to that, and for the whole of any operator outage, the run is live, its Leases and proxy pods are
+live, and no `Play` names it. A run that appears in *neither* record is the orphan this section is
+about.
 
 The Node a proxy serves is read from its `ansible.cloudbending.dev/target-host` **annotation**, which
 always spells the Node name out in full. The label of the same name is the selectable form and is
@@ -483,21 +520,33 @@ kubectl get leases -n "$OPERATOR_NAMESPACE" \
 
 kubectl get plays -A \
   -o custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,RUN:.spec.runId
+
+kubectl get playbookplans -A \
+  -o custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,RUN:.status.activeRun.runId
 ```
 
-Compare them run ID by run ID. A Lease's holder identity is `<plan namespace>/<plan>/<run ID>`, so
-its third field is what to match on:
+Compare them run ID by run ID, against both of the last two listings. A Lease's holder identity is
+`<plan namespace>/<plan>/<run ID>`, so its third field is what to match on:
 
-- **the run ID appears in no `Play`** — its plan is gone, so nothing will ever come back for these
+- **the run ID appears in a `Play` or in a plan's `activeRun`** — that record is the run's recovery
+  handle and the operator may still be working on it. Do not delete anything by hand; go to that
+  plan and follow the per-run procedure, which is written for exactly that case. A run named only by
+  an `activeRun` is a live run whose `Play` was deleted; the operator releases it from that mirror on
+  its own, and a plan stuck in `Terminating` is the section above, not this one.
+- **the run ID appears in neither** — its plan is gone, so nothing will ever come back for these
   resources. Delete them with the commands under [The plan is stuck in
   `Applying`](#the-plan-is-stuck-in-applying), using that run ID and the hash from the pod's label.
   Only the operator-namespace commands apply: the run's plan-namespace resources were owned by the
   plan and Kubernetes removed them with it. If you need the plan's name and namespace anyway — to
   record what was cleaned up, or to match a Lease to a pod — the Lease's holder identity is the last
   place they still appear.
-- **the run ID does appear in a `Play`** — that record is the run's recovery handle and the operator
-  may still be working on it. Do not delete anything by hand; go to that `Play`'s plan and follow the
-  per-run procedure, which is written for exactly that case.
+
+  Confirm first that the run's pods are gone, in the namespace the Lease's holder identity names:
+  `kubectl get pods -n <plan namespace> -l ansible.cloudbending.dev/run-id=<run ID>`. The run's Job
+  was reaped with its plan, but under background propagation — the default — the Job object is removed
+  at once and its pods are deleted afterwards, so a Job that is already gone says nothing about
+  whether Ansible has stopped. If that namespace was deleted along with the plan, the pods went with
+  it and there is nothing left to wait for.
 
 ### Hosts show `NotReached`
 
