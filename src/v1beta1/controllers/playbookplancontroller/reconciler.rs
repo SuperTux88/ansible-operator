@@ -23,9 +23,9 @@ use tracing::{debug, error, info, warn};
 use crate::v1beta1::{
     ActiveRun, AnsibleInventory, ClusterInventory, ExecutionMode, GenericMap, NodeAccessPolicy,
     Phase, Play, PlaybookPlanStatus, ResolvedHosts, ResolvedInventoryGroup, StaticInventory,
-    ansible, flatten_hosts, labels,
+    ansible, distinct_host_count, flatten_hosts, labels,
     playbookplancontroller::{
-        execution_evaluator::{ExecutionHash, distinct_host_count, find_all_hosts},
+        execution_evaluator::{ExecutionHash, find_all_hosts},
         locking, managed_ssh,
         triggers::{Timing, evaluate_schedule, forecast_next_run},
         workspace::render_secret,

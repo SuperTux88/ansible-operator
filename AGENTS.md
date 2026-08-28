@@ -72,7 +72,7 @@ src/v1beta1/
     playbookplancontroller/          the big one — see below
     clusterinventorycontroller/      resolves Node → hosts, watches Nodes, writes ClusterInventoryStatus
     nodeaccesspolicycontroller/      writes NodeAccessPolicyStatus (matched namespaces / allowed nodes) for observability; watches ns + nodes
-    ansible_inventory.rs             ResolvedInventoryGroup (ManagedSsh | Ssh) + ResolvedHosts; AnsibleInventory trait (get_hosts)
+    ansible_inventory.rs             ResolvedInventoryGroup (ManagedSsh | Ssh) + ResolvedHosts; AnsibleInventory trait (get_hosts); distinct_hosts/_count (every host-population count, in both controllers)
     nodeselector.rs                  node_matches / selector_matches / selector_matches_fail_closed (INV-1)
     reconcile_error.rs               shared ReconcileError (thiserror)
   controllers/playbookplancontroller/

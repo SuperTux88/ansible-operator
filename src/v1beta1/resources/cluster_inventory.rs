@@ -60,7 +60,14 @@ impl From<Toleration> for k8s_openapi::api::core::v1::Toleration {
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterInventoryStatus {
+    /// How many distinct Nodes this inventory resolves to — the `Hosts` column. A Node matched by
+    /// two of the inventory's groups is listed in both of `resolvedHosts` and counted here once,
+    /// because that is what it is to a run: one host, applied to once. The plan's own `n/m hosts`
+    /// summaries and a `Play`'s `Hosts` column count the same way, and they are read side by side.
     pub host_count: usize,
+    /// The Nodes each group resolved to, with their group membership preserved — a Node in two
+    /// groups appears in both, which is what makes the rendered Ansible inventory's groups mean
+    /// something.
     pub resolved_hosts: Vec<ResolvedHosts>,
 }
 

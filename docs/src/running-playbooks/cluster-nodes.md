@@ -40,7 +40,10 @@ spec:
 
 The controller watches Nodes and keeps `.status.resolvedHosts` and `.status.hostCount` up to date as
 Nodes are labelled, added, or removed, so `kubectl get clusterinventory` shows how many Nodes
-currently match.
+currently match. `hostCount` counts each Node once even when several of the inventory's groups match
+it — the same way a plan's `n/m hosts` summary does, since one Node is one host to a run whatever it
+is grouped under. `resolvedHosts` still lists it under every group it belongs to; that is what makes
+the group names usable in a playbook's `hosts:`.
 
 ## Group variables
 

@@ -2,13 +2,13 @@ use k8s_openapi::api::batch;
 
 use crate::{
     utils::upsert_condition,
-    v1beta1::{HostOutcome, PlayPhase, PlayStatus, PlaybookPlanCondition, PlaybookPlanStatus},
+    v1beta1::{
+        HostOutcome, PlayPhase, PlayStatus, PlaybookPlanCondition, PlaybookPlanStatus,
+        distinct_host_count,
+    },
 };
 
-use super::{
-    execution_evaluator::{ExecutionHash, distinct_host_count},
-    locking::BlockedBy,
-};
+use super::{execution_evaluator::ExecutionHash, locking::BlockedBy};
 
 /// Whether this run's single Job has reached a terminal state — `Complete` or `Failed`.
 pub fn job_finished(job: &batch::v1::Job) -> bool {
