@@ -216,8 +216,11 @@ What the budget covers depends on the mode, because what counts as "the same pie
   duration of earlier attempts and reconciliation between them; otherwise the plan waits for the
   next tick with its unused tries.
 
-A run that never got as far as its Job — one given up because the plan was edited, suspended, or
-missed its window — is not a failed try, but it does consume a run number.
+A run that never got as far as its Job — one given up because the plan was edited, suspended, missed
+its window, or lost a host lock — is not a failed try, but it does consume a run number. If the same
+scheduled execution can still start, as after a host-lock takeover clears within its grace window,
+the unspent attempt remains available. Giving up a retry restores the preceding `Failed` verdict;
+giving up an execution's first attempt leaves the plan `Pending` because it has no verdict yet.
 
 ## Host locks
 
