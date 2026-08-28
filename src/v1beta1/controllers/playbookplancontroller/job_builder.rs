@@ -712,9 +712,13 @@ fn configure_job_for_managed_ssh_preflight(job: &mut Job, plan: &v1beta1::Playbo
                     name: MANAGED_SSH_PREFLIGHT_CONTAINER_NAME.into(),
                     image: Some(plan.spec.image.clone()),
                     working_dir: Some(paths::WORKSPACE_MOUNT_PATH.into()),
-                    // The plan's own image is the one container image guaranteed to be present on
-                    // this node and to hold a Python interpreter (ansible-core *is* Python), so the
-                    // gate needs no second image to mirror and no extra pull.
+                    // The plan's own image is the one already being pulled for this run, and
+                    // ansible-core *is* Python, so the gate needs no second image to mirror and no
+                    // extra pull. What that does not guarantee is the *name*: an image whose
+                    // interpreter is only reachable inside a virtualenv or as `python` fails here,
+                    // before the script's own fail-open handler can run, and the run produces no
+                    // recap at all. `python3` on `PATH` is therefore part of the documented image
+                    // contract (`playbook-plans.md`), not an assumption this code may widen.
                     command: Some(vec![
                         "python3".into(),
                         paths::managed_ssh_preflight_script_path(),

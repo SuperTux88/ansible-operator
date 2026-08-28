@@ -95,8 +95,8 @@ For each targeted Node in a run, the operator:
    same unchanged plan cannot reach the pods of the run it replaced.
 3. Locks each proxy pod's ingress to that run's Job with a NetworkPolicy.
 4. Renders the inventory so Ansible dials the proxy pod and verifies the Node's host certificate.
-5. Holds the Job back, in a `managed-ssh-preflight` init container, until every proxy actually
-   answers. See [Preflight connectivity check](#preflight-connectivity-check).
+5. Holds the Job back, in a `managed-ssh-preflight` init container, until every proxy it can expect
+   to reach actually answers. See [Preflight connectivity check](#preflight-connectivity-check).
 6. Tears the proxy pods, their Secrets, and the NetworkPolicy down when the run finishes.
 
 There is **no standing agent or DaemonSet** on your Nodes: proxy pods exist only for the duration of
@@ -113,10 +113,18 @@ run targeting several Nodes at once, the proxy on the Job's own Node answers imm
 remote ones briefly refuse connections.
 
 To keep that from surfacing as a failed run, the operator adds a `managed-ssh-preflight` init
-container that waits for every proxy in the run to answer on port 22 before `ansible-playbook`
-starts. It normally adds no measurable delay, and it never fails a run: after 60 seconds it starts
-Ansible regardless, and any proxy still not answering is reported **unreachable** for that run and
-retried on the next one, exactly as it would have been.
+container that waits on port 22 of every proxy this run can expect to reach before
+`ansible-playbook` starts. Hosts whose proxy never became `Ready` are left out deliberately: they are
+already unreachable for this run, and waiting on them could only burn the gate's budget at the
+expense of the hosts that can still be rescued.
+
+Once it starts, the gate never fails a run. After 60 seconds it starts Ansible regardless, and any
+proxy still not answering is reported **unreachable** for that run and retried on the next one,
+exactly as it would have been; an unexpected error inside the gate is logged and otherwise ignored
+for the same reason. Starting is the part your image has to make possible: the container runs
+`python3` from the plan's own image, so an image without it on `PATH` fails here instead, before
+Ansible has run at all — see [`python3` must be on
+`PATH`](./playbook-plans.md#python3-must-be-on-path).
 
 If a run seems slow to start, the gate says what it was waiting for:
 
