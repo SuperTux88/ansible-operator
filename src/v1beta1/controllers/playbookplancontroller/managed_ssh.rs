@@ -333,6 +333,19 @@ fn resource_name(host: &str, run_id: &str) -> String {
 /// would create a fresh node-root pod per host per tick and orphan the previous one.
 ///
 /// The untruncated name is never lost: [`run_annotations`] records it verbatim.
+///
+/// **A derived segment is itself a valid Node name, and that collision is accepted rather than
+/// prevented.** A cluster could hold both a long Node `L` and a second Node named exactly
+/// `L`'s truncated prefix plus the hash of `L`, and the two would then derive one proxy pod. Nothing
+/// about the numbers makes that plausible by accident — it is a specific 64-bit target — and aiming
+/// at it deliberately needs the right to name Nodes and yields nothing: both hosts are already in
+/// the same run's authorized set, so the result is that one authorized Node is applied to twice
+/// while the other fails its host-certificate check. `refuse_foreign_proxy_resource` turns that into
+/// a refusal naming the host rather than a silent mis-mapping.
+///
+/// The alternative is encoding every host as a digest, which would close it — with a cryptographic
+/// hash, since `xxh3` collisions are cheap to construct — at the cost of the readable names an
+/// administrator greps for on every cluster, every day. That trade was considered and declined.
 fn host_segment(host: &str) -> String {
     if host.len() <= utils::MAX_DNS_LABEL_LEN {
         return host.to_string();
@@ -345,6 +358,67 @@ fn host_segment(host: &str) -> String {
     let suffix = format!("-{:016x}", hasher.finish());
     let budget = utils::MAX_DNS_LABEL_LEN.saturating_sub(suffix.len());
     format!("{}{suffix}", utils::readable_name_segment(host, budget))
+}
+
+/// Refuses an object standing at a proxy resource's name that is not the one this run created for
+/// `host` — checked before it is adopted, because adopting it means treating whatever it is as this
+/// host's node-root access path.
+///
+/// The name is derived (`resource_name`), never read back from the cluster, so anything else under
+/// it is something this code did not put there. Two ways that can happen, and the cheap check
+/// covers both. One is the [`host_segment`] collision documented there: two Nodes whose segments
+/// coincide would otherwise share one proxy, silently applying the playbook twice to one of them
+/// while the other fails its host-certificate check and reports a network problem it does not have.
+/// The other is anything planted by something with write access to the operator namespace.
+///
+/// The four identifying fields are checked individually rather than by comparing the whole label
+/// map: a cluster whose admission webhooks decorate objects with labels of their own would fail an
+/// equality check on every tick, and refusing to run is only right when the object is genuinely not
+/// ours.
+///
+/// Fails closed and stays failed — the run reports it and retries, rather than deleting an object
+/// whose provenance it just admitted it cannot establish. An administrator resolves the collision.
+fn refuse_foreign_proxy_resource(
+    kind: &'static str,
+    name: &str,
+    metadata: &ObjectMeta,
+    execution_hash: &ExecutionHash,
+    run_id: &str,
+    host: &str,
+) -> Result<(), ReconcileError> {
+    let label = |key: &str| metadata.labels.as_ref().and_then(|labels| labels.get(key));
+    let ours = label(labels::RUN_ID).is_some_and(|value| value == run_id)
+        && label(labels::PLAYBOOKPLAN_HASH).is_some_and(|value| *value == execution_hash.to_string())
+        && label(labels::COMPONENT).is_some_and(|value| value == labels::MANAGED_SSH_PROXY_COMPONENT)
+        // The annotation, not the label: the label may be a truncated form of the Node name and is
+        // exactly what two hosts can collide on, while the annotation is the name spelled out.
+        && metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(labels::PLAYBOOKPLAN_HOST))
+            .is_some_and(|value| value == host);
+
+    if ours {
+        return Ok(());
+    }
+    Err(ReconcileError::ForeignProxyResource {
+        kind,
+        name: name.to_string(),
+        host: host.to_string(),
+    })
+}
+
+/// Whether an existing proxy pod is pinned to the Node it claims to serve.
+///
+/// Separate from [`refuse_foreign_proxy_resource`] because it is the *pod's* half of the same
+/// question and the only one that says where node-root actually lands: metadata can be copied onto
+/// a pod running anywhere, while `nodeSelector` is what the scheduler obeyed.
+fn proxy_pod_targets_host(pod: &Pod, host: &str) -> bool {
+    pod.spec
+        .as_ref()
+        .and_then(|spec| spec.node_selector.as_ref())
+        .and_then(|selector| selector.get("kubernetes.io/hostname"))
+        .is_some_and(|node| node == host)
 }
 
 /// Name of this run's client-cert Secret, shared by `job_builder`'s mount and `ensure_client_cert`.
@@ -828,14 +902,43 @@ pub async fn ensure_proxy_infra(
     for host in hosts {
         let name = resource_name(host, run_id);
 
-        if secrets_api.get_opt(&name).await?.is_none() {
-            let secret = build_secret(&name, execution_hash, run_id, host, ca)?;
-            secrets_api.create(&PostParams::default(), &secret).await?;
+        match secrets_api.get_opt(&name).await? {
+            Some(existing) => {
+                refuse_foreign_proxy_resource(
+                    "Secret",
+                    &name,
+                    &existing.metadata,
+                    execution_hash,
+                    run_id,
+                    host,
+                )?;
+            }
+            None => {
+                let secret = build_secret(&name, execution_hash, run_id, host, ca)?;
+                secrets_api.create(&PostParams::default(), &secret).await?;
+            }
         }
 
         // Create the pod for EVERY host, including a NotReady one — we want to attempt scheduling it.
         let pod = match pods_api.get_opt(&name).await? {
-            Some(pod) => pod,
+            Some(pod) => {
+                refuse_foreign_proxy_resource(
+                    "Pod",
+                    &name,
+                    &pod.metadata,
+                    execution_hash,
+                    run_id,
+                    host,
+                )?;
+                if !proxy_pod_targets_host(&pod, host) {
+                    return Err(ReconcileError::ForeignProxyResource {
+                        kind: "Pod",
+                        name,
+                        host: host.clone(),
+                    });
+                }
+                pod
+            }
             None => {
                 let pod = build_pod(
                     &name,
@@ -971,6 +1074,108 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A proxy resource is node-root access to the host it names, so an object found at that name is
+    /// adopted only when it is provably this run's — the collision `host_segment` documents, and
+    /// anything planted under the operator's namespace, both arrive as an object at the right name.
+    #[test]
+    fn only_this_runs_own_proxy_resource_is_adopted() {
+        use crate::v1beta1::ca::CertificateAuthority;
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+
+        let hash = calculate_execution_hash("playbook", std::iter::empty());
+        let other_hash = calculate_execution_hash("other playbook", std::iter::empty());
+        let name = resource_name("worker-1", "run-1");
+        let secret = build_secret(
+            &name,
+            &hash,
+            "run-1",
+            "worker-1",
+            &CertificateAuthority::generate().unwrap(),
+        )
+        .unwrap();
+        let ours = |metadata: &ObjectMeta| {
+            refuse_foreign_proxy_resource("Secret", &name, metadata, &hash, "run-1", "worker-1")
+                .is_ok()
+        };
+
+        assert!(ours(&secret.metadata));
+
+        // Every identifying field is load-bearing: the run it belongs to, the revision it was built
+        // for, that it is a proxy at all, and the host it serves.
+        for key in [labels::RUN_ID, labels::PLAYBOOKPLAN_HASH, labels::COMPONENT] {
+            let mut foreign = secret.clone();
+            foreign
+                .metadata
+                .labels
+                .as_mut()
+                .unwrap()
+                .insert(key.to_string(), "something-else".into());
+            assert!(!ours(&foreign.metadata), "{key} must be checked");
+
+            let mut missing = secret.clone();
+            missing.metadata.labels.as_mut().unwrap().remove(key);
+            assert!(!ours(&missing.metadata), "a missing {key} fails closed");
+        }
+
+        // The annotation carries the *full* Node name, which is the field two colliding segments
+        // disagree on — the label may be the shortened form both of them share.
+        let mut other_host = secret.clone();
+        other_host
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(labels::PLAYBOOKPLAN_HOST.to_string(), "worker-2".into());
+        assert!(!ours(&other_host.metadata));
+
+        let mut unlabelled = secret.clone();
+        unlabelled.metadata.labels = None;
+        unlabelled.metadata.annotations = None;
+        assert!(!ours(&unlabelled.metadata), "bare metadata fails closed");
+
+        // A resource of another run at the same name is the ordinary form of all this.
+        assert!(
+            refuse_foreign_proxy_resource(
+                "Secret",
+                &name,
+                &secret.metadata,
+                &other_hash,
+                "run-2",
+                "worker-1",
+            )
+            .is_err()
+        );
+    }
+
+    /// Metadata can say anything; `nodeSelector` is what the scheduler obeyed, and therefore the
+    /// only field that says where this pod's node-root actually lands.
+    #[test]
+    fn a_proxy_pod_is_adopted_only_while_it_is_pinned_to_its_own_node() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+
+        let hash = calculate_execution_hash("playbook", std::iter::empty());
+        let name = resource_name("worker-1", "run-1");
+        let pod = build_pod(
+            &name,
+            &name,
+            &hash,
+            "run-1",
+            "worker-1",
+            None,
+            "proxy:latest",
+        );
+
+        assert!(proxy_pod_targets_host(&pod, "worker-1"));
+        assert!(!proxy_pod_targets_host(&pod, "worker-2"));
+
+        let mut unpinned = pod.clone();
+        unpinned.spec.as_mut().unwrap().node_selector = None;
+        assert!(
+            !proxy_pod_targets_host(&unpinned, "worker-1"),
+            "a pod free to run anywhere is not this host's proxy"
+        );
+    }
 
     /// Pins the wire format of the per-run resource names, and the length budget behind
     /// `resource_name` — the worst case is a Node name that has to be truncated, so the bound is

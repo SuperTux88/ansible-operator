@@ -2678,6 +2678,9 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         | ReconcileError::InventoryNotFound { .. }
         | ReconcileError::SecretNotFound { .. } => true,
         ReconcileError::KubeError(_) => false,
+        // Not an input read at all — it comes from a run's own proxy infrastructure — but the enum
+        // is matched exhaustively so that a new failure has to be classified here deliberately.
+        ReconcileError::ForeignProxyResource { .. } => false,
         ReconcileError::PreconditionFailed(_)
         | ReconcileError::RenderError(_)
         | ReconcileError::CaError(_)
