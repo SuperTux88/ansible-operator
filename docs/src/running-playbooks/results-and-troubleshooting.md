@@ -161,13 +161,6 @@ Plays beyond these limits are pruned automatically as new runs finish. The opera
 retention pass on ordinary reconciles if a deletion fails, so a temporary API error does not
 permanently leave old records behind. Deleting the `PlaybookPlan` removes all of its Plays.
 
-These records also backstop the schedule-slot marker when deciding whether a `Recurring` plan may
-retry. If a stale status write loses that marker after every failed record for the active slot has
-been pruned, the remaining retry counter cannot identify which slot spent it and the operator may
-admit another try. When strictly enforcing `maxAttempts` within a tick matters, keep
-`failedPlaysHistoryLimit` at least as large as `maxAttempts`; setting the history limit to zero
-removes this backstop as soon as each failed result is recorded on the plan.
-
 Only *finished* Plays are counted against the history limits, and a finished one is temporarily kept
 until its result has been folded into the plan — so the limits can never discard the only surviving
 copy of a run's recap. Once acknowledged, an old record whose deletion failed remains eligible for
