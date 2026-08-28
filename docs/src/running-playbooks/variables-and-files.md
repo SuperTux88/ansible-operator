@@ -63,6 +63,13 @@ at:
 
 so the playbook can read it there, or via the relative path `files/my-assets/...`.
 
+The `name` is that one directory, so it has to be a single path component: not empty, not `.` or
+`..`, and with no `/`, `:` or control characters in it. Anything else is refused with a message on
+the plan and no run is started — a name that is a *path* would mount your Secret somewhere else in
+the run's pod entirely. Two entries may not share a name either: they would claim one directory, and
+the operator will not pick between them for you. Letters, digits, dots, dashes and underscores are
+all fine, in any case: `TLS_certs` and `assets.v2` are valid names.
+
 ### From a Secret
 
 Mounts a Secret's keys as files under the entry's directory — the way to ship certificates, config

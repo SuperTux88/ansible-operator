@@ -509,6 +509,25 @@ async fn reconcile(
         retry_prune = prune_history(&context, &object).await;
     }
 
+    // Read alongside the desired inputs, and reported the same way, because it answers the same
+    // question: whether there is an executable desired state at all. Nothing here touches the
+    // cluster — it is the plan's own spec — but a spec that cannot produce a valid Job has to be
+    // caught *before* a run takes its Leases and starts its proxy pods, or the rejection lands at
+    // Job creation, where no retry can clear it and the plan wedges holding those Leases.
+    if let Err(error) = validate_file_entries(&object) {
+        report_desired_input_error(
+            &context,
+            &object,
+            &api,
+            unlaunched_run.as_ref(),
+            &mut resource_status,
+            &error,
+            error.to_string(),
+        )
+        .await?;
+        return Err(error);
+    }
+
     // Steps 0 and 0b: resolve the plan's inventories and clamp them to what NodeAccessPolicy grants
     // this namespace. One fallible step with one error site, because they fail the same way — the
     // desired inputs could not be read — and a recovered run's fate depends on which kind of
@@ -1028,6 +1047,64 @@ fn window_taken_by_a_record(
         }
     }
     failures >= max_attempts
+}
+
+/// Checks that every `spec.template.files` entry can name a directory of its own under the
+/// workspace, and that no two of them claim the same one.
+///
+/// The name is a path component, not decoration: each entry is mounted at
+/// `{workspace}/files/{name}`, which is where the guide tells playbooks to read their files from.
+/// Until this branch it was also the Job's *volume* name, so the apiserver's DNS-label check on that
+/// name was doing this job by accident — badly, since it rejected `TLS_certs` along with `../etc`,
+/// and it rejected them at Job creation, where the run is already holding host Leases and node-root
+/// proxy pods and no retry can ever clear the rejection. Volume names are derived now
+/// (`job_builder::volume_name`), so the check that remains has to be the one that was actually
+/// wanted, and it has to be here: reported on the plan, before any of that exists.
+///
+/// A duplicate is refused rather than deduplicated. Two entries claiming one directory are two
+/// different sources the playbook cannot both read at that path, and picking one silently mounts
+/// something the user did not ask for.
+fn validate_file_entries(plan: &PlaybookPlan) -> Result<(), ReconcileError> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for name in plan
+        .spec
+        .template
+        .files
+        .iter()
+        .flatten()
+        .map(|source| match source {
+            v1beta1::FilesSource::Secret { name, .. }
+            | v1beta1::FilesSource::Other { name, .. } => name,
+        })
+    {
+        let invalid = |reason| {
+            Err(ReconcileError::InvalidFileEntry {
+                name: name.clone(),
+                reason,
+            })
+        };
+
+        if name.is_empty() {
+            return invalid("it has no name");
+        }
+        if name == "." || name == ".." || name.contains('/') {
+            // Anything that is not one directory *inside* `files/` mounts the entry somewhere else
+            // in the run's own pod — over its inventory or its client certificate, given a name
+            // chosen for it.
+            return invalid("a name must be a single directory, not a path");
+        }
+        if name.contains(':') || name.chars().any(char::is_control) {
+            // Kubernetes refuses such a `mountPath` outright, and it refuses it at Job creation,
+            // which is the failure this function exists to move earlier.
+            return invalid("a name cannot contain ':' or control characters");
+        }
+        if !seen.insert(name) {
+            return invalid("two entries cannot share a name");
+        }
+    }
+
+    Ok(())
 }
 
 /// Whether the plan has work a run could start this tick, from the mode, whether a schedule is set,
@@ -2706,6 +2783,9 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         | ReconcileError::InventoryNotFound { .. }
         | ReconcileError::SecretNotFound { .. } => true,
         ReconcileError::KubeError(_) => false,
+        // A spec the user has to edit, exactly like the three above: no tick clears it, and holding
+        // a run open against it would hold host Leases for as long as the plan stays wrong.
+        ReconcileError::InvalidFileEntry { .. } => true,
         // Not an input read at all — it comes from a run's own proxy infrastructure — but the enum
         // is matched exhaustively so that a new failure has to be classified here deliberately.
         ReconcileError::ForeignProxyResource { .. } => false,
@@ -5910,6 +5990,60 @@ spec:
             collect_secret_data(vec![("vars".into(), Ok(secret))]).unwrap()[0]["variables.yaml"].0,
             b"key: value"
         );
+    }
+
+    /// Every name here is one the apiserver would have accepted on the `Job` only by rejecting it —
+    /// or, worse, one it would have accepted outright once volume names stopped carrying it.
+    #[test]
+    fn a_file_entry_names_one_directory_of_its_own() {
+        let plan_with = |names: &[&str]| {
+            let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+            plan.spec.template.files = Some(
+                names
+                    .iter()
+                    .map(|name| v1beta1::FilesSource::Secret {
+                        name: (*name).to_string(),
+                        secret_ref: v1beta1::SecretRef {
+                            name: "some-secret".into(),
+                        },
+                    })
+                    .collect(),
+            );
+            plan
+        };
+
+        assert!(validate_file_entries(&plan_with(&["tls", "TLS_certs", "assets.v2"])).is_ok());
+        assert!(validate_file_entries(&plan_with(&[])).is_ok());
+
+        // The one that matters: an entry is mounted at `{workspace}/files/{name}`, so a name that
+        // is a path puts a user-controlled Secret somewhere else in the run's own pod.
+        for escape in ["..", ".", "../../etc", "a/b", "/absolute"] {
+            assert!(
+                validate_file_entries(&plan_with(&[escape])).is_err(),
+                "{escape:?} must not be accepted as a directory name"
+            );
+        }
+
+        // Rejected by Kubernetes at Job creation, which is the failure this moves earlier.
+        assert!(validate_file_entries(&plan_with(&["a:b"])).is_err());
+        assert!(validate_file_entries(&plan_with(&["a\nb"])).is_err());
+        assert!(validate_file_entries(&plan_with(&[""])).is_err());
+
+        // Two sources cannot share one directory, and choosing between them is not this operator's
+        // call to make silently.
+        assert!(validate_file_entries(&plan_with(&["tls", "tls"])).is_err());
+    }
+
+    /// A spec error no tick can clear: holding a run open against it would hold its host Leases for
+    /// as long as the plan stays wrong, and those Leases block every other plan on the same hosts.
+    #[test]
+    fn an_unusable_file_entry_supersedes_a_run_that_has_not_launched() {
+        assert!(input_error_supersedes_unlaunched(
+            &ReconcileError::InvalidFileEntry {
+                name: "..".into(),
+                reason: "a name must be a single directory, not a path",
+            }
+        ));
     }
 
     #[test]
