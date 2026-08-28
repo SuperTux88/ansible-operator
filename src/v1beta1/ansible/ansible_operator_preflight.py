@@ -35,9 +35,20 @@ DEFAULT_TIMEOUT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 0.5
 
 # Bounds a single dial so one endpoint that black-holes packets (rather than refusing them) cannot
-# eat the whole budget. Endpoints are dialled concurrently, so this is the cost of a sweep, not of
-# a sweep times the number of hosts.
+# eat the whole budget. It bounds the connect and the banner read separately, and both are clamped
+# to whatever is left of the overall deadline, so no dial can outlive the gate it belongs to.
 CONNECT_TIMEOUT_SECONDS = 2.0
+
+# How many endpoints are dialled at once. A run has one proxy per targeted Node and nothing bounds
+# how many Nodes a `ClusterInventory` matches, so without a cap the pool sizes itself to the fleet:
+# one thread and one socket per Node, and on a large enough cluster the interpreter fails to start
+# the threads at all — which the fail-open handler turns into "no gate today".
+#
+# Small is enough because the dials this exists for are cheap: a proxy whose datapath is not
+# programmed yet refuses the connection in microseconds, so a sweep of hundreds of endpoints costs
+# little more with 32 workers than with hundreds. Only endpoints that black-hole packets hold a
+# worker for the full `CONNECT_TIMEOUT_SECONDS`, and the deadline is what bounds those.
+MAX_CONCURRENT_DIALS = 32
 
 # sshd sends its identification string as soon as the connection is accepted. Requiring it rules out
 # a half-programmed datapath where the SYN is answered but sshd is not actually serving us yet.
@@ -68,10 +79,30 @@ def read_endpoints(path):
     return endpoints
 
 
-def reachable(address, port, timeout):
+def dial_timeout(deadline):
+    """Seconds a single connect or read may take, or `None` once the gate is out of time.
+
+    Taken from the absolute deadline rather than from a budget computed per sweep, because the
+    worker cap means a sweep is several batches and a per-sweep budget would grant each of them a
+    fresh `CONNECT_TIMEOUT_SECONDS` — turning the 60 seconds the gate advertises into 60 seconds per
+    batch. Applied to the connect and the banner read separately for the same reason: a dial that
+    spends the constant on each phase costs twice what the constant says.
+    """
+    remaining = deadline - time.monotonic()
+    return min(CONNECT_TIMEOUT_SECONDS, remaining) if remaining > 0 else None
+
+
+def reachable(address, port, deadline):
+    connect_timeout = dial_timeout(deadline)
+    if connect_timeout is None:
+        return False
+
     try:
-        with socket.create_connection((address, port), timeout=timeout) as sock:
-            sock.settimeout(timeout)
+        with socket.create_connection((address, port), timeout=connect_timeout) as sock:
+            read_timeout = dial_timeout(deadline)
+            if read_timeout is None:
+                return False
+            sock.settimeout(read_timeout)
             banner = sock.recv(BANNER_BYTES)
     except OSError:
         return False
@@ -84,15 +115,14 @@ def wait_for(endpoints, timeout):
     deadline = started + timeout
     pending = list(endpoints)
 
-    with futures.ThreadPoolExecutor(max_workers=len(endpoints)) as pool:
+    workers = min(len(endpoints), MAX_CONCURRENT_DIALS)
+    with futures.ThreadPoolExecutor(max_workers=workers) as pool:
         while pending:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if time.monotonic() >= deadline:
                 break
 
-            budget = min(CONNECT_TIMEOUT_SECONDS, max(remaining, 0.1))
             results = pool.map(
-                lambda endpoint: reachable(endpoint[1], endpoint[2], budget), pending
+                lambda endpoint: reachable(endpoint[1], endpoint[2], deadline), pending
             )
 
             still_pending = []
