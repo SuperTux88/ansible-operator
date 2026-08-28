@@ -207,8 +207,13 @@ What the budget covers depends on the mode, because what counts as "the same pie
 - **`Recurring`** spends its budget on one schedule tick, and defaults to `1` — no retry, since the
   next tick re-applies the same playbook anyway. With a higher `maxAttempts` a failed run is retried
   within the current tick, and the next tick starts over with a full budget whatever the previous one
-  did. Retries are still bound by `startingDeadlineSeconds` (see above): a retry that cannot start
-  before the tick's grace window closes is not started, and the plan waits for the next tick.
+  did. Retries are still bound by `startingDeadlineSeconds` (see above), measured from the original
+  schedule tick rather than from the time an attempt fails. Every retry must start before that
+  original deadline, so time spent running earlier attempts counts against the window. With the
+  default 30 seconds, a first attempt that runs for longer than 30 seconds cannot be retried. When
+  setting `maxAttempts` above `1`, set `startingDeadlineSeconds` long enough to cover the expected
+  duration of earlier attempts and reconciliation between them; otherwise the plan waits for the
+  next tick with its unused tries.
 
 A run that never got as far as its Job — one given up because the plan was edited, suspended, or
 missed its window — is not a failed try, but it does consume a run number.
