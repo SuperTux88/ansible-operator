@@ -12,7 +12,9 @@ Two independent things decide *when* a plan runs and *what* runs:
 day-of-week`). `spec.timeZone` is the IANA time zone it is evaluated in; if omitted, **UTC** is used.
 The granularity is minutes, not seconds. Schedules with a seconds or year field are not accepted.
 Invalid cron expressions, unknown time zones, and expressions with no future occurrence are rejected;
-the plan does not run until the field is corrected.
+the plan does not run until the field is corrected. Its status identifies the invalid field; see
+[The plan's schedule or time zone is
+invalid](./results-and-troubleshooting.md#the-plans-schedule-or-time-zone-is-invalid).
 
 The operator evaluates the schedule on its own reconcile cycle rather than exactly on the tick, so a
 run starts within a short window *after* each scheduled time. `spec.startingDeadlineSeconds` sets how

@@ -23,11 +23,11 @@ per-host status, and the summary line.
 
 | Phase | Meaning |
 |---|---|
-| `Pending` | Triggers not yet evaluated — the resting state right after creation, after the inputs changed, or while an input [cannot be read](#the-plans-inputs-cannot-be-read). |
+| `Pending` | Triggers not yet evaluated — the resting state right after creation, after the inputs changed, while an input [cannot be read](#the-plans-inputs-cannot-be-read), or while an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevents a plan with no run verdict from starting. |
 | `Delayed` | The plan is waiting for its scheduled time and has no result yet under the current playbook and inputs. |
 | `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has seen the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name. |
-| `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. |
-| `Failed` | The latest run did not succeed on every host, or its recap could not be read. A `Recurring` plan keeps this result between ticks the same way. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
+| `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. The verdict remains visible if an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevents another run. |
+| `Failed` | The latest run did not succeed on every host, or its recap could not be read. A `Recurring` plan keeps this result between ticks the same way. The verdict remains visible if an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevents another run. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
 | `UnauthorizedNamespace` | The plan's namespace is not enrolled for the operator — it will not run. See below. |
 
 ## Summary
@@ -210,6 +210,30 @@ cluster that does not enforce CRD validation rules. Either way nothing is create
 The name is used as a label value on every object a run creates, and Kubernetes label values stop at
 63 characters. An object's name cannot be changed, so recreate the plan under a shorter one — a
 `kubectl edit` will not clear this.
+
+### The plan's schedule or time zone is invalid
+
+The operator cannot determine when the plan should run when its scheduling configuration is invalid.
+Its summary reports one of these diagnostics:
+
+- **`spec.timeZone "…" is not a recognized IANA time zone: …`** — use an IANA time-zone name such
+  as `Europe/Berlin`, or remove `spec.timeZone` to use UTC.
+- **`spec.schedule "…" is not a valid 5-field cron expression: …`** — provide exactly the minute,
+  hour, day-of-month, month, and day-of-week fields; seconds and year fields are not supported.
+- **`spec.schedule "…" has no future occurrence`** — the expression is syntactically valid but
+  cannot produce another date; replace it with one that can.
+
+The plan starts no new runs and clears `.status.nextRun` until the field is corrected. `Ready=False`
+with reason `InvalidSchedulingConfiguration` carries the same diagnostic as the summary. An idle plan
+without a run verdict moves to `Pending`, but a real `Succeeded` or `Failed` verdict from its latest
+run remains visible rather than being hidden by the configuration error.
+
+A run whose Job already exists is still allowed to finish, so its phase remains `Applying` until the
+run completes. A run that has not created its Job is abandoned instead, following the same boundary
+as any other spec edit; see [Editing a plan while a run is in
+flight](./scheduling-and-modes.md#editing-a-plan-while-a-run-is-in-flight). Correcting the field clears
+the readiness reason and restores the plan's host verdict or next scheduled time on the next
+reconcile.
 
 ### The plan's inputs cannot be read
 
