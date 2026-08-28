@@ -1999,6 +1999,26 @@ fn mirrors_run(status: &PlaybookPlanStatus, run: &RecordedRun) -> bool {
         .is_none_or(|mirrored| mirrored.play_uid == run.mirror.play_uid)
 }
 
+/// Applies the plan-status side of abandoning an unlaunched run.
+///
+/// A run spends its attempt while it is prepared so recovery cannot offer the same budget twice
+/// while it waits for locks or proxy pods. If it is abandoned before its Job exists, that attempt
+/// was never made and is returned here. The revision, attempt and mirror guards make replay a no-op
+/// and prevent an old aborted record from returning a newer run's budget.
+fn apply_abandoned_run_status(status: &mut PlaybookPlanStatus, run: &RecordedRun) {
+    if !mirrors_run(status, run) {
+        return;
+    }
+
+    if status.current_hash == run.mirror.execution_hash && status.retry_count == run.mirror.attempt
+    {
+        status.retry_count = run.mirror.attempt.saturating_sub(1);
+    }
+    status.active_run = None;
+    status.phase = Phase::Pending;
+    status.next_run = None;
+}
+
 /// Whether this run's record has reached `Running`, the only phase that may enter Job finalization.
 /// Earlier phases belong to absent-Job recovery, including when a tick just drained another run's
 /// terminal result while the plan status mirrors this one.
@@ -2401,11 +2421,7 @@ async fn abandon_run(
         return Err(report_failed_abandon(api, object, run, resource_status, error).await);
     }
 
-    if mirrors_run(resource_status, run) {
-        resource_status.active_run = None;
-        resource_status.phase = Phase::Pending;
-        resource_status.next_run = None;
-    }
+    apply_abandoned_run_status(resource_status, run);
     status::clear_run_conditions(resource_status);
     patch_status(api, object, resource_status.clone()).await?;
 
@@ -5408,6 +5424,65 @@ mod tests {
         assert_eq!(
             status.active_run.as_ref().map(|run| run.play_uid.as_str()),
             Some("other-play-uid")
+        );
+    }
+
+    #[test]
+    fn an_abandoned_run_returns_only_its_own_unspent_attempt() {
+        let run = |hash: &str, play_uid: &str, attempt: u32| RecordedRun {
+            execution_hash: ExecutionHash::from_hex(hash).unwrap(),
+            mirror: ActiveRun {
+                execution_hash: hash.into(),
+                run_id: format!("run-{play_uid}"),
+                job_name: format!("apply-web-{play_uid}"),
+                play_uid: play_uid.into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 8,
+                attempt,
+                triggered_slot: None,
+            },
+        };
+        let abandoned = run("1", "abandoned", 3);
+        let status = |mirrored: &RecordedRun| PlaybookPlanStatus {
+            current_hash: "1".into(),
+            retry_count: 3,
+            last_run_number: 8,
+            phase: Phase::Applying,
+            active_run: Some(mirrored.mirror.clone()),
+            ..Default::default()
+        };
+
+        let mut matching = status(&abandoned);
+        apply_abandoned_run_status(&mut matching, &abandoned);
+        assert_eq!(matching.retry_count, 2);
+        assert_eq!(matching.last_run_number, 8);
+        assert_eq!(matching.phase, Phase::Pending);
+        assert!(matching.active_run.is_none());
+
+        apply_abandoned_run_status(&mut matching, &abandoned);
+        assert_eq!(matching.retry_count, 2, "replay must not refund twice");
+
+        let mut newer_attempt = status(&abandoned);
+        newer_attempt.retry_count = 4;
+        apply_abandoned_run_status(&mut newer_attempt, &abandoned);
+        assert_eq!(newer_attempt.retry_count, 4);
+
+        let mut newer_revision = status(&abandoned);
+        newer_revision.current_hash = "2".into();
+        apply_abandoned_run_status(&mut newer_revision, &abandoned);
+        assert_eq!(newer_revision.retry_count, 3);
+
+        let surviving = run("1", "surviving", 3);
+        let mut different_mirror = status(&surviving);
+        apply_abandoned_run_status(&mut different_mirror, &abandoned);
+        assert_eq!(different_mirror.retry_count, 3);
+        assert_eq!(different_mirror.phase, Phase::Applying);
+        assert_eq!(
+            different_mirror
+                .active_run
+                .as_ref()
+                .map(|run| run.play_uid.as_str()),
+            Some("surviving")
         );
     }
 
