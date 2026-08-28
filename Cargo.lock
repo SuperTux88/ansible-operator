@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "ansible-operator"
-version = "0.0.19"
+version = "0.0.20"
 dependencies = [
  "chrono",
  "chrono-tz",
