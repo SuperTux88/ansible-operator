@@ -2077,29 +2077,44 @@ fn mirrors_run(status: &PlaybookPlanStatus, run: &RecordedRun) -> bool {
 /// A run spends its attempt while it is prepared so recovery cannot offer the same budget twice
 /// while it waits for locks or proxy pods. If it is abandoned before its Job exists, that attempt
 /// was never made and is returned here. The revision, attempt and mirror guards make replay a no-op
-/// and prevent an old aborted record from returning a newer run's budget.
+/// and prevent an old aborted record from returning a newer run's budget. Returning a retry restores
+/// the preceding `Failed` verdict, which is what keeps the remaining budget available; a first try
+/// has no preceding verdict and returns to `Pending`.
 fn apply_abandoned_run_status(status: &mut PlaybookPlanStatus, run: &RecordedRun) {
     if !mirrors_run(status, run) {
         return;
     }
 
-    if status.current_hash == run.mirror.execution_hash
+    let retiring_mirrored_run = status
+        .active_run
+        .as_ref()
+        .is_some_and(|mirrored| mirrored.play_uid == run.mirror.play_uid);
+    let remaining_attempts = run.mirror.attempt.saturating_sub(1);
+    let remaining_slot = if remaining_attempts == 0 {
+        None
+    } else {
+        run.mirror.triggered_slot
+    };
+    let same_execution = status.current_hash == run.mirror.execution_hash;
+    let refund_due = same_execution
         && status.retry_count == run.mirror.attempt
-        && status.retry_count_slot == run.mirror.triggered_slot
-    {
-        let remaining_attempts = run.mirror.attempt.saturating_sub(1);
-        record_retry_budget(
-            status,
-            remaining_attempts,
-            if remaining_attempts == 0 {
-                None
-            } else {
-                run.mirror.triggered_slot
-            },
-        );
+        && status.retry_count_slot == run.mirror.triggered_slot;
+    let already_refunded = same_execution
+        && status.retry_count == remaining_attempts
+        && status.retry_count_slot == remaining_slot;
+    if refund_due {
+        record_retry_budget(status, remaining_attempts, remaining_slot);
+    }
+    if refund_due || already_refunded {
+        status.phase = if remaining_attempts > 0 {
+            Phase::Failed
+        } else {
+            Phase::Pending
+        };
+    } else if retiring_mirrored_run {
+        status.phase = Phase::Pending;
     }
     status.active_run = None;
-    status.phase = Phase::Pending;
     status.next_run = None;
 }
 
@@ -2474,10 +2489,10 @@ async fn resume_launching_run(
 /// makes the cleanup retryable, so it must outlive every step that can fail.
 ///
 /// `reason` becomes the plan's summary, and taking it as a parameter is what makes that
-/// unconditional. The phase this leaves behind (`Pending`) says only that nothing is happening, and
-/// a plan can rest there indefinitely — a suspended one, or a `OneShot` with nothing left to do —
-/// so an abandon that wrote no summary would leave whatever the last one happened to say standing
-/// as the explanation for a state it does not describe.
+/// unconditional. The phase this leaves behind says only whether an earlier failed try still has
+/// budget; it cannot explain why the current run stopped. An abandon that wrote no summary would
+/// therefore leave whatever the last one happened to say standing as the explanation for a state it
+/// does not describe.
 ///
 /// Both fallible steps report themselves on the plan before handing the error back. This is the path
 /// that gives up a run's node-root proxy pods and host Leases, so "it did not work" has to be
@@ -5609,11 +5624,28 @@ mod tests {
         assert_eq!(matching.retry_count, 2);
         assert_eq!(matching.retry_count_slot, Some(slot));
         assert_eq!(matching.last_run_number, 8);
-        assert_eq!(matching.phase, Phase::Pending);
+        assert_eq!(matching.phase, Phase::Failed);
         assert!(matching.active_run.is_none());
+        assert!(!retry_budget_closes_window(
+            &matching.phase,
+            matching.retry_count,
+            matching.retry_count_slot,
+            Some(slot),
+            3,
+        ));
 
         apply_abandoned_run_status(&mut matching, &abandoned);
         assert_eq!(matching.retry_count, 2, "replay must not refund twice");
+        assert_eq!(matching.phase, Phase::Failed);
+
+        matching.active_run = Some(abandoned.mirror.clone());
+        apply_abandoned_run_status(&mut matching, &abandoned);
+        assert_eq!(
+            matching.retry_count, 2,
+            "a stale mirror must not refund twice"
+        );
+        assert_eq!(matching.phase, Phase::Failed);
+        assert!(matching.active_run.is_none());
 
         let mut newer_attempt = status(&abandoned);
         newer_attempt.retry_count = 4;
@@ -5646,6 +5678,7 @@ mod tests {
         apply_abandoned_run_status(&mut first_status, &first_attempt);
         assert_eq!(first_status.retry_count, 0);
         assert_eq!(first_status.retry_count_slot, None);
+        assert_eq!(first_status.phase, Phase::Pending);
     }
 
     /// The finalizer edits must be surgical: the list they rewrite also holds Kubernetes' own
@@ -7544,6 +7577,15 @@ spec:
         assert!(!retry_budget_closes_window(
             &Phase::Pending,
             0,
+            current,
+            current,
+            3,
+        ));
+        // `Pending` is not enough to prove a refund: an input outage can hide a successful verdict
+        // after its Play was pruned, so the persisted nonzero count must still close the window.
+        assert!(retry_budget_closes_window(
+            &Phase::Pending,
+            1,
             current,
             current,
             3,
