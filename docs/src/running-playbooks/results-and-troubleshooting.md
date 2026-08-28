@@ -318,6 +318,19 @@ instead, and `.status.activeRun` names the run it is waiting on:
   its own proxy resources and Leases. If the plan remains stuck after the foreign Job is gone, inspect
   the new `.status.summary` and operator logs rather than deleting the `Play`; it may be reporting a
   separate cleanup or API-permission problem.
+- **"could not prepare run …: Pod/Secret … already exists but is not this run's managed-ssh proxy
+  for host …"** — the operator found an object at a derived proxy-resource name in the operator
+  namespace, but could not prove that it belongs to this run and host. It refuses to treat the object
+  as this run's proxy because a managed-SSH proxy grants node-root access, keeps the run's host locks,
+  and retries the check.
+
+  This can mean an object was planted or edited in the operator namespace. It can also mean two Node
+  names produced the same shortened resource-name segment, which requires a deliberately constructed
+  collision rather than an ordinary hash accident. Inspect the exact Pod or Secret named in the
+  message. Its run ID, execution hash and component labels and its full target-host annotation must
+  identify the active run and host; the Pod must also select that host's Node. Delete the object only
+  after confirming that it is foreign and that its owner considers deletion safe. For a Node-name
+  collision, change the inventory selection so the colliding Nodes are not targeted by the same run.
 - **"could not complete run …: …"** — the run's Job reached a terminal state, but the operator could
   not finish handling it: releasing its proxy pods or host locks, writing the recap onto its `Play`,
   or folding that result into the plan. The rest of the message is the underlying error, and every
