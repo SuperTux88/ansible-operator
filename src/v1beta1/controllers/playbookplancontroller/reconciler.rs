@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 use crate::v1beta1::{
     ActiveRun, AnsibleInventory, ClusterInventory, ExecutionMode, GenericMap, NodeAccessPolicy,
     Phase, Play, PlaybookPlanStatus, ResolvedHosts, ResolvedInventoryGroup, StaticInventory,
-    Toleration, ansible, flatten_hosts, labels,
+    ansible, flatten_hosts, labels,
     playbookplancontroller::{
         execution_evaluator::{ExecutionHash, distinct_host_count, find_all_hosts},
         locking, managed_ssh,
@@ -1763,7 +1763,8 @@ async fn ensure_infra_and_launch(
     resource_status: &mut PlaybookPlanStatus,
 ) -> Result<Option<std::time::Duration>, ReconcileError> {
     let (namespace, name) = namespace_and_name(object)?;
-    let (managed_hosts, tolerations) = managed_ssh_hosts_and_tolerations(run_groups);
+    let proxy_hosts = managed_ssh_proxy_hosts(run_groups);
+    let managed_hosts: Vec<String> = proxy_hosts.iter().map(|host| host.name.clone()).collect();
 
     // INV-3/INV-3b: proxy pods are node root, so the set about to get them — derived from the groups
     // this tick will actually render, never read back from the record — is what has to be authorized,
@@ -1816,8 +1817,7 @@ async fn ensure_infra_and_launch(
         namespace,
         &run.execution_hash,
         &run.mirror.run_id,
-        &managed_hosts,
-        tolerations.as_deref(),
+        &proxy_hosts,
         &context.proxy_grace,
         &context.ca,
         &context.proxy_image,
@@ -4162,30 +4162,55 @@ fn filter_groups_to_hosts(
         .collect()
 }
 
-/// Flat list of managed-ssh-sourced hostnames in these groups, plus the tolerations to use for
-/// their proxy pods. If a run spans multiple ClusterInventory resources with different
-/// tolerations, only the first non-`None` one found is used for all of them.
-fn managed_ssh_hosts_and_tolerations(
-    groups: &[ResolvedInventoryGroup],
-) -> (Vec<String>, Option<Vec<Toleration>>) {
-    let mut hosts = Vec::new();
-    let mut tolerations = None;
+/// The Nodes this run needs proxy pods on, each with the tolerations its pod must carry.
+///
+/// Tolerations are a property of the `ClusterInventory` that names the Node, so they are resolved
+/// per host rather than per run: a run spanning two inventories used to give every proxy whichever
+/// list was found first, which meant a tainted Node could receive tolerations that say nothing about
+/// its taints. Its pod then never schedules, waits out its grace window and is reported unreachable —
+/// a host silently dropped from the run, with no error anywhere that names the cause.
+///
+/// A Node reached through several inventories gets the **union** of theirs, deduplicated. Union is
+/// the safe direction here, and deliberately so: a proxy pod is pinned to one Node by its
+/// `nodeSelector`, so a toleration it did not need cannot take it anywhere else — it can only fail
+/// to have one it did need. Intersecting, the instinct that usually passes for conservative, is what
+/// would reintroduce the bug.
+///
+/// Hosts are deduplicated too, in first-seen order, so a Node named by two inventories is one proxy
+/// with one set of API calls rather than the same pod reconciled twice.
+fn managed_ssh_proxy_hosts(groups: &[ResolvedInventoryGroup]) -> Vec<managed_ssh::ProxyHost> {
+    let mut hosts: Vec<managed_ssh::ProxyHost> = Vec::new();
 
     for group in groups {
-        if let ResolvedInventoryGroup::ManagedSsh {
-            hosts: h,
-            tolerations: t,
+        let ResolvedInventoryGroup::ManagedSsh {
+            hosts: group_hosts,
+            tolerations,
             ..
         } = group
-        {
-            hosts.extend(h.hosts.clone());
-            if tolerations.is_none() {
-                tolerations = t.clone();
+        else {
+            continue;
+        };
+
+        for name in &group_hosts.hosts {
+            let host = match hosts.iter_mut().position(|host| host.name == *name) {
+                Some(index) => &mut hosts[index],
+                None => {
+                    hosts.push(managed_ssh::ProxyHost {
+                        name: name.clone(),
+                        tolerations: Vec::new(),
+                    });
+                    hosts.last_mut().expect("just pushed")
+                }
+            };
+            for toleration in tolerations.iter().flatten() {
+                if !host.tolerations.contains(toleration) {
+                    host.tolerations.push(toleration.clone());
+                }
             }
         }
     }
 
-    (hosts, tolerations)
+    hosts
 }
 
 async fn upsert_workspace_secret(
@@ -4783,7 +4808,9 @@ fn annotation_value<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v1beta1::{PlaySpec, PlaybookPlanSpec, ResolvedHosts, SecretRef, SshConfig};
+    use crate::v1beta1::{
+        PlaySpec, PlaybookPlanSpec, ResolvedHosts, SecretRef, SshConfig, Toleration,
+    };
 
     fn managed_ssh_group(
         name: &str,
@@ -4862,37 +4889,65 @@ mod tests {
     }
 
     #[test]
-    fn managed_ssh_hosts_and_tolerations_flattens_only_managed_ssh_groups() {
+    fn only_managed_ssh_groups_ask_for_a_proxy() {
         let groups = vec![
             managed_ssh_group("controlplanes", &["worker-1"], None),
             ssh_group("external", &["ccu.fritz.box"], "ccu"),
             managed_ssh_group("workers", &["worker-2"], None),
         ];
 
-        let (hosts, _) = managed_ssh_hosts_and_tolerations(&groups);
+        let proxies = managed_ssh_proxy_hosts(&groups);
+        let hosts: Vec<&str> = proxies.iter().map(|host| host.name.as_str()).collect();
 
-        assert_eq!(hosts, vec!["worker-1".to_string(), "worker-2".to_string()]);
+        assert_eq!(hosts, vec!["worker-1", "worker-2"]);
     }
 
+    /// Tolerations belong to the inventory that names the Node, and a run may span several. Giving
+    /// every proxy whichever list came first left a tainted Node with tolerations that said nothing
+    /// about its taints: its pod never scheduled, waited out its grace window, and the host was
+    /// reported unreachable with nothing naming the cause.
     #[test]
-    fn managed_ssh_hosts_and_tolerations_uses_first_non_none_toleration() {
-        let first = vec![Toleration {
-            key: Some("first".into()),
+    fn each_proxy_gets_the_tolerations_of_the_inventories_that_reach_its_node() {
+        let toleration = |key: &str| crate::v1beta1::Toleration {
+            key: Some(key.into()),
             ..Default::default()
-        }];
-        let second = vec![Toleration {
-            key: Some("second".into()),
-            ..Default::default()
-        }];
+        };
+        let control_plane = vec![toleration("node-role.kubernetes.io/control-plane")];
+        let storage = vec![toleration("storage"), toleration("shared")];
+
         let groups = vec![
-            managed_ssh_group("a", &["worker-1"], None),
-            managed_ssh_group("b", &["worker-2"], Some(first.clone())),
-            managed_ssh_group("c", &["worker-3"], Some(second)),
+            managed_ssh_group("plain", &["worker-1"], None),
+            managed_ssh_group("controlplanes", &["cp-1"], Some(control_plane.clone())),
+            managed_ssh_group("storage", &["cp-1", "store-1"], Some(storage.clone())),
+            // The same list again from a third inventory: one Node, one copy of it.
+            managed_ssh_group("storage-too", &["store-1"], Some(storage.clone())),
         ];
 
-        let (_, tolerations) = managed_ssh_hosts_and_tolerations(&groups);
+        let hosts = managed_ssh_proxy_hosts(&groups);
+        let tolerations = |name: &str| {
+            hosts
+                .iter()
+                .find(|host| host.name == name)
+                .unwrap_or_else(|| panic!("{name} has no proxy"))
+                .tolerations
+                .clone()
+        };
 
-        assert_eq!(tolerations, Some(first));
+        // An inventory that sets none contributes none — it must not erase another's.
+        assert_eq!(tolerations("worker-1"), vec![]);
+        assert_eq!(tolerations("store-1"), storage);
+        // Reached through two inventories, so it carries both — the union, because a proxy pod is
+        // pinned to its Node and a toleration it did not need cannot take it anywhere else, while
+        // one it did need is the difference between running and being dropped from the run.
+        assert_eq!(
+            tolerations("cp-1"),
+            [control_plane, storage].concat(),
+            "a Node in two inventories carries both, deduplicated and in group order"
+        );
+
+        // And it is one proxy per Node, not one per mention.
+        let names: Vec<&str> = hosts.iter().map(|host| host.name.as_str()).collect();
+        assert_eq!(names, vec!["worker-1", "cp-1", "store-1"]);
     }
 
     /// The run-identity predicates recovery and Job validation are built from. Each one answers
