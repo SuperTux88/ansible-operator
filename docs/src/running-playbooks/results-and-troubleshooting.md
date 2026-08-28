@@ -193,6 +193,13 @@ admin which policy applies to your namespace (see
 `.status.hostCount` shows how many Nodes match *before* policy clamping, which helps localise the
 problem.
 
+An idle `Recurring` plan does not create an empty Job when this happens. It reports **"plan
+currently resolves to no hosts"** in `.status.summary` and continues to forecast
+`.status.nextRun`. While it is not suspended, a previous run's `Succeeded` or `Failed` phase remains
+visible; a plan that has never run is `Delayed`. If matching, authorized hosts return, the plan can
+run on a later tick or in the current tick's grace window if it reconciles again before that window
+closes.
+
 ### The plan's name is too long
 
 The plan is `Failed` and its summary reads **"name is N characters; a PlaybookPlan name must be at
