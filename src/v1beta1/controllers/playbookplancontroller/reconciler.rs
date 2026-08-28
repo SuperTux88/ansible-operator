@@ -3325,7 +3325,7 @@ fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usi
 fn adopt_recovered_run(status: &mut PlaybookPlanStatus, active_run: &ActiveRun) {
     if status.current_hash == active_run.execution_hash {
         status.last_run_number = status.last_run_number.max(active_run.run_number);
-        status.retry_count = status.retry_count.max(active_run.attempt);
+        status.retry_count = active_run.attempt;
     }
     status.phase = Phase::Applying;
     status.summary = Some(applying_summary(active_run));
@@ -3466,6 +3466,8 @@ async fn finalize_finished_run(
 ///
 /// The run number is claimed either way, because it answers a different question: it reserves a
 /// name against every later run, and a finished run holds its number whatever else is in flight.
+/// The attempt is not a high-water mark: a new `Recurring` slot restarts it, so the current-revision
+/// surviving run is authoritative when present, and the finished run is authoritative otherwise.
 fn sync_desired_hash_after_finished_run(
     status: &mut PlaybookPlanStatus,
     desired_hash: &ExecutionHash,
@@ -3488,11 +3490,16 @@ fn sync_desired_hash_after_finished_run(
     if finished.execution_hash == *desired_hash {
         record_triggered_slot(status, surviving_slot.or(finished.mirror.triggered_slot));
         status.last_run_number = status.last_run_number.max(finished.mirror.run_number);
-        // The try is claimed for the same reason the number is: it was spent, and a status that was
-        // behind this run must not offer its budget a second time.
-        status.retry_count = status.retry_count.max(finished.mirror.attempt);
     } else {
         record_triggered_slot(status, surviving_slot);
+    }
+
+    if let Some(attempt) = surviving
+        .filter(|surviving| surviving.run.execution_hash == *desired_hash)
+        .map(|surviving| surviving.run.mirror.attempt)
+        .or_else(|| (finished.execution_hash == *desired_hash).then_some(finished.mirror.attempt))
+    {
+        status.retry_count = attempt;
     }
 }
 
@@ -6755,10 +6762,12 @@ spec:
         let mut matching = PlaybookPlanStatus {
             current_hash: "1".into(),
             last_run_number: 1,
+            retry_count: 7,
             ..Default::default()
         };
         adopt_recovered_run(&mut matching, &active_run);
         assert_eq!(matching.last_run_number, 4);
+        assert_eq!(matching.retry_count, 4);
         assert_eq!(matching.phase, Phase::Applying);
         assert_eq!(
             matching
@@ -6771,10 +6780,12 @@ spec:
         let mut replacement = PlaybookPlanStatus {
             current_hash: "2".into(),
             last_run_number: 0,
+            retry_count: 2,
             ..Default::default()
         };
         adopt_recovered_run(&mut replacement, &active_run);
         assert_eq!(replacement.last_run_number, 0);
+        assert_eq!(replacement.retry_count, 2);
         assert!(replacement.active_run.is_some());
     }
 
@@ -7080,6 +7091,7 @@ spec:
         let mut status = PlaybookPlanStatus {
             current_hash: hash.to_string(),
             last_run_number: 0,
+            retry_count: 7,
             ..Default::default()
         };
 
@@ -7219,6 +7231,7 @@ spec:
             current_hash: hash.to_string(),
             last_run_number: 0,
             last_triggered_run: Some(live_slot),
+            retry_count: 7,
             ..Default::default()
         };
 
@@ -7237,6 +7250,7 @@ spec:
         // The number is still claimed: it reserves a name against every later run, which is
         // true of a finished run whatever else the plan is holding.
         assert_eq!(status.last_run_number, 3);
+        assert_eq!(status.retry_count, 4);
     }
 
     /// The surviving run's window is taken from its own record, so a plan status that has not
@@ -7393,6 +7407,7 @@ spec:
         let mut status = PlaybookPlanStatus {
             current_hash: old_hash.to_string(),
             last_triggered_run: Some(slot),
+            retry_count: 7,
             ..Default::default()
         };
 
@@ -7404,6 +7419,33 @@ spec:
         );
 
         assert_eq!(status.last_triggered_run, None);
+        assert_eq!(status.retry_count, 0);
+    }
+
+    #[test]
+    fn draining_an_obsolete_result_takes_the_current_survivors_attempt() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let old_hash = ExecutionHash::from_hex("1").unwrap();
+        let new_hash = ExecutionHash::from_hex("2").unwrap();
+        let mut surviving = surviving_run(new_hash, Some(slot));
+        surviving.run.mirror.attempt = 1;
+        let mut status = PlaybookPlanStatus {
+            current_hash: old_hash.to_string(),
+            retry_count: 3,
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &new_hash,
+            &finished_run(old_hash, 3, 3, slot),
+            Some(&surviving),
+        );
+
+        assert_eq!(status.current_hash, new_hash.to_string());
+        assert_eq!(status.retry_count, 1);
     }
 
     #[test]
