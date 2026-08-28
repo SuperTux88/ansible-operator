@@ -1811,7 +1811,7 @@ async fn ensure_infra_and_launch(
     )
     .await?;
 
-    let proxy_readiness = managed_ssh::ensure_proxy_infra(
+    let proxy_readiness = match managed_ssh::ensure_proxy_infra(
         &context.client,
         &context.operator_namespace,
         namespace,
@@ -1826,7 +1826,17 @@ async fn ensure_infra_and_launch(
         // before cleanup runs (the per-run delete in `cleanup_proxy_infra` is the primary path).
         &playbookplan_owner_ref(object)?,
     )
-    .await?;
+    .await
+    {
+        Ok(readiness) => readiness,
+        Err(error @ ReconcileError::ForeignProxyResource { .. }) => {
+            let api = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace);
+            return Err(
+                report_failed_run_preparation(&api, object, run, resource_status, error).await,
+            );
+        }
+        Err(error) => return Err(error),
+    };
 
     let (ready, unreachable) = match proxy_readiness {
         managed_ssh::ProxyReadiness::Pending { waiting } => {
@@ -2498,6 +2508,41 @@ async fn report_failed_finalization(
         );
     }
     error
+}
+
+/// Records a proxy-provenance refusal on the plan and hands the error straight back.
+///
+/// The run remains active and keeps its host locks: the operator cannot safely treat the object as
+/// this run's proxy, and retries after an administrator resolves the collision. Best-effort
+/// reporting must not replace the refusal with a status-write error.
+async fn report_failed_run_preparation(
+    api: &Api<PlaybookPlan>,
+    object: &PlaybookPlan,
+    run: &RecordedRun,
+    resource_status: &mut PlaybookPlanStatus,
+    error: ReconcileError,
+) -> ReconcileError {
+    record_failed_run_preparation(resource_status, run, &error);
+    if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
+        warn!(
+            "Could not report the failed preparation of run {} on {:?}/{:?}: {patch_error}",
+            run.mirror.job_name, object.metadata.namespace, object.metadata.name
+        );
+    }
+    error
+}
+
+/// The status half of [`report_failed_run_preparation`], split out to pin that reporting a refusal
+/// changes only the diagnosis and leaves the active run available for recovery.
+fn record_failed_run_preparation(
+    status: &mut PlaybookPlanStatus,
+    run: &RecordedRun,
+    error: &ReconcileError,
+) {
+    status.summary = Some(format!(
+        "could not prepare run {}: {error}",
+        run.mirror.job_name
+    ));
 }
 
 /// The history-retention pass, run either as the last step of [`finalize_finished_run`] or — on a
@@ -6823,6 +6868,55 @@ spec:
         assert!(!summary_unclaimed_since_adoption(&stale, &active_run));
         adopt_recovered_run(&mut stale, &active_run);
         assert!(summary_unclaimed_since_adoption(&stale, &active_run));
+    }
+
+    #[test]
+    fn a_foreign_proxy_refusal_is_reported_without_giving_up_the_run() {
+        let run = RecordedRun {
+            execution_hash: ExecutionHash::from_hex("1").unwrap(),
+            mirror: ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-1".into(),
+                job_name: "apply-plan-1-4".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 4,
+                attempt: 2,
+                triggered_slot: None,
+            },
+        };
+        let mut status = PlaybookPlanStatus {
+            current_hash: "1".into(),
+            phase: Phase::Applying,
+            active_run: Some(run.mirror.clone()),
+            retry_count: 2,
+            last_run_number: 4,
+            ..Default::default()
+        };
+        let error = ReconcileError::ForeignProxyResource {
+            kind: "Pod",
+            name: "managed-ssh-worker-1-run-1".into(),
+            host: "worker-1".into(),
+        };
+
+        record_failed_run_preparation(&mut status, &run, &error);
+
+        assert_eq!(
+            status.summary.as_deref(),
+            Some(
+                "could not prepare run apply-plan-1-4: Pod \"managed-ssh-worker-1-run-1\" already exists but is not this run's managed-ssh proxy for host \"worker-1\""
+            )
+        );
+        assert_eq!(status.phase, Phase::Applying);
+        assert_eq!(status.retry_count, 2);
+        assert_eq!(status.last_run_number, 4);
+        assert_eq!(
+            status
+                .active_run
+                .as_ref()
+                .map(|active| active.play_uid.as_str()),
+            Some("play-uid")
+        );
     }
 
     #[test]
