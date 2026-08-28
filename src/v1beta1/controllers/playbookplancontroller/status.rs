@@ -245,9 +245,13 @@ fn set_ready_overlay(status: &mut PlaybookPlanStatus, reason: &str, message: &st
 }
 
 /// Retires the [`set_inputs_unavailable_condition`] overlay once the desired inputs read cleanly
-/// again.
-pub fn clear_inputs_unavailable_condition(status: &mut PlaybookPlanStatus, outdated_count: usize) {
-    clear_ready_overlay(status, outdated_count, "InputsUnavailable");
+/// again, returning whether that overlay was present so the caller only replaces its matching plan
+/// summary.
+pub fn clear_inputs_unavailable_condition(
+    status: &mut PlaybookPlanStatus,
+    outdated_count: usize,
+) -> bool {
+    clear_ready_overlay(status, outdated_count, "InputsUnavailable")
 }
 
 /// Retires the invalid-scheduling overlay once the schedule and time zone are valid, returning
@@ -740,7 +744,7 @@ mod tests {
         let mut status = plan_with_results(&[("worker-1", HostOutcome::Succeeded)], "1");
         set_inputs_unavailable_condition(&mut status, "cannot read referenced Secrets: nope");
 
-        clear_inputs_unavailable_condition(&mut status, 0);
+        assert!(clear_inputs_unavailable_condition(&mut status, 0));
 
         let ready = status
             .conditions
@@ -868,7 +872,7 @@ mod tests {
             "cannot resolve the plan's inventories: nope",
         );
 
-        clear_inputs_unavailable_condition(&mut status, 0);
+        assert!(clear_inputs_unavailable_condition(&mut status, 0));
 
         assert!(status.conditions.iter().all(|c| c.type_ != "Ready"));
     }
@@ -892,7 +896,7 @@ mod tests {
         };
         apply_terminal_play_status(&hash(), &play_status, &mut status);
 
-        clear_inputs_unavailable_condition(&mut status, 0);
+        assert!(!clear_inputs_unavailable_condition(&mut status, 0));
 
         let ready = status
             .conditions

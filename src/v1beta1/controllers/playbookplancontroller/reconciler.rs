@@ -680,7 +680,7 @@ async fn reconcile(
     // current and therefore what the restated verdict is. A `Ready` written from a terminal `Play`
     // earlier in this tick is not the overlay and is left alone.
     clear_scheduling_configuration_failure(&mut resource_status, outdated_hosts.len());
-    status::clear_inputs_unavailable_condition(&mut resource_status, outdated_hosts.len());
+    clear_input_failure(&mut resource_status, outdated_hosts.len());
 
     let hosts_to_trigger = match object.spec.mode {
         ExecutionMode::OneShot => outdated_hosts.clone(),
@@ -886,8 +886,9 @@ async fn reconcile(
         && resource_status.hosts_status.is_some()
         && resource_status.phase == Phase::Pending
     {
-        // A failed input read clears the visible terminal state, but not the per-host results. Once
-        // the inputs recover, restore the idle verdict instead of waiting for a hash change.
+        // A revision edit resets the visible terminal state, but not the per-host results. If it is
+        // reverted before another run starts, restore the idle verdict instead of waiting for a new
+        // hash change.
         let total_count = distinct_host_count(&resource_status.eligible_hosts);
         restore_idle_oneshot_status(&mut resource_status, total_count);
     } else if eligible_to_start && resource_status.active_run.is_none() {
@@ -2795,15 +2796,15 @@ fn prune_retry_after(current: std::time::Duration) -> std::time::Duration {
 /// the operator's log. Without it the last successful run's summary keeps standing over a plan that
 /// has been failing every tick since, which reads as "nothing to do" rather than "broken".
 ///
-/// The phase and `nextRun` are reset for the same reason the summary is written: they are the other
-/// two printer columns, and leaving a `Succeeded`/`Delayed` phase over a plan that has not been
-/// able to read its own inputs since — pointing, in both cases, at a slot that will not fire — is
-/// exactly the "nothing to do" reading this exists to prevent. `hostsStatus` is left
-/// alone: the previous run's per-host results are still true, and nothing here re-ran anything.
+/// The summary and `Ready=False` condition make the outage explicit without erasing a real run
+/// verdict: `Succeeded` or `Failed` still says what the plan last did, which an unreadable input does
+/// not undo. A lifecycle phase resets to `Pending`, and `nextRun` is cleared because the advertised
+/// slot cannot fire. `hostsStatus` is left alone for the same reason as the verdict: the previous
+/// run's per-host results are still true, and nothing here re-ran anything.
 ///
 /// A run still in flight keeps its phase, matching [`update_desired_hash`]'s guard. The read failure
-/// does not stop a Job that is already executing, and reporting `Pending` over one would contradict
-/// the `activeRun` standing right next to it.
+/// does not stop a Job that is already executing, and changing its phase would contradict the
+/// `activeRun` standing right next to it.
 ///
 /// Best effort, and deliberately so: the reconcile fails on the original error either way, and a
 /// failure to report must not replace the diagnosis it was trying to surface. Same shape as
@@ -2829,7 +2830,7 @@ fn record_input_failure(status: &mut PlaybookPlanStatus, summary: String) {
     status::set_inputs_unavailable_condition(status, &summary);
     status.summary = Some(summary);
     if status.active_run.is_none() {
-        status.phase = Phase::Pending;
+        status.phase = phase_under_readiness_overlay(&status.phase);
         status.next_run = None;
     }
 }
@@ -3548,28 +3549,59 @@ fn update_desired_hash(status: &mut PlaybookPlanStatus, execution_hash: &Executi
 /// Retires the scheduling-specific readiness overlay and restores an idle summary without erasing a
 /// real failed-run verdict. Ordinary inventory and Secret outages use their own overlay and path.
 fn clear_scheduling_configuration_failure(status: &mut PlaybookPlanStatus, outdated_count: usize) {
-    let failed = status.phase == Phase::Failed;
-    let recovering =
-        status::clear_invalid_scheduling_configuration_condition(status, outdated_count);
+    restore_summary_after_overlay(
+        status,
+        outdated_count,
+        status::clear_invalid_scheduling_configuration_condition,
+    );
+}
 
-    if recovering && status.active_run.is_none() {
+/// Retires the desired-input readiness overlay and restores its idle summary without erasing a real
+/// failed-run verdict.
+fn clear_input_failure(status: &mut PlaybookPlanStatus, outdated_count: usize) {
+    restore_summary_after_overlay(
+        status,
+        outdated_count,
+        status::clear_inputs_unavailable_condition,
+    );
+}
+
+/// Restores the host-derived summary an overlay was covering once `clear` reports it was present.
+/// `failed` is read before the clear because that is where the verdict still is.
+fn restore_summary_after_overlay(
+    status: &mut PlaybookPlanStatus,
+    outdated_count: usize,
+    clear: impl FnOnce(&mut PlaybookPlanStatus, usize) -> bool,
+) {
+    let failed = status.phase == Phase::Failed;
+    if clear(status, outdated_count) && status.active_run.is_none() {
         let total_count = distinct_host_count(&status.eligible_hosts);
         status.summary = Some(plan_summary(outdated_count, total_count, failed));
     }
 }
 
-/// Restores the terminal verdict a `OneShot` plan had before a failed input read cleared it.
+/// Restores an idle `OneShot` verdict after a revision is changed and then reverted.
 ///
 /// The conditions under which that is the right thing to do — idle, `OneShot`, no outdated hosts,
-/// per-host results still on the plan, and a phase that a read failure reset to `Pending` — are the
+/// per-host results still on the plan, and a phase the revision edit reset to `Pending` — are the
 /// caller's `else if`, and are not restated here. They have to be the caller's: they select this
-/// branch out of the chain that also decides scheduling, so a plan that fails them must fall
-/// through to the next arm rather than reach a function that quietly does nothing.
+/// branch out of the chain that also decides scheduling, so a plan that fails them must fall through
+/// to the next arm rather than reach a function that quietly does nothing.
 fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usize) {
     status.phase = Phase::Succeeded;
     status.next_run = None;
     // Restoring the verdict of a plan that succeeded, so there is no failure to report.
     status.summary = Some(plan_summary(0, total_count, false));
+}
+
+/// The phase an idle plan keeps while a readiness overlay explains why it is not running. A real
+/// run verdict survives — it says what the plan last did, which an outage does not undo — while a
+/// lifecycle state resets to `Pending`.
+fn phase_under_readiness_overlay(current: &Phase) -> Phase {
+    match current {
+        Phase::Succeeded | Phase::Failed => current.clone(),
+        _ => Phase::Pending,
+    }
 }
 
 /// Puts a recovered run back onto the plan's status: the run itself, the `Applying` phase it
@@ -4948,10 +4980,7 @@ fn record_invalid_scheduling_configuration(
     status.next_run = None;
     if status.active_run.is_none() {
         status.phase = finished_run.map_or_else(
-            || match status.phase {
-                Phase::Succeeded | Phase::Failed => status.phase.clone(),
-                _ => Phase::Pending,
-            },
+            || phase_under_readiness_overlay(&status.phase),
             |finished| {
                 if finished.run.mirror.execution_hash == status.current_hash {
                     phase_for_finished_run(&finished.outcome)
@@ -7398,14 +7427,14 @@ spec:
         assert_eq!(idle.retry_count_slot, None);
     }
 
-    /// A plan that cannot read its own inputs must not keep advertising the last run's verdict. The
-    /// summary alone is not enough — `phase` and `nextRun` are the other two printer columns, and a
-    /// `Succeeded`/`Delayed` plan pointing at a slot that will never fire reads as healthy.
+    /// A plan that cannot read its own inputs reports the outage without erasing what its last run
+    /// did. The summary and `Ready` condition carry the current failure; `nextRun` is cleared because
+    /// that slot cannot fire, while a terminal verdict remains true.
     ///
     /// The exception is a run still in flight: the read failure did not stop its Job, so it keeps
     /// its phase, exactly as `update_desired_hash` leaves an active run alone.
     #[test]
-    fn an_unreadable_input_stops_the_plan_advertising_the_previous_verdict() {
+    fn an_unreadable_input_preserves_a_verdict_but_clears_the_next_run() {
         let slot = "2025-08-12T20:00:00Z"
             .parse::<DateTime<FixedOffset>>()
             .unwrap();
@@ -7428,7 +7457,7 @@ spec:
             ..Default::default()
         };
         record_input_failure(&mut idle, "cannot read referenced Secrets: nope".into());
-        assert_eq!(idle.phase, Phase::Pending);
+        assert_eq!(idle.phase, Phase::Succeeded);
         assert_eq!(idle.next_run, None);
         assert_eq!(
             idle.summary.as_deref(),
@@ -7447,6 +7476,18 @@ spec:
         );
         // The previous run's per-host results are still true — nothing here re-ran anything.
         assert!(idle.hosts_status.unwrap().contains_key("worker-1"));
+
+        let mut waiting = PlaybookPlanStatus {
+            phase: Phase::Delayed,
+            next_run: Some(slot),
+            ..Default::default()
+        };
+        record_input_failure(
+            &mut waiting,
+            "cannot resolve the plan's inventories: nope".into(),
+        );
+        assert_eq!(waiting.phase, Phase::Pending);
+        assert_eq!(waiting.next_run, None);
 
         let mut applying = PlaybookPlanStatus {
             active_run: Some(ActiveRun {
@@ -7467,6 +7508,82 @@ spec:
             "cannot resolve the plan's inventories: nope".into(),
         );
         assert_eq!(applying.phase, Phase::Applying);
+    }
+
+    /// Once desired inputs are readable, an idle Recurring plan must replace the outage summary
+    /// immediately rather than carrying it until the next scheduled run. Preserving the verdict is
+    /// what lets a failed plan keep saying that its last run failed in the restored summary.
+    #[test]
+    fn recovered_recurring_inputs_restore_successful_and_failed_summaries() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let eligible_hosts = vec![ResolvedHosts {
+            name: "workers".into(),
+            hosts: vec!["worker-1".into()],
+        }];
+        let slot = "2025-08-13T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+
+        let mut succeeded = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            phase: Phase::Succeeded,
+            next_run: Some(slot),
+            eligible_hosts: eligible_hosts.clone(),
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".into(),
+                v1beta1::HostStatus {
+                    last_applied_hash: hash.to_string(),
+                    last_outcome: v1beta1::HostOutcome::Succeeded,
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        record_input_failure(
+            &mut succeeded,
+            "cannot read referenced Secrets: temporary failure".into(),
+        );
+        assert_eq!(succeeded.phase, Phase::Succeeded);
+        assert_eq!(succeeded.next_run, None);
+
+        let outdated = find_outdated_hosts(&succeeded, &hash);
+        clear_input_failure(&mut succeeded, outdated.len());
+        succeeded.phase = phase_while_waiting_for_schedule(&succeeded.phase);
+
+        assert_eq!(succeeded.phase, Phase::Succeeded);
+        assert_eq!(succeeded.summary.as_deref(), Some("1/1 up-to-date"));
+
+        let mut failed = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            phase: Phase::Failed,
+            next_run: Some(slot),
+            eligible_hosts,
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".into(),
+                v1beta1::HostStatus {
+                    last_applied_hash: hash.to_string(),
+                    last_outcome: v1beta1::HostOutcome::Failed,
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        record_input_failure(
+            &mut failed,
+            "cannot resolve the plan's inventories: temporary failure".into(),
+        );
+        assert_eq!(failed.phase, Phase::Failed);
+        assert_eq!(failed.next_run, None);
+
+        let outdated = find_outdated_hosts(&failed, &hash);
+        clear_input_failure(&mut failed, outdated.len());
+        failed.phase = phase_while_waiting_for_schedule(&failed.phase);
+
+        assert_eq!(failed.phase, Phase::Failed);
+        assert_eq!(
+            failed.summary.as_deref(),
+            Some("1/1 up-to-date (last run failed)")
+        );
     }
 
     /// An outage reported while an unlaunched run is being decided has to survive that decision.
@@ -7508,11 +7625,12 @@ spec:
         );
     }
 
-    /// Once desired inputs are readable again, an idle OneShot plan with no outdated hosts restores
-    /// the successful status it had before the read failure.
+    /// Reverting a revision before its first run makes the old per-host results current again, so an
+    /// idle OneShot plan restores the successful status that `update_desired_hash` cleared.
     #[test]
-    fn a_recovered_idle_oneshot_restores_its_successful_verdict() {
+    fn a_reverted_idle_oneshot_restores_its_successful_verdict() {
         let hash = ExecutionHash::from_hex("1").unwrap();
+        let replacement_hash = ExecutionHash::from_hex("2").unwrap();
         let mut status = PlaybookPlanStatus {
             current_hash: hash.to_string(),
             phase: Phase::Succeeded,
@@ -7531,36 +7649,17 @@ spec:
             ..Default::default()
         };
 
-        record_input_failure(
-            &mut status,
-            "cannot read referenced Secrets: temporary failure".into(),
-        );
+        update_desired_hash(&mut status, &replacement_hash);
         assert_eq!(status.phase, Phase::Pending);
-        assert_eq!(
-            status.summary.as_deref(),
-            Some("cannot read referenced Secrets: temporary failure")
-        );
 
         update_desired_hash(&mut status, &hash);
         let outdated = find_outdated_hosts(&status, &hash);
         assert!(outdated.is_empty());
-        status::clear_inputs_unavailable_condition(&mut status, outdated.len());
         restore_idle_oneshot_status(&mut status, 1);
 
         assert_eq!(status.phase, Phase::Succeeded);
         assert_eq!(status.next_run, None);
         assert_eq!(status.summary.as_deref(), Some("1/1 up-to-date"));
-        let ready = status
-            .conditions
-            .iter()
-            .find(|condition| condition.type_ == "Ready")
-            .unwrap();
-        assert_eq!(ready.status, "True");
-        assert_eq!(ready.reason.as_deref(), Some("HostsUpToDate"));
-        assert_eq!(
-            ready.message.as_deref(),
-            Some("1/1 hosts on the current revision")
-        );
     }
 
     /// A recovered run is put back onto the plan whole, but its retry number only counts towards
@@ -8099,8 +8198,8 @@ spec:
             current,
             3,
         ));
-        // `Pending` is not enough to prove a refund: an input outage can hide a successful verdict
-        // after its Play was pruned, so the persisted nonzero count must still close the window.
+        // `Pending` alone is not enough to prove the slot is free: a lifecycle transition can
+        // replace the verdict after the run spent budget, so the persisted count still closes it.
         assert!(retry_budget_closes_window(
             &Phase::Pending,
             1,
