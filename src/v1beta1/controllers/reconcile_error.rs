@@ -17,6 +17,9 @@ pub enum ReconcileError {
     #[error("Referenced Secret {name:?} does not exist")]
     SecretNotFound { name: String },
 
+    #[error("spec.template.files entry {name:?} is not usable: {reason}")]
+    InvalidFileEntry { name: String, reason: &'static str },
+
     #[error(
         "{kind} {name:?} already exists but is not this run's managed-ssh proxy for host {host:?}"
     )]
