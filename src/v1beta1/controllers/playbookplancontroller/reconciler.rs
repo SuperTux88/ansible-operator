@@ -297,6 +297,10 @@ async fn reconcile(
     // needs the resolved, policy-clamped groups its fingerprint covers.
     let mut unlaunched_run: Option<UnlaunchedRun> = None;
     let mut finished_active_run: Option<FinishedRun> = None;
+    // Terminal records stay unacknowledged until the complete plan status has been persisted at the
+    // end of the tick. That keeps their outcomes replayable if any intervening input read or status
+    // write fails.
+    let mut finished_records = Vec::new();
     // Recovery drives the privileged parts of a run (Job creation, proxy infra, locks), so a failure
     // here aborts the tick before the final `patch_status`. Report it on the plan first, otherwise a
     // run that can't be recovered — a rejected Job, a revoked node grant — is only ever visible in
@@ -316,7 +320,6 @@ async fn reconcile(
     // it: the plan is emphatically not finished, so the terminal classification below is skipped,
     // and the schedule window that run holds is what the plan records.
     let mut surviving_run: Option<Box<SurvivingRun>> = None;
-    let mut finalized_run = false;
     // Whether this tick found the plan holding a run at all. Recovery is the only complete answer:
     // a record whose result has not been drained, or one being given up, owns resources while the
     // status mirror may already have moved on — so the finalizer is kept until a tick finds neither.
@@ -360,36 +363,18 @@ async fn reconcile(
                 // Adopted *before* the result is persisted, so the plan never goes a tick describing
                 // a run it is holding with no `activeRun` to reach it by: the mirror is the only
                 // handle `finalize_lost_run` has if that run's record is deleted while it runs.
-                // It also settles what `finalize_finished_run` may give up — the mirror now names a
+                // It also settles what `stage_finished_run` may give up — the mirror now names a
                 // different run than the one finishing, which is exactly when it keeps it.
                 if let Some(surviving) = &surviving {
                     adopt_recovered_run(&mut resource_status, &surviving.run.mirror);
                 }
-                match finalize_finished_run(
-                    &context,
-                    &object,
-                    &api,
-                    &finished,
+                stage_finished_run(&finished, &mut resource_status);
+                finished_records.push(FinishedRecord {
+                    run: finished.clone(),
                     // Drained straight off its own record, which is therefore still there to
-                    // acknowledge — that acknowledgement is what stops it being drained again.
-                    TerminalRecord::Present,
-                    &mut resource_status,
-                )
-                .await
-                {
-                    Ok(prune_failed) => retry_prune |= prune_failed,
-                    Err(error) => {
-                        return Err(report_failed_finalization(
-                            &api,
-                            &object,
-                            &finished,
-                            &mut resource_status,
-                            error,
-                        )
-                        .await);
-                    }
-                }
-                finalized_run = true;
+                    // acknowledge after the complete plan status is durable.
+                    record: TerminalRecord::Present,
+                });
                 finished_active_run = Some(FinishedRun {
                     outcome: status.phase,
                     run: finished,
@@ -464,29 +449,11 @@ async fn reconcile(
             } => {
                 resource_status.summary =
                     Some("previous run finished; evaluating desired revision".to_string());
-                match finalize_finished_run(
-                    &context,
-                    &object,
-                    &api,
-                    &finished,
+                stage_finished_run(&finished, &mut resource_status);
+                finished_records.push(FinishedRecord {
+                    run: finished.clone(),
                     record,
-                    &mut resource_status,
-                )
-                .await
-                {
-                    Ok(prune_failed) => retry_prune |= prune_failed,
-                    Err(error) => {
-                        return Err(report_failed_finalization(
-                            &api,
-                            &object,
-                            &finished,
-                            &mut resource_status,
-                            error,
-                        )
-                        .await);
-                    }
-                }
-                finalized_run = true;
+                });
                 finished_active_run = Some(FinishedRun {
                     run: finished,
                     outcome,
@@ -498,14 +465,15 @@ async fn reconcile(
         }
     }
 
-    // After both finalization paths, because each ends in a retention pass of its own and running
-    // one here as well would list and delete the same history twice on the tick a run completes.
+    // Finished records are retained until the final status patch below, then acknowledged and
+    // pruned. Running a standalone pass here as well would list the same history twice on the tick a
+    // run completes.
     // Restricted to an *idle* plan for the reason in `prune_history`: retention only ever gains work
     // when a run finishes, and a plan with a run in flight is polled every few seconds, so
     // listing its history on each of those ticks is a steady apiserver cost that can find nothing to
     // do. A deletion that failed is retried on the first tick without a run, which is exactly the
     // state the standalone pass exists for.
-    if !finalized_run && resource_status.active_run.is_none() {
+    if finished_records.is_empty() && resource_status.active_run.is_none() {
         retry_prune = prune_history(&context, &object).await;
     }
 
@@ -926,23 +894,50 @@ async fn reconcile(
         requeue_after = requeue_after.min(until_next_run);
     }
 
-    if retry_prune {
-        requeue_after = prune_retry_after(requeue_after);
-    }
-
     // Given back the moment the plan holds nothing outside its own namespace, so deleting an idle
     // plan never waits on this operator. Deliberately conservative about *when* that is: a tick that
     // recovered anything keeps it, even if the run finished on this very tick, because the release
     // it just performed is the last thing that needed the finalizer and one extra tick costs nothing.
     let release_finalizer = !recovered_a_run && resource_status.active_run.is_none();
 
-    patch_status(&api, &object, resource_status).await?;
+    patch_status(&api, &object, resource_status.clone()).await?;
 
-    // After the plan has been told what this tick decided, and never at its expense. This is a
-    // version-checked write (see `patch_finalizers`) against an object the operator has just written
-    // the status of, so it loses that race routinely — and losing it must cost one more tick before
-    // an idle plan can be deleted, not the whole tick's account of the plan. Doing it the other way
-    // round is what left a plan advertising a `nextRun` it would never reach.
+    // The complete terminal verdict, summary, retry budget, and schedule state are durable now.
+    // Only now may the receipts stop recovery from replaying their results. A failed acknowledgement
+    // leaves its record recoverable for the next tick.
+    for finished in &finished_records {
+        if finished.record == TerminalRecord::Present
+            && let Err(error) = play_history::acknowledge_finished(
+                &context.client,
+                namespace,
+                &finished.run.mirror.job_name,
+                &finished.run.mirror.play_uid,
+            )
+            .await
+        {
+            return Err(report_failed_finalization(
+                &api,
+                &object,
+                &finished.run,
+                &mut resource_status,
+                error,
+            )
+            .await);
+        }
+    }
+    if !finished_records.is_empty() {
+        retry_prune |= prune_history(&context, &object).await;
+    }
+    if retry_prune {
+        requeue_after = prune_retry_after(requeue_after);
+    }
+
+    // After the plan has been told what this tick decided and its terminal receipts have been handed
+    // back to history, never at either's expense. This is a version-checked write (see
+    // `patch_finalizers`) against an object the operator has just written the status of, so it loses
+    // that race routinely — and losing it must cost one more tick before an idle plan can be deleted,
+    // not the whole tick's account of the plan. Doing it the other way round is what left a plan
+    // advertising a `nextRun` it would never reach.
     if release_finalizer && let Err(error) = drop_run_cleanup_finalizer(&api, &object).await {
         if !error.is_conflict() {
             return Err(error);
@@ -2059,7 +2054,7 @@ fn own_record(found: Option<Play>, expected_uid: &str) -> Option<Play> {
 }
 
 /// Whether the plan's `activeRun` mirror is `run`'s — the question both paths that *stop* driving a
-/// run have to answer before clearing it ([`finalize_finished_run`], [`abandon_run`]).
+/// run have to answer before clearing it ([`stage_finished_run`], [`abandon_run`]).
 ///
 /// An absent mirror answers yes: the tick that finishes a run clears it before either path is reached
 /// (`advance_active_run`), and that case still has to reset the phase. What the guard excludes is a mirror
@@ -2488,7 +2483,7 @@ async fn resume_launching_run(
 /// that gives up a run's node-root proxy pods and host Leases, so "it did not work" has to be
 /// readable on the resource too, not only in the operator's log.
 ///
-/// The mirror is given up only when it is *this* run's, exactly as in [`finalize_finished_run`]: it
+/// The mirror is given up only when it is *this* run's, exactly as in [`stage_finished_run`]: it
 /// is what lets the operator release a run whose `Play` was deleted out from under it
 /// ([`finalize_lost_run`]), so clearing it for a run it does not describe would leave that run's
 /// host Leases and node-root proxy pods with nothing pointing at them. Every caller reached through
@@ -2556,9 +2551,10 @@ async fn report_failed_abandon(
 ///
 /// Covers everything between "the Job reached a terminal state" and "the record has been handed back
 /// to history": releasing the run's proxy pods and host Leases, stamping the recap onto its `Play`,
-/// persisting that to the plan, and acknowledging it. Until those succeed, the run still owns
-/// node-root resources — so the plan must say so rather than standing at "applying run …" while only
-/// the log knows. They are all retried through the run's recovery record.
+/// persisting that to the plan, and acknowledging it. Cleanup failures leave privileged resources to
+/// recover; acknowledgement failures happen after cleanup and leave the terminal record replayable.
+/// Either way the plan reports the incomplete boundary rather than leaving the diagnosis only in the
+/// log.
 ///
 /// Deliberately *not* reached by a failure of the retention pass that follows acknowledgement. By
 /// then the run is genuinely complete: its recap is on the plan and its record is acknowledged, so
@@ -2624,17 +2620,14 @@ fn record_failed_run_preparation(
     ));
 }
 
-/// The history-retention pass, run either as the last step of [`finalize_finished_run`] or — on a
-/// tick that finalized nothing and has no run in flight — standalone from `reconcile`. The two are
+/// The history-retention pass, run either after finished records are acknowledged or — on a tick
+/// that finalized nothing and has no run in flight — standalone from `reconcile`. The two are
 /// mutually exclusive, so the tick a run completes does not also list and delete the same history
 /// standalone.
 ///
-/// That is not the same as "once per tick", and it is worth not claiming it is. One tick can finalize
-/// *two* runs — a terminal record queued behind a live run is drained first, and the run it
-/// was queued behind can reach its own terminal state in the same tick — and each finalization prunes
-/// after acknowledging its own result. The second pass is a redundant list on a rare tick rather than
-/// a correctness problem: the pass is idempotent, and it has to follow acknowledgement, so it cannot
-/// simply be hoisted out of finalization and run once at the end.
+/// One tick can finish *two* runs — a terminal record queued behind a live run is drained first, and
+/// the run it was queued behind can reach its own terminal state in the same tick. Both records are
+/// acknowledged after the complete status write, then one retention pass handles them together.
 ///
 /// It has to be reachable from an ordinary reconcile and not only from finalization: a terminal
 /// Play is acknowledged *before* the pass that would delete it, so a deletion that fails leaves an
@@ -3524,17 +3517,15 @@ struct FinishedRun {
     outcome: v1beta1::PlayPhase,
 }
 
-/// Persists a run's terminal result and hands its record back to history. Returns whether the
-/// closing retention pass failed and should be retried with a shortened requeue — see
-/// [`prune_history`] for why that is a return value rather than an error.
-///
-/// The plan is written **first** and the record acknowledged **second**, so a crash in between
-/// replays the (idempotent) result rather than losing it. History pruning follows acknowledgement and
-/// is also retried independently on ordinary reconciles once nothing is in flight, so a deletion
-/// failure cannot block the run's result from being durable or leave old records behind forever. Persisting before the caller goes on
-/// to resolve the replacement revision also means a broken new inventory cannot make the completed run
-/// look active again on the next tick. Both the tick that finishes a run and the tick that recovers an
-/// already-finished one come through here, so that ordering cannot drift between them.
+struct FinishedRecord {
+    run: RecordedRun,
+    record: TerminalRecord,
+}
+
+/// Stages a finished run for the remainder of the reconcile. Its terminal record is deliberately
+/// left unacknowledged until the final status patch has persisted the complete verdict, summary,
+/// retry budget, and schedule state. Any failure before that boundary therefore replays the record
+/// on the next tick instead of stranding the plan in a provisional phase.
 ///
 /// The mirror is only given up when it is *this* run's. A terminal result is drained ahead of
 /// anything live (`recover_active_run`), so the plan may well still be mirroring a different run
@@ -3543,37 +3534,11 @@ struct FinishedRun {
 /// would leave that run's host Leases and node-root proxy pods with nothing pointing at them.
 /// The drain path adopts the surviving run before calling this, so an absent mirror there means
 /// there is genuinely nothing left in flight rather than a plan that has not caught up.
-async fn finalize_finished_run(
-    context: &ReconciliationContext,
-    object: &PlaybookPlan,
-    api: &Api<PlaybookPlan>,
-    finished: &RecordedRun,
-    record: TerminalRecord,
-    resource_status: &mut PlaybookPlanStatus,
-) -> Result<bool, ReconcileError> {
-    let (namespace, _) = namespace_and_name(object)?;
-
+fn stage_finished_run(finished: &RecordedRun, resource_status: &mut PlaybookPlanStatus) {
     if mirrors_run(resource_status, finished) {
         resource_status.active_run = None;
-        resource_status.phase = Phase::Pending;
         resource_status.next_run = None;
     }
-    patch_status(api, object, resource_status.clone()).await?;
-
-    // A run finalized without its record has nothing to acknowledge, and must not try: the name may
-    // now hold a *replacement* run's `Play`, and a version-checked write aimed at that would fail
-    // as "Play UID changed" — reporting a teardown problem for a run that is complete, and delaying
-    // the replacement's own recovery by a tick. Retention still runs: the plan gained a result.
-    if record == TerminalRecord::Present {
-        play_history::acknowledge_finished(
-            &context.client,
-            namespace,
-            &finished.mirror.job_name,
-            &finished.mirror.play_uid,
-        )
-        .await?;
-    }
-    Ok(prune_history(context, object).await)
 }
 
 /// Folds a finished run's revision bookkeeping into the plan.
@@ -5523,11 +5488,11 @@ mod tests {
         assert_ne!(TerminalRecord::Lost, TerminalRecord::Present);
     }
 
-    /// The guard both `finalize_finished_run` and `abandon_run` clear the mirror behind. A mirror
+    /// The guard both `stage_finished_run` and `abandon_run` clear the mirror behind. A mirror
     /// naming a *different* run is the one thing that must survive: it is genuinely in flight,
     /// and it is the only handle `finalize_lost_run` has for releasing its host Leases and node-root
     /// proxy pods if its `Play` is deleted. An absent mirror still answers yes, because the tick that
-    /// finishes a run clears it before either path runs and the phase reset still has to happen.
+    /// finishes a run clears it before either path runs and terminal staging still has to happen.
     #[test]
     fn only_the_mirror_describing_this_run_is_given_up_with_it() {
         let run = |play_uid: &str| RecordedRun {
@@ -5552,7 +5517,7 @@ mod tests {
         assert!(mirrors_run(&mirroring(Some(&this_run)), &this_run));
         assert!(
             mirrors_run(&mirroring(None), &this_run),
-            "an already-cleared mirror still has to reach the phase reset"
+            "an already-cleared mirror still has to reach terminal staging"
         );
         assert!(
             !mirrors_run(&mirroring(Some(&run("other-play-uid"))), &this_run),
@@ -5572,6 +5537,41 @@ mod tests {
             status.active_run.as_ref().map(|run| run.play_uid.as_str()),
             Some("other-play-uid")
         );
+    }
+
+    /// Staging happens before desired inputs, retry state, and scheduling have been evaluated. It
+    /// must therefore only retire this run's mirror; publishing a provisional `Pending` phase here
+    /// would make that phase durable before the terminal record can safely be acknowledged.
+    #[test]
+    fn terminal_staging_does_not_publish_a_provisional_phase() {
+        let run = RecordedRun {
+            execution_hash: ExecutionHash::from_hex("1").unwrap(),
+            mirror: ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-1".into(),
+                job_name: "apply-web-abc-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: None,
+            },
+        };
+        let next_run = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let mut status = PlaybookPlanStatus {
+            active_run: Some(run.mirror.clone()),
+            phase: Phase::Applying,
+            next_run: Some(next_run),
+            ..Default::default()
+        };
+
+        stage_finished_run(&run, &mut status);
+
+        assert!(status.active_run.is_none());
+        assert_eq!(status.phase, Phase::Applying);
+        assert_eq!(status.next_run, None);
     }
 
     #[test]
@@ -7466,6 +7466,34 @@ spec:
         // Recurring is answered by the window gate instead — a spent tick must not stop the next
         // one from starting, and this gate cannot tell the two apart.
         assert!(attempt_budget_available(&ExecutionMode::Recurring, 9, 1));
+    }
+
+    #[test]
+    fn an_exhausted_oneshot_keeps_the_failed_terminal_status() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let max_attempts = 3;
+
+        assert!(!attempt_budget_available(
+            &ExecutionMode::OneShot,
+            max_attempts,
+            max_attempts,
+        ));
+        let outcome = decide_terminal(
+            &ExecutionMode::OneShot,
+            None,
+            &v1beta1::PlayPhase::Failed,
+            retry_due(&Phase::Failed, max_attempts, max_attempts),
+            1,
+            1,
+            now,
+        );
+
+        assert_eq!(outcome.phase, Phase::Failed);
+        assert_eq!(
+            outcome.summary,
+            "0/1 up-to-date (1 outdated, last run failed)"
+        );
+        assert_eq!(outcome.requeue, None);
     }
 
     #[test]
