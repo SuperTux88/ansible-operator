@@ -189,8 +189,11 @@ def wait_for(endpoints, timeout):
                     still_pending.append(endpoint)
             pending = still_pending
 
-            if pending and time.monotonic() + POLL_INTERVAL_SECONDS < deadline:
-                time.sleep(POLL_INTERVAL_SECONDS)
+            if pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(POLL_INTERVAL_SECONDS, remaining))
 
     return pending, time.monotonic() - started
 

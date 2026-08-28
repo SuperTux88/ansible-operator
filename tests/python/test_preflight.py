@@ -18,6 +18,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = (
     Path(__file__).resolve().parents[2]
@@ -212,6 +213,27 @@ class WaitForTest(unittest.TestCase):
 
         self.assertEqual(len(pending), len(endpoints))
         self.assertLess(elapsed, 3.0, "batches must share one deadline, not each get their own")
+
+    def test_refused_connection_retries_are_bounded_by_the_poll_interval(self):
+        listener = Listener(lambda connection, stop: None)
+        port = listener.port
+        listener.close()
+        calls = []
+        original_reachable = preflight.reachable
+
+        def counted_reachable(*args):
+            calls.append(args)
+            return original_reachable(*args)
+
+        endpoint = [("node", "127.0.0.1", port)]
+        with mock.patch.object(preflight, "reachable", side_effect=counted_reachable):
+            pending, _ = preflight.wait_for(endpoint, 1.0)
+
+        self.assertEqual(pending, endpoint)
+        self.assertLessEqual(
+            len(calls), int(1.0 / preflight.POLL_INTERVAL_SECONDS) + 1,
+            "a refused connection must not make the polling loop free-run",
+        )
 
 
 class ReadEndpointsTest(unittest.TestCase):
