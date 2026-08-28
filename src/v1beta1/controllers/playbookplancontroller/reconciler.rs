@@ -3298,7 +3298,8 @@ fn update_desired_hash(status: &mut PlaybookPlanStatus, execution_hash: &Executi
 fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usize) {
     status.phase = Phase::Succeeded;
     status.next_run = None;
-    status.summary = Some(format!("{total_count}/{total_count} up-to-date"));
+    // Restoring the verdict of a plan that succeeded, so there is no failure to report.
+    status.summary = Some(plan_summary(0, total_count, false));
 }
 
 /// Puts a recovered run back onto the plan's status: the run itself, the `Applying` phase it
@@ -4025,11 +4026,8 @@ fn decide_terminal<Tz: TimeZone>(
     total_count: usize,
     now: DateTime<Tz>,
 ) -> TerminalOutcome {
-    let summary = match outdated_count {
-        0 => format!("{total_count}/{total_count} up-to-date"),
-        n => format!("{n}/{total_count} outdated"),
-    };
     let phase = phase_for_finished_run(outcome);
+    let summary = plan_summary(outdated_count, total_count, phase == Phase::Failed);
 
     // A try that is still owed is the next thing the plan does, so it is what the plan waits for:
     // the wait is short because a scheduled retry has only the rest of the tick's grace window to
@@ -4073,6 +4071,34 @@ fn decide_terminal<Tz: TimeZone>(
             },
         },
     }
+}
+
+/// The plan's summary line: how much of its inventory is on the current revision, and — when the
+/// count cannot say it — that the last run failed anyway.
+///
+/// One helper for every caller because the numerator has to keep its meaning. It used to flip: a
+/// converged plan said `5/5 up-to-date` and a drifted one said `2/5 outdated`, so the same field
+/// counted successes one day and failures the next, in a printer column with nothing around it to
+/// say which. `Ready`'s restated message (`status::clear_inputs_unavailable_condition`) already
+/// counts the other way round; this brings the summary into line with it.
+///
+/// `failed` is what stops the line reassuring a reader about a plan that just failed. A `Recurring`
+/// run that fails on a host which succeeded at this revision yesterday leaves *no* drift behind —
+/// the host still carries the current hash — so the honest drift statement is `5/5 up-to-date`,
+/// sitting beside a `Failed` phase. True, and exactly what someone scanning a summary column reads
+/// as "nothing to see here".
+fn plan_summary(outdated_count: usize, total_count: usize, failed: bool) -> String {
+    let current = total_count.saturating_sub(outdated_count);
+    let mut summary = format!("{current}/{total_count} up-to-date");
+
+    match (outdated_count, failed) {
+        (0, false) => {}
+        (0, true) => summary.push_str(" (last run failed)"),
+        (outdated, false) => summary.push_str(&format!(" ({outdated} outdated)")),
+        (outdated, true) => summary.push_str(&format!(" ({outdated} outdated, last run failed)")),
+    }
+
+    summary
 }
 
 /// The plan phase a finished run resolves to, in either mode.
@@ -7332,6 +7358,24 @@ spec:
         assert_eq!(status.last_triggered_run, None);
     }
 
+    /// The summary is a printer column, read with nothing around it to say which way it counts. So
+    /// the numerator is always the hosts on the current revision, and everything else is said in
+    /// words beside it.
+    #[test]
+    fn the_summary_always_counts_the_hosts_that_are_current() {
+        assert_eq!(plan_summary(0, 5, false), "5/5 up-to-date");
+        assert_eq!(plan_summary(2, 5, false), "3/5 up-to-date (2 outdated)");
+        // A failed run leaves no drift when its hosts already carried this revision — which is the
+        // ordinary `Recurring` failure, and the one a drift count alone reports as healthy.
+        assert_eq!(plan_summary(0, 5, true), "5/5 up-to-date (last run failed)");
+        assert_eq!(
+            plan_summary(2, 5, true),
+            "3/5 up-to-date (2 outdated, last run failed)"
+        );
+        // A plan with no eligible hosts states it rather than dividing by zero.
+        assert_eq!(plan_summary(0, 0, false), "0/0 up-to-date");
+    }
+
     #[test]
     fn decide_terminal_oneshot_all_current_succeeds() {
         let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
@@ -7368,7 +7412,10 @@ spec:
 
         assert_eq!(outcome.phase, Phase::Failed);
         assert_eq!(outcome.next_run, None);
-        assert_eq!(outcome.summary, "1/3 outdated");
+        assert_eq!(
+            outcome.summary,
+            "2/3 up-to-date (1 outdated, last run failed)"
+        );
         assert_eq!(outcome.requeue, None);
     }
 
@@ -7420,7 +7467,8 @@ spec:
         );
 
         assert_eq!(outcome.phase, Phase::Failed);
-        assert_eq!(outcome.summary, "2/2 up-to-date");
+        // The drift statement alone would read as reassurance on a plan that just failed.
+        assert_eq!(outcome.summary, "2/2 up-to-date (last run failed)");
         assert!(outcome.next_run.is_some());
     }
 

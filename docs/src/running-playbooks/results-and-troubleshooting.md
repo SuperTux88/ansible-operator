@@ -30,6 +30,27 @@ per-host status, and the summary line.
 | `Failed` | The latest run did not succeed on every host, or its recap could not be read. A `Recurring` plan keeps this result between ticks the same way. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
 | `UnauthorizedNamespace` | The plan's namespace is not enrolled for the operator — it will not run. See below. |
 
+## Summary
+
+`.status.summary` — the `Summary` printer column — is one line about the plan's hosts:
+
+```text
+5/5 up-to-date
+3/5 up-to-date (2 outdated)
+5/5 up-to-date (last run failed)
+```
+
+The first number is always how many hosts are on the current execution hash, out of every host the
+plan targets; anything else is said in words after it. A host counts as up to date once a run has
+applied the current playbook and inputs to it successfully, so `outdated` is what the next run has
+left to do — for a `OneShot` plan, what stands between it and going quiet.
+
+The last line is worth recognising: a `Recurring` run that fails on a host which already applied this
+revision leaves nothing outdated, because the host still carries the hash its previous run gave it.
+The drift count is genuinely `5/5` there, so the failure is named separately rather than left to be
+inferred from a column that reads like good news. The `Ready` condition says how that run went
+per-host.
+
 ## Conditions
 
 `.status.conditions` carries `True`/`False` conditions. `Ready` and `Running` are also surfaced as
