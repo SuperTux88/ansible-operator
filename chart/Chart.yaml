@@ -6,9 +6,9 @@ type: application
 # record's spec; those are only evaluated from 1.25 on, and would be silently ignored, not
 # rejected, on anything older.
 kubeVersion: ">=1.25.0-0"
-version: 0.0.16 # VERSION
-appVersion: "0.0.16"
+version: 0.0.17 # VERSION
+appVersion: "0.0.17"
 dependencies:
   - name: crds
-    version: 0.0.16 # VERSION
+    version: 0.0.17 # VERSION
     condition: crds.install
