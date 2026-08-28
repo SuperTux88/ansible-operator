@@ -328,7 +328,9 @@ async fn reconcile(
         // Re-asserted rather than assumed: a plan that lost the finalizer — stripped by hand, or
         // adopted from a release that predates it — would otherwise keep the run it is holding
         // outside the contract for as long as that run lasts.
-        ensure_run_cleanup_finalizer(&api, &object).await?;
+        ensure_run_cleanup_finalizer(&api, &object)
+            .await
+            .or_else(|error| error.is_conflict().then_some(()).ok_or(error))?;
     }
     if let Some(recovered) = recovered {
         match recovered {
@@ -1663,7 +1665,12 @@ async fn try_start_run(
     // Before the record, the locks and the proxy pods: from here on the plan owns resources its own
     // deletion cannot reach, and the finalizer is the only thing that will release them.
     let plan_api = Api::<PlaybookPlan>::namespaced(context.client.clone(), run.namespace);
-    ensure_run_cleanup_finalizer(&plan_api, object).await?;
+    if let Err(error) = ensure_run_cleanup_finalizer(&plan_api, object).await {
+        return error
+            .is_conflict()
+            .then_some(Some(RETRY_REQUEUE))
+            .ok_or(error);
+    }
 
     let run_groups = run.run_groups;
     let active_run = match prepared {
