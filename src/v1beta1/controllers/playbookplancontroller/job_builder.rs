@@ -406,7 +406,15 @@ fn create_job_skeleton(
         ..Default::default()
     }]);
 
-    let variable_secrets: Vec<&String> = extract_secret_names_for_variables(plan).collect();
+    // Deduplicated: two `secretRef` entries naming one Secret describe one mount at one path, and
+    // emitting it twice is a duplicate volume the apiserver refuses — taking the whole run with it.
+    let variable_secrets: Vec<&String> =
+        extract_secret_names_for_variables(plan).fold(Vec::new(), |mut unique, secret| {
+            if !unique.contains(&secret) {
+                unique.push(secret);
+            }
+            unique
+        });
 
     let mut volumes = vec![kcore::v1::Volume {
         name: WORKSPACE_VOLUME_NAME.into(),
@@ -424,8 +432,9 @@ fn create_job_skeleton(
     }];
 
     for secret_name in &variable_secrets {
+        let volume = volume_name("vars", secret_name);
         volumes.push(kcore::v1::Volume {
-            name: secret_name.to_string(),
+            name: volume.clone(),
             secret: Some(SecretVolumeSource {
                 secret_name: Some(secret_name.to_string()),
                 default_mode: Some(0o0400),
@@ -440,25 +449,24 @@ fn create_job_skeleton(
         });
 
         volume_mounts.push(kcore::v1::VolumeMount {
-            name: secret_name.to_string(),
+            name: volume,
+            // The Secret's own name, not the volume's: this path is what
+            // `render_ansible_command` passes to `--extra-vars`, and what a user reads there.
             mount_path: format!("{}/vars/{secret_name}", paths::WORKSPACE_MOUNT_PATH),
             ..Default::default()
         });
     }
 
     for files_volume in extract_file_volumes(plan) {
-        volumes.push(files_volume?);
-        let volume = volumes.last().unwrap();
-
+        let (entry_name, volume) = files_volume?;
         volume_mounts.push(kcore::v1::VolumeMount {
             name: volume.name.clone(),
-            mount_path: format!(
-                "{}/files/{}",
-                paths::WORKSPACE_MOUNT_PATH,
-                volume.name.clone()
-            ),
+            // The entry's own name, which is the directory the guide tells users to read their
+            // files from.
+            mount_path: format!("{}/files/{entry_name}", paths::WORKSPACE_MOUNT_PATH),
             ..Default::default()
         });
+        volumes.push(volume);
     }
 
     let mut init_containers = Vec::new();
@@ -628,7 +636,7 @@ fn configure_job_for_ssh(job: &mut Job, ssh_configs: &[(String, SshConfig)]) {
                 .expect("job should have a container");
 
             for (static_inventory_name, config) in ssh_configs {
-                let volume_name = format!("ssh-{static_inventory_name}");
+                let volume_name = volume_name("ssh", static_inventory_name);
 
                 pod_spec.volumes.get_or_insert_default().push(Volume {
                     name: volume_name.clone(),
@@ -806,32 +814,82 @@ pub fn extract_secret_names_for_files(pp: &PlaybookPlan) -> impl Iterator<Item =
 /// own Result.
 fn extract_file_volumes(
     pp: &PlaybookPlan,
-) -> impl Iterator<Item = Result<Volume, serde_json::Error>> {
+) -> impl Iterator<Item = Result<(String, Volume), serde_json::Error>> {
     let files = pp.spec.template.files.as_ref();
 
     files.into_iter().flatten().map(|source| {
-        let value = match source {
-            FilesSource::Secret { name, secret_ref } => serde_json::to_value(kcore::v1::Volume {
-                name: name.to_owned(),
-                secret: Some(SecretVolumeSource {
-                    secret_name: Some(secret_ref.name.to_owned()),
+        let (entry_name, value) = match source {
+            FilesSource::Secret { name, secret_ref } => (
+                name,
+                serde_json::to_value(kcore::v1::Volume {
+                    name: volume_name("files", name),
+                    secret: Some(SecretVolumeSource {
+                        secret_name: Some(secret_ref.name.to_owned()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            })?,
+                })?,
+            ),
             FilesSource::Other { name, extra } => {
                 let mut volume = serde_json::to_value(extra)?;
-                volume
-                    .as_object_mut()
-                    .unwrap()
-                    .entry("name")
-                    .or_insert(serde_json::to_value(name)?);
+                // Set, not defaulted: the entry's `name` is the one the mount path is built from,
+                // so a `name` inside the free-form fields would otherwise name a volume that
+                // nothing mounts.
+                volume.as_object_mut().unwrap().insert(
+                    "name".into(),
+                    serde_json::to_value(volume_name("files", name))?,
+                );
 
-                volume
+                (name, volume)
             }
         };
-        serde_json::from_value::<Volume>(value)
+        Ok((
+            entry_name.to_owned(),
+            serde_json::from_value::<Volume>(value)?,
+        ))
     })
+}
+
+/// A Pod volume name for the Secret or file entry the volume mounts.
+///
+/// Volume names are RFC 1123 *labels*: at most 63 characters of `[a-z0-9-]`. The things they are
+/// named after are not. A Secret and a `StaticInventory` are named by DNS *subdomains*, so
+/// `edge.keys` is a perfectly ordinary name for either and up to 253 characters is legal, while a
+/// `files` entry's name is whatever the user wrote. Using those verbatim made the apiserver refuse
+/// the Job — and refuse it *after* the run had taken its host Leases and brought up its proxy pods,
+/// with a rejection no retry could ever clear.
+///
+/// So the name is derived: every character a label cannot carry folded to `-`, truncated to fit, and
+/// a short id of the *original* string appended. The id is what keeps `edge.keys` and `edge-keys`
+/// apart once folding has made them look alike, and the readable half is what lets somebody reading
+/// `kubectl describe pod` see which Secret a volume belongs to. The names the user actually chose
+/// stay where they are visible and where they are contracts: in `secretName`, and in the mount paths
+/// under `vars/` and `files/`.
+fn volume_name(prefix: &str, source: &str) -> String {
+    let mut hasher = twox_hash::XxHash3_64::new();
+    source.hash(&mut hasher);
+    let id = utils::generate_id(hasher.finish());
+
+    // Both separators, so the budget holds whether or not the readable half survives folding.
+    let budget = utils::MAX_DNS_LABEL_LEN.saturating_sub(prefix.len() + id.len() + 2);
+    let readable: String = source
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .take(budget)
+        .collect();
+    let readable = readable.trim_matches('-');
+
+    if readable.is_empty() {
+        format!("{prefix}-{id}")
+    } else {
+        format!("{prefix}-{readable}-{id}")
+    }
 }
 
 /// Builds the `ansible-playbook` invocation. Connection details no longer appear here at all —
@@ -892,6 +950,110 @@ fn render_ansible_command(
 mod tests {
     use crate::v1beta1::{PlaybookPlan, controllers::playbookplancontroller::paths, labels};
 
+    /// Volume names are DNS labels; the things they are named after are not. Every case here is a
+    /// name Kubernetes accepts on the object it belongs to and would have refused on a volume.
+    #[test]
+    fn volume_names_are_dns_labels_whatever_they_are_named_after() {
+        let is_dns_label = |name: &str| {
+            !name.is_empty()
+                && name.len() <= crate::utils::MAX_DNS_LABEL_LEN
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                && !name.starts_with('-')
+                && !name.ends_with('-')
+        };
+
+        // Ordinary names stay readable — the point of not hashing the whole thing.
+        assert!(super::volume_name("vars", "app-config").starts_with("vars-app-config-"));
+
+        for source in [
+            "edge.keys",      // a Secret name is a DNS subdomain: dots are legal
+            &"a".repeat(253), // and so is 253 characters
+            &format!("{}.example.com", "b".repeat(240)),
+            "TLS_certs", // a files entry name is whatever the user wrote
+            "...",       // ...including one with nothing a label can keep
+            "-",
+        ] {
+            let name = super::volume_name("files", source);
+            assert!(is_dns_label(&name), "{source:?} produced {name:?}");
+        }
+
+        // Folding makes distinct names look alike, so the id is taken over the original.
+        assert_ne!(
+            super::volume_name("vars", "edge.keys"),
+            super::volume_name("vars", "edge-keys")
+        );
+        // And it is a function of the name alone: the same Secret names the same volume on every
+        // reconcile, or a rebuilt Job would not match the one it is meant to be.
+        assert_eq!(
+            super::volume_name("vars", "edge.keys"),
+            super::volume_name("vars", "edge.keys")
+        );
+    }
+
+    /// One Secret referenced twice is one mount at one path. Emitted twice it is a duplicate volume,
+    /// which the apiserver refuses — after the run has taken its Leases and started its proxies.
+    #[test]
+    fn a_secret_referenced_twice_is_mounted_once() {
+        let yaml = r#"
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: PlaybookPlan
+metadata:
+  name: an-example
+  namespace: default
+spec:
+  image: some-image
+  mode: OneShot
+  inventoryRefs:
+    - staticInventory: blubb
+  template:
+    variables:
+      - secretRef:
+          name: shared.vars
+      - inline:
+          key: value
+      - secretRef:
+          name: shared.vars
+    playbook: |
+      - hosts: all
+        "#;
+        let mut pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        pp.metadata.uid = Some("plan-uid".into());
+        let hash = crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash("- hosts: all", std::iter::empty());
+
+        let pod_spec = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp)
+            .unwrap()
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+
+        let mounted: Vec<&str> = pod_spec
+            .volumes
+            .iter()
+            .flatten()
+            .filter_map(|volume| volume.secret.as_ref())
+            .filter_map(|secret| secret.secret_name.as_deref())
+            .filter(|name| *name == "shared.vars")
+            .collect();
+        assert_eq!(mounted, vec!["shared.vars"]);
+
+        let paths: Vec<&str> = pod_spec.containers[0]
+            .volume_mounts
+            .iter()
+            .flatten()
+            .map(|mount| mount.mount_path.as_str())
+            .filter(|path| path.contains("/vars/"))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![format!("{}/vars/shared.vars", paths::WORKSPACE_MOUNT_PATH)],
+            "the Secret's own name stays in the path the playbook reads"
+        );
+    }
+
     #[test]
     fn test_extract_file_volumes_generates_correct_volumes() {
         let yaml = r#"
@@ -937,17 +1099,20 @@ spec:
         assert!(errs.is_empty(), "Some results were Err: {errs:#?}");
 
         let volumes: Vec<_> = oks.into_iter().map(Result::unwrap).collect();
-        let volume1 = volumes.first().unwrap();
-        let volume2 = volumes.get(1).unwrap();
+        let (entry1, volume1) = volumes.first().unwrap();
+        let (entry2, volume2) = volumes.get(1).unwrap();
 
-        assert_eq!("some-configs", volume1.name);
+        // The entry name is what the mount path is built from; the volume carries the derived one.
+        assert_eq!("some-configs", entry1);
+        assert_eq!(volume1.name, super::volume_name("files", "some-configs"));
         assert!(volume1.secret.is_some());
         assert_eq!(
             volume1.secret.as_ref().unwrap().secret_name,
             Some("secret-with-config-files".into())
         );
 
-        assert_eq!("binary-assets", volume2.name);
+        assert_eq!("binary-assets", entry2);
+        assert_eq!(volume2.name, super::volume_name("files", "binary-assets"));
         assert!(volume2.image.is_some());
         assert_eq!(
             volume2.image.as_ref().unwrap().reference,
