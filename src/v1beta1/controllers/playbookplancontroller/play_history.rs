@@ -365,8 +365,8 @@ pub fn needs_recovery(play: &Play) -> bool {
 /// that very record this tick, so a name that is now empty — or now holds a different object — means
 /// something outside the protocol removed the receipt for a privileged run between the read and the
 /// acknowledgement. That is worth one failed tick to say out loud. It costs no more than that: the
-/// plan's own status was already patched before this call, so the run is persisted and the retry
-/// finds nothing left to finalize. Callers that *know* there is nothing to acknowledge pass
+/// plan's own complete status was already patched before this call, so replaying the record on the
+/// next tick is idempotent. Callers that *know* there is nothing to acknowledge pass
 /// `TerminalRecord::Lost` and never come here.
 pub async fn acknowledge_finished(
     client: &kube::Client,
