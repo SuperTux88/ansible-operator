@@ -118,7 +118,9 @@ pub struct PlaybookPlanSpec {
     /// absorbs the gap between a tick and the next reconcile (e.g. the operator was busy or
     /// restarting). If more than this many seconds pass past a tick without the run starting, that
     /// tick is skipped and the run waits for the next one. The same idea as a CronJob's
-    /// `.spec.startingDeadlineSeconds`. Only affects scheduled (`schedule`) plans. Defaults to 30.
+    /// `.spec.startingDeadlineSeconds`. A `Recurring` retry shares the original tick's deadline; the
+    /// window does not restart when an attempt fails, so time spent running earlier attempts counts
+    /// against it. Only affects scheduled (`schedule`) plans. Defaults to 30.
     #[schemars(with = "Option<UnsignedInt>")]
     pub starting_deadline_seconds: Option<u32>,
 
