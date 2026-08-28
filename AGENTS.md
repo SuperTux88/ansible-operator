@@ -218,6 +218,13 @@ handful of decisions that are easy to undo by accident:
   resolved groups, which is exactly what `preparationFingerprint` covers; `create_job_blueprint` is
   deterministic, so a resumed rebuild is byte-identical. An unlaunched run whose inputs changed is
   deliberately *not* finished.
+- **A run is mirrored onto the plan's status before it acquires anything.** `try_start_run` writes
+  the record, then patches `activeRun`, and only then takes host Leases and creates proxy pods. The
+  record alone is not enough to hold that ordering open: it is a *dependent* of the plan, so a
+  `--cascade=foreground` delete has the garbage collector remove it while the run-cleanup finalizer
+  still holds the plan, and `release_deleted_plan` would then find no handle on resources in the
+  operator namespace that nothing else can collect. The mirror is a field of the plan and cannot be
+  collected separately. Do not move lock acquisition or proxy creation above that patch.
 - **Only `Prepared` is gated on the schedule window** and the rest of `has_work_to_start`.
   `Starting`/`Launching` wait on proxy pods, which routinely outlasts `startingDeadlineSeconds`;
   gating them would leave a scheduled plan unable to launch.
