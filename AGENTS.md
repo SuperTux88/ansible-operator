@@ -153,8 +153,10 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    from the pod's **termination message** (`callback_output.rs`, written by the callback
    plugin — not from logs, no `pods/log` access), `cleanup_proxy_infra`, release Leases,
    `record_finished` on the `Play`, fold it into the plan via
-   `status::apply_terminal_play_status`, then `finalize_finished_run` (persist, acknowledge,
-   prune) and set the terminal `Phase` (or reschedule for `Recurring`).
+   `status::apply_terminal_play_status`, stage the finished record, and set the terminal `Phase`
+   (or reschedule for `Recurring`). The complete status is persisted before the `Play` is
+   acknowledged and eligible for pruning, so a failure anywhere before that write replays the
+   result instead of stranding a provisional status.
    This is also where a run whose `Play` is gone is `finalize_lost_run`'d (infra released, hosts
    `Unknown`) — not in step 0a: recovery has no record left to dispatch on, so it is the *mirror*
    in `status.activeRun` that brings the run here to be released.
@@ -162,9 +164,10 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    between read and write, so a version-checked PUT would routinely 409. It is also where the
    suspension contract is held (`suspended_advertises_no_next_run`): a tick has several ways to write
    a status and only one way to reach the end of the pipeline, so "a suspended plan advertises no
-   `nextRun`" belongs at the write, not at the end. The version-checked *finalizer* write
-   (`drop_run_cleanup_finalizer`) comes **after** it and treats a 409 as "retry next tick" — it
-   raced the status write this tick just made, and losing that race must not discard it.
+   `nextRun`" belongs at the write, not at the end. Terminal `Play` acknowledgement and the
+   version-checked *finalizer* write (`drop_run_cleanup_finalizer`) come **after** it. The finalizer
+   write treats a 409 as "retry next tick" — it raced the status write this tick just made, and
+   losing that race must not discard it.
 
 Requeue is dynamic: 3600s default, tightened to "time until next scheduled run" / 15s
 (Job-polling) / 5s (waiting on proxy readiness) as appropriate.
@@ -246,9 +249,10 @@ handful of decisions that are easy to undo by accident:
   suspended plan sitting on its host Leases behind a read that may never succeed. That is why
   `has_work_to_start` excludes it and `decide_unlaunched_action` may assume it is not set; folding it
   back in there looks like a simplification and is a second, later decision.
-- **The result reaches the plan first and the `Play` second** (`finalize_finished_run`), so a crash
-  between them replays idempotently. `plays_to_prune` therefore never prunes an unacknowledged
-  terminal record, nor an `Aborted` one.
+- **The complete result reaches the plan first and the `Play` second.** The terminal phase, summary,
+  retry budget and schedule state are patched before the `Play` is acknowledged, so a crash or
+  input-read failure before that boundary replays idempotently. `plays_to_prune` therefore never
+  prunes an unacknowledged terminal record, nor an `Aborted` one.
 - **`recover_active_run` enforces one-run-at-a-time rather than assuming it.** More than one *in
   flight* record fails the tick loudly (`sole_active_record`) instead of orphaning the loser's
   node-root proxy pods — after `renew_contested_locks` has kept every candidate's hosts protected. It
