@@ -50,11 +50,12 @@ Cluster-node access needs a **real OpenSSH `sshd`** image for the proxy pods; th
 is distroless and cannot serve this role. It is configured via the chart's `managedSsh.proxyImage`.
 
 The default is the first-party, minimal, statically-linked `sshd` image published alongside the
-operator (`ghcr.io/webd97/ansible-operator-sshd`). With `tag` left empty it tracks the chart
-appVersion, so it moves in lockstep with the operator on upgrade.
+operator (`ghcr.io/webd97/ansible-operator-sshd`), pinned to a release-specific `@sha256:` digest.
+The empty `tag` is intentional: the release workflow repins the digest when publishing a new proxy
+image.
 
-**This is a node-root pod, so treat the image as node-root supply chain.** In production, pin it to a
-digest from a registry you trust — set `tag: ""` and put the digest in `repository`:
+**This is a node-root pod, so treat the image as node-root supply chain.** If you override the default,
+pin the image to a digest from a registry you trust — set `tag: ""` and put the digest in `repository`:
 
 ```yaml
 # values.yaml
