@@ -61,7 +61,9 @@ jobs:
         run: cargo test
 
       - name: Run Clippy
-        run: cargo clippy -- -D warnings
+        run: |
+          rustup component add clippy
+          cargo clippy -- -D warnings
 
       - name: Verify generated CRDs are current
         run: |
