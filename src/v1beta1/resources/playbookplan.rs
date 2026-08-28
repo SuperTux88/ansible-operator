@@ -2,7 +2,7 @@ use std::{borrow::Cow, collections::BTreeMap};
 
 use crate::{
     utils::Condition,
-    v1beta1::{ResolvedHosts, UnsignedInt},
+    v1beta1::{PositiveInt, ResolvedHosts, UnsignedInt},
 };
 use chrono::{DateTime, FixedOffset};
 use chrono_tz::Tz;
@@ -90,6 +90,15 @@ pub struct PlaybookPlanSpec {
     #[schemars(default)]
     pub mode: ExecutionMode,
 
+    /// How many times a failed run may be tried again before the operator stops, counting the first
+    /// run — so `1` means no retry. Defaults to 3 for `OneShot` and 1 for `Recurring`.
+    ///
+    /// The budget covers one *execution*: for `OneShot` the current playbook and inputs, which an
+    /// edit resets; for `Recurring` one schedule tick, since the next tick is going to re-apply the
+    /// playbook anyway. Every try is a run of its own, with its own `Play` record and its own Job.
+    #[schemars(with = "Option<PositiveInt>")]
+    pub max_attempts: Option<u32>,
+
     /// When true, the operator stops starting new runs for this plan — the same idea as a
     /// CronJob's `.spec.suspend`. A run already in progress is left to finish; only the *starting*
     /// of new runs is gated. While suspended the `Suspended` printer column reads `true` and
@@ -132,7 +141,7 @@ pub struct PlaybookPlanSpec {
 
     /// How many failed (or outcome-unknown) `Play` history records to keep for this plan. Kept
     /// larger than the successful limit so failures stay visible longer. A terminal result is
-    /// temporarily exempt until it reaches the plan status; an aborted attempt is deleted only
+    /// temporarily exempt until it reaches the plan status; an aborted run is deleted only
     /// after its resources are cleaned up. Defaults to 10.
     #[schemars(with = "Option<UnsignedInt>")]
     pub failed_plays_history_limit: Option<u32>,
@@ -310,19 +319,21 @@ pub enum Phase {
     #[default]
     Pending,
 
-    /// Playbook execution has been delayed.
+    /// The plan is waiting for its scheduled time, and the current playbook and inputs have not
+    /// produced a result yet. Once a run has finished, its `Succeeded`/`Failed` verdict is what the
+    /// plan reports between runs, with `nextRun` naming the next one.
     Delayed,
 
     /// Playbook has not yet been applied to all hosts.
     Applying,
 
-    /// Playbook is scheduled for reexecution.
-    Scheduled,
-
-    /// Some or all jobs failed (for OneShot mode only)
+    /// The latest run did not succeed on every host it targeted, or its recap could not be read.
+    /// A `Recurring` plan keeps this result between schedule ticks, with `nextRun` naming the next
+    /// one. Also set when the plan is refused outright, e.g. for a name that is too long.
     Failed,
 
-    /// Jobs for all hosts ran successfully (for OneShot mode only)
+    /// Every host the latest run targeted succeeded. A `Recurring` plan keeps this result between
+    /// schedule ticks, with `nextRun` naming the next one.
     Succeeded,
 
     /// The PlaybookPlan's namespace is not enrolled for the operator (not in the chart's
@@ -371,14 +382,28 @@ pub struct PlaybookPlanStatus {
     pub phase: Phase,
     pub current_hash: String,
     pub summary: Option<String>,
-    /// The attempt number of the current run, which is what distinguishes retries in the Job name
-    /// (`apply-{plan}-{shortid}-{n}`). Reset to 0 whenever `currentHash` changes, but that reset
-    /// only ever lowers the *starting point*: a new attempt is numbered past every attempt still
-    /// claiming a name — all of this plan's Jobs and all of its retained `Play` records, whatever
-    /// revision they belong to — so it can advance by more than one, and a new revision does not
-    /// restart at 1 while earlier runs are still retained. Names are reserved plan-wide rather than
-    /// per revision because the short id truncates a hash over the plan and the revision, so two
-    /// revisions of one plan can share one; see `reconciler::select_job`.
+    /// The highest run number this plan has handed out, which is what keeps the Job name
+    /// (`apply-{plan}-{shortid}-{n}`) unique across runs of an unchanged spec. Reset to 0 whenever
+    /// `currentHash` changes, but that reset only ever lowers the *starting point*: a new run is
+    /// numbered past every run still claiming a name — all of this plan's Jobs and all of its
+    /// retained `Play` records, whatever revision they belong to — so it can advance by more than
+    /// one, and a new revision does not restart at 1 while earlier runs are still retained. Names
+    /// are reserved plan-wide rather than per revision because the short id truncates a hash over
+    /// the plan and the revision, so two revisions of one plan can share one; see
+    /// `reconciler::select_job`.
+    ///
+    /// A high-water mark, not a count of runs: a run abandoned before its Job existed is not
+    /// deducted, so its number stays reserved for as long as this field outlives its `Play`.
+    #[schemars(with = "UnsignedInt")]
+    pub last_run_number: u32,
+    /// How many tries the current execution has spent of its `spec.maxAttempts` budget, the latest
+    /// run included. Unlike `lastRunNumber` this counts, and it counts within one execution only:
+    /// it restarts at 1 whenever `currentHash` changes and, for `Recurring` plans, whenever a new
+    /// schedule tick starts a run — the two events that begin a new execution.
+    ///
+    /// Written from the run's own `Play` record, so a status that lags a run in flight cannot hand
+    /// the budget back by forgetting a try that was already made.
+    #[serde(default)]
     #[schemars(with = "UnsignedInt")]
     pub retry_count: u32,
 }
@@ -388,7 +413,7 @@ pub struct PlaybookPlanStatus {
 pub struct ActiveRun {
     /// The execution hash used to create this run's Job and infrastructure.
     pub execution_hash: String,
-    /// Stable per-attempt resource/cleanup identity, distinct even across same-hash retries.
+    /// Stable per-run resource/cleanup identity, distinct even across same-hash retries.
     pub run_id: String,
     /// The Job backing this run, which is also the name of its `Play`.
     pub job_name: String,
@@ -396,7 +421,10 @@ pub struct ActiveRun {
     pub play_uid: String,
     /// Hosts targeted by this run, preserved even if the desired inventory changes while it runs.
     pub hosts: Vec<String>,
-    /// Attempt number represented by `jobName`.
+    /// Run number represented by `jobName`.
+    #[schemars(with = "UnsignedInt")]
+    pub run_number: u32,
+    /// Which try of the current execution this run is — see `status.retryCount`.
     #[schemars(with = "UnsignedInt")]
     pub attempt: u32,
     /// Start of the schedule slot consumed by this run, if it is scheduled.
@@ -528,6 +556,7 @@ mod tests {
                 service_account_name: None,
                 verbosity: None,
                 mode: ExecutionMode::Recurring,
+                max_attempts: None,
                 suspend: false,
                 schedule: Some("0 1 * * *".into()),
                 time_zone: None,
@@ -653,7 +682,7 @@ spec:
             "phase": "Applying",
             "currentHash": "abc123",
             "summary": null,
-            "retryCount": 1
+            "lastRunNumber": 1
         });
 
         let status: PlaybookPlanStatus = serde_json::from_value(json).unwrap();

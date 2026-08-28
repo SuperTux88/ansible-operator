@@ -59,7 +59,7 @@ spec:
                 description: |-
                   How many failed (or outcome-unknown) `Play` history records to keep for this plan. Kept
                   larger than the successful limit so failures stay visible longer. A terminal result is
-                  temporarily exempt until it reaches the plan status; an aborted attempt is deleted only
+                  temporarily exempt until it reaches the plan status; an aborted run is deleted only
                   after its resources are cleaned up. Defaults to 10.
                 minimum: 0.0
                 nullable: true
@@ -81,6 +81,17 @@ spec:
                       type: string
                   type: object
                 type: array
+              maxAttempts:
+                description: |-
+                  How many times a failed run may be tried again before the operator stops, counting the first
+                  run — so `1` means no retry. Defaults to 3 for `OneShot` and 1 for `Recurring`.
+
+                  The budget covers one *execution*: for `OneShot` the current playbook and inputs, which an
+                  edit resets; for `Recurring` one schedule tick, since the next tick is going to re-apply the
+                  playbook anyway. Every try is a run of its own, with its own `Play` record and its own Job.
+                minimum: 1.0
+                nullable: true
+                type: integer
               mode:
                 default: OneShot
                 description: Controls if a playbook is executed once or repeatedly
@@ -312,7 +323,7 @@ spec:
                 nullable: true
                 properties:
                   attempt:
-                    description: Attempt number represented by `jobName`.
+                    description: Which try of the current execution this run is — see `status.retryCount`.
                     minimum: 0.0
                     type: integer
                   executionHash:
@@ -330,8 +341,12 @@ spec:
                     description: UID of the immutable `Play` recovery record correlated with the Job and its pod template.
                     type: string
                   runId:
-                    description: Stable per-attempt resource/cleanup identity, distinct even across same-hash retries.
+                    description: Stable per-run resource/cleanup identity, distinct even across same-hash retries.
                     type: string
+                  runNumber:
+                    description: Run number represented by `jobName`.
+                    minimum: 0.0
+                    type: integer
                   triggeredSlot:
                     description: Start of the schedule slot consumed by this run, if it is scheduled.
                     nullable: true
@@ -343,6 +358,7 @@ spec:
                 - jobName
                 - playUid
                 - runId
+                - runNumber
                 type: object
               conditions:
                 items:
@@ -414,6 +430,22 @@ spec:
                 format: int64
                 nullable: true
                 type: integer
+              lastRunNumber:
+                description: |-
+                  The highest run number this plan has handed out, which is what keeps the Job name
+                  (`apply-{plan}-{shortid}-{n}`) unique across runs of an unchanged spec. Reset to 0 whenever
+                  `currentHash` changes, but that reset only ever lowers the *starting point*: a new run is
+                  numbered past every run still claiming a name — all of this plan's Jobs and all of its
+                  retained `Play` records, whatever revision they belong to — so it can advance by more than
+                  one, and a new revision does not restart at 1 while earlier runs are still retained. Names
+                  are reserved plan-wide rather than per revision because the short id truncates a hash over
+                  the plan and the revision, so two revisions of one plan can share one; see
+                  `reconciler::select_job`.
+
+                  A high-water mark, not a count of runs: a run abandoned before its Job existed is not
+                  deducted, so its number stays reserved for as long as this field outlives its `Play`.
+                minimum: 0.0
+                type: integer
               lastTriggeredRun:
                 description: |-
                   The start of the schedule slot (`Timing::Now`'s window start) that a run was last started
@@ -431,21 +463,20 @@ spec:
                 - Pending
                 - Delayed
                 - Applying
-                - Scheduled
                 - Failed
                 - Succeeded
                 - UnauthorizedNamespace
                 type: string
               retryCount:
+                default: 0
                 description: |-
-                  The attempt number of the current run, which is what distinguishes retries in the Job name
-                  (`apply-{plan}-{shortid}-{n}`). Reset to 0 whenever `currentHash` changes, but that reset
-                  only ever lowers the *starting point*: a new attempt is numbered past every attempt still
-                  claiming a name — all of this plan's Jobs and all of its retained `Play` records, whatever
-                  revision they belong to — so it can advance by more than one, and a new revision does not
-                  restart at 1 while earlier runs are still retained. Names are reserved plan-wide rather than
-                  per revision because the short id truncates a hash over the plan and the revision, so two
-                  revisions of one plan can share one; see `reconciler::select_job`.
+                  How many tries the current execution has spent of its `spec.maxAttempts` budget, the latest
+                  run included. Unlike `lastRunNumber` this counts, and it counts within one execution only:
+                  it restarts at 1 whenever `currentHash` changes and, for `Recurring` plans, whenever a new
+                  schedule tick starts a run — the two events that begin a new execution.
+
+                  Written from the run's own `Play` record, so a status that lags a run in flight cannot hand
+                  the budget back by forgetting a try that was already made.
                 minimum: 0.0
                 type: integer
               summary:
@@ -455,8 +486,8 @@ spec:
             - conditions
             - currentHash
             - eligibleHosts
+            - lastRunNumber
             - phase
-            - retryCount
             type: object
         required:
         - spec

@@ -21,6 +21,7 @@ validation rules, the operator refuses the plan instead and says so in `.status.
 | `inventoryRefs` | yes | Which inventories to target — one entry per referenced `ClusterInventory` or `StaticInventory`. |
 | `template.playbook` | yes | The playbook text itself (see below). |
 | `mode` | no (`OneShot`) | `OneShot` or `Recurring` — see [Scheduling and execution modes](./scheduling-and-modes.md). |
+| `maxAttempts` | no (`3` / `1`) | How many times a failed run may be tried again, counting the first run. Defaults to `3` for `OneShot` and `1` for `Recurring` — see [Retries](./scheduling-and-modes.md#retries). |
 | `schedule` | no | A 5-field cron expression gating when the plan may run. Omit for "as soon as possible". |
 | `timeZone` | no (UTC) | IANA time zone the `schedule` is evaluated in, e.g. `Europe/Berlin`. |
 | `suspend` | no (`false`) | Pause switch, like a CronJob's `suspend`: while `true` the operator starts no new runs. See [Suspending a plan](./scheduling-and-modes.md#suspending-a-plan). |
@@ -126,7 +127,7 @@ lowering it never re-runs the playbook on hosts that are already current.
 
 ## One Job per run
 
-Each run is a single Kubernetes Job (named `apply-<plan>-<id>-<retry>`) that applies the playbook to
+Each run is a single Kubernetes Job (named `apply-<plan>-<id>-<n>`) that applies the playbook to
 all of that run's hosts together, not one Job per host. This lets a playbook use Ansible features
 that span hosts (`serial`, `run_once`, delegation) normally. The operator adds per-host **Leases** so
 two runs never touch the same host at once, and it steers the Job's own pod away from the Nodes the
@@ -134,14 +135,15 @@ run targets, so a disruptive playbook is less likely to evict its own runner mid
 
 ## Lifecycle at a glance
 
-A plan moves through phases: `Pending` → `Applying` → `Succeeded`/`Failed` (for `OneShot`) or
-`… → Scheduled → …` (for `Recurring`). Drift detection decides *which* hosts actually run: an
+A plan moves through phases: `Pending` → `Delayed` while it waits for a scheduled start →
+`Applying` → `Succeeded`/`Failed`, in both modes, from the recap of the run that just finished. A `Recurring` plan keeps that result between ticks and
+advertises the next one through `.status.nextRun`. Drift detection decides *which* hosts actually run: an
 execution hash over the playbook plus every referenced Secret marks hosts out of date, and a host
 that already succeeded on the current hash is skipped. See
 [Scheduling and execution modes](./scheduling-and-modes.md) for the mechanics and
 [Reading results](./results-and-troubleshooting.md) for how to read the outcome.
 
-`Applying` covers the whole active attempt, including waiting for host locks and proxy readiness.
+`Applying` covers the whole active run, including waiting for host locks and proxy readiness.
 The `Running` condition distinguishes the narrower period when the Job itself is active.
 
 ## Deleting a plan
@@ -167,7 +169,7 @@ operator log, which names the run it is waiting on.
 The finalizer is only present while a plan actually holds a run, and a plan that has never started
 one never carries it at all. Deleting an idle plan is immediate — with one exception: a plan gives
 the finalizer back on the tick *after* the one that released its run, so a plan whose run has just
-finished, or whose attempt was interrupted before it created anything, holds it for one more tick. If
+finished, or whose run was interrupted before it created anything, holds it for one more tick. If
 the operator stops inside that moment, even an idle plan waits in `Terminating` until it returns.
 
 Everything a run creates in the plan's own namespace (its Job, `Play` records, workspace Secret,

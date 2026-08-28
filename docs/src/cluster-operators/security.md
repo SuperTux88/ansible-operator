@@ -42,18 +42,18 @@ Cross-run isolation is enforced at the **certificate** layer, not merely by netw
 
 - The operator runs its **own SSH certificate authority**, generated **in memory at startup**. The CA
   private key is never written to a Secret, never persisted to etcd, never logged. **Restarting the
-  operator rotates the CA**. An attempt still has mutually valid old-CA client and proxy certificates
+  operator rotates the CA**. A run still has mutually valid old-CA client and proxy certificates
   until its infrastructure is reset or cleaned up; new infrastructure is always minted from the new
   CA.
-- Each attempt gets fresh, short-lived host and client certificates. Each proxy pod's
-  authorized-principals list contains **only its own per-attempt run ID** — never `root`, never a
+- Each run gets fresh, short-lived host and client certificates. Each proxy pod's
+  authorized-principals list contains **only its own run ID** — never `root`, never a
   wildcard — so even retries of the same execution hash authenticate only to their own proxies.
-- A per-attempt **NetworkPolicy** locks each proxy pod's ingress to that attempt's Job. This is
+- A per-run **NetworkPolicy** locks each proxy pod's ingress to that run's Job. This is
   defense in depth on top of the certificate isolation, not the primary control.
 - Proxy pods, their Secrets, and the NetworkPolicy are **torn down when the run ends** — there is no
   standing SSH surface on your Nodes between runs.
 
-Run recovery has its own trust boundary. Each attempt is written down as a `Play` before anything is
+Run recovery has its own trust boundary. Each run is written down as a `Play` before anything is
 created for it, and a CRD validation rule freezes that record's spec for its lifetime. The record
 identifies a run rather than copying what it executes: no plan spec, no connection configuration, no
 Job blueprint — those are re-derived from live cluster state and guarded by a fingerprint, so there
@@ -71,7 +71,7 @@ cluster that does not evaluate such rules it would be silently absent rather tha
 it holds before relying on it:
 
 ```sh
-kubectl patch play <name> -n my-team --type merge -p '{"spec":{"attempt":99}}'
+kubectl patch play <name> -n my-team --type merge -p '{"spec":{"runNumber":99}}'
 # expected: Play spec is immutable
 ```
 
@@ -154,7 +154,7 @@ cannot reach:
   Secrets that are already part of the Ansible trust boundary.
 - **Bounded to policy-granted Nodes.** Even a fully forged request cannot reach a Node outside the
   intersection of the admin-authored policies.
-- **No persistent node foothold from the mechanism itself.** Proxy infra is per-attempt and ephemeral, and
+- **No persistent node foothold from the mechanism itself.** Proxy infra is per-run and ephemeral, and
   the CA is in-memory and rotates on restart. What a *playbook* does to a Node is up to the playbook —
   that is the tenant's power, gated by the two fences above.
 
@@ -163,8 +163,8 @@ cannot reach:
 The properties above are pinned by the numbered invariants in `THREAT_MODEL.md` §7, enforced by
 unit tests. In brief: fail-closed selectors (INV-1); enforcement is intersection-only and can only
 remove hosts (INV-2); it runs before any proxy infra, every reconcile (INV-3), and every fresh or
-resumed attempt re-authorizes the exact set before creating proxies (INV-3b); cross-run isolation is
-per-attempt cert principals (INV-4); the Node allow-set is a live read (INV-5); the CA private key
+resumed run re-authorizes the exact set before creating proxies (INV-3b); cross-run isolation is
+per-run cert principals (INV-4); the Node allow-set is a live read (INV-5); the CA private key
 never leaves the process (INV-6); proxy pods are labelled so cleanup can never sweep the ansible Job
 pod (INV-7). If you are modifying the operator, do not regress these without an explicit, deliberate
 decision.

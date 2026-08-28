@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::v1beta1::{HostOutcome, ResolvedHosts, UnsignedInt};
 
-/// An immutable per-attempt recovery and history record. It is written before Job creation, advances
+/// An immutable per-run recovery and history record. It is written before Job creation, advances
 /// from preparation through execution, and retains the terminal recap after the Job is reaped.
 ///
 /// Owned (ownerReference) by its `PlaybookPlan`, so deleting the plan cascades to all its Plays;
@@ -21,7 +21,8 @@ use crate::v1beta1::{HostOutcome, ResolvedHosts, UnsignedInt};
     namespaced,
     status = "PlayStatus",
     printcolumn = r#"{"name":"Plan","type":"string","jsonPath":".spec.playbookPlan"}"#,
-    printcolumn = r#"{"name":"Attempt","type":"integer","jsonPath":".spec.attempt","priority":1}"#,
+    printcolumn = r#"{"name":"Run","type":"integer","jsonPath":".spec.runNumber","priority":1}"#,
+    printcolumn = r#"{"name":"Try","type":"integer","jsonPath":".spec.attempt","priority":1}"#,
     printcolumn = r#"{"name":"Hosts","type":"integer","jsonPath":".status.hostCount"}"#,
     printcolumn = r#"{"name":"Ok","type":"integer","jsonPath":".status.recap.ok"}"#,
     printcolumn = r#"{"name":"Changed","type":"integer","jsonPath":".status.recap.changed"}"#,
@@ -35,7 +36,7 @@ use crate::v1beta1::{HostOutcome, ResolvedHosts, UnsignedInt};
 )]
 // Freezes the whole spec. CEL is blind inside `x-kubernetes-preserve-unknown-fields`, so the rule is
 // only worth its name because every field below is *typed* — which is possible because the inputs an
-// attempt may be resumed against are reduced to the `preparationFingerprint` hash rather than stored
+// run may be resumed against are reduced to the `preparationFingerprint` hash rather than stored
 // verbatim. `crd_makes_the_play_spec_immutable` fails if a schemaless field is ever reintroduced.
 // Not the only control: the nodes a resumed run is about to reach are re-authorized against live
 // policy before any of them get a proxy pod. See THREAT_MODEL §T-ESC-8.
@@ -52,31 +53,46 @@ pub struct PlaySpec {
     /// The execution hash the run applied — matches the backing Job's hash label.
     pub execution_hash: String,
 
-    /// Stable identifier for this attempt, used to isolate resource names, labels, and cleanup from
-    /// other attempts that share the same execution hash.
+    /// Stable identifier for this run, used to isolate resource names, labels, and cleanup from
+    /// other runs that share the same execution hash.
     pub run_id: String,
 
-    /// Fingerprint of all plan and resolved-inventory inputs used while preparing this attempt.
+    /// Fingerprint of all plan and resolved-inventory inputs used while preparing this run.
     ///
     /// This is the run's change detector, and it is why the record carries no copy of the plan spec,
-    /// resolved connection configuration or the Job. Everything an unlaunched attempt needs to be
+    /// resolved connection configuration or the Job. Everything an unlaunched run needs to be
     /// resumed is a pure function of the live plan spec and the freshly resolved groups, so while
     /// the fingerprint still matches those the inputs can simply be re-derived; once it stops
-    /// matching there is nothing worth resuming and the attempt is aborted in favour of the new
+    /// matching there is nothing worth resuming and the run is aborted in favour of the new
     /// revision. Reducing them to one *typed* field is also what lets the spec's `self == oldSelf`
     /// rule cover the whole record: CEL cannot see into a schemaless field, and there is none here.
     pub preparation_fingerprint: String,
 
-    /// Attempt number reserved across all revisions of this plan: 1 for the first attempt, then one
-    /// past every Job and retained `Play` record still claiming a number. It may therefore continue
-    /// across plan edits and skip numbers. Mirrors the backing Job's numbered name
-    /// (`apply-{plan}-{shortid}-{attempt}`).
+    /// Sequence number reserved across all revisions of this plan: 1 for the first run, then one
+    /// past every Job and retained `Play` record still claiming a number. It therefore continues
+    /// across plan edits rather than restarting at 1 for a new revision. Mirrors the backing Job's
+    /// numbered name (`apply-{plan}-{shortid}-{runNumber}`).
+    ///
+    /// Not a dense count of this plan's runs: a run abandoned before its Job exists leaves its
+    /// number unused whenever the plan's `lastRunNumber` already recorded it. Uniqueness of the
+    /// name is the whole contract.
+    #[schemars(with = "UnsignedInt")]
+    pub run_number: u32,
+
+    /// Which try of its execution this run is: 1 for the first, one more for each retry of a failed
+    /// one, up to the plan's `spec.maxAttempts`. An execution is the current playbook and inputs
+    /// for a `OneShot` plan and one schedule tick for a `Recurring` one, so this restarts at 1
+    /// whenever the plan is edited and, for `Recurring`, at every tick.
+    ///
+    /// Orthogonal to `runNumber`, which every try advances because every try *is* a run — with its
+    /// own record, its own `runId` and its own Job. This says which try of its execution that run
+    /// was, which the run number cannot: it is reserved plan-wide and continues across editions.
     #[schemars(with = "UnsignedInt")]
     pub attempt: u32,
 
     /// The inventory this run targeted, preserving the groups the user designed (each group's name
     /// and its hosts) rather than a flat host list. Same shape as the plan's `.status.eligibleHosts`,
-    /// filtered to the hosts this attempt actually ran.
+    /// filtered to the hosts this run actually ran.
     pub inventory: Vec<ResolvedHosts>,
 
     /// Start of the schedule slot consumed by this run. Unscheduled runs leave this absent. Keeping
@@ -161,13 +177,13 @@ pub enum PlayPhase {
     #[default]
     Prepared,
     /// The run holds its host locks and its privileged infrastructure is being created. Recovery
-    /// resumes that setup while the plan's inputs are unchanged; the attempt is abandoned if its
+    /// resumes that setup while the plan's inputs are unchanged; the run is abandoned if its
     /// nodes lost their authorization or if the desired revision moved on.
     Starting,
     /// Setup is complete and final live authorization has passed, so Job creation is committed.
     /// Recovery re-derives the blueprint from the plan and creates it. If the desired revision moved
     /// on first, recovery adopts the Job when it already exists — a started run is always allowed to
-    /// finish — and otherwise abandons the attempt rather than launching a superseded one.
+    /// finish — and otherwise abandons the run rather than launching a superseded one.
     Launching,
     /// The backing Job has been confirmed and hasn't reached a terminal state yet.
     Running,

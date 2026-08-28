@@ -1,5 +1,5 @@
-//! Writes and prunes `Play` recovery/history records. A Play is a durable, per-attempt receipt of
-//! one Ansible attempt. It begins before Job creation, so an attempt abandoned during preparation has
+//! Writes and prunes `Play` recovery/history records. A Play is a durable, per-run receipt of
+//! one Ansible run. It begins before Job creation, so a run abandoned during preparation has
 //! no backing Job; once launched, it is 1:1 with its Job. Run identity survives status-write failures
 //! and the recap survives the Job/pod's short TTL. Retention is bounded by the history limits.
 //!
@@ -50,8 +50,8 @@ pub const DEFAULT_FAILED_PLAYS_HISTORY_LIMIT: u32 = 10;
 
 const FIELD_MANAGER: &str = "ansible-operator";
 
-/// Identifies one run attempt for the history calls: the plan it belongs to, the backing Job's name
-/// (which is also the Play's name), the execution hash, the attempt/retry number, and the inventory
+/// Identifies one run for the history calls: the plan it belongs to, the backing Job's name
+/// (which is also the Play's name), the execution hash, the run/retry number, and the inventory
 /// it targeted (grouped, for the Play spec).
 pub struct PlayRef<'a> {
     pub plan: &'a PlaybookPlan,
@@ -59,6 +59,7 @@ pub struct PlayRef<'a> {
     pub hash: &'a ExecutionHash,
     pub run_id: &'a str,
     pub preparation_fingerprint: &'a str,
+    pub run_number: u32,
     pub attempt: u32,
     pub inventory: &'a [ResolvedHosts],
     pub triggered_slot: Option<chrono::DateTime<chrono::FixedOffset>>,
@@ -80,9 +81,9 @@ pub async fn record_prepared(
                 "existing Play does not belong to the selected run",
             ));
         }
-        // Includes a statusless record: `same_run_record` has just proved it is *this* attempt's, and
+        // Includes a statusless record: `same_run_record` has just proved it is *this* run's, and
         // a statusless record is exactly the artifact a lost `create` response leaves behind. Falling
-        // through initializes it below instead of wedging the attempt on its own crash artifact.
+        // through initializes it below instead of wedging the run on its own crash artifact.
         Some(existing) => existing,
         None => match api.create(&post_params(), &desired).await {
             Ok(created) => created,
@@ -199,7 +200,7 @@ pub async fn commit_launching(
     .await
 }
 
-/// Abandons an attempt that has not launched its Job, from whichever pre-`Running` phase it is in.
+/// Abandons a run that has not launched its Job, from whichever pre-`Running` phase it is in.
 ///
 /// `from` is the phase the caller observed, and it is passed rather than inferred so the transition
 /// keeps its precondition: a record that has moved on since the caller looked must fail loudly
@@ -235,7 +236,7 @@ pub async fn abort_unlaunched(
 /// either accepting it as already-done, or failing loudly because the record moved elsewhere.
 const TRANSITION_CONFLICT_RETRIES: usize = 1;
 
-/// Whether a phase is one in which the attempt's Job does not exist yet. Pure so the set stays
+/// Whether a phase is one in which the run's Job does not exist yet. Pure so the set stays
 /// pinned: a new phase added on the wrong side of this line would let a run with a live Job be
 /// abandoned as if nothing had been created for it.
 fn is_unlaunched(phase: &PlayPhase) -> bool {
@@ -259,7 +260,7 @@ async fn transition_phase(
 ) -> Result<Play, ReconcileError> {
     let api = Api::<Play>::namespaced(client.clone(), namespace);
 
-    for attempt in 0..=TRANSITION_CONFLICT_RETRIES {
+    for run in 0..=TRANSITION_CONFLICT_RETRIES {
         let object = api.get(play_name).await?;
         verify_play_uid(&object, play_uid)?;
         let status = object
@@ -271,7 +272,7 @@ async fn transition_phase(
             return Ok(object);
         };
         match replace_status(&api, object, status).await {
-            Err(error) if error.is_conflict() && attempt < TRANSITION_CONFLICT_RETRIES => {
+            Err(error) if error.is_conflict() && run < TRANSITION_CONFLICT_RETRIES => {
                 debug!("Lost a write race transitioning Play {play_name}; re-reading and retrying");
             }
             result => return result,
@@ -307,22 +308,22 @@ fn decide_transition(
     Ok(Some(next_status))
 }
 
-/// Whether an object already at this attempt's name *is* this attempt's record.
+/// Whether an object already at this run's name *is* this run's record.
 ///
 /// Compared on identity, not on the whole spec. The identity fields are sufficient and narrower:
-/// `run_id` is minted per attempt and never re-derived, so no other attempt can present the same
+/// `run_id` is minted per run and never re-derived, so no other run can present the same
 /// one, and `preparation_fingerprint` already reduces the plan spec plus the resolved run groups to
 /// a single value. Matching field-by-field on everything else would buy nothing and would be the
 /// same brittleness `validate_selected_job` deliberately avoids for Jobs: any server-side
 /// normalization the operator failed to predict would make the comparison fail forever, and the
-/// failure mode is an unrepairable `PreconditionFailed` on that attempt number.
+/// failure mode is an unrepairable `PreconditionFailed` on that run number.
 fn same_run_record(existing: &Play, desired: &Play) -> bool {
     existing_owner_matches(existing, desired)
         && existing.spec.playbook_plan == desired.spec.playbook_plan
         && existing.spec.playbook_plan_uid == desired.spec.playbook_plan_uid
         && existing.spec.execution_hash == desired.spec.execution_hash
         && existing.spec.run_id == desired.spec.run_id
-        && existing.spec.attempt == desired.spec.attempt
+        && existing.spec.run_number == desired.spec.run_number
         && existing.spec.preparation_fingerprint == desired.spec.preparation_fingerprint
 }
 
@@ -618,6 +619,7 @@ fn build_play(play: &PlayRef<'_>) -> Result<Play, ReconcileError> {
             execution_hash: play.hash.to_string(),
             run_id: play.run_id.to_string(),
             preparation_fingerprint: play.preparation_fingerprint.to_string(),
+            run_number: play.run_number,
             attempt: play.attempt,
             inventory: play.inventory.to_vec(),
             triggered_slot: play.triggered_slot,
@@ -801,7 +803,7 @@ mod tests {
         hash: &'a ExecutionHash,
         run_id: &'a str,
         fingerprint: &'a str,
-        attempt: u32,
+        run_number: u32,
         inventory: &'a [ResolvedHosts],
     ) -> PlayRef<'a> {
         PlayRef {
@@ -810,7 +812,8 @@ mod tests {
             hash,
             run_id,
             preparation_fingerprint: fingerprint,
-            attempt,
+            run_number,
+            attempt: 1,
             inventory,
             triggered_slot: None,
         }
@@ -835,7 +838,8 @@ mod tests {
         assert_eq!(built.spec.playbook_plan_uid, "plan-uid");
         assert_eq!(built.spec.run_id, "run-1");
         assert_eq!(built.spec.preparation_fingerprint, "fp-1");
-        assert_eq!(built.spec.attempt, 3);
+        assert_eq!(built.spec.run_number, 3);
+        assert_eq!(built.spec.attempt, 1);
         assert_eq!(built.spec.inventory, inventory);
 
         // The plan-name label is what `prune` and the recovery scan list on.
@@ -852,19 +856,19 @@ mod tests {
     }
 
     /// The anti-adoption property the whole write-ahead protocol rests on: an object sitting at this
-    /// attempt's name is only *this* attempt's record if its identity matches. Compared on identity
+    /// run's name is only *this* run's record if its identity matches. Compared on identity
     /// rather than the whole spec, so that a field the apiserver normalizes on the way in can never
-    /// wedge the attempt permanently.
+    /// wedge the run permanently.
     #[test]
-    fn same_run_record_accepts_only_this_attempts_identity() {
+    fn same_run_record_accepts_only_this_runs_identity() {
         let hash = hash();
         let inventory = vec![ResolvedHosts {
             name: "nodes".into(),
             hosts: vec!["a".into()],
         }];
-        let build = |run_id: &str, fp: &str, attempt: u32, uid: &str| {
+        let build = |run_id: &str, fp: &str, run_number: u32, uid: &str| {
             let plan = plan("web", uid);
-            build_play(&play_ref(&plan, &hash, run_id, fp, attempt, &inventory)).unwrap()
+            build_play(&play_ref(&plan, &hash, run_id, fp, run_number, &inventory)).unwrap()
         };
 
         let desired = build("run-1", "fp-1", 1, "plan-uid");
@@ -873,13 +877,13 @@ mod tests {
             &desired
         ));
 
-        // A different attempt of the same plan: same name is possible after an abort freed the
+        // A different run of the same plan: same name is possible after an abort freed the
         // number, but the run ID never repeats.
         assert!(!same_run_record(
             &build("run-2", "fp-1", 1, "plan-uid"),
             &desired
         ));
-        // A different revision that happens to reuse the attempt number.
+        // A different revision that happens to reuse the run number.
         assert!(!same_run_record(
             &build("run-1", "fp-2", 1, "plan-uid"),
             &desired
@@ -994,7 +998,7 @@ mod tests {
     }
 
     /// Every status write re-reads the object, so the UID is what proves the object read back is the
-    /// same one the run recorded — a name alone can be reused by a later attempt.
+    /// same one the run recorded — a name alone can be reused by a later run.
     #[test]
     fn verify_play_uid_rejects_a_different_or_missing_object() {
         let mut play = Play::new("run", PlaySpec::default());
@@ -1198,7 +1202,7 @@ mod tests {
     }
 
     /// `abort_unlaunched` is the only way into `Aborted`, and it is only ever legitimate while the
-    /// attempt has no Job. Aborting a `Running` one would drop a live node-root execution's record
+    /// run has no Job. Aborting a `Running` one would drop a live node-root execution's record
     /// while the execution carried on.
     #[test]
     fn only_a_phase_without_a_job_counts_as_unlaunched() {

@@ -3,7 +3,7 @@
 The operator reports everything about a run on the plan's `.status`. There is no separate dashboard,
 and you do not need pod logs — the per-host recap travels back via the Job container's termination
 message, so `kubectl` is enough. For a durable history of *past* runs, the operator also records a
-[`Play`](#run-history) per run attempt.
+[`Play`](#run-history) per run.
 
 ## At a glance
 
@@ -24,11 +24,10 @@ per-host status, and the summary line.
 | Phase | Meaning |
 |---|---|
 | `Pending` | Triggers not yet evaluated — the resting state right after creation, after the inputs changed, or while an input [cannot be read](#the-plans-inputs-cannot-be-read). |
-| `Delayed` | Reserved for deferred execution; not currently produced. |
-| `Applying` | An attempt is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has seen the attempt's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name. |
-| `Scheduled` | (`Recurring`) The run finished and the plan is waiting for the next schedule tick. |
-| `Succeeded` | (`OneShot`) Every host has succeeded on the current hash; the plan is quiet until the inputs change. |
-| `Failed` | (`OneShot`) The run finished but some host could not be brought current. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
+| `Delayed` | The plan is waiting for its scheduled time and has no result yet under the current playbook and inputs. |
+| `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has seen the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name. |
+| `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. |
+| `Failed` | The latest run did not succeed on every host, or its recap could not be read. A `Recurring` plan keeps this result between ticks the same way. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
 | `UnauthorizedNamespace` | The plan's namespace is not enrolled for the operator — it will not run. See below. |
 
 ## Conditions
@@ -44,7 +43,7 @@ printer columns:
   differently on purpose: `n/m hosts completed successfully` is a statement about an execution,
   `n/m hosts on the current revision` about the plan's standing, and the second is not a claim that
   anything ran.
-- **`Running`** — the operator has observed this attempt's own Job in a non-terminal state
+- **`Running`** — the operator has observed this run's own Job in a non-terminal state
   (`JobRunning`). It is set from an observation, not from Job creation, so it lags by a reconcile and
   covers a Job that is still scheduling, pulling its image or starting its pod. `Running=False` with
   reason `JobIdentityMismatch` means something that is not this run's Job holds the name the run
@@ -83,13 +82,14 @@ detection compares against) and `lastTransitionTime`.
 
 ## Run history
 
-The plan's `.status` only reflects the **current** run. For a durable, per-attempt history, the
-operator records a `Play` before creating the attempt's Job, in the plan's namespace and owned by the
-plan (so they are removed when you delete it). Once an attempt launches, its `Play` corresponds to
-exactly one Job; an attempt abandoned during preparation never creates one. Unlike a launched run's
+The plan's `.status` only reflects the **current** run. For a durable, per-run history, the
+operator records a `Play` before creating the run's Job, in the plan's namespace and owned by the
+plan (so they are removed when you delete it). Once a run launches, its `Play` corresponds to
+exactly one Job; a run abandoned during preparation never creates one. Unlike a launched run's
 Job, which Kubernetes reaps shortly after it finishes (`spec.ttlSecondsAfterFinished`), a `Play` keeps
 the recap for as long as retention allows. Its spec preserves the plan UID, execution hash,
-per-attempt run ID, target inventory, preparation-input fingerprint, attempt, and schedule slot, and
+run ID, target inventory, preparation-input fingerprint, run number, attempt number, and schedule
+slot, and
 is rejected for update once written. It records the run's *identity*, not a copy of the plan: what the
 run executes is re-derived from the plan and its inventories, and the fingerprint is what tells the
 operator whether those are still the same ones the run was prepared for. The operator creates this
@@ -104,8 +104,9 @@ kubectl get plays -n my-team
 ```
 
 The columns mirror the Ansible **recap**, summed across every host the run targeted. `kubectl get
-plays -o wide` adds the less-common counters (`rescued`, `skipped`, `ignored`) and the attempt
-number. Each `Play`'s `.status` also carries the per-host recap and outcome plus `finishedAt`:
+plays -o wide` adds the less-common counters (`rescued`, `skipped`, `ignored`), the run number and
+the `Try` column — which try of its execution that run was, in the sense
+[Retries](./scheduling-and-modes.md#retries) gives it. Each `Play`'s `.status` also carries the per-host recap and outcome plus `finishedAt`:
 
 ```sh
 kubectl get play apply-web-config-a1b2c3-2 -n my-team -o yaml
@@ -118,11 +119,11 @@ means the locks are held and the run's proxy infrastructure is being set up. `La
 creation was committed; if the Job is absent, recovery re-verifies the locks, proxy infrastructure,
 and live node authorization before creating it. `Unknown` means the Job ran but its recap could not be
 read — the same meaning as the per-host [`Unknown`](#hosts-show-unknown) outcome. You may also briefly
-catch `Aborted`: the internal cleanup phase of an attempt that was given up before its Job existed.
-Such a record is deleted once its resources are released, so a superseded attempt is never left behind
+catch `Aborted`: the internal cleanup phase of a run that was given up before its Job existed.
+Such a record is deleted once its resources are released, so a superseded run is never left behind
 as a failed or unknown execution.
 
-Which attempts can be given up that way — and which are always left to finish — is one rule, covered
+Which runs can be given up that way — and which are always left to finish — is one rule, covered
 in [Editing a plan while a run is in
 flight](./scheduling-and-modes.md#editing-a-plan-while-a-run-is-in-flight).
 
@@ -194,7 +195,7 @@ so could not decide anything this tick:
   is wrong or the Secret was deleted; anything else is an API error to retry.
 
 Both reads are treated the same way, including for a run that is already in flight: a missing
-resource is permanent and supersedes an attempt that has not launched, while anything else is
+resource is permanent and supersedes a run that has not launched, while anything else is
 transient and holds it.
 
 Neither starts a run and neither changes `.status.hostsStatus`, so the plan holds its previous
@@ -223,8 +224,8 @@ locks are cluster-wide, and a Node is applied to by one run at a time (see
 [Host locks](./scheduling-and-modes.md#host-locks)). `kubectl describe playbookplan <name>` shows the
 host and the run holding it, and the operator logs a matching warning. This is normal when two plans
 share hosts: the run proceeds once the other finishes. If it never clears, look at the run named as
-the holder — a plan that runs very often (a `Recurring` plan on a tight schedule, or a `OneShot` that
-keeps failing and retrying) can keep an overlapping plan waiting for a long time.
+the holder — a plan that runs very often (a `Recurring` plan on a tight schedule, or one retrying a
+failed run) can keep an overlapping plan waiting for a long time.
 
 ### The plan is stuck in `Applying`
 
@@ -273,8 +274,8 @@ instead, and `.status.activeRun` names the run it is waiting on:
   must carry an owner reference identifying the plan by both name and UID, the plan name, component,
   run's hash, and run ID as labels, and the `Play`'s UID as an annotation. Its pod template must carry
   the run ID, hash, and `Play` UID as well, plus the plan name and the `playbook` component. The Job's
-  name must also be the one recorded by the `Play`, including the trailing attempt number, which is
-  where the operator reads the attempt from. Any mismatch confirms that the Job is foreign. A Job that
+  name must also be the one recorded by the `Play`, including the trailing run number, which is
+  where the operator reads the run from. Any mismatch confirms that the Job is foreign. A Job that
   happens to copy every one of these fields is indistinguishable from an operator-created Job at the
   Kubernetes object level, which is why
   enrolled-namespace Job creation must be protected by administrator RBAC or admission controls (see
@@ -314,7 +315,7 @@ instead, and `.status.activeRun` names the run it is waiting on:
 - **"run recovery paused: …"** — the operator needs something it cannot currently read to decide
   what to do with the run: an inventory, `NodeAccessPolicy` or referenced Secret lookup that is
   failing for a reason that may clear on its own, such as an API error or a lost connection. The
-  attempt is deliberately *held*, not dropped: its host locks keep being renewed so no other plan can
+  run is deliberately *held*, not dropped: its host locks keep being renewed so no other plan can
   start on those hosts while the question is open, and the operator retries every tick. Unlike the
   messages above, this one can persist indefinitely if the underlying read never succeeds — the rest
   of the message is the error to fix. A read that fails because the resource is simply *gone* is not
@@ -322,18 +323,18 @@ instead, and `.status.activeRun` names the run it is waiting on:
 - **"aborted the run because its desired inputs cannot be resolved: …"** — the same lookup failed in
   a way that cannot be transient: a referenced `ClusterInventory`/`StaticInventory` or a referenced
   variables/files `Secret` no longer exists, or an inventory group sets a variable the operator
-  manages. There is no executable desired state left, so the attempt was released and deleted; fix
-  the reference and a fresh attempt starts. Giving the attempt up rather than holding it also frees
-  its host locks — an attempt held indefinitely blocks every other plan targeting those hosts, not
+  manages. There is no executable desired state left, so the run was released and deleted; fix
+  the reference and a fresh run starts. Giving the run up rather than holding it also frees
+  its host locks — a run held indefinitely blocks every other plan targeting those hosts, not
   just this one. If its Job had already been created it is adopted and allowed to finish instead,
   reported as **"adopted the started run; the desired inputs cannot be resolved: …"**.
-- **"aborted the run: host '…' is now locked by …"** — while the attempt was still being set up,
+- **"aborted the run: host '…' is now locked by …"** — while the run was still being set up,
   another run was *observed* holding one of its host locks (its own lease lapsed during an operator
   outage and the other run took it over). Rather than run two playbooks against the same host, it was
   released and deleted; it starts again once the host is free.
 - **"could not confirm the lock on host '…'; retrying"** — the same check, but inconclusive: the
   operator raced another writer on that Lease and cannot say who holds it. Nothing was seen taking
-  the lock over, so the attempt is deliberately *kept* and the question is asked again a second
+  the lock over, so the run is deliberately *kept* and the question is asked again a second
   later. If this persists, something outside the operator is writing to its Leases.
 - **"aborted the run: its nodes are no longer granted to this namespace"** — the run's
   `NodeAccessPolicy` grant was withdrawn while it was being set up, so it was abandoned before its
@@ -341,26 +342,26 @@ instead, and `.status.activeRun` names the run it is waiting on:
   See [Node access policies](../cluster-operators/node-access-policies.md).
 - **"aborted the run: it may no longer start (the desired revision changed or it missed its schedule
   window)"** and **"aborted the run: it may no longer launch and its Job was never created"** — the
-  ordinary supersede path: the plan was edited (or its resolved nodes changed) while an attempt was
-  still preparing. The second wording is the same decision for an attempt that had already committed
+  ordinary supersede path: the plan was edited (or its resolved nodes changed) while a run was
+  still preparing. The second wording is the same decision for a run that had already committed
   to launching, once the API server confirmed its Job was never created. See [Editing a plan while a
   run is in flight](./scheduling-and-modes.md#editing-a-plan-while-a-run-is-in-flight).
 - **"aborted the run: the plan was suspended before its Job was created"** — `spec.suspend` was set
-  while an attempt was still preparing, so it was dropped rather than left to launch whenever it
+  while a run was still preparing, so it was dropped rather than left to launch whenever it
   became able to. Unlike the other "aborted the run…" messages this one is a *resting* state: the
   plan goes to `Pending` and stays there until you resume it. See [Suspending a
   plan](./scheduling-and-modes.md#suspending-a-plan).
-- **"released the abandoned run …"** — cleanup of an attempt abandoned by an earlier tick has now
+- **"released the abandoned run …"** — cleanup of a run abandoned by an earlier tick has now
   finished. Only seen after a "could not release the abandoned run …" below, or after a restart
   interrupted a teardown; the plan re-evaluates immediately.
-- **"recorded a finished run; another attempt is still in flight"** — after an outage, more than one
+- **"recorded a finished run; another run is still in flight"** — after an outage, more than one
   finished result can be waiting to be written to the plan. The operator applies them one tick at a
-  time, oldest first, and says so rather than reporting the plan finished while a later attempt is
+  time, oldest first, and says so rather than reporting the plan finished while a later run is
   still going. It clears on its own.
 - **"could not release the abandoned run …"** — one of the "aborted the run…" cases above got as
-  far as deciding to give the attempt up, but could not finish tearing it down: a proxy pod, Secret,
+  far as deciding to give the run up, but could not finish tearing it down: a proxy pod, Secret,
   NetworkPolicy or Lease would not delete, or its run record could not be removed afterwards. The
-  rest of the message is the underlying error. The attempt's record is deliberately kept as the
+  rest of the message is the underlying error. The run's record is deliberately kept as the
   handle for retrying that cleanup, and the operator retries every tick, so this clears on its own
   once the underlying problem does. Until then the run's proxy pods may still be up — worth looking
   at if the message persists, since these are node-root pods. This is the one message here that can
@@ -369,7 +370,7 @@ instead, and `.status.activeRun` names the run it is waiting on:
 
   Fixing the reported permission, admission, finalizer or API problem is safest: cleanup is
   idempotent, so the operator resumes it automatically. If that is impossible, a cluster
-  administrator can clean up the exact attempt manually. Read its identity first:
+  administrator can clean up the exact run manually. Read its identity first:
 
   ```sh
   PLAN_NAMESPACE=my-team
@@ -381,7 +382,7 @@ instead, and `.status.activeRun` names the run it is waiting on:
   SELECTOR="ansible.cloudbending.dev/hash=$HASH,ansible.cloudbending.dev/run-id=$RUN_ID"
   ```
 
-  Delete only resources carrying both attempt labels. The first two commands remove the node-root
+  Delete only resources carrying both run labels. The first two commands remove the node-root
   proxy infrastructure in the operator namespace; the third removes the plan-namespace credential
   and egress policy:
 
@@ -406,7 +407,7 @@ instead, and `.status.activeRun` names the run it is waiting on:
   first can leave privileged resources with nothing identifying them for later cleanup.
 
 With the sole exception of the `suspend` one, every "aborted the run…" message above is a transient
-state rather than a resting one: the attempt is gone and the plan re-evaluates immediately, so if the
+state rather than a resting one: the run is gone and the plan re-evaluates immediately, so if the
 plan stays `Applying` on one of them the *next* tick has usually already replaced it with something
 else. A run that is merely pausing *before* it launches reports that through a condition instead:
 `Blocked` for a contended host lock, or `WaitingForNodes` for proxy pods that are not `Ready` yet.
@@ -496,7 +497,7 @@ its third field is what to match on:
   place they still appear.
 - **the run ID does appear in a `Play`** — that record is the run's recovery handle and the operator
   may still be working on it. Do not delete anything by hand; go to that `Play`'s plan and follow the
-  per-attempt procedure, which is written for exactly that case.
+  per-run procedure, which is written for exactly that case.
 
 ### Hosts show `NotReached`
 
@@ -530,3 +531,12 @@ Check the `schedule`/`timeZone` and `.status.nextRun`. Remember that `OneShot` g
 host is current — that is success, not a hang. A `Recurring` plan with no `schedule` has nothing
 telling it when to fire. If the `Blocked` condition is `True`, it is waiting on host locks held by
 another run — see above.
+
+### A `OneShot` plan is `Failed` and stops trying
+
+It has spent its [attempt budget](./scheduling-and-modes.md#retries): `.status.retryCount` has
+reached `spec.maxAttempts` (3 by default), so the plan holds its `Failed` result instead of applying
+a playbook its hosts have already refused that many times. Fix the cause and edit the playbook or a
+referenced Secret — the new execution hash starts a fresh budget — or raise `maxAttempts` to let it
+try again with the inputs unchanged. The failed runs are still in the plan's
+[run history](#run-history), which is where the recap of each attempt is.

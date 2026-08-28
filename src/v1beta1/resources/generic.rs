@@ -13,6 +13,25 @@ pub type LabelMap = BTreeMap<String, String>;
 /// format. Use `Option<UnsignedInt>` for optional `u32` fields.
 pub struct UnsignedInt;
 
+/// Marker type for `u32` fields whose zero value is meaningless, emitting the same
+/// Kubernetes-compatible integer schema as [`UnsignedInt`] with a minimum of one. Rejecting `0` at
+/// admission is what keeps a "how many times" field from being read as "never".
+pub struct PositiveInt;
+
+impl JsonSchema for PositiveInt {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("PositiveInt")
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "integer",
+            "minimum": 1
+        }))
+        .unwrap()
+    }
+}
+
 impl JsonSchema for UnsignedInt {
     fn schema_name() -> Cow<'static, str> {
         Cow::Borrowed("UnsignedInt")

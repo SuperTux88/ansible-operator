@@ -48,6 +48,14 @@ use crate::{
 /// Default grace window after a scheduled tick during which a run may still start, when the plan
 /// does not set `spec.startingDeadlineSeconds`. See that field's docs.
 const DEFAULT_STARTING_DEADLINE_SECONDS: u32 = 30;
+/// Tries one `OneShot` execution gets when the plan does not set `spec.maxAttempts`. See
+/// [`max_attempts`] for why the two modes default differently.
+const DEFAULT_ONESHOT_ATTEMPTS: u32 = 3;
+/// Tries one `Recurring` schedule tick gets when the plan does not set `spec.maxAttempts`.
+const DEFAULT_RECURRING_ATTEMPTS: u32 = 1;
+/// How long a plan waits before making a try it still owes. Short because a scheduled retry has only
+/// the remainder of its tick's `startingDeadlineSeconds` window to start in.
+const RETRY_REQUEUE: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub struct WorkloadEgressPolicies {
     pub playbook: Option<Vec<NetworkPolicyEgressRule>>,
@@ -84,7 +92,7 @@ struct ReconciliationContext {
     workload_egress_policies: WorkloadEgressPolicies,
 }
 
-/// What `try_start_run` needs to name and record a new attempt: the resource's namespace/name, the
+/// What `try_start_run` needs to name and record a new run: the resource's namespace/name, the
 /// execution hash, the schedule slot being consumed, and the run's resolved inventory. Kube `Api<T>`
 /// handles are deliberately *not* here — those are plumbing built on demand from
 /// `ReconciliationContext::client` plus `namespace`, not run identity.
@@ -97,8 +105,8 @@ struct RunContext<'a> {
     /// inventory and the `Play` record all derive from this one value, so they cannot disagree.
     run_groups: &'a [ResolvedInventoryGroup],
     /// The fingerprint of `run_groups` plus the live plan spec, computed once per tick by the
-    /// caller — which also compares it against a recovered attempt's recorded one. Passed in rather
-    /// than recomputed here so the value a fresh attempt records is provably the same one a resume
+    /// caller — which also compares it against a recovered run's recorded one. Passed in rather
+    /// than recomputed here so the value a fresh run records is provably the same one a resume
     /// is later judged against.
     preparation_fingerprint: &'a str,
     triggered_slot: Option<DateTime<FixedOffset>>,
@@ -284,11 +292,11 @@ async fn reconcile(
     let mut requeue_after = std::time::Duration::from_secs(3600);
     let mut retry_prune = false;
     let mut resource_status = object.status.clone().unwrap_or_default();
-    // An attempt recovered before its Job exists, with the phase it was found in. It is dispatched
+    // A run recovered before its Job exists, with the phase it was found in. It is dispatched
     // after inventory resolution rather than here, because deciding whether it may still be resumed
     // needs the resolved, policy-clamped groups its fingerprint covers.
     let mut unlaunched_run: Option<UnlaunchedRun> = None;
-    let mut finished_active_run: Option<RecordedRun> = None;
+    let mut finished_active_run: Option<FinishedRun> = None;
     // Recovery drives the privileged parts of a run (Job creation, proxy infra, locks), so a failure
     // here aborts the tick before the final `patch_status`. Report it on the plan first, otherwise a
     // run that can't be recovered — a rejected Job, a revoked node grant — is only ever visible in
@@ -304,10 +312,10 @@ async fn reconcile(
             return Err(error);
         }
     };
-    // Set when the tick drained a finished run's result but the plan still has a live attempt behind
+    // Set when the tick drained a finished run's result but the plan still has a live run behind
     // it: the plan is emphatically not finished, so the terminal classification below is skipped,
-    // and the schedule window that attempt holds is what the plan records.
-    let mut surviving_attempt: Option<Box<SurvivingAttempt>> = None;
+    // and the schedule window that run holds is what the plan records.
+    let mut surviving_run: Option<Box<SurvivingRun>> = None;
     let mut finalized_run = false;
     // Whether this tick found the plan holding a run at all. Recovery is the only complete answer:
     // a record whose result has not been drained, or one being given up, owns resources while the
@@ -322,10 +330,10 @@ async fn reconcile(
     if let Some(recovered) = recovered {
         match recovered {
             RecoveredRun::Active(run) => {
-                adopt_recovered_attempt(&mut resource_status, &run.mirror);
+                adopt_recovered_run(&mut resource_status, &run.mirror);
             }
             RecoveredRun::Unlaunched(unlaunched) => {
-                adopt_recovered_attempt(&mut resource_status, &unlaunched.run.mirror);
+                adopt_recovered_run(&mut resource_status, &unlaunched.run.mirror);
                 unlaunched_run = Some(unlaunched);
             }
             RecoveredRun::Aborted(run) => {
@@ -350,12 +358,12 @@ async fn reconcile(
                     &mut resource_status,
                 );
                 // Adopted *before* the result is persisted, so the plan never goes a tick describing
-                // an attempt it is holding with no `activeRun` to reach it by: the mirror is the only
-                // handle `finalize_lost_run` has if that attempt's record is deleted while it runs.
+                // a run it is holding with no `activeRun` to reach it by: the mirror is the only
+                // handle `finalize_lost_run` has if that run's record is deleted while it runs.
                 // It also settles what `finalize_finished_run` may give up — the mirror now names a
                 // different run than the one finishing, which is exactly when it keeps it.
                 if let Some(surviving) = &surviving {
-                    adopt_recovered_attempt(&mut resource_status, &surviving.run.mirror);
+                    adopt_recovered_run(&mut resource_status, &surviving.run.mirror);
                 }
                 match finalize_finished_run(
                     &context,
@@ -382,8 +390,11 @@ async fn reconcile(
                     }
                 }
                 finalized_run = true;
-                finished_active_run = Some(finished);
-                surviving_attempt = surviving;
+                finished_active_run = Some(FinishedRun {
+                    outcome: status.phase,
+                    run: finished,
+                });
+                surviving_run = surviving;
             }
         }
     }
@@ -448,6 +459,7 @@ async fn reconcile(
             }
             ActiveRunProgress::Finished {
                 run: finished,
+                outcome,
                 record,
             } => {
                 resource_status.summary =
@@ -475,10 +487,13 @@ async fn reconcile(
                     }
                 }
                 finalized_run = true;
-                finished_active_run = Some(finished);
-                // This *was* the attempt a drained result was still waiting behind, and it has now
+                finished_active_run = Some(FinishedRun {
+                    run: finished,
+                    outcome,
+                });
+                // This *was* the run a drained result was still waiting behind, and it has now
                 // finished too, so the plan may be classified on its own terms after all.
-                surviving_attempt = None;
+                surviving_run = None;
             }
         }
     }
@@ -486,7 +501,7 @@ async fn reconcile(
     // After both finalization paths, because each ends in a retention pass of its own and running
     // one here as well would list and delete the same history twice on the tick a run completes.
     // Restricted to an *idle* plan for the reason in `prune_history`: retention only ever gains work
-    // when a run finishes, and a plan with an attempt in flight is polled every few seconds, so
+    // when a run finishes, and a plan with a run in flight is polled every few seconds, so
     // listing its history on each of those ticks is a steady apiserver cost that can find nothing to
     // do. A deletion that failed is retried on the first tick without a run, which is exactly the
     // state the standalone pass exists for.
@@ -496,7 +511,7 @@ async fn reconcile(
 
     // Steps 0 and 0b: resolve the plan's inventories and clamp them to what NodeAccessPolicy grants
     // this namespace. One fallible step with one error site, because they fail the same way — the
-    // desired inputs could not be read — and a recovered attempt's fate depends on which kind of
+    // desired inputs could not be read — and a recovered run's fate depends on which kind of
     // failure it was, not on which of the two calls produced it.
     let (target_groups, excluded_nodes) =
         match resolve_authorized_inventory(&context, &object).await {
@@ -547,7 +562,7 @@ async fn reconcile(
     {
         Ok(hash) => hash,
         Err(error) => {
-            // A held attempt is holding *host Leases* by this point — the inventory resolved, so
+            // A held run is holding *host Leases* by this point — the inventory resolved, so
             // its hosts are still known-authorized and the hold is safe, but it is not free: the
             // hold renews those Leases every tick, and an indefinite one starves every other plan
             // targeting the same hosts. That is what `input_error_supersedes_unlaunched` bounds.
@@ -569,8 +584,8 @@ async fn reconcile(
         sync_desired_hash_after_finished_run(
             &mut resource_status,
             &execution_hash,
-            finished,
-            surviving_attempt.as_deref(),
+            &finished.run,
+            surviving_run.as_deref(),
         );
     } else {
         update_desired_hash(&mut resource_status, &execution_hash);
@@ -609,8 +624,8 @@ async fn reconcile(
     let run_groups = filter_groups_to_hosts(&target_groups, &hosts_to_trigger);
 
     // Plain `?`, unlike the desired-input reads above: this hashes two already-deserialized values,
-    // so it has no cluster state to fail against and nothing to hold a recovered attempt open for.
-    // Computed once and used for both jobs it has: recording a fresh attempt's fingerprint, and
+    // so it has no cluster state to fail against and nothing to hold a recovered run open for.
+    // Computed once and used for both jobs it has: recording a fresh run's fingerprint, and
     // judging whether a recovered one's still matches.
     let live_preparation_fingerprint = preparation_fingerprint(&object, &run_groups)?;
 
@@ -628,11 +643,16 @@ async fn reconcile(
         object.spec.schedule.is_some(),
         !hosts_to_trigger.is_empty(),
     );
-    let eligible_to_start = may_start_new_run(object.spec.suspend, has_work_to_start);
+    let max_attempts = max_attempts(&object.spec.mode, object.spec.max_attempts);
+    let eligible_to_start = may_start_new_run(
+        object.spec.suspend,
+        has_work_to_start,
+        attempt_budget_available(&object.spec.mode, resource_status.retry_count, max_attempts),
+    );
 
-    // Whether a recorded attempt's preparation inputs are still the desired ones. While this holds,
+    // Whether a recorded run's preparation inputs are still the desired ones. While this holds,
     // the plan spec, resolved groups and Job blueprint are re-derivable from live state; once it
-    // stops holding, the absent-Job attempt is superseded.
+    // stops holding, the absent-Job run is superseded.
     let inputs_unchanged = |unlaunched: &UnlaunchedRun| -> bool {
         unlaunched.run.mirror.execution_hash == execution_hash.to_string()
             && live_preparation_fingerprint == unlaunched.preparation_fingerprint
@@ -685,9 +705,9 @@ async fn reconcile(
                     requeue_after = requeue;
                 } else if resource_status.active_run.is_some()
                     // `resume_launching_run` returned without asking for another tick, so this
-                    // attempt's Job exists — adopted or created just now — and its record has been
+                    // run's Job exists — adopted or created just now — and its record has been
                     // marked `Running`. Whether that consumes the window is then the same question
-                    // the drain path asks, and a superseded attempt adopted here answers it no.
+                    // the drain path asks, and a superseded run adopted here answers it no.
                     && consumed_its_slot(
                         &v1beta1::PlayPhase::Running,
                         &unlaunched.run.execution_hash,
@@ -716,8 +736,8 @@ async fn reconcile(
                 {
                     requeue_after = requeue;
                 } else {
-                    // The Job exists now, so this attempt has consumed its slot — recorded here and
-                    // not only on the tick that first prepared it, since an attempt that spent
+                    // The Job exists now, so this run has consumed its slot — recorded here and
+                    // not only on the tick that first prepared it, since a run that spent
                     // several ticks waiting on locks or proxy pods never got that far.
                     record_triggered_slot(
                         &mut resource_status,
@@ -727,16 +747,16 @@ async fn reconcile(
             }
         }
     } else if let Some(finished) = &finished_active_run {
-        if surviving_attempt.is_some() {
+        if surviving_run.is_some() {
             // A terminal result is drained ahead of anything live (`recover_active_run`), so this
-            // tick applied one run's recap while another attempt is still going. Classifying the
-            // plan as `Succeeded`/`Scheduled` here would publish a verdict for a run that has not
-            // finished; the next tick recovers that attempt and reports it properly.
+            // tick applied one run's recap while another run is still going. Reporting the drained
+            // run's `Succeeded`/`Failed` here would publish a verdict over a plan that is still
+            // applying; the next tick recovers that run and reports it properly.
             resource_status.phase = Phase::Applying;
             resource_status.summary =
-                Some("recorded a finished run; another attempt is still in flight".to_string());
+                Some("recorded a finished run; another run is still in flight".to_string());
             requeue_after = std::time::Duration::from_secs(1);
-        } else if finished.execution_hash != execution_hash {
+        } else if finished.run.execution_hash != execution_hash {
             resource_status.phase = Phase::Pending;
             resource_status.next_run = None;
             resource_status.summary =
@@ -745,25 +765,27 @@ async fn reconcile(
         } else if matches!(
             timing,
             Timing::Now(Some(start))
-                if Some(start.fixed_offset()) != finished.mirror.triggered_slot
+                if Some(start.fixed_offset()) != finished.run.mirror.triggered_slot
                     && matches!(object.spec.mode, ExecutionMode::Recurring)
         ) {
-            resource_status.phase = Phase::Scheduled;
+            // The result stands even though the next run is already due: it is what the plan last
+            // did, and `nextRun` is what says another one is coming.
+            resource_status.phase = phase_for_finished_run(&finished.outcome);
             resource_status.next_run = match timing {
                 Timing::Now(start) => start.map(|start| start.fixed_offset()),
                 Timing::Delayed(_) => unreachable!("the guard only accepts Timing::Now"),
             };
             // The recovery path reaches here without having passed the `advance_active_run` branch
             // that reports a finished run, so this states it rather than leaving whatever the last
-            // tick said standing over a `Scheduled` plan.
+            // tick said standing over a plan whose next run is already due.
             resource_status.summary =
                 Some("previous run finished; the next scheduled run is already due".to_string());
             requeue_after = std::time::Duration::from_secs(1);
         } else {
             let total_count = distinct_host_count(&resource_status.eligible_hosts);
             // Reaching here without a schedule means it was removed mid-run: the eligibility gate
-            // normally stops such a plan from ever starting one. Log the anomaly — `decide_terminal`
-            // deliberately leaves the plan in `Applying` for this case.
+            // normally stops such a plan from ever starting one. Log the anomaly — the run still
+            // gets its verdict, it simply has no next slot to advertise.
             if matches!(object.spec.mode, ExecutionMode::Recurring)
                 && object.spec.schedule.is_none()
             {
@@ -772,6 +794,12 @@ async fn reconcile(
             let outcome = decide_terminal(
                 &object.spec.mode,
                 object.spec.schedule.as_deref(),
+                &finished.outcome,
+                retry_due(
+                    &phase_for_finished_run(&finished.outcome),
+                    resource_status.retry_count,
+                    max_attempts,
+                ),
                 outdated_hosts.len(),
                 total_count,
                 now(),
@@ -798,22 +826,42 @@ async fn reconcile(
         match timing {
             Timing::Delayed(until) => {
                 requeue_after = (until - now()).to_std().unwrap();
-                resource_status.phase = Phase::Scheduled;
+                resource_status.phase = phase_while_waiting_for_schedule(&resource_status.phase);
                 resource_status.next_run = Some(until.fixed_offset());
             }
             Timing::Now(start) => {
                 let this_slot = start.map(|s| s.fixed_offset());
 
                 // The marker first, because it answers from state this tick already holds; the
-                // records only when it says the window is free, so the extra read happens once per
-                // window rather than on every tick of it.
+                // records only when it settles nothing on its own, so the extra read happens once
+                // per window rather than on every tick of it.
+                //
+                // What the marker settles is narrower than it looks: it says a run for this window
+                // got a Job, which used to end the question and now only ends it while no retry is
+                // due. A retry *is* a second run for the window, so once one is due the records —
+                // which know what each of those runs did and how many there were — are what decide.
+                let retry_is_due = retry_due(
+                    &resource_status.phase,
+                    resource_status.retry_count,
+                    max_attempts,
+                );
                 let window_taken =
-                    if slot_already_triggered(this_slot, resource_status.last_triggered_run) {
+                    if slot_already_triggered(this_slot, resource_status.last_triggered_run)
+                        && !retry_is_due
+                    {
                         true
                     } else if let Some(slot) = this_slot {
-                        schedule_window_already_taken(&context, &object, slot, &execution_hash)
-                            .await?
+                        schedule_window_already_taken(
+                            &context,
+                            &object,
+                            slot,
+                            &execution_hash,
+                            max_attempts,
+                        )
+                        .await?
                     } else {
+                        // Unscheduled plans have no window to take. `OneShot` is the only mode that
+                        // gets here, and its budget was already spent at the start gate.
                         false
                     };
 
@@ -903,15 +951,15 @@ fn slot_already_triggered(
 /// this schedule window, read from the apiserver.
 ///
 /// `status.lastTriggeredRun` is a *derived* view of that fact. It is written by whichever tick got
-/// an attempt's Job created, onto a status this tick read from the reflector cache — which lags this
+/// a run's Job created, onto a status this tick read from the reflector cache — which lags this
 /// controller's own writes — and a merge patch of the whole status re-states it from that cached
 /// value on every tick. So a tick running from a status that predates the marker's write, or one
 /// whose write was lost to a conflicting write, sees a window nothing has taken and starts a second
-/// attempt for it. That breaks the one property the window exists for: a recurring plan applies its
+/// run for it. That breaks the one property the window exists for: a recurring plan applies its
 /// playbook at most once per slot, and a non-idempotent playbook applied twice is a real change to
 /// the hosts.
 ///
-/// The records cannot lag in that way — every attempt books its revision and its slot on its own
+/// The records cannot lag in that way — every run books its revision and its slot on its own
 /// immutable record *before* anything is created for it — so they, not the marker, are what the gate
 /// falls back to.
 async fn schedule_window_already_taken(
@@ -919,6 +967,7 @@ async fn schedule_window_already_taken(
     object: &PlaybookPlan,
     slot: DateTime<FixedOffset>,
     desired_hash: &ExecutionHash,
+    max_attempts: u32,
 ) -> Result<bool, ReconcileError> {
     let (namespace, plan_name) = namespace_and_name(object)?;
     let plays = Api::<Play>::namespaced(context.client.clone(), namespace)
@@ -929,44 +978,56 @@ async fn schedule_window_already_taken(
         object,
         slot,
         desired_hash,
+        max_attempts,
     ))
 }
 
-/// Whether any record in `plays` describes an attempt that took `slot` at the desired revision.
+/// Whether this schedule window has nothing left for a run to do, judged from the plan's own
+/// records: one of its runs is still going, one of them succeeded, or its failed runs have spent the
+/// execution's attempt budget.
 ///
-/// Pure so the rule stays pinned beside [`consumed_its_slot`], which asks the same question of a
-/// *live* attempt and must keep answering it the same way. The two differ in one place only: a
+/// Pure so the rule stays pinned beside [`consumed_its_slot`], which asks the neighbouring question
+/// of a *live* run and must keep answering it the same way. The two differ in one place only: a
 /// terminal record had a Job by definition, while there the terminal phases are excluded because the
 /// tick draining the result re-records the window from the run it is finishing. `Prepared`,
 /// `Starting` and `Aborted` never reached a Job and hand the window back, exactly as they do there.
 /// `Launching` is left out for the same reason — `play_history::abort_unlaunched` accepts it only
 /// once its Job is known to be absent — and cannot be seen here anyway: a record still in flight is
 /// dispatched long before the start gate is reached.
+///
+/// Counting the failures here rather than trusting `status.retryCount` alone is what keeps the
+/// window honest when the status lags: the marker and the counter are both written onto a status
+/// read from the reflector cache, while the records are written before anything a run creates. The
+/// counter is still consulted by the caller, so history pruning cannot *grant* tries the status says
+/// were already spent — the two gates only ever agree to a run when both do.
 fn window_taken_by_a_record(
     plays: &[Play],
     plan: &PlaybookPlan,
     slot: DateTime<FixedOffset>,
     desired_hash: &ExecutionHash,
+    max_attempts: u32,
 ) -> bool {
     let (Some(plan_name), Some(uid)) =
         (plan.metadata.name.as_deref(), plan.metadata.uid.as_deref())
     else {
         return false;
     };
-    plays.iter().any(|play| {
+    let mut failures = 0;
+    for play in plays.iter().filter(|play| {
         play_belongs_to_plan(play, plan_name, uid)
             && play.spec.triggered_slot == Some(slot)
             && play.spec.execution_hash == desired_hash.to_string()
-            && play.status.as_ref().is_some_and(|status| {
-                matches!(
-                    status.phase,
-                    v1beta1::PlayPhase::Running
-                        | v1beta1::PlayPhase::Succeeded
-                        | v1beta1::PlayPhase::Failed
-                        | v1beta1::PlayPhase::Unknown
-                )
-            })
-    })
+    }) {
+        match play.status.as_ref().map(|status| &status.phase) {
+            // Still going, or done and done well: either way the window is not a retry's to take.
+            Some(v1beta1::PlayPhase::Running | v1beta1::PlayPhase::Succeeded) => return true,
+            // `Unknown` counts as a failure here for the same reason it does everywhere else: a
+            // recap that could not be read is not evidence the hosts were reached.
+            Some(v1beta1::PlayPhase::Failed | v1beta1::PlayPhase::Unknown) => failures += 1,
+            _ => {}
+        }
+    }
+    failures >= max_attempts
 }
 
 /// Whether the plan has work a run could start this tick, from the mode, whether a schedule is set,
@@ -981,9 +1042,9 @@ fn window_taken_by_a_record(
 ///     tick from starting more than one run, and without a schedule there'd be no slot to dedup
 ///     against — it would busy-loop. That's why the schedule check lives here.
 ///
-/// Deliberately excludes `spec.suspend`. Suspending has to drop an attempt that has not launched
+/// Deliberately excludes `spec.suspend`. Suspending has to drop a run that has not launched
 /// yet, and that decision is made *before* the inventory is resolved
-/// ([`resolve_unlaunched_before_inputs`]) — dropping such an attempt needs no inventory, and
+/// ([`resolve_unlaunched_before_inputs`]) — dropping such a run needs no inventory, and
 /// deferring it would leave a suspended plan holding host Leases behind a failing inventory read.
 /// Starting a *new* run is gated by [`may_start_new_run`] at the one call site that does so; see
 /// [`decide_unlaunched_action`] for why the resume path must not fold `suspend` in again.
@@ -998,8 +1059,99 @@ fn has_work_to_start(mode: &ExecutionMode, has_schedule: bool, has_hosts_to_trig
 /// The start gate: whether this tick may start a *new* run. [`has_work_to_start`] deliberately
 /// leaves `spec.suspend` out (see its doc), so this is the one place that folds it back in —
 /// pinned as its own function so `suspend` losing its veto breaks a test, not a cluster.
-fn may_start_new_run(suspend: bool, has_work_to_start: bool) -> bool {
-    !suspend && has_work_to_start
+fn may_start_new_run(suspend: bool, has_work_to_start: bool, budget_available: bool) -> bool {
+    !suspend && has_work_to_start && budget_available
+}
+
+/// How many tries one execution of this plan gets, `spec.maxAttempts` or the mode's default.
+///
+/// The defaults differ because the modes fail differently. A `OneShot` plan has nothing else coming:
+/// if its run fails, the plan is finished until somebody edits it, so a couple of retries are what
+/// stand between a transient failure — an unreachable host, a mirror that timed out — and a plan
+/// that silently stopped. A `Recurring` plan is going to re-apply the same playbook at the next
+/// tick anyway, so retrying inside the current one buys nothing by default and only makes a
+/// systematically failing playbook hammer its hosts.
+fn max_attempts(mode: &ExecutionMode, configured: Option<u32>) -> u32 {
+    configured
+        .unwrap_or(match mode {
+            ExecutionMode::OneShot => DEFAULT_ONESHOT_ATTEMPTS,
+            ExecutionMode::Recurring => DEFAULT_RECURRING_ATTEMPTS,
+        })
+        // The CRD refuses 0, but a cluster that does not evaluate validation rules would let one
+        // through as "never run", which is what `spec.suspend` is for.
+        .max(1)
+}
+
+/// Whether the plan's attempt budget allows starting a run *here*, at the gate that decides whether
+/// a new run may begin at all.
+///
+/// It is the whole answer for `OneShot`, whose budget spans the revision: once its tries are spent
+/// the plan is finished, and without this it would keep numbering a fresh Job every tick — its hosts
+/// stay outdated precisely *because* the runs failed, so the work gate never closes on its own.
+///
+/// For `Recurring` it is deliberately not asked here, and the answer is always yes. Its budget spans
+/// one schedule tick, and the gate that knows about ticks is the window gate below: a plan whose
+/// current tick is exhausted must still be free to start the next one, which is a run this gate
+/// cannot tell apart from a retry.
+fn attempt_budget_available(mode: &ExecutionMode, tries_spent: u32, max_attempts: u32) -> bool {
+    match mode {
+        ExecutionMode::OneShot => tries_spent < max_attempts,
+        ExecutionMode::Recurring => true,
+    }
+}
+
+/// Whether the plan is between tries: its last run failed and its execution has budget left.
+///
+/// The one thing a *failed* plan says that a plan simply waiting does not, and both places that have
+/// to know ask it — the window gate, so a retry is not turned away as a repeat of a window that
+/// already ran, and the terminal decision, so the plan is woken up promptly enough to make that try
+/// rather than left asleep until the next tick.
+///
+/// The phase is the evidence because it is written from the finished run's own record
+/// (`phase_for_finished_run`), so it says what the last run did rather than what the plan's drift
+/// state implies — which for a `Recurring` failure is nothing at all.
+fn retry_due(phase: &Phase, tries_spent: u32, max_attempts: u32) -> bool {
+    phase == &Phase::Failed && tries_spent < max_attempts
+}
+
+/// Which try a run about to start is, from the budget the plan has already spent.
+///
+/// A `Recurring` run reaching a tick the plan has not run for starts a new execution and so a new
+/// budget; every other run continues the one in progress. `OneShot` has no ticks to divide its
+/// revision into, and gets a fresh budget only from an edit (`update_desired_hash`) — including when
+/// it has a schedule, since a schedule says when a `OneShot` plan may run, not how often it may fail.
+fn next_attempt(
+    mode: &ExecutionMode,
+    tries_spent: u32,
+    slot: Option<DateTime<FixedOffset>>,
+    last_triggered_run: Option<DateTime<FixedOffset>>,
+) -> u32 {
+    let new_execution = matches!(mode, ExecutionMode::Recurring)
+        && !slot_already_triggered(slot, last_triggered_run);
+    if new_execution {
+        1
+    } else {
+        tries_spent.saturating_add(1)
+    }
+}
+
+/// The phase of a plan whose next run is still ahead of it: `Delayed` until the current revision
+/// has a result, and that result from then on.
+///
+/// A schedule ahead of the plan is only a *lifecycle* state while nothing has been applied yet —
+/// that is the plan waiting, and `Delayed` says so. Once a run has finished, what the plan last did
+/// is the more useful thing to report, and the wait is fully described by `nextRun`; overwriting the
+/// verdict with a state meaning "waiting" would erase the only record of the last run's outcome on
+/// the plan itself.
+///
+/// A verdict is what marks the boundary because it is the one thing only a finished run writes, and
+/// it is cleared with the revision it belongs to (`update_desired_hash`): an edited plan is waiting
+/// for its first run again, whatever the previous revision achieved.
+fn phase_while_waiting_for_schedule(current: &Phase) -> Phase {
+    match current {
+        Phase::Succeeded | Phase::Failed => current.clone(),
+        _ => Phase::Delayed,
+    }
 }
 
 /// The other half of the suspension contract: while suspended, the plan advertises no next run. The
@@ -1011,7 +1163,7 @@ fn may_start_new_run(suspend: bool, has_work_to_start: bool) -> bool {
 /// more than one way to write one and only one way to reach the end. A tick that finalizes a run, or
 /// that reports an unreadable inventory and gives up, writes the status too — and those writes were
 /// carrying whatever `nextRun` the plan already advertised straight back onto it, so a plan
-/// suspended while `Scheduled` could keep advertising its old slot until some later tick happened to
+/// suspended while waiting on its schedule could keep advertising its old slot until some later tick happened to
 /// run the whole pipeline through. Every write now settles it, so the first one after the suspend
 /// takes effect regardless of how the tick ends.
 ///
@@ -1031,13 +1183,13 @@ enum UnlaunchedAction {
     ResumeLaunching { may_proceed: bool },
 }
 
-/// Decides a recovered absent-Job attempt after its desired inputs have been resolved. `Prepared`
+/// Decides a recovered absent-Job run after its desired inputs have been resolved. `Prepared`
 /// remains subject to the normal start and schedule gates; `Starting` has already acquired its
 /// locks, so from here on only an input change supersedes it. `Launching` always goes through
 /// `resume_launching_run`, which adopts an existing Job even when `may_proceed` is false.
 ///
 /// Reached **only for a plan that is not suspended**: [`resolve_unlaunched_before_inputs`] resolves
-/// every phase's fate under `spec.suspend` before the inventory is read, so an attempt that gets
+/// every phase's fate under `spec.suspend` before the inventory is read, so a run that gets
 /// this far has already survived that gate. `has_work_to_start` is therefore the suspend-free half
 /// of the start gate — folding `spec.suspend` back in here would add a condition that can never be
 /// false, and reading like a second, independent suspend decision.
@@ -1058,38 +1210,38 @@ fn decide_unlaunched_action(
     }
 }
 
-/// What to do with a recovered attempt once its Job has been looked for.
+/// What to do with a recovered run once its Job has been looked for.
 #[derive(Debug, PartialEq, Eq)]
 enum JobPresenceAction {
-    /// This attempt's own Job exists: take the started run over and let it finish.
+    /// This run's own Job exists: take the started run over and let it finish.
     Adopt,
-    /// Its Job is absent and the attempt is still wanted: carry on with it.
+    /// Its Job is absent and the run is still wanted: carry on with it.
     Proceed,
-    /// Its Job is absent and the attempt is no longer wanted: release and delete it.
+    /// Its Job is absent and the run is no longer wanted: release and delete it.
     Abandon,
-    /// A Job this attempt did not create holds its name. Neither adopted nor given up — see
+    /// A Job this run did not create holds its name. Neither adopted nor given up — see
     /// [`decide_job_presence`].
     Contested,
 }
 
-/// The rule [`resume_launching_run`] follows, from whether the attempt is still wanted and what is
+/// The rule [`resume_launching_run`] follows, from whether the run is still wanted and what is
 /// actually sitting at its Job name. Pure so it stays pinned in one place and unit-testable.
 ///
-/// This attempt's *own* Job always wins, whatever `may_proceed` says: a started run is never killed
+/// This run's *own* Job always wins, whatever `may_proceed` says: a started run is never killed
 /// by an edit or by `suspend`, and its results belong to the revision it actually ran. Only when the
 /// name is free does anything else get a say — which is why what is there is established with a
 /// direct apiserver read rather than a watch-cache one.
 ///
 /// **A foreign Job is neither adopted nor a reason to give up.** Name collisions are made unlikely
 /// rather than impossible (`job_builder::job_name`), so the name is a hint and the identity check is
-/// the boundary. Adopting on the strength of the name would move this attempt's record to `Running`
+/// the boundary. Adopting on the strength of the name would move this run's record to `Running`
 /// for work it did not commission and later write the run off as `Unknown`. Abandoning instead may
-/// look safe — a foreign Job means this attempt has none of its own, since the name is deterministic
+/// look safe — a foreign Job means this run has none of its own, since the name is deterministic
 /// — but it inverts the risk: if the identity check ever rejected a Job that genuinely *was* ours,
 /// abandoning would release the host Leases while that Job kept running, which is the double-apply
 /// the Leases exist to prevent. Waiting has no such failure mode, and it resolves on its own once
 /// the foreign Job is reaped by its `ttlSecondsAfterFinished`, after which the name is free and the
-/// attempt proceeds normally.
+/// run proceeds normally.
 fn decide_job_presence(may_proceed: bool, job: RecordedJob) -> JobPresenceAction {
     match (may_proceed, job) {
         (_, RecordedJob::Own) => JobPresenceAction::Adopt,
@@ -1099,23 +1251,23 @@ fn decide_job_presence(may_proceed: bool, job: RecordedJob) -> JobPresenceAction
     }
 }
 
-/// What is actually sitting at a recorded attempt's Job name, read straight from the apiserver.
+/// What is actually sitting at a recorded run's Job name, read straight from the apiserver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordedJob {
-    /// The Job this attempt created: every identity field `validate_selected_job` checks matches.
+    /// The Job this run created: every identity field `validate_selected_job` checks matches.
     Own,
-    /// A Job this attempt did not create holds the name.
+    /// A Job this run did not create holds the name.
     Foreign,
     /// The name is free.
     Absent,
 }
 
-/// Reads what holds this attempt's Job name and checks whether it is the attempt's own Job.
+/// Reads what holds this run's Job name and checks whether it is the run's own Job.
 ///
 /// Existence is deliberately *not* treated as identity. The name is derived, and derived names are
 /// bounded and therefore lossy, so the only thing that establishes ownership is the identity
-/// `validate_selected_job` compares: the plan's owner reference, the execution hash, the attempt
-/// number, the per-attempt run ID and the `Play` UID — on the Job *and* on its pod template.
+/// `validate_selected_job` compares: the plan's owner reference, the execution hash, the run
+/// number, the run ID and the `Play` UID — on the Job *and* on its pod template.
 async fn job_at_recorded_name(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -1131,7 +1283,7 @@ async fn job_at_recorded_name(
             &job,
             object,
             run.execution_hash,
-            run.mirror.attempt,
+            run.mirror.run_number,
             &run.mirror.run_id,
             &run.mirror.play_uid,
         ) {
@@ -1141,21 +1293,21 @@ async fn job_at_recorded_name(
     )
 }
 
-/// How `spec.suspend` disposes of a recovered absent-Job attempt, decided before the desired
-/// inputs are read. Pure so the rule that suspending always drops an unlaunched attempt — and does
+/// How `spec.suspend` disposes of a recovered absent-Job run, decided before the desired
+/// inputs are read. Pure so the rule that suspending always drops an unlaunched run — and does
 /// so through the right door — stays pinned by unit tests rather than implied by control flow.
 ///
 /// Only `Launching` straddles Job creation; the earlier phases cannot have a Job, so for them
-/// `suspend` is the whole decision and the attempt is released outright. A `Launching` attempt may
+/// `suspend` is the whole decision and the run is released outright. A `Launching` run may
 /// already have committed its Job, so its fate belongs to [`resume_launching_run`] alone, called
 /// with nothing left to resume for.
 #[derive(Debug, PartialEq, Eq)]
 enum SuspendedUnlaunched {
-    /// The attempt cannot have a Job yet: release its locks and delete its record outright.
+    /// The run cannot have a Job yet: release its locks and delete its record outright.
     Abandon,
-    /// The attempt straddles Job creation: only [`resume_launching_run`] may decide its fate.
+    /// The run straddles Job creation: only [`resume_launching_run`] may decide its fate.
     GiveUpThroughResume,
-    /// The plan is not suspended: the gate holds no opinion on the attempt.
+    /// The plan is not suspended: the gate holds no opinion on the run.
     NotSuspended,
 }
 
@@ -1167,16 +1319,16 @@ fn decide_suspended_unlaunched(phase: &v1beta1::PlayPhase, suspend: bool) -> Sus
     }
 }
 
-/// Everything that can be decided about a recovered absent-Job attempt *before* the live desired
-/// inputs are read. Returns `true` when the attempt survives and the remaining gates need those
+/// Everything that can be decided about a recovered absent-Job run *before* the live desired
+/// inputs are read. Returns `true` when the run survives and the remaining gates need those
 /// inputs after all — which is also what makes this the sole owner of the two decisions below, and
 /// lets [`decide_unlaunched_action`] assume the plan is not suspended.
 ///
-///   - **`spec.suspend`, in every phase.** Dropping an attempt that has not launched needs no
+///   - **`spec.suspend`, in every phase.** Dropping a run that has not launched needs no
 ///     inventory, so it is decided here rather than after resolution: a suspended plan must not sit
 ///     on its host Leases waiting for an inventory read that may never succeed.
-///   - **Whether a `Launching` attempt's own Job exists.** Checked before input resolution so an
-///     existing Job cannot be hidden behind a broken replacement inventory. Only the attempt's own
+///   - **Whether a `Launching` run's own Job exists.** Checked before input resolution so an
+///     existing Job cannot be hidden behind a broken replacement inventory. Only the run's own
 ///     Job short-circuits here; anything else at the name falls through to
 ///     [`resume_launching_run`], which owns that decision and can report it.
 async fn resolve_unlaunched_before_inputs(
@@ -1216,9 +1368,9 @@ async fn resolve_unlaunched_before_inputs(
         return Ok(true);
     }
 
-    // Not suspended: this attempt's own Job is adopted *now* rather than after inventory resolution,
+    // Not suspended: this run's own Job is adopted *now* rather than after inventory resolution,
     // which is what keeps a started run from losing its locks behind a broken replacement inventory.
-    // Anything else — a free name, or a Job this attempt did not create — falls through to the
+    // Anything else — a free name, or a Job this run did not create — falls through to the
     // fingerprint and eligibility gates, and from there back to `resume_launching_run` for the real
     // decision, which is also the one place that reports a contested name.
     if job_at_recorded_name(context, object, &unlaunched.run).await? == RecordedJob::Own {
@@ -1255,17 +1407,17 @@ async fn adopt_started_run(
     Ok(())
 }
 
-/// Applies a lock-renewal outcome to an attempt whose Job does not exist yet, reporting the
-/// contended host on the plan and deciding whether the attempt survives.
+/// Applies a lock-renewal outcome to a run whose Job does not exist yet, reporting the
+/// contended host on the plan and deciding whether the run survives.
 ///
 /// Returns `Some(requeue)` when the tick has to stop short, `None` when every lock is still this
 /// run's. The two contended outcomes are deliberately *not* the same:
 ///
 ///   - `Lost` is evidence — another holder was observed on the Lease. Two runs applying a playbook
-///     to the same host is what the Leases exist to prevent, and an attempt with no Job can still be
+///     to the same host is what the Leases exist to prevent, and a run with no Job can still be
 ///     given up cleanly, so it is.
 ///   - `Unconfirmed` is the absence of evidence — a write race, with nobody seen taking the lock
-///     over. Tearing a healthy attempt's node-root infrastructure down on a transient 409 would be a
+///     over. Tearing a healthy run's node-root infrastructure down on a transient 409 would be a
 ///     far worse outcome than looking again a second later, so it is only retried.
 async fn resolve_contended_locks(
     context: &ReconciliationContext,
@@ -1316,14 +1468,14 @@ async fn resolve_contended_locks(
     }
 }
 
-/// Gives up an attempt whose Job does not exist, from the phase the caller observed it in.
+/// Gives up a run whose Job does not exist, from the phase the caller observed it in.
 ///
 /// The record is moved to `Aborted` **first**, so it outlives the cleanup that follows and keeps it
 /// retryable; `abandon_run` then releases everything, persists a plan status that no longer mentions
-/// the attempt, and finally deletes the record.
+/// the run, and finally deletes the record.
 ///
 /// `reason` is the caller's one-line explanation, and it is a parameter rather than something the
-/// caller sets beforehand so that giving an attempt up and saying why cannot come apart — see
+/// caller sets beforehand so that giving a run up and saying why cannot come apart — see
 /// [`abandon_run`].
 async fn abandon_unlaunched_run(
     context: &ReconciliationContext,
@@ -1346,13 +1498,13 @@ async fn abandon_unlaunched_run(
     abandon_run(context, object, api, run, reason, resource_status).await
 }
 
-/// Steps 2-5: name the attempt (or adopt the one a `Play` already records), acquire its per-host
+/// Steps 2-5: name the run (or adopt the one a `Play` already records), acquire its per-host
 /// locks (all-or-nothing, renewed every tick for as long as the run is in progress), then hand off
 /// to [`ensure_infra_and_launch`]. Each guard clause returns early with a short requeue the moment a
 /// precondition isn't met yet; `None` means it ran to completion and the Job now exists.
 ///
-/// A fresh attempt and one resumed from a `Prepared`/`Starting` record both come through here. They
-/// differ only in `prepared`: a resumed attempt keeps the identity its `Play` recorded, while a
+/// A fresh run and one resumed from a `Prepared`/`Starting` record both come through here. They
+/// differ only in `prepared`: a resumed run keeps the identity its `Play` recorded, while a
 /// fresh one mints it and writes the record. Everything after the locks is identical, so it lives in
 /// one place — an operator restart mid-setup must not take a different code path than the tick it
 /// interrupted.
@@ -1384,10 +1536,16 @@ async fn try_start_run(
                 &jobs_api,
                 run.execution_hash,
                 object,
-                resource_status.retry_count,
+                resource_status.last_run_number,
             )
             .await?;
             let run_id = run_id(object, &run.execution_hash)?;
+            let attempt = next_attempt(
+                &object.spec.mode,
+                resource_status.retry_count,
+                run.triggered_slot,
+                resource_status.last_triggered_run,
+            );
             // The recorded inventory — not `hosts_to_trigger` — is what every later step reads the
             // run's host set back from, so it is also what the initial host count is taken from.
             let inventory = flatten_hosts(run_groups);
@@ -1400,7 +1558,8 @@ async fn try_start_run(
                     hash: &run.execution_hash,
                     run_id: &run_id,
                     preparation_fingerprint: run.preparation_fingerprint,
-                    attempt: selected.attempt,
+                    run_number: selected.run_number,
+                    attempt,
                     inventory: &inventory,
                     triggered_slot: run.triggered_slot,
                 },
@@ -1411,6 +1570,9 @@ async fn try_start_run(
     };
 
     let holder_identity = holder_identity(run.namespace, run.name, &active_run);
+    resource_status.last_run_number = active_run.mirror.run_number;
+    // From the record either way: a resumed run's try was numbered on the tick that prepared it, and
+    // re-deriving it here would hand its budget back on every tick it spends waiting for locks.
     resource_status.retry_count = active_run.mirror.attempt;
     resource_status.phase = Phase::Applying;
     resource_status.summary = Some(applying_summary(&active_run.mirror));
@@ -1418,8 +1580,8 @@ async fn try_start_run(
     resource_status.active_run = Some(active_run.mirror.clone());
 
     if prepared.is_some_and(|run| run.phase == v1beta1::PlayPhase::Starting) {
-        // A resumed `Starting` attempt already holds its locks, so this re-asserts them rather than
-        // acquiring a set it may have lost — and only an *observed* takeover gives the attempt up.
+        // A resumed `Starting` run already holds its locks, so this re-asserts them rather than
+        // acquiring a set it may have lost — and only an *observed* takeover gives the run up.
         let outcome =
             locking::renew_locks(&leases_api, &active_run.mirror.hosts, &holder_identity).await?;
         let plan_api = Api::<PlaybookPlan>::namespaced(context.client.clone(), run.namespace);
@@ -1440,7 +1602,7 @@ async fn try_start_run(
         locking::ensure_locks(&leases_api, &active_run.mirror.hosts, &holder_identity).await?
     {
         // Acquisition is all-or-nothing and took nothing this tick, so there is nothing to give up:
-        // the attempt waits its turn and stays supersedable meanwhile.
+        // the run waits its turn and stays supersedable meanwhile.
         warn!(
             "PlaybookPlan {}/{} is blocked: host '{}' is locked by {}",
             run.namespace,
@@ -1457,7 +1619,7 @@ async fn try_start_run(
 
     // Leave `Prepared` only once the locks are held: everything up to here is abortable, so a run
     // that can't take its locks stays supersedable by a newer revision (or by `suspend`) instead of
-    // launching a stale one later. Idempotent, so resuming an already-`Starting` attempt is a no-op.
+    // launching a stale one later. Idempotent, so resuming an already-`Starting` run is a no-op.
     play_history::commit_starting(
         &context.client,
         run.namespace,
@@ -1477,16 +1639,16 @@ async fn try_start_run(
     .await
 }
 
-/// Everything between "this attempt holds its host Leases and its record says `Starting`" and "its
+/// Everything between "this run holds its host Leases and its record says `Starting`" and "its
 /// Job exists": live node authorization, the managed-ssh proxy infrastructure, the workspace Secret,
 /// the playbook NetworkPolicy, the `Launching` commit, the Job itself, and `Running`.
 ///
-/// Shared verbatim by a fresh attempt and one resumed after a restart. That sharing is the point:
+/// Shared verbatim by a fresh run and one resumed after a restart. That sharing is the point:
 /// these are the node-root steps, and having a resumed run walk a second, subtly different
 /// implementation of them is exactly how an invariant gets lost on the path nobody exercises daily.
 ///
 /// Returns `Some(requeue)` when it stopped short of the Job — proxy pods aren't Ready yet, or the
-/// attempt's nodes lost their grant — and `None` once the Job exists and the record says `Running`.
+/// run's nodes lost their grant — and `None` once the Job exists and the record says `Running`.
 async fn ensure_infra_and_launch(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -1509,11 +1671,11 @@ async fn ensure_infra_and_launch(
             run.mirror.job_name
         );
         // Released here rather than left for the next tick to pick up as an `Aborted` record: the
-        // attempt may already hold host Leases and proxy pods, and a grant live policy has just
+        // run may already hold host Leases and proxy pods, and a grant live policy has just
         // refused is not worth holding those for a moment longer than the cleanup itself takes. The
         // record still outlives the cleanup, so a failure part-way through is retried as before.
         //
-        // This is the one abandon of a `Launching` attempt that does not route through
+        // This is the one abandon of a `Launching` run that does not route through
         // `resume_launching_run` and so does not re-read the Job — see that function's doc for why
         // the exception is safe here and must not be copied elsewhere.
         let api = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace);
@@ -1530,8 +1692,8 @@ async fn ensure_infra_and_launch(
         return Ok(Some(std::time::Duration::from_secs(1)));
     }
 
-    // Discards half-built infrastructure this attempt owns that the *current* CA cannot authenticate
-    // against — i.e. a resume across an operator restart. A no-op (one `get_opt`) for an attempt that
+    // Discards half-built infrastructure this run owns that the *current* CA cannot authenticate
+    // against — i.e. a resume across an operator restart. A no-op (one `get_opt`) for a run that
     // has not built anything yet.
     managed_ssh::reset_incomplete_run(
         &context.client,
@@ -1673,6 +1835,10 @@ enum ActiveRunProgress {
     Running(std::time::Duration),
     Finished {
         run: RecordedRun,
+        /// The verdict the run's record carried, which is what the plan's own phase is decided
+        /// from. A run finalized without its record reads `Unknown` here, and that is a failure
+        /// like any other: nothing proves its hosts were reached.
+        outcome: v1beta1::PlayPhase,
         record: TerminalRecord,
     },
     /// The cached plan status named a run that the apiserver's copy no longer has — an earlier tick
@@ -1704,7 +1870,7 @@ enum TerminalRecord {
 /// A different object under the name is the same fact as no object at all — the recorded run is gone
 /// — so both answer `None` and both reach `finalize_lost_run`, which reconstructs the result from the
 /// plan's own copy of the run. Pure so the equivalence stays pinned: it is what keeps a replacement
-/// attempt from being finalized, acknowledged or pruned as though it were the run it replaced.
+/// run from being finalized, acknowledged or pruned as though it were the run it replaced.
 fn own_record(found: Option<Play>, expected_uid: &str) -> Option<Play> {
     found.filter(|play| play.metadata.uid.as_deref() == Some(expected_uid))
 }
@@ -1714,13 +1880,13 @@ fn own_record(found: Option<Play>, expected_uid: &str) -> Option<Play> {
 ///
 /// An absent mirror answers yes: the tick that finishes a run clears it before either path is reached
 /// (`advance_active_run`), and that case still has to reset the phase. What the guard excludes is a mirror
-/// describing a *different* attempt, which is genuinely in flight and is the only thing that would
+/// describing a *different* run, which is genuinely in flight and is the only thing that would
 /// bring it to [`finalize_lost_run`] if its `Play` were deleted. Clearing that would leave its host
 /// Leases and node-root proxy pods with nothing pointing at them.
 ///
 /// Pure, and shared, so the two paths cannot drift: the guard was only ever reasoned about on the
 /// finalize side, while `abandon_run` reaches the same fields from `recover_active_run`'s `Aborted`
-/// branch — the one path that adopts no attempt first.
+/// branch — the one path that adopts no run first.
 fn mirrors_run(status: &PlaybookPlanStatus, run: &RecordedRun) -> bool {
     status
         .active_run
@@ -1735,7 +1901,7 @@ fn mirrors_run(status: &PlaybookPlanStatus, run: &RecordedRun) -> bool {
 /// The UID is checked by the caller rather than here, because a record that no longer carries it is
 /// not a wrong *phase* — it is a different object at the same name, which says the recorded run is
 /// gone.
-fn play_is_running_attempt(play: &Play) -> Result<bool, ReconcileError> {
+fn play_is_running(play: &Play) -> Result<bool, ReconcileError> {
     let status = play
         .status
         .as_ref()
@@ -1774,13 +1940,13 @@ async fn advance_active_run(
     // Deliberately silent on the plan, and deliberately the slow interval. Two ticks reach here,
     // and neither wants a message or a prompt return of its own:
     //
-    //   - one that drained a queued terminal result while the mirror still named an attempt that
+    //   - one that drained a queued terminal result while the mirror still named a run that
     //     has not reached `Running`. That tick describes the situation itself, in terms this could
-    //     not improve on ("recorded a finished run; another attempt is still in flight"), and sets
+    //     not improve on ("recorded a finished run; another run is still in flight"), and sets
     //     its own one-second requeue afterwards — so a summary written here would only be
     //     overwritten a few steps later, inviting a reader to reconcile two messages that always
     //     disagree about which of the two runs the plan is waiting on.
-    //   - a suspended plan whose `Launching` attempt found a foreign Job at its name.
+    //   - a suspended plan whose `Launching` run found a foreign Job at its name.
     //     `resolve_unlaunched_before_inputs` has already reported that through
     //     `resume_launching_run`, which keeps the mirror and asks for fifteen seconds; nothing
     //     between here and the end of the tick will set the interval again, so returning one second
@@ -1790,7 +1956,7 @@ async fn advance_active_run(
     //
     // Fifteen seconds serves both: the first overrides it, and the second is exactly the cadence
     // the contested path asked for.
-    if !play_is_running_attempt(&play)? {
+    if !play_is_running(&play)? {
         return Ok(ActiveRunProgress::Running(std::time::Duration::from_secs(
             15,
         )));
@@ -1806,7 +1972,7 @@ async fn advance_active_run(
                 job,
                 object,
                 run.execution_hash,
-                run.mirror.attempt,
+                run.mirror.run_number,
                 &run.mirror.run_id,
                 &run.mirror.play_uid,
             )
@@ -1817,9 +1983,9 @@ async fn advance_active_run(
                 // so there is nothing safe left to do about a lock it no longer holds.
                 let _outcome =
                     locking::renew_locks(&leases_api, &run.mirror.hosts, &holder_identity).await?;
-                // The attempt is past setup, so a `Blocked`/`WaitingForNodes` left over from the
+                // The run is past setup, so a `Blocked`/`WaitingForNodes` left over from the
                 // tick that started it would otherwise stay on the plan for the whole wait.
-                status::clear_attempt_conditions(resource_status);
+                status::clear_run_conditions(resource_status);
                 status::set_job_identity_mismatch_condition(resource_status, &job_name);
                 resource_status.summary = Some(format!(
                     "waiting for Job {job_name}, which does not carry this run's identity"
@@ -1843,7 +2009,7 @@ async fn advance_active_run(
         // As above: the Job is already running, so a lost lock is reported and nothing more.
         let _outcome =
             locking::renew_locks(&leases_api, &run.mirror.hosts, &holder_identity).await?;
-        status::clear_attempt_conditions(resource_status);
+        status::clear_run_conditions(resource_status);
         status::set_running_condition(resource_status);
         resource_status.summary = Some(applying_summary(&run.mirror));
         return Ok(ActiveRunProgress::Running(std::time::Duration::from_secs(
@@ -1893,19 +2059,19 @@ async fn advance_active_run(
         parsed.as_ref(),
     )
     .await?;
-    status::apply_terminal_play_status(
-        &run.execution_hash,
+    let finished_status =
         finished_play
             .status
             .as_ref()
             .ok_or(ReconcileError::PreconditionFailed(
                 "finished Play has no status",
-            ))?,
-        resource_status,
-    );
+            ))?;
+    let outcome = finished_status.phase.clone();
+    status::apply_terminal_play_status(&run.execution_hash, finished_status, resource_status);
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
+        outcome,
         record: TerminalRecord::Present,
     })
 }
@@ -1952,24 +2118,23 @@ async fn finalize_lost_run(
 
     release_run_infrastructure(context, object, run).await?;
 
-    status::apply_terminal_play_status(
-        &run.execution_hash,
-        &play_history::lost_run_status(&run.mirror.job_name, &run.mirror.hosts),
-        resource_status,
-    );
+    let lost_status = play_history::lost_run_status(&run.mirror.job_name, &run.mirror.hosts);
+    let outcome = lost_status.phase.clone();
+    status::apply_terminal_play_status(&run.execution_hash, &lost_status, resource_status);
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
+        outcome,
         record: TerminalRecord::Lost,
     })
 }
 
 /// Completes a run whose Job creation was already committed — and the **only** place that decides
-/// the fate of a `Launching` attempt.
+/// the fate of a `Launching` run.
 ///
-/// `Launching` is the one phase where "abandon the superseded attempt" is not unconditionally
-/// available, because the Job may already be out there doing node-root work under this attempt's
-/// identity. `resume_with` says which it is: `Some(groups)` when the attempt may still launch — the
+/// `Launching` is the one phase where "abandon the superseded run" is not unconditionally
+/// available, because the Job may already be out there doing node-root work under this run's
+/// identity. `resume_with` says which it is: `Some(groups)` when the run may still launch — the
 /// groups are the inputs to converge it against — and `None` when it may not, because the desired
 /// revision moved on, the plan was suspended, or those inputs could not be read at all.
 /// [`decide_job_presence`] turns that, plus what [`job_at_recorded_name`] found, into the action —
@@ -1980,13 +2145,13 @@ async fn finalize_lost_run(
 /// repeated here even when `resolve_unlaunched_before_inputs` already did one. That matters: a
 /// `create` whose response was lost still leaves a real Job, everything between the two reads is a
 /// window for it to become visible, and a stale answer would tear infrastructure down out from under
-/// a live run. Every path that abandons a `Launching` attempt *because the plan moved on* routes
+/// a live run. Every path that abandons a `Launching` run *because the plan moved on* routes
 /// through here for exactly that reason — including `suspend`, which has no inventory to converge
 /// against and so arrives with `resume_with` of `None`.
 ///
 /// There is one deliberate exception, and it is not a "the plan moved on" abandon:
-/// `ensure_infra_and_launch` gives an attempt up on the spot when live policy has just revoked its
-/// nodes, without coming back here. Re-reading the Job would change nothing — the attempt is only
+/// `ensure_infra_and_launch` gives a run up on the spot when live policy has just revoked its
+/// nodes, without coming back here. Re-reading the Job would change nothing — the run is only
 /// there because this function *just* read it as absent, and nothing between the two reads creates
 /// Jobs — while routing it back would recurse. Do not copy the shortcut into a path where the
 /// intervening work can span a Job creation.
@@ -2060,7 +2225,7 @@ async fn resume_launching_run(
                 resource_status,
             )
             .await?;
-            // A short requeue, matching every other abandon path: nothing of this attempt is left,
+            // A short requeue, matching every other abandon path: nothing of this run is left,
             // so the replacement revision should be prepared promptly rather than after the
             // caller's Job-polling interval.
             Some(std::time::Duration::from_secs(1))
@@ -2070,10 +2235,10 @@ async fn resume_launching_run(
                 "PlaybookPlan {namespace}/{name}: run {} cannot launch — a Job it did not create holds its name",
                 run.mirror.job_name
             );
-            // The attempt keeps its host Leases while it waits. It reached `Launching`, so it may
+            // The run keeps its host Leases while it waits. It reached `Launching`, so it may
             // already own node-root proxy pods on these hosts, and it is not giving up — so the
             // protection has to stay. The renewal outcome is discarded for the same reason
-            // `advance_active_run` discards it against a foreign Job: a host this attempt no longer
+            // `advance_active_run` discards it against a foreign Job: a host this run no longer
             // holds may be occupied by work it does not control, and there is nothing safe left to
             // do about that from here.
             let leases_api =
@@ -2111,10 +2276,10 @@ async fn resume_launching_run(
 ///
 /// The mirror is given up only when it is *this* run's, exactly as in [`finalize_finished_run`]: it
 /// is what lets the operator release a run whose `Play` was deleted out from under it
-/// ([`finalize_lost_run`]), so clearing it for a run it does not describe would leave that attempt's
+/// ([`finalize_lost_run`]), so clearing it for a run it does not describe would leave that run's
 /// host Leases and node-root proxy pods with nothing pointing at them. Every caller reached through
 /// [`abandon_unlaunched_run`] has just written this run into the mirror, so the guard is only
-/// load-bearing on the `Aborted` recovery path, which adopts no attempt and inherits whatever the
+/// load-bearing on the `Aborted` recovery path, which adopts no run and inherits whatever the
 /// reflector cache held. Stating it here rather than relying on that reasoning keeps the abandon and
 /// finalize paths the same shape.
 async fn abandon_run(
@@ -2136,7 +2301,7 @@ async fn abandon_run(
         resource_status.phase = Phase::Pending;
         resource_status.next_run = None;
     }
-    status::clear_attempt_conditions(resource_status);
+    status::clear_run_conditions(resource_status);
     patch_status(api, object, resource_status.clone()).await?;
 
     if let Err(error) = play_history::delete_aborted(
@@ -2220,7 +2385,7 @@ async fn report_failed_finalization(
 /// standalone.
 ///
 /// That is not the same as "once per tick", and it is worth not claiming it is. One tick can finalize
-/// *two* runs — a terminal record queued behind a live attempt is drained first, and the attempt it
+/// *two* runs — a terminal record queued behind a live run is drained first, and the run it
 /// was queued behind can reach its own terminal state in the same tick — and each finalization prunes
 /// after acknowledging its own result. The second pass is a redundant list on a rare tick rather than
 /// a correctness problem: the pass is idempotent, and it has to follow acknowledgement, so it cannot
@@ -2232,7 +2397,7 @@ async fn report_failed_finalization(
 ///
 /// That is also the whole of what the standalone pass is for, which is why the caller runs it only
 /// while nothing is in flight. Retention gains work only when a run finishes, and a plan with an
-/// attempt in flight is requeued every 5-15s — listing its history on each of those ticks is a
+/// run in flight is requeued every 5-15s — listing its history on each of those ticks is a
 /// steady, unindexed apiserver read that can only ever find the same nothing. Deferring a failed
 /// deletion until the run ends costs a few retained records for the length of one run; the record it
 /// would have deleted is acknowledged history and owns nothing.
@@ -2260,7 +2425,7 @@ fn prune_retry_after(current: std::time::Duration) -> std::time::Duration {
     current.min(std::time::Duration::from_secs(15))
 }
 
-/// Reports on the plan that its desired inputs could not be read, for a tick with no attempt in
+/// Reports on the plan that its desired inputs could not be read, for a tick with no run in
 /// flight to hold open.
 ///
 /// Both desired-input reads — the inventories and the referenced Secrets — come through here, so a
@@ -2269,9 +2434,9 @@ fn prune_retry_after(current: std::time::Duration) -> std::time::Duration {
 /// has been failing every tick since, which reads as "nothing to do" rather than "broken".
 ///
 /// The phase and `nextRun` are reset for the same reason the summary is written: they are the other
-/// two printer columns, and leaving a `Succeeded`/`Scheduled` phase over a plan that has not been
-/// able to read its own inputs since — pointing, in the `Scheduled` case, at a slot that will not
-/// fire — is exactly the "nothing to do" reading this exists to prevent. `hostsStatus` is left
+/// two printer columns, and leaving a `Succeeded`/`Delayed` phase over a plan that has not been
+/// able to read its own inputs since — pointing, in both cases, at a slot that will not fire — is
+/// exactly the "nothing to do" reading this exists to prevent. `hostsStatus` is left
 /// alone: the previous run's per-host results are still true, and nothing here re-ran anything.
 ///
 /// A run still in flight keeps its phase, matching [`update_desired_hash`]'s guard. The read failure
@@ -2310,11 +2475,11 @@ fn record_input_failure(status: &mut PlaybookPlanStatus, summary: String) {
 /// Keeps a deferred unlaunched run safe when a prerequisite needed to decide its fate cannot be
 /// read. `Starting` and `Launching` may hold Leases; renewing them here prevents a transient or
 /// persistent inventory/policy error from letting another run acquire the same hosts while this
-/// attempt's proxy pods or Job still exist. `Prepared` has not acquired anything and must stay that
+/// run's proxy pods or Job still exist. `Prepared` has not acquired anything and must stay that
 /// way. Reporting is best effort because the original error remains the reconcile result.
 ///
 /// The summary is only claimed if nothing better is already there. A step that fails *after*
-/// deciding the attempt's fate reports itself — `report_failed_abandon` names the run whose
+/// deciding the run's fate reports itself — `report_failed_abandon` names the run whose
 /// node-root proxy pods and host Leases could not be released, and tells the reader which manual
 /// cleanup applies. Writing "run recovery paused" over that would replace a specific, actionable
 /// diagnosis with a vague one, for the same error.
@@ -2355,7 +2520,7 @@ async fn preserve_unlaunched_run_after_error(
 }
 
 /// Reports a failed desired-input read on the plan, whichever of the two reads it came from and
-/// whether or not an attempt is waiting behind it.
+/// whether or not a run is waiting behind it.
 ///
 /// Both reads — the inventories and the referenced Secrets — fail the same way and are answered the
 /// same way, so the choice between the two reporting paths is made once here instead of at each
@@ -2395,15 +2560,15 @@ async fn report_desired_input_error(
     }
 }
 
-/// Decides what a failed desired-input read means for an attempt whose Job does not exist yet, and
+/// Decides what a failed desired-input read means for a run whose Job does not exist yet, and
 /// reports the outage on the plan either way.
 ///
-/// `summary` is the same diagnostic the no-attempt path ([`report_input_failure`]) would have
+/// `summary` is the same diagnostic the no-run path ([`report_input_failure`]) would have
 /// written, and it is passed in rather than rebuilt here so both paths describe one outage in one
 /// wording. The readiness overlay is set before the branch because it is true of every outcome
-/// below: whether the attempt is held, adopted or given up, the plan cannot read what it should be
-/// running, and `Ready` is the column that says so. Leaving it to the *next* tick's no-attempt path
-/// would let the last run's verdict stand over an outage for as long as an attempt was being held —
+/// below: whether the run is held, adopted or given up, the plan cannot read what it should be
+/// running, and `Ready` is the column that says so. Leaving it to the *next* tick's no-run path
+/// would let the last run's verdict stand over an outage for as long as a run was being held —
 /// which, for a transient error, is exactly the case that can persist.
 ///
 /// Reporting is not left to whatever the chosen outcome writes, because each of them can fail before
@@ -2412,7 +2577,7 @@ async fn report_desired_input_error(
 /// specific — which run was aborted, or that a started Job was adopted instead — but it can no longer
 /// leave the plan showing only the previous run's verdict.
 ///
-/// The phase is deliberately not touched here, unlike in [`record_input_failure`]: an attempt is in
+/// The phase is deliberately not touched here, unlike in [`record_input_failure`]: a run is in
 /// flight, and `Pending` would contradict the `activeRun` standing next to it.
 async fn handle_unlaunched_input_error(
     context: &ReconciliationContext,
@@ -2456,10 +2621,10 @@ async fn handle_unlaunched_input_error(
         warn!("Could not report unreadable desired inputs on {namespace}/{name}: {patch_error}");
     }
 
-    // A `Launching` attempt is never abandoned on the strength of the pre-input Job read alone:
+    // A `Launching` run is never abandoned on the strength of the pre-input Job read alone:
     // `resolve_inventory` has run since, and that is exactly the window in which a `create` whose
     // response was lost becomes visible. Hand it to the one function that owns that boundary, with
-    // no inputs to converge against — this attempt may not launch, so all that is left for it is
+    // no inputs to converge against — this run may not launch, so all that is left for it is
     // adopting an existing Job or abandoning an absent one.
     if unlaunched.phase == v1beta1::PlayPhase::Launching {
         let (action, _requeue) =
@@ -2479,7 +2644,7 @@ async fn handle_unlaunched_input_error(
                 ));
             }
             // `Contested` explained itself, and more usefully than this could. `Proceed` cannot
-            // happen: it needs inputs to converge against, and this attempt has none.
+            // happen: it needs inputs to converge against, and this run has none.
             JobPresenceAction::Contested | JobPresenceAction::Proceed => {}
         }
         return patch_status(api, object, resource_status.clone()).await;
@@ -2497,13 +2662,13 @@ async fn handle_unlaunched_input_error(
     .await
 }
 
-/// Whether failing to read the plan's desired inputs is a reason to give an unlaunched attempt up.
+/// Whether failing to read the plan's desired inputs is a reason to give an unlaunched run up.
 ///
 /// The line is whether the failure can plausibly clear on its own. A referenced resource that does
 /// not exist, or an inventory that names a variable the operator manages, leaves no executable
-/// desired state to resume the attempt against, so it is superseded and a fresh one starts once the
+/// desired state to resume the run against, so it is superseded and a fresh one starts once the
 /// input is fixed. Anything else — including a 404 that arrived as a bare `KubeError`, which no read
-/// site has classified — is treated as transient and holds the attempt open instead.
+/// site has classified — is treated as transient and holds the run open instead.
 ///
 /// Both desired-input reads route through here, so the two cannot drift: a deleted `ClusterInventory`
 /// and a deleted variables Secret end the same way.
@@ -2615,7 +2780,7 @@ async fn release_deleted_plan(
 ///
 /// The records are listed before anything is released and a failure to list them ends the teardown,
 /// because they are not a supplement to the status mirror — they are the *only* handle on a run
-/// during the window between `record_prepared` and the status write that mirrors it. An attempt in
+/// during the window between `record_prepared` and the status write that mirrors it. A run in
 /// that window already holds host Leases and node-root proxy pods, so a teardown that saw only the
 /// (still empty) mirror and then dropped the finalizer would strand them where nothing can reach
 /// them again. Every discovery failure that a later tick could clear is therefore kept as one, in
@@ -2636,7 +2801,7 @@ async fn runs_to_release(
 /// The runs a deleted plan's status mirror and records name between them, deduplicated.
 ///
 /// The mirror leads because it is the one source that survives the plan's own cascade; the records
-/// cover the attempt that has not reached the status yet. A handle that does not parse is dropped
+/// cover the run that has not reached the status yet. A handle that does not parse is dropped
 /// with a warning rather than failing the teardown: there is nothing to release for a run whose
 /// identity is unreadable, and no tick will ever repair it, so holding the finalizer over one would
 /// only trade a leak for a plan that can never finish deleting. The manual cleanup procedure in the
@@ -2733,7 +2898,7 @@ async fn cancel_run_job(
             job,
             object,
             run.execution_hash,
-            run.mirror.attempt,
+            run.mirror.run_number,
             &run.mirror.run_id,
             &run.mirror.play_uid,
         )
@@ -2808,7 +2973,7 @@ async fn cancel_run_job(
     Ok(executing)
 }
 
-/// Selects an attempt's *playbook* pods — the Job's — and not the proxy pods it shares its run ID
+/// Selects a run's *playbook* pods — the Job's — and not the proxy pods it shares its run ID
 /// with, which carry the managed-ssh component instead and are released with the rest of the
 /// infrastructure.
 fn run_pod_selector(run_id: &str) -> String {
@@ -2948,7 +3113,7 @@ fn holder_identity(namespace: &str, name: &str, run: &RecordedRun) -> String {
 /// because it has not taken its locks yet, and `renew_locks` re-asserts a *missing* Lease, so
 /// renewing for it would acquire locks on a tick that is about to bail. `Aborted` is excluded for
 /// the same reason from the other end: it has no Job, so nothing is executing behind it, and an
-/// attempt aborted straight out of `Prepared` never held a lock to renew — while the refusal that
+/// run aborted straight out of `Prepared` never held a lock to renew — while the refusal that
 /// brought us here can persist for a long time, pinning hosts against every other plan. Best effort
 /// by design: the caller is already returning an error, and a failure to renew here must not replace
 /// the diagnosis that explains why.
@@ -2998,6 +3163,9 @@ fn update_desired_hash(status: &mut PlaybookPlanStatus, execution_hash: &Executi
     }
 
     status.current_hash = execution_hash.to_string();
+    status.last_run_number = 0;
+    // A new revision is a new execution, and its budget is its own: the tries the previous one spent
+    // say nothing about a playbook that has since been fixed.
     status.retry_count = 0;
     // Clearing the slot is what lets an edit take effect inside the very window it was made in: the
     // dedupe exists to stop one revision re-triggering itself, not to stop a different one from
@@ -3021,11 +3189,13 @@ fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usi
     status.summary = Some(format!("{total_count}/{total_count} up-to-date"));
 }
 
-/// Puts a recovered attempt back onto the plan's status: the run itself, the `Applying` phase it
-/// implies, and — only while the attempt applies the currently desired revision — the retry number
-/// it reached, which is what stops a later attempt from reusing its name.
-fn adopt_recovered_attempt(status: &mut PlaybookPlanStatus, active_run: &ActiveRun) {
+/// Puts a recovered run back onto the plan's status: the run itself, the `Applying` phase it
+/// implies, and — only while the run applies the currently desired revision — the run number it
+/// reached, which is what stops a later run from reusing its name, and the try it was, which is what
+/// stops the budget being offered twice.
+fn adopt_recovered_run(status: &mut PlaybookPlanStatus, active_run: &ActiveRun) {
     if status.current_hash == active_run.execution_hash {
+        status.last_run_number = status.last_run_number.max(active_run.run_number);
         status.retry_count = status.retry_count.max(active_run.attempt);
     }
     status.phase = Phase::Applying;
@@ -3033,27 +3203,27 @@ fn adopt_recovered_attempt(status: &mut PlaybookPlanStatus, active_run: &ActiveR
     status.active_run = Some(active_run.clone());
 }
 
-/// The plan's summary while an attempt is in progress.
+/// The plan's summary while a run is in progress.
 ///
 /// Written wherever a run is adopted or advanced, and deliberately said in one line rather than
-/// narrating the step the attempt has reached: waiting on host locks and waiting on proxy pods are
+/// narrating the step the run has reached: waiting on host locks and waiting on proxy pods are
 /// reported by the `Blocked`/`WaitingForNodes` conditions, and duplicating them here would only give
 /// them a second chance to disagree.
 ///
 /// What matters is that *something* claims the summary on the way in. Every error path this tick
 /// might take overwrites it with its own message, and merge patches never drop the key, so without
-/// this a message explaining why an earlier attempt was given up would stay on the plan for the
+/// this a message explaining why an earlier run was given up would stay on the plan for the
 /// whole of the run that replaced it.
 fn applying_summary(active_run: &ActiveRun) -> String {
     format!("applying run {}", active_run.job_name)
 }
 
-/// Whether the summary is still the one [`adopt_recovered_attempt`] claimed for this attempt on the
+/// Whether the summary is still the one [`adopt_recovered_run`] claimed for this run on the
 /// way into the tick — i.e. no step has since replaced it with an account of its own failure.
 ///
 /// This is what lets a fallback message defer to a specific one without the two having to be
-/// sequenced through a shared return value: every recovered attempt passes through
-/// `adopt_recovered_attempt`, so anything else standing here was written by the step that just
+/// sequenced through a shared return value: every recovered run passes through
+/// `adopt_recovered_run`, so anything else standing here was written by the step that just
 /// failed, and that step knew more about the failure than the fallback does.
 fn summary_unclaimed_since_adoption(status: &PlaybookPlanStatus, active_run: &ActiveRun) -> bool {
     status.summary.as_deref() == Some(applying_summary(active_run).as_str())
@@ -3090,6 +3260,17 @@ impl RecordedRun {
     }
 }
 
+/// A run whose terminal result this tick applied, and the verdict its record carried.
+///
+/// The two travel together because both halves are needed to classify the plan afterwards: the run
+/// says which revision and which schedule window the result belongs to, while the verdict says what
+/// the result *was*. Recovering the verdict later from the plan's own state is not possible — a
+/// failed `Recurring` run leaves no drift behind to read it back out of.
+struct FinishedRun {
+    run: RecordedRun,
+    outcome: v1beta1::PlayPhase,
+}
+
 /// Persists a run's terminal result and hands its record back to history. Returns whether the
 /// closing retention pass failed and should be retried with a shortened requeue — see
 /// [`prune_history`] for why that is a return value rather than an error.
@@ -3103,11 +3284,11 @@ impl RecordedRun {
 /// already-finished one come through here, so that ordering cannot drift between them.
 ///
 /// The mirror is only given up when it is *this* run's. A terminal result is drained ahead of
-/// anything live (`recover_active_run`), so the plan may well still be mirroring a different attempt
+/// anything live (`recover_active_run`), so the plan may well still be mirroring a different run
 /// that is genuinely in flight — and that mirror is what lets the operator release a run whose `Play`
 /// is deleted out from under it (`finalize_lost_run`). Clearing it for a run it does not describe
-/// would leave that attempt's host Leases and node-root proxy pods with nothing pointing at them.
-/// The drain path adopts the surviving attempt before calling this, so an absent mirror there means
+/// would leave that run's host Leases and node-root proxy pods with nothing pointing at them.
+/// The drain path adopts the surviving run before calling this, so an absent mirror there means
 /// there is genuinely nothing left in flight rather than a plan that has not caught up.
 async fn finalize_finished_run(
     context: &ReconciliationContext,
@@ -3127,7 +3308,7 @@ async fn finalize_finished_run(
     patch_status(api, object, resource_status.clone()).await?;
 
     // A run finalized without its record has nothing to acknowledge, and must not try: the name may
-    // now hold a *replacement* attempt's `Play`, and a version-checked write aimed at that would fail
+    // now hold a *replacement* run's `Play`, and a version-checked write aimed at that would fail
     // as "Play UID changed" — reporting a teardown problem for a run that is complete, and delaying
     // the replacement's own recovery by a tick. Retention still runs: the plan gained a result.
     if record == TerminalRecord::Present {
@@ -3144,23 +3325,23 @@ async fn finalize_finished_run(
 
 /// Folds a finished run's revision bookkeeping into the plan.
 ///
-/// `surviving` is the *different* attempt the plan still holds behind this result, if any — a
+/// `surviving` is the *different* run the plan still holds behind this result, if any — a
 /// terminal record is drained ahead of anything live, so a tick can apply one run's outcome while
 /// another is genuinely running. `lastTriggeredRun` is the sole dedupe key for "one run per schedule
-/// window", so it has to describe the newest attempt of the desired revision the plan is holding:
-/// stamping the finished run's window over a live attempt's would describe a run that is already
-/// over. That is taken from the surviving attempt's own record rather than from whatever the last
+/// window", so it has to describe the newest run of the desired revision the plan is holding:
+/// stamping the finished run's window over a live run's would describe a run that is already
+/// over. That is taken from the surviving run's own record rather than from whatever the last
 /// status write left behind, because a tick that failed between marking the run `Running` and
-/// patching the plan leaves the *previous* run's slot standing. A surviving attempt with no slot of
+/// patching the plan leaves the *previous* run's slot standing. A surviving run with no slot of
 /// its own consumed none, so the finished run's remains the newest window there was.
 ///
-/// The attempt number is claimed either way, because it answers a different question: it reserves a
-/// name against every later attempt, and a finished run holds its number whatever else is in flight.
+/// The run number is claimed either way, because it answers a different question: it reserves a
+/// name against every later run, and a finished run holds its number whatever else is in flight.
 fn sync_desired_hash_after_finished_run(
     status: &mut PlaybookPlanStatus,
     desired_hash: &ExecutionHash,
     finished: &RecordedRun,
-    surviving: Option<&SurvivingAttempt>,
+    surviving: Option<&SurvivingRun>,
 ) {
     // Clears the slot when the desired revision has moved on, so the replacement can start inside
     // the window the finished run used. When it hasn't, the slot is re-recorded below instead, which
@@ -3177,6 +3358,9 @@ fn sync_desired_hash_after_finished_run(
         .and_then(|surviving| surviving.run.mirror.triggered_slot);
     if finished.execution_hash == *desired_hash {
         record_triggered_slot(status, surviving_slot.or(finished.mirror.triggered_slot));
+        status.last_run_number = status.last_run_number.max(finished.mirror.run_number);
+        // The try is claimed for the same reason the number is: it was spent, and a status that was
+        // behind this run must not offer its budget a second time.
         status.retry_count = status.retry_count.max(finished.mirror.attempt);
     } else {
         record_triggered_slot(status, surviving_slot);
@@ -3202,7 +3386,7 @@ fn record_triggered_slot(status: &mut PlaybookPlanStatus, slot: Option<DateTime<
 /// A terminal record whose result has not reached the plan yet does *not* count towards that
 /// invariant and is drained ahead of anything live: it owns no cluster resources any more, and
 /// handing its recap over is what allows the plan to move on at all. The invariant is still settled
-/// first, because the drain describes the attempt that outlives the result and so must not be taken
+/// first, because the drain describes the run that outlives the result and so must not be taken
 /// from a live set that was never proved to hold one.
 async fn recover_active_run(
     context: &ReconciliationContext,
@@ -3260,7 +3444,7 @@ async fn recover_active_run(
             return Ok(Some(RecoveredRun::Finished {
                 finished: recorded_run_from_play(play)?,
                 status: play_status.clone(),
-                surviving: surviving.map(surviving_attempt_from_play).transpose()?,
+                surviving: surviving.map(surviving_run_from_play).transpose()?,
             }));
         }
         Some(RecoverableRecord::Live(play)) => play,
@@ -3273,7 +3457,7 @@ async fn recover_active_run(
     let run = recorded_run_from_play(play)?;
 
     match play_status.phase.clone() {
-        // Deferred rather than decided here: whether an absent-Job attempt may still be resumed
+        // Deferred rather than decided here: whether an absent-Job run may still be resumed
         // needs the resolved, policy-clamped inventory this step runs ahead of. The reconciler
         // resolves `Launching` Job existence and `suspend` before that dependency, and preserves
         // this record's locks if resolving the remaining inputs fails.
@@ -3358,30 +3542,30 @@ enum RecoveredRun {
     Finished {
         finished: RecordedRun,
         status: v1beta1::PlayStatus,
-        /// The attempt still in flight behind the drained result, if any. A terminal result is
+        /// The run still in flight behind the drained result, if any. A terminal result is
         /// handed over ahead of anything live, so the plan is *not* finished when this is set, and
         /// the tick must not classify it as such — nor let the finished run's schedule window
-        /// overwrite the one this attempt holds.
+        /// overwrite the one this run holds.
         ///
-        /// Carried whole, and rebuilt from the attempt's own immutable record rather than read off
+        /// Carried whole, and rebuilt from the run's own immutable record rather than read off
         /// a plan status that may not have caught up with it: the tick adopts it as the plan's
         /// mirror, which is both the handle every later tick recovers it by and the only way its
         /// Leases and proxy pods can still be released if its record is deleted while it runs.
         /// Boxed to keep this variant from dominating the size of every recovery result.
-        surviving: Option<Box<SurvivingAttempt>>,
+        surviving: Option<Box<SurvivingRun>>,
     },
 }
 
-/// The attempt that outlives a drained terminal result: its run, and the phase its record was found
-/// in. The phase travels with it because the two things the tick does with the attempt need
+/// The run that outlives a drained terminal result: its run, and the phase its record was found
+/// in. The phase travels with it because the two things the tick does with the run need
 /// different evidence — adopting its mirror is right in every phase, while crediting it with the
 /// schedule window its record names is only right once its Job exists.
-struct SurvivingAttempt {
+struct SurvivingRun {
     run: RecordedRun,
     phase: v1beta1::PlayPhase,
 }
 
-/// Whether an attempt has actually consumed the schedule window its record names — the one rule
+/// Whether a run has actually consumed the schedule window its record names — the one rule
 /// `lastTriggeredRun` is written by, wherever the write happens.
 ///
 /// Both halves have to hold.
@@ -3391,9 +3575,9 @@ struct SurvivingAttempt {
 ///     gives it a Job instead ([`resume_launching_run`]'s adoption and the `ResumePreparing` path),
 ///     and `Aborted` never had one: `play_history::abort_unlaunched` only accepts an unlaunched
 ///     record, and from `Launching` only once its Job is known to be absent. Crediting those would
-///     let an attempt that is then abandoned — suspended, or left with no hosts to trigger — burn a
+///     let a run that is then abandoned — suspended, or left with no hosts to trigger — burn a
 ///     window nothing ever ran in, since no abandon path clears the marker.
-///   - **It must apply the revision the plan currently wants.** A superseded attempt whose Job
+///   - **It must apply the revision the plan currently wants.** A superseded run whose Job
 ///     already exists is adopted and allowed to finish, but the window belongs to the revision that
 ///     replaced it: `update_desired_hash` cleared the marker precisely so the edit can run inside
 ///     the window it was made in, and the replacement is what will claim it. Nothing takes a
@@ -3404,7 +3588,7 @@ struct SurvivingAttempt {
 /// caller forgetting the revision, breaks a test rather than silently suppressing a scheduled run.
 fn consumed_its_slot(
     phase: &v1beta1::PlayPhase,
-    attempt_hash: &ExecutionHash,
+    run_hash: &ExecutionHash,
     desired_hash: &ExecutionHash,
 ) -> bool {
     let job_exists = match phase {
@@ -3417,7 +3601,7 @@ fn consumed_its_slot(
         | v1beta1::PlayPhase::Failed
         | v1beta1::PlayPhase::Unknown => false,
     };
-    job_exists && attempt_hash == desired_hash
+    job_exists && run_hash == desired_hash
 }
 
 /// What a recoverable `Play` is to recovery. Pure so the one line that actually matters here stays
@@ -3446,12 +3630,12 @@ fn classify_record(play: &Play) -> RecordKind {
 
 /// What a tick has to recover, chosen from the records a plan holds.
 enum RecoverableRecord<'a> {
-    /// A terminal result to hand over, together with the attempt that outlives it, if any.
+    /// A terminal result to hand over, together with the run that outlives it, if any.
     Finished {
         play: &'a Play,
         surviving: Option<&'a Play>,
     },
-    /// An attempt that is genuinely in flight.
+    /// A run that is genuinely in flight.
     Live(&'a Play),
 }
 
@@ -3459,7 +3643,7 @@ enum RecoverableRecord<'a> {
 ///
 /// A queued terminal result wins, because it is the only copy of its run's recap and the plan cannot
 /// start anything until it has been applied — but only once the live set has been proved to hold at
-/// most one attempt. Draining names the surviving attempt off that set and ends the tick there, so
+/// most one run. Draining names the surviving run off that set and ends the tick there, so
 /// taking it unproved would let a second live record pass a whole tick without being advanced or
 /// having its host Leases renewed, which is precisely what the refusal exists to prevent.
 fn select_recoverable_record<'a>(
@@ -3478,7 +3662,7 @@ fn select_recoverable_record<'a>(
 
 /// The one in-flight record that may describe this plan's run, or `None` when it has none.
 ///
-/// Pure so the invariant is testable: a plan runs at most one attempt at a time, and every path
+/// Pure so the invariant is testable: a plan has at most one run in flight at a time, and every path
 /// that creates a record does so only when no other is in flight. Two therefore means something
 /// outside this protocol wrote one, and picking either would leave the other's node-root proxy pods
 /// unswept with nothing left pointing at them. Refusing is recoverable by an operator (delete the
@@ -3498,11 +3682,11 @@ fn sole_active_record<'a>(live: &[&'a Play]) -> Result<Option<&'a Play>, Reconci
     }
 }
 
-/// An attempt recovered before its Job exists, reduced to what deciding its fate needs: its
+/// A run recovered before its Job exists, reduced to what deciding its fate needs: its
 /// identity, the phase it was found in, and the fingerprint of the inputs it was prepared against.
 ///
 /// The `Play` itself is deliberately not carried further: the fingerprint is the only thing about
-/// the record that the resume decision consults, and everything else the attempt needs is re-derived
+/// the record that the resume decision consults, and everything else the run needs is re-derived
 /// from live cluster state.
 struct UnlaunchedRun {
     run: RecordedRun,
@@ -3560,6 +3744,7 @@ fn recorded_run_from_play(play: &Play) -> Result<RecordedRun, ReconcileError> {
             job_name,
             play_uid,
             hosts: host_names(&play.spec.inventory),
+            run_number: play.spec.run_number,
             attempt: play.spec.attempt,
             triggered_slot: play.spec.triggered_slot,
         },
@@ -3567,7 +3752,7 @@ fn recorded_run_from_play(play: &Play) -> Result<RecordedRun, ReconcileError> {
     })
 }
 
-fn surviving_attempt_from_play(play: &Play) -> Result<Box<SurvivingAttempt>, ReconcileError> {
+fn surviving_run_from_play(play: &Play) -> Result<Box<SurvivingRun>, ReconcileError> {
     let phase = play
         .status
         .as_ref()
@@ -3575,7 +3760,7 @@ fn surviving_attempt_from_play(play: &Play) -> Result<Box<SurvivingAttempt>, Rec
         .ok_or(ReconcileError::PreconditionFailed(
             "an in-flight Play has no status",
         ))?;
-    Ok(Box::new(SurvivingAttempt {
+    Ok(Box::new(SurvivingRun {
         run: recorded_run_from_play(play)?,
         phase,
     }))
@@ -3594,18 +3779,18 @@ fn preparation_fingerprint(
 
 /// How many characters [`run_id`] mints.
 ///
-/// Long enough that concurrent attempts cannot collide on it, short enough to leave room for a node
+/// Long enough that concurrent runs cannot collide on it, short enough to leave room for a node
 /// name inside the object names it feeds. Every name budget that depends on it — the proxy pods and
 /// Secrets in `managed_ssh::resource_name`, the egress policy in
 /// `job_builder::job_network_policy_name` — is pinned by a test that mints an ID of exactly this
 /// length, so raising it fails in all of them at once rather than at the apiserver.
 pub(super) const RUN_ID_LENGTH: usize = 10;
 
-/// Mints this attempt's run ID — the identity that scopes its Leases, proxy resources, client
+/// Mints this run's run ID — the identity that scopes its Leases, proxy resources, client
 /// certificate principal and cleanup.
 ///
-/// Deliberately *not* a function of (plan, hash, attempt): an aborted attempt frees its number
-/// again, so a derived ID would be reused by the retry while the aborted attempt's proxy pods are
+/// Deliberately *not* a function of (plan, hash, runNumber): an aborted run frees its number
+/// again, so a derived ID would be reused by the retry while the aborted run's proxy pods are
 /// still terminating, and the retry would adopt those dying pods under the same names. A counter
 /// separates the IDs minted by one process and the clock separates them across restarts; the run ID
 /// never has to be recomputed, since it is recorded in the `Play` before anything is named after it.
@@ -3633,7 +3818,7 @@ fn run_id(plan: &PlaybookPlan, execution_hash: &ExecutionHash) -> Result<String,
     ))
 }
 
-/// Creates a recorded attempt's backing Job from inputs already checked against its fingerprint.
+/// Creates a recorded run's backing Job from inputs already checked against its fingerprint.
 async fn launch_recorded_job(
     jobs_api: &Api<Job>,
     object: &PlaybookPlan,
@@ -3642,7 +3827,7 @@ async fn launch_recorded_job(
 ) -> Result<(), ReconcileError> {
     let mut job = job_builder::create_job_blueprint(
         &run.execution_hash,
-        run.mirror.attempt,
+        run.mirror.run_number,
         &run.mirror.run_id,
         run_groups,
         object,
@@ -3650,7 +3835,7 @@ async fn launch_recorded_job(
     job_builder::correlate_job_to_play(&mut job, &run.mirror.play_uid);
     let selected = SelectedJob {
         job_name: run.mirror.job_name.clone(),
-        attempt: run.mirror.attempt,
+        run_number: run.mirror.run_number,
     };
     spawn_ansible_job(jobs_api, object, &selected, &run.mirror.play_uid, job).await
 }
@@ -3697,7 +3882,7 @@ fn job_run_id(job: &Job) -> Result<&str, ReconcileError> {
     ))
 }
 
-fn retry_count_from_job_name(job_name: &str) -> Option<u32> {
+fn run_number_from_job_name(job_name: &str) -> Option<u32> {
     job_name.rsplit('-').next()?.parse().ok()
 }
 
@@ -3705,11 +3890,13 @@ fn retry_count_from_job_name(job_name: &str) -> Option<u32> {
 /// and the caller's requeue duration become once this run's Job has reached a terminal state. Pure
 /// (every wall-clock/inventory input is passed in) so the per-mode matrix is unit-testable without a
 /// kube client:
-///   - OneShot resolves to `Succeeded`/`Failed` solely by whether any host is still outdated and
-///     never reschedules.
-///   - Recurring with a schedule reschedules to the next slot and requeues until then.
-///   - Recurring *without* a schedule is the dead-end the eligibility gate normally prevents (the
-///     caller logs it): nothing to reschedule against, so the plan stays `Applying`.
+///   - Every finished run resolves to `Succeeded`/`Failed`, in either mode, from *that run's* own
+///     verdict — see [`phase_for_finished_run`].
+///   - OneShot never reschedules.
+///   - Recurring with a schedule keeps the verdict and advertises the next slot through `next_run`,
+///     requeueing until then.
+///   - Recurring *without* a schedule is the dead-end the start gate normally prevents (the caller
+///     logs it): the verdict still stands, there is simply no next slot to name.
 struct TerminalOutcome {
     phase: Phase,
     next_run: Option<DateTime<FixedOffset>>,
@@ -3720,6 +3907,8 @@ struct TerminalOutcome {
 fn decide_terminal<Tz: TimeZone>(
     mode: &ExecutionMode,
     schedule: Option<&str>,
+    outcome: &v1beta1::PlayPhase,
+    retry_due: bool,
     outdated_count: usize,
     total_count: usize,
     now: DateTime<Tz>,
@@ -3728,38 +3917,66 @@ fn decide_terminal<Tz: TimeZone>(
         0 => format!("{total_count}/{total_count} up-to-date"),
         n => format!("{n}/{total_count} outdated"),
     };
+    let phase = phase_for_finished_run(outcome);
+
+    // A try that is still owed is the next thing the plan does, so it is what the plan waits for:
+    // the wait is short because a scheduled retry has only the rest of the tick's grace window to
+    // start in, and there is no next run to advertise until the execution is actually finished.
+    let retrying = retry_due.then(|| TerminalOutcome {
+        phase: phase.clone(),
+        next_run: None,
+        summary: summary.clone(),
+        requeue: Some(RETRY_REQUEUE),
+    });
 
     match mode {
-        ExecutionMode::OneShot => TerminalOutcome {
-            phase: if outdated_count == 0 {
-                Phase::Succeeded
-            } else {
-                Phase::Failed
-            },
+        ExecutionMode::OneShot => retrying.unwrap_or(TerminalOutcome {
+            phase,
             next_run: None,
             summary,
             requeue: None,
-        },
+        }),
         ExecutionMode::Recurring => match schedule {
             Some(schedule) => {
+                if let Some(retrying) = retrying {
+                    return retrying;
+                }
                 let next =
                     forecast_next_run(schedule, now.clone(), Some(chrono::Duration::seconds(-5)));
                 let requeue = (next.clone() - now).to_std().ok();
                 TerminalOutcome {
-                    phase: Phase::Scheduled,
+                    phase,
                     next_run: Some(next.fixed_offset()),
                     summary,
                     requeue,
                 }
             }
-            // Any prior forecast is now unreachable, so clear `next_run` and hold at `Applying`.
+            // Any prior forecast is now unreachable, so clear `next_run`. The verdict is kept: it
+            // describes a run that did happen, and removing the schedule does not undo it.
             None => TerminalOutcome {
-                phase: Phase::Applying,
+                phase,
                 next_run: None,
                 summary,
                 requeue: None,
             },
         },
+    }
+}
+
+/// The plan phase a finished run resolves to, in either mode.
+///
+/// Read from the run's own record rather than from the plan's drift state, because the two can
+/// legitimately disagree: a `Recurring` run that fails leaves every host still carrying the
+/// `lastAppliedHash` an earlier run gave it, so nothing is outdated and a drift-based verdict would
+/// report the failed run as a success. Anything short of `Succeeded` is a failure, `Unknown`
+/// included — a recap that could not be read is not evidence that the hosts were reached.
+///
+/// The non-terminal phases cannot arrive here: `apply_terminal_play_status` refuses them, and both
+/// paths that produce an outcome have already been through it.
+fn phase_for_finished_run(outcome: &v1beta1::PlayPhase) -> Phase {
+    match outcome {
+        v1beta1::PlayPhase::Succeeded => Phase::Succeeded,
+        _ => Phase::Failed,
     }
 }
 
@@ -4220,24 +4437,22 @@ fn namespace_and_name(object: &PlaybookPlan) -> Result<(&str, &str), ReconcileEr
 
 struct SelectedJob {
     job_name: String,
-    attempt: u32,
+    run_number: u32,
 }
 
-/// One past the highest attempt number any of `claimed` occupies. Pure so the "never reuse a name
+/// One past the highest run number any of `claimed` occupies. Pure so the "never reuse a name
 /// something still on the cluster claims" rule is unit-testable without a kube client.
-fn next_attempt_number(claimed: &[u32]) -> Result<u32, ReconcileError> {
+fn next_run_number(claimed: &[u32]) -> Result<u32, ReconcileError> {
     claimed
         .iter()
         .copied()
         .max()
         .unwrap_or_default()
         .checked_add(1)
-        .ok_or(ReconcileError::PreconditionFailed(
-            "run attempt number overflowed",
-        ))
+        .ok_or(ReconcileError::PreconditionFailed("run number overflowed"))
 }
 
-/// Names the next attempt of `hash`, one past every attempt number anything still on the cluster
+/// Names the next run of `hash`, one past every run number anything still on the cluster
 /// claims: **all** of this plan's Jobs, and **all** of its retained `Play` records (which reserve
 /// their number even after the Job has been reaped, and even before their status exists — an
 /// uninitialized record still occupies its name until recovery deletes it).
@@ -4255,14 +4470,14 @@ fn next_attempt_number(claimed: &[u32]) -> Result<u32, ReconcileError> {
 /// recovered `Play`, and under the write-ahead protocol every Job this plan created has a `Play`
 /// recorded *before* it — so an active Job with no recoverable record is not this run's, and
 /// adopting it would mint a fresh `run_id` for a Job whose own record claims a different one,
-/// wedging the attempt on an unrepairable `PreconditionFailed`. Resuming a genuinely in-flight run
+/// wedging the run on an unrepairable `PreconditionFailed`. Resuming a genuinely in-flight run
 /// is `recover_active_run`'s job; same-run idempotency within a tick is `spawn_ansible_job`'s.
 async fn select_job(
     client: &kube::Client,
     api: &Api<Job>,
     hash: ExecutionHash,
     playbookplan: &PlaybookPlan,
-    current_retry_count: u32,
+    last_run_number: u32,
 ) -> Result<SelectedJob, ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
 
@@ -4279,44 +4494,44 @@ async fn select_job(
     let jobs = api
         .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
         .await?;
-    let max_job_attempt = jobs
+    let max_job_run_number = jobs
         .items
         .iter()
         .filter(|job| job_belongs_to_plan(job, plan_name.as_ref(), plan_uid.as_ref()))
         .filter_map(|job| job.metadata.name.as_deref())
-        .filter_map(retry_count_from_job_name)
+        .filter_map(run_number_from_job_name)
         .max()
         .unwrap_or_default();
 
     let plays = Api::<Play>::namespaced(client.clone(), namespace.as_ref())
         .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
         .await?;
-    let max_recorded_attempt = plays
+    let max_recorded_run_number = plays
         .items
         .iter()
         .filter(|play| play_belongs_to_plan(play, plan_name.as_ref(), plan_uid.as_ref()))
-        .map(|play| play.spec.attempt)
+        .map(|play| play.spec.run_number)
         .max()
         .unwrap_or_default();
 
-    let attempt =
-        next_attempt_number(&[current_retry_count, max_job_attempt, max_recorded_attempt])?;
+    let run_number =
+        next_run_number(&[last_run_number, max_job_run_number, max_recorded_run_number])?;
 
     Ok(SelectedJob {
-        job_name: job_builder::job_name(plan_name.as_ref(), plan_uid.as_ref(), &hash, attempt),
-        attempt,
+        job_name: job_builder::job_name(plan_name.as_ref(), plan_uid.as_ref(), &hash, run_number),
+        run_number,
     })
 }
 
-/// Creates this attempt's Job, tolerating the fact that it may already exist.
+/// Creates this run's Job, tolerating the fact that it may already exist.
 ///
-/// Same-run idempotency, and nothing wider: which attempt gets to run is decided long before this by
+/// Same-run idempotency, and nothing wider: which run gets to run is decided long before this by
 /// `select_job` (which never adopts a Job it has no record for) and `recover_active_run`. What is
-/// left here is that the *same* attempt can reach this point more than once — several reconciles
+/// left here is that the *same* run can reach this point more than once — several reconciles
 /// fired in quick succession all read `phase` from the reflector cache, which lags this controller's
 /// own `patch_status` writes, and a `create` whose response was lost still left a real Job behind.
 /// So the Job is looked up by its exact name and, either way, `validate_selected_job` has to confirm
-/// it carries this attempt's identity before it is adopted.
+/// it carries this run's identity before it is adopted.
 async fn spawn_ansible_job(
     api: &Api<Job>,
     playbookplan: &PlaybookPlan,
@@ -4325,18 +4540,11 @@ async fn spawn_ansible_job(
     expected_job: Job,
 ) -> Result<(), ReconcileError> {
     let job_name = &selected.job_name;
-    let retry_count = selected.attempt;
+    let run_number = selected.run_number;
     let hash = job_execution_hash(&expected_job)?;
     let run_id = job_run_id(&expected_job)?.to_string();
     if let Some(existing) = api.get_opt(job_name).await? {
-        validate_selected_job(
-            &existing,
-            playbookplan,
-            hash,
-            retry_count,
-            &run_id,
-            play_uid,
-        )?;
+        validate_selected_job(&existing, playbookplan, hash, run_number, &run_id, play_uid)?;
         debug!("Adopting already-active job {job_name} for this run");
         return Ok(());
     }
@@ -4355,14 +4563,7 @@ async fn spawn_ansible_job(
         Ok(_) => {}
         Err(err) if is_conflict(&err) => {
             let existing = api.get(job_name).await?;
-            validate_selected_job(
-                &existing,
-                playbookplan,
-                hash,
-                retry_count,
-                &run_id,
-                play_uid,
-            )?;
+            validate_selected_job(&existing, playbookplan, hash, run_number, &run_id, play_uid)?;
             debug!("Adopting already-active job {job_name} for this run");
         }
         Err(err) => return Err(err.into()),
@@ -4372,11 +4573,11 @@ async fn spawn_ansible_job(
 }
 
 /// Whether `job` is the exact Job this run committed to. Identity, not content: the run's `Play` UID
-/// (unique per attempt) has to be on both the Job and its pod template, alongside the plan's owner
-/// reference, the execution hash, the per-attempt run ID and the attempt number in the name.
+/// (unique per run) has to be on both the Job and its pod template, alongside the plan's owner
+/// reference, the execution hash, the run ID and the run number in the name.
 ///
 /// Deliberately *not* a comparison against the stored blueprint. A Job's pod template is immutable
-/// once created, so a Job carrying this attempt's `Play` UID can only have been created from that
+/// once created, so a Job carrying this run's `Play` UID can only have been created from that
 /// blueprint — while a field-by-field comparison would have to model every server-side default and
 /// mutating webhook, and each field it failed to predict would disown a healthy run: the operator
 /// would sit out the whole run holding this plan's host Leases against every other plan targeting
@@ -4385,7 +4586,7 @@ fn validate_selected_job(
     job: &Job,
     plan: &PlaybookPlan,
     expected_hash: ExecutionHash,
-    expected_attempt: u32,
+    expected_run_number: u32,
     expected_run_id: &str,
     expected_play_uid: &str,
 ) -> Result<(), ReconcileError> {
@@ -4397,17 +4598,17 @@ fn validate_selected_job(
     let plan_uid = plan
         .uid()
         .ok_or(ReconcileError::PreconditionFailed("uid not set"))?;
-    let actual_attempt = job
+    let actual_run_number = job
         .metadata
         .name
         .as_deref()
-        .and_then(retry_count_from_job_name);
+        .and_then(run_number_from_job_name);
     let expected_hash_string = expected_hash.to_string();
     if !job_belongs_to_plan(job, plan_name.as_ref(), plan_uid.as_ref())
         || job_label(job, labels::PLAYBOOKPLAN_NAME) != Some(plan_name.as_ref())
         || job_label(job, labels::COMPONENT) != Some(labels::PLAYBOOK_COMPONENT)
         || job_execution_hash(job)? != expected_hash
-        || actual_attempt != Some(expected_attempt)
+        || actual_run_number != Some(expected_run_number)
         || job_label(job, labels::RUN_ID) != Some(expected_run_id)
         || job_template_label(job, labels::RUN_ID) != Some(expected_run_id)
         || annotation_value(&job.metadata, labels::PLAY_UID_ANNOTATION) != Some(expected_play_uid)
@@ -4583,8 +4784,8 @@ mod tests {
     }
 
     /// The run-identity predicates recovery and Job validation are built from. Each one answers
-    /// "is this object part of *this* attempt?", and each is deliberately proof rather than a label
-    /// match — a name or a label can be reused by a later attempt or a recreated plan.
+    /// "is this object part of *this* run?", and each is deliberately proof rather than a label
+    /// match — a name or a label can be reused by a later run or a recreated plan.
     #[test]
     fn ownership_predicates_require_the_plan_uid_not_just_its_name() {
         let owner = |kind: &str, name: &str, uid: &str| OwnerReference {
@@ -4663,7 +4864,7 @@ mod tests {
         let mut job = Job::default();
         assert!(
             job_run_id(&job).is_err(),
-            "a Job with no run ID cannot be matched to an attempt"
+            "a Job with no run ID cannot be matched to a run"
         );
 
         job.metadata.labels = Some(BTreeMap::from([(
@@ -4673,18 +4874,18 @@ mod tests {
         assert_eq!(job_run_id(&job).unwrap(), "run-1");
     }
 
-    /// The attempt number is carried in the Job name, so recovering it has to survive plan names
+    /// The run number is carried in the Job name, so recovering it has to survive plan names
     /// that themselves contain dashes and digits.
     #[test]
-    fn retry_count_is_read_from_the_trailing_segment_of_a_job_name() {
-        assert_eq!(retry_count_from_job_name("apply-web-abc-7"), Some(7));
+    fn run_number_is_read_from_the_trailing_segment_of_a_job_name() {
+        assert_eq!(run_number_from_job_name("apply-web-abc-7"), Some(7));
         assert_eq!(
-            retry_count_from_job_name("apply-web-2-config-abc-12"),
+            run_number_from_job_name("apply-web-2-config-abc-12"),
             Some(12),
-            "a plan name containing digits must not confuse the attempt number"
+            "a plan name containing digits must not confuse the run number"
         );
-        assert_eq!(retry_count_from_job_name("apply-web-abc-notanumber"), None);
-        assert_eq!(retry_count_from_job_name(""), None);
+        assert_eq!(run_number_from_job_name("apply-web-abc-notanumber"), None);
+        assert_eq!(run_number_from_job_name(""), None);
     }
 
     /// The run's lock set. Group order is preserved so the list reads like the inventory, and a host
@@ -4782,21 +4983,21 @@ mod tests {
         );
     }
 
-    /// Every attempt number anything still on the cluster claims — this plan's Jobs for the hash
-    /// and its retained `Play` records — is skipped, so a new attempt can never land on a name an
+    /// Every run number anything still on the cluster claims — this plan's Jobs for the hash
+    /// and its retained `Play` records — is skipped, so a new run can never land on a name an
     /// existing object already occupies.
     #[test]
-    fn next_attempt_number_starts_past_everything_still_claiming_a_name() {
+    fn next_run_number_starts_past_everything_still_claiming_a_name() {
         // First run: nothing claims a number yet.
-        assert_eq!(next_attempt_number(&[0, 0, 0]).unwrap(), 1);
+        assert_eq!(next_run_number(&[0, 0, 0]).unwrap(), 1);
 
         // A retained Play reserves its number even after its Job has been reaped.
-        assert_eq!(next_attempt_number(&[0, 0, 7]).unwrap(), 8);
+        assert_eq!(next_run_number(&[0, 0, 7]).unwrap(), 8);
 
-        // A surviving Job past the plan's own retry count still wins.
-        assert_eq!(next_attempt_number(&[3, 5, 0]).unwrap(), 6);
+        // A surviving Job past the plan's own last run number still wins.
+        assert_eq!(next_run_number(&[3, 5, 0]).unwrap(), 6);
 
-        assert!(next_attempt_number(&[u32::MAX]).is_err());
+        assert!(next_run_number(&[u32::MAX]).is_err());
     }
 
     /// Why `select_job` reserves names across *every* revision instead of only the one it is naming.
@@ -4814,23 +5015,23 @@ mod tests {
     /// testing the width rather than the rule that survives it.
     #[test]
     fn two_revisions_can_share_a_run_name_so_numbers_are_reserved_plan_wide() {
-        /// Splits `apply-{plan}-{digest}-{attempt}` on its last two separators.
+        /// Splits `apply-{plan}-{digest}-{run}` on its last two separators.
         fn parts(name: &str) -> (&str, &str, &str) {
-            let (head, attempt) = name.rsplit_once('-').unwrap();
+            let (head, run_number) = name.rsplit_once('-').unwrap();
             let (plan, digest) = head.rsplit_once('-').unwrap();
-            (plan, digest, attempt)
+            (plan, digest, run_number)
         }
 
         let a = ExecutionHash::from_hex("1").unwrap();
         let b = ExecutionHash::from_hex("2").unwrap();
         let name_a = job_builder::job_name("web", "plan-uid", &a, 1);
         let name_b = job_builder::job_name("web", "plan-uid", &b, 1);
-        let (plan_a, digest_a, attempt_a) = parts(&name_a);
-        let (plan_b, digest_b, attempt_b) = parts(&name_b);
+        let (plan_a, digest_a, run_number_a) = parts(&name_a);
+        let (plan_b, digest_b, run_number_b) = parts(&name_b);
 
         // Two revisions of one plan are separated by the digest and nothing else...
         assert_ne!(name_a, name_b);
-        assert_eq!((plan_a, attempt_a), (plan_b, attempt_b));
+        assert_eq!((plan_a, run_number_a), (plan_b, run_number_b));
         assert_ne!(digest_a, digest_b);
 
         // ...and that digest is a fixed width, so it cannot keep an unbounded number of revisions
@@ -4851,7 +5052,7 @@ mod tests {
             "the digest is fixed width, whatever it is derived from"
         );
 
-        // The attempt number is the part that is guaranteed to differ, which is why it is reserved
+        // The run number is the part that is guaranteed to differ, which is why it is reserved
         // across every revision of the plan rather than per hash.
         assert_ne!(name_a, job_builder::job_name("web", "plan-uid", &a, 2));
     }
@@ -4921,7 +5122,7 @@ mod tests {
             play
         };
 
-        assert!(play_is_running_attempt(&play(v1beta1::PlayPhase::Running)).unwrap());
+        assert!(play_is_running(&play(v1beta1::PlayPhase::Running)).unwrap());
         for phase in [
             v1beta1::PlayPhase::Prepared,
             v1beta1::PlayPhase::Starting,
@@ -4929,7 +5130,7 @@ mod tests {
             v1beta1::PlayPhase::Aborted,
             v1beta1::PlayPhase::Succeeded,
         ] {
-            assert!(!play_is_running_attempt(&play(phase)).unwrap());
+            assert!(!play_is_running(&play(phase)).unwrap());
         }
 
         // A statusless record never crossed the operator-owned boundary, so it describes no phase to
@@ -4937,7 +5138,7 @@ mod tests {
         // filters out before ever getting here.
         let mut statusless = play(v1beta1::PlayPhase::Running);
         statusless.status = None;
-        assert!(play_is_running_attempt(&statusless).is_err());
+        assert!(play_is_running(&statusless).is_err());
     }
 
     /// A replacement `Play` at the same name is not this run's record, and has to be indistinguishable
@@ -4967,7 +5168,7 @@ mod tests {
     }
 
     /// The guard both `finalize_finished_run` and `abandon_run` clear the mirror behind. A mirror
-    /// naming a *different* attempt is the one thing that must survive: it is genuinely in flight,
+    /// naming a *different* run is the one thing that must survive: it is genuinely in flight,
     /// and it is the only handle `finalize_lost_run` has for releasing its host Leases and node-root
     /// proxy pods if its `Play` is deleted. An absent mirror still answers yes, because the tick that
     /// finishes a run clears it before either path runs and the phase reset still has to happen.
@@ -4981,6 +5182,7 @@ mod tests {
                 job_name: "apply-web-abc-1".into(),
                 play_uid: play_uid.into(),
                 hosts: vec!["worker-1".into()],
+                run_number: 1,
                 attempt: 1,
                 triggered_slot: None,
             },
@@ -4998,16 +5200,16 @@ mod tests {
         );
         assert!(
             !mirrors_run(&mirroring(Some(&run("other-play-uid"))), &this_run),
-            "a mirror describing another attempt is that attempt's only recovery handle"
+            "a mirror describing another run is that run's only recovery handle"
         );
 
-        // What the drain path relies on: adopting the attempt that outlives the result is what turns
+        // What the drain path relies on: adopting the run that outlives the result is what turns
         // the "give it up" answer into "keep it". Without the adoption the plan would be persisted as
-        // `Applying` with no `activeRun` at all, and an attempt whose record is deleted in that state
+        // `Applying` with no `activeRun` at all, and a run whose record is deleted in that state
         // has nothing left to release its host Leases and node-root proxy pods by.
         let mut status = mirroring(None);
         let surviving = run("other-play-uid");
-        adopt_recovered_attempt(&mut status, &surviving.mirror);
+        adopt_recovered_run(&mut status, &surviving.mirror);
         assert!(!mirrors_run(&status, &this_run));
         assert_eq!(status.phase, Phase::Applying);
         assert_eq!(
@@ -5070,6 +5272,7 @@ mod tests {
                 job_name: job.into(),
                 play_uid: "play-uid".into(),
                 hosts: vec!["worker-1".into()],
+                run_number: 1,
                 attempt: 1,
                 triggered_slot: None,
             },
@@ -5092,7 +5295,7 @@ mod tests {
     }
 
     /// The two halves of the deletion path's discovery answer for different failures. A record is
-    /// the only handle on an attempt that has taken its Leases and proxy pods but has not reached
+    /// the only handle on a run that has taken its Leases and proxy pods but has not reached
     /// the plan's status yet, so its list failing propagates and keeps the finalizer (enforced by
     /// `runs_to_release`'s `?`). A handle that does not *parse* is a dead end no retry repairs, so
     /// it is dropped and never stops the runs next to it from being released.
@@ -5109,6 +5312,7 @@ mod tests {
                     execution_hash: execution_hash.into(),
                     run_id: run_id.into(),
                     preparation_fingerprint: "fingerprint".into(),
+                    run_number: 1,
                     attempt: 1,
                     inventory: vec![ResolvedHosts {
                         name: "workers".into(),
@@ -5151,7 +5355,7 @@ mod tests {
         assert_eq!(
             run_ids(&plan, &[play("apply-plan-abc-1", "run-a", "1a")]),
             vec!["run-a"],
-            "an attempt that has not reached the status yet still has to be released"
+            "a run that has not reached the status yet still has to be released"
         );
 
         plan.status = Some(PlaybookPlanStatus {
@@ -5161,6 +5365,7 @@ mod tests {
                 job_name: "apply-plan-broken-1".into(),
                 play_uid: "play-uid".into(),
                 hosts: vec!["worker-1".into()],
+                run_number: 1,
                 attempt: 1,
                 triggered_slot: None,
             }),
@@ -5268,7 +5473,7 @@ mod tests {
             Some(RecoverableRecord::Live(play)) if play.metadata.name.as_deref() == Some("apply-web-abc-1")
         ));
         // One live run behind a result: the result is still drained first, and names that run as the
-        // attempt outliving it.
+        // run outliving it.
         assert!(matches!(
             select_recoverable_record(&[&first], &[&finished]).unwrap(),
             Some(RecoverableRecord::Finished { play, surviving: Some(live) })
@@ -5309,7 +5514,7 @@ mod tests {
     }
 
     /// The half of the start gate that does not go through the plan's status: a window one of the
-    /// plan's own records already took must never be handed to a second attempt, however far behind
+    /// plan's own records already took must never be handed to a second run, however far behind
     /// `lastTriggeredRun` happens to be.
     #[test]
     fn a_record_with_a_job_takes_the_window_for_its_own_revision() {
@@ -5333,6 +5538,7 @@ mod tests {
                     execution_hash: execution_hash.into(),
                     run_id: "run-1".into(),
                     preparation_fingerprint: "fingerprint".into(),
+                    run_number: 1,
                     attempt: 1,
                     inventory: Vec::new(),
                     triggered_slot,
@@ -5352,9 +5558,10 @@ mod tests {
         let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
         plan.metadata.uid = Some("plan-uid".into());
 
-        let taken = |plays: &[Play]| window_taken_by_a_record(plays, &plan, slot, &hash);
+        // One try per tick — the `Recurring` default — so a single finished run spends the window.
+        let taken = |plays: &[Play]| window_taken_by_a_record(plays, &plan, slot, &hash, 1);
 
-        // An attempt that reached a Job takes the window, running or already finished — the plan's
+        // A run that reached a Job takes the window, running or already finished — the plan's
         // marker is written from these and may be behind them, or missing entirely.
         for phase in [
             v1beta1::PlayPhase::Running,
@@ -5368,7 +5575,7 @@ mod tests {
             );
         }
 
-        // Nothing ran for the window: an attempt given up before its Job hands it back, exactly as
+        // Nothing ran for the window: a run given up before its Job hands it back, exactly as
         // `consumed_its_slot` decides it for a live one.
         for phase in [
             None,
@@ -5400,6 +5607,7 @@ mod tests {
             &plan,
             slot,
             &other_hash,
+            1,
         ));
         assert!(!taken(&[play(
             "plan-uid",
@@ -5419,6 +5627,68 @@ mod tests {
             Some(slot),
             Some(v1beta1::PlayPhase::Running)
         )]));
+    }
+
+    /// With a budget above one, the window is a `Recurring` plan's to retry in until its failures
+    /// have spent it — but never while one of its runs is still going or has already succeeded.
+    #[test]
+    fn a_window_with_budget_left_is_free_for_a_retry() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+
+        let failed = |name: &str| {
+            let mut play = Play::new(
+                name,
+                v1beta1::PlaySpec {
+                    playbook_plan: "plan".into(),
+                    playbook_plan_uid: "plan-uid".into(),
+                    execution_hash: "1a".into(),
+                    run_id: name.into(),
+                    preparation_fingerprint: "fp".into(),
+                    run_number: 1,
+                    attempt: 1,
+                    inventory: Vec::new(),
+                    triggered_slot: Some(slot),
+                },
+            );
+            play.metadata.owner_references = Some(vec![OwnerReference {
+                uid: "plan-uid".into(),
+                name: "plan".into(),
+                ..Default::default()
+            }]);
+            play.status = Some(v1beta1::PlayStatus {
+                phase: v1beta1::PlayPhase::Failed,
+                ..Default::default()
+            });
+            play
+        };
+        let taken = |plays: &[Play], max_attempts| {
+            window_taken_by_a_record(plays, &plan, slot, &hash, max_attempts)
+        };
+
+        assert!(!taken(&[failed("run-1")], 3));
+        assert!(!taken(&[failed("run-1"), failed("run-2")], 3));
+        assert!(taken(
+            &[failed("run-1"), failed("run-2"), failed("run-3")],
+            3
+        ));
+
+        // An unreadable recap is a failure like any other, and spends a try like one.
+        let mut unknown = failed("run-2");
+        unknown.status.as_mut().unwrap().phase = v1beta1::PlayPhase::Unknown;
+        assert!(taken(&[failed("run-1"), unknown], 2));
+
+        // Budget or no budget, a run that succeeded ends the window, and one still going owns it.
+        let mut succeeded = failed("run-2");
+        succeeded.status.as_mut().unwrap().phase = v1beta1::PlayPhase::Succeeded;
+        assert!(taken(&[failed("run-1"), succeeded], 3));
+        let mut running = failed("run-2");
+        running.status.as_mut().unwrap().phase = v1beta1::PlayPhase::Running;
+        assert!(taken(&[failed("run-1"), running], 3));
     }
 
     #[test]
@@ -5574,13 +5844,13 @@ spec:
             }))
         };
 
-        // A transient failure holds an unlaunched attempt open, so it must stay a plain KubeError.
+        // A transient failure holds an unlaunched run open, so it must stay a plain KubeError.
         assert!(matches!(
             collect_secret_data(vec![("vars".into(), Err(api_error(500)))]),
             Err(ReconcileError::KubeError(_))
         ));
 
-        // A Secret that is gone supersedes the attempt, which needs the 404 named as such — and
+        // A Secret that is gone supersedes the run, which needs the 404 named as such — and
         // named after the Secret, since the message is what tells the user which one to recreate.
         assert!(matches!(
             collect_secret_data(vec![("vars".into(), Err(api_error(404)))]),
@@ -5629,20 +5899,46 @@ spec:
     }
 
     #[test]
+    fn a_plan_waiting_for_its_first_run_is_delayed_and_then_keeps_its_verdict() {
+        // Nothing has been applied under this revision yet — an untouched plan, one whose edit just
+        // reset it, and one whose run was given up before it launched all read the same way.
+        assert_eq!(
+            phase_while_waiting_for_schedule(&Phase::Pending),
+            Phase::Delayed
+        );
+        assert_eq!(
+            phase_while_waiting_for_schedule(&Phase::Delayed),
+            Phase::Delayed
+        );
+
+        // Once a run has finished, the wait is `nextRun`'s to describe and the verdict stands.
+        assert_eq!(
+            phase_while_waiting_for_schedule(&Phase::Succeeded),
+            Phase::Succeeded
+        );
+        assert_eq!(
+            phase_while_waiting_for_schedule(&Phase::Failed),
+            Phase::Failed
+        );
+    }
+
+    #[test]
     fn suspend_vetoes_starting_a_new_run_even_with_work_to_do() {
-        assert!(!may_start_new_run(true, true));
+        assert!(!may_start_new_run(true, true, true));
         // The veto is suspend's alone: without it the work gate decides.
-        assert!(may_start_new_run(false, true));
-        assert!(!may_start_new_run(false, false));
+        assert!(may_start_new_run(false, true, true));
+        assert!(!may_start_new_run(false, false, true));
+        // ...and the budget's alone the same way.
+        assert!(!may_start_new_run(false, true, false));
     }
 
     /// The other half of the contract: a suspended plan never advertises a run it will not start.
     /// Asserted over a status that already carries a forecast, because that is the case the rule
-    /// exists for — a plan suspended while `Scheduled` has one standing on it.
+    /// exists for — a plan suspended while `Delayed` has one standing on it.
     #[test]
     fn a_suspended_plan_advertises_no_next_run() {
         let forecast = || PlaybookPlanStatus {
-            phase: Phase::Scheduled,
+            phase: Phase::Delayed,
             next_run: Some(
                 "2025-08-12T20:00:00Z"
                     .parse::<DateTime<FixedOffset>>()
@@ -5656,18 +5952,18 @@ spec:
         assert_eq!(suspended.next_run, None);
         // Only the forecast: the phase keeps saying what the plan's underlying state is, and the
         // `Suspended` printer column is what says it is paused.
-        assert_eq!(suspended.phase, Phase::Scheduled);
+        assert_eq!(suspended.phase, Phase::Delayed);
 
         let mut running = forecast();
         suspended_advertises_no_next_run(false, &mut running);
         assert_eq!(running.next_run, forecast().next_run);
     }
 
-    /// The suspend half of the unlaunched-attempt decision: a suspended plan must never keep an
-    /// unlaunched attempt sitting on its host Leases, and a `Launching` attempt may only be given
+    /// The suspend half of the unlaunched-run decision: a suspended plan must never keep an
+    /// unlaunched run sitting on its host Leases, and a `Launching` run may only be given
     /// up through `resume_launching_run`, which adopts a Job that made it out before the suspend.
     #[test]
-    fn a_suspended_plan_drops_every_unlaunched_attempt_through_the_right_door() {
+    fn a_suspended_plan_drops_every_unlaunched_run_through_the_right_door() {
         use v1beta1::PlayPhase;
         assert_eq!(
             decide_suspended_unlaunched(&PlayPhase::Prepared, true),
@@ -5698,16 +5994,16 @@ spec:
         }
     }
 
-    /// The one rule shared by every "may this attempt still go on?" site: the attempt's *own* Job is
+    /// The one rule shared by every "may this run still go on?" site: the run's *own* Job is
     /// always adopted, whatever the plan now says, and only a free name may be abandoned. Getting
     /// this backwards would tear a live run's node-root infrastructure down underneath it.
     ///
-    /// A Job that is not this attempt's is neither, in either direction. Adopting it would put this
-    /// attempt's record behind work it did not commission; abandoning would release the host Leases
+    /// A Job that is not this run's is neither, in either direction. Adopting it would put this
+    /// run's record behind work it did not commission; abandoning would release the host Leases
     /// on the strength of an identity check, and a check that ever rejected a Job which genuinely was
     /// ours would then let a second run start on hosts the first is still applying to.
     #[test]
-    fn only_the_attempts_own_job_is_adopted_and_only_a_free_name_abandoned() {
+    fn only_the_runs_own_job_is_adopted_and_only_a_free_name_abandoned() {
         for may_proceed in [true, false] {
             assert_eq!(
                 decide_job_presence(may_proceed, RecordedJob::Own),
@@ -5730,7 +6026,7 @@ spec:
 
     /// The identity check that classifies what holds a run's name, exercised at the boundary that
     /// used to trust the name alone. A colliding name is not evidence of ownership: the Job has to
-    /// carry this attempt's own run ID, `Play` UID, hash, attempt number and owner reference — on the
+    /// carry this run's own run ID, `Play` UID, hash, run number and owner reference — on the
     /// Job *and* on the pod template that actually does the work.
     #[test]
     fn a_job_at_the_expected_name_is_only_this_runs_if_it_carries_its_identity() {
@@ -5763,11 +6059,12 @@ spec:
             "another plan's Job must never pass as this run's"
         );
 
-        // A retry of this same plan, which shares the name's readable half but not the attempt.
-        let mut retry = job_builder::create_job_blueprint(&hash, 8, "run-2", &[], &plan).unwrap();
-        job_builder::correlate_job_to_play(&mut retry, "other-play-uid");
-        retry.metadata.owner_references = Some(vec![playbookplan_owner_ref(&plan).unwrap()]);
-        assert!(validate(&retry).is_err());
+        // Another run of this same plan, which shares the name's readable half but not the run.
+        let mut other_run =
+            job_builder::create_job_blueprint(&hash, 8, "run-2", &[], &plan).unwrap();
+        job_builder::correlate_job_to_play(&mut other_run, "other-play-uid");
+        other_run.metadata.owner_references = Some(vec![playbookplan_owner_ref(&plan).unwrap()]);
+        assert!(validate(&other_run).is_err());
 
         // The pod template is checked as well as the Job, because the pod is what reaches the hosts.
         // A Job whose own metadata is impeccable but whose template lost the correlation fails —
@@ -5820,7 +6117,7 @@ spec:
     /// assertions here decide a suspended plan's fate a second time, after the inventory read that
     /// the first decision exists to stay in front of.
     #[test]
-    fn only_a_prepared_attempt_is_gated_on_its_schedule_window() {
+    fn only_a_prepared_run_is_gated_on_its_schedule_window() {
         // Still waiting for its locks: the window (and the rest of the start gate) still applies.
         assert_eq!(
             decide_unlaunched_action(&v1beta1::PlayPhase::Prepared, true, true, false),
@@ -5843,10 +6140,10 @@ spec:
         );
     }
 
-    /// A superseded attempt is dropped from every unlaunched phase, `suspend` or not — that check is
+    /// A superseded run is dropped from every unlaunched phase, `suspend` or not — that check is
     /// what keeps a stale revision from being launched once its locks or proxy pods come free.
     #[test]
-    fn changed_inputs_stop_an_unlaunched_attempt_in_every_phase() {
+    fn changed_inputs_stop_an_unlaunched_run_in_every_phase() {
         for phase in [v1beta1::PlayPhase::Prepared, v1beta1::PlayPhase::Starting] {
             assert_eq!(
                 decide_unlaunched_action(&phase, false, true, true),
@@ -5860,7 +6157,7 @@ spec:
     }
 
     #[test]
-    fn permanent_input_errors_supersede_absent_job_attempts() {
+    fn permanent_input_errors_supersede_absent_job_runs() {
         let api_error = |code| {
             ReconcileError::from(kube::Error::Api(Box::new(kube::core::Status {
                 code,
@@ -5907,12 +6204,13 @@ spec:
                 job_name: "apply-plan-1-1".into(),
                 play_uid: "play-uid".into(),
                 hosts: vec!["worker-1".into()],
+                run_number: 1,
                 attempt: 1,
                 triggered_slot: Some(slot),
             }),
             current_hash: old_hash.to_string(),
             phase: Phase::Applying,
-            retry_count: 1,
+            last_run_number: 1,
             last_triggered_run: Some(slot),
             ..Default::default()
         };
@@ -5921,7 +6219,7 @@ spec:
 
         assert_eq!(status.current_hash, new_hash.to_string());
         assert_eq!(status.phase, Phase::Applying);
-        assert_eq!(status.retry_count, 0);
+        assert_eq!(status.last_run_number, 0);
         assert_eq!(status.last_triggered_run, None);
         assert_eq!(
             status.active_run.as_ref().unwrap().execution_hash,
@@ -5940,19 +6238,19 @@ spec:
         let mut idle = PlaybookPlanStatus {
             current_hash: old_hash.to_string(),
             phase: Phase::Succeeded,
-            retry_count: 3,
+            last_run_number: 3,
             last_triggered_run: Some(slot),
             ..Default::default()
         };
         update_desired_hash(&mut idle, &new_hash);
         assert_eq!(idle.phase, Phase::Pending);
-        assert_eq!(idle.retry_count, 0);
+        assert_eq!(idle.last_run_number, 0);
         assert_eq!(idle.last_triggered_run, None);
     }
 
     /// A plan that cannot read its own inputs must not keep advertising the last run's verdict. The
     /// summary alone is not enough — `phase` and `nextRun` are the other two printer columns, and a
-    /// `Succeeded`/`Scheduled` plan pointing at a slot that will never fire reads as healthy.
+    /// `Succeeded`/`Delayed` plan pointing at a slot that will never fire reads as healthy.
     ///
     /// The exception is a run still in flight: the read failure did not stop its Job, so it keeps
     /// its phase, exactly as `update_desired_hash` leaves an active run alone.
@@ -6007,6 +6305,7 @@ spec:
                 job_name: "apply-plan-1-1".into(),
                 play_uid: "play-uid".into(),
                 hosts: vec!["worker-1".into()],
+                run_number: 1,
                 attempt: 1,
                 triggered_slot: None,
             }),
@@ -6020,12 +6319,12 @@ spec:
         assert_eq!(applying.phase, Phase::Applying);
     }
 
-    /// An outage reported while an unlaunched attempt is being decided has to survive that decision.
+    /// An outage reported while an unlaunched run is being decided has to survive that decision.
     /// `handle_unlaunched_input_error` sets the overlay before branching, and every branch below it
-    /// ends in `clear_attempt_conditions` (via `abandon_run`) — which must keep clearing only the
-    /// per-attempt conditions, never the readiness verdict that outlives the attempt.
+    /// ends in `clear_run_conditions` (via `abandon_run`) — which must keep clearing only the
+    /// per-run conditions, never the readiness verdict that outlives the run.
     #[test]
-    fn clearing_attempt_conditions_leaves_the_input_outage_standing() {
+    fn clearing_run_conditions_leaves_the_input_outage_standing() {
         let mut status = PlaybookPlanStatus::default();
         status::set_blocked_condition(
             &mut status,
@@ -6039,7 +6338,7 @@ spec:
             "cannot resolve the plan's inventories: nope",
         );
 
-        status::clear_attempt_conditions(&mut status);
+        status::clear_run_conditions(&mut status);
 
         let ready = status
             .conditions
@@ -6114,27 +6413,28 @@ spec:
         );
     }
 
-    /// A recovered attempt is put back onto the plan whole, but its retry number only counts towards
+    /// A recovered run is put back onto the plan whole, but its retry number only counts towards
     /// the revision it belongs to — carrying it onto a plan that has since moved on would make the
-    /// replacement's first attempt skip numbers for no reason.
+    /// replacement's first run skip numbers for no reason.
     #[test]
-    fn a_recovered_attempt_is_readopted_and_keeps_its_number_only_for_its_own_revision() {
+    fn a_recovered_run_is_readopted_and_keeps_its_number_only_for_its_own_revision() {
         let active_run = ActiveRun {
             execution_hash: "1".into(),
             run_id: "run-1".into(),
             job_name: "apply-plan-1-4".into(),
             play_uid: "play-uid".into(),
             hosts: vec!["worker-1".into()],
+            run_number: 4,
             attempt: 4,
             triggered_slot: None,
         };
         let mut matching = PlaybookPlanStatus {
             current_hash: "1".into(),
-            retry_count: 1,
+            last_run_number: 1,
             ..Default::default()
         };
-        adopt_recovered_attempt(&mut matching, &active_run);
-        assert_eq!(matching.retry_count, 4);
+        adopt_recovered_run(&mut matching, &active_run);
+        assert_eq!(matching.last_run_number, 4);
         assert_eq!(matching.phase, Phase::Applying);
         assert_eq!(
             matching
@@ -6146,11 +6446,11 @@ spec:
 
         let mut replacement = PlaybookPlanStatus {
             current_hash: "2".into(),
-            retry_count: 0,
+            last_run_number: 0,
             ..Default::default()
         };
-        adopt_recovered_attempt(&mut replacement, &active_run);
-        assert_eq!(replacement.retry_count, 0);
+        adopt_recovered_run(&mut replacement, &active_run);
+        assert_eq!(replacement.last_run_number, 0);
         assert!(replacement.active_run.is_some());
     }
 
@@ -6158,7 +6458,7 @@ spec:
     /// after steps that may already have reported themselves — `report_failed_abandon` names the run
     /// whose node-root proxy pods and host Leases could not be released, and points at the manual
     /// cleanup — so it claims the summary only while nothing has replaced the one every recovered
-    /// attempt is adopted with.
+    /// run is adopted with.
     #[test]
     fn a_step_that_reported_itself_keeps_the_summary() {
         let active_run = ActiveRun {
@@ -6167,12 +6467,13 @@ spec:
             job_name: "apply-plan-1-4".into(),
             play_uid: "play-uid".into(),
             hosts: vec!["worker-1".into()],
+            run_number: 4,
             attempt: 4,
             triggered_slot: None,
         };
 
         let mut status = PlaybookPlanStatus::default();
-        adopt_recovered_attempt(&mut status, &active_run);
+        adopt_recovered_run(&mut status, &active_run);
         assert!(summary_unclaimed_since_adoption(&status, &active_run));
 
         status.summary = Some("could not release the abandoned run apply-plan-1-4: boom".into());
@@ -6185,7 +6486,7 @@ spec:
             ..Default::default()
         };
         assert!(!summary_unclaimed_since_adoption(&stale, &active_run));
-        adopt_recovered_attempt(&mut stale, &active_run);
+        adopt_recovered_run(&mut stale, &active_run);
         assert!(summary_unclaimed_since_adoption(&stale, &active_run));
     }
 
@@ -6198,7 +6499,7 @@ spec:
         let first = run_id(&plan, &hash).unwrap();
         let second = run_id(&plan, &hash).unwrap();
 
-        // Same plan, same revision, same attempt number: an aborted attempt's retry must still not
+        // Same plan, same revision, same run number: an aborted run's retry must still not
         // land on the identity whose proxy pods may still be terminating.
         assert_ne!(first, second);
         assert_eq!(first.len(), RUN_ID_LENGTH);
@@ -6224,6 +6525,7 @@ spec:
                     execution_hash: "1a".into(),
                     run_id: "run-1".into(),
                     preparation_fingerprint: "fingerprint".into(),
+                    run_number: 1,
                     attempt: 1,
                     inventory: vec![ResolvedHosts {
                         name: "workers".into(),
@@ -6309,6 +6611,7 @@ spec:
                 execution_hash: "00001A".into(),
                 run_id: "run-2".into(),
                 preparation_fingerprint: "fingerprint".into(),
+                run_number: 2,
                 attempt: 2,
                 inventory: vec![ResolvedHosts {
                     name: "workers".into(),
@@ -6327,7 +6630,7 @@ spec:
         assert_eq!(run.mirror.job_name, "apply-plan-abc-2");
         assert_eq!(run.mirror.play_uid, "play-uid");
         assert_eq!(run.mirror.hosts, vec!["worker-1", "worker-2"]);
-        assert_eq!(run.mirror.attempt, 2);
+        assert_eq!(run.mirror.run_number, 2);
 
         // The record is only a run's identity if it can be tied back to a specific object.
         let mut uidless = play.clone();
@@ -6379,8 +6682,8 @@ spec:
 
         assert!(validate_selected_job(&job, &plan, hash, 1, "run-1", "play-uid").is_ok());
 
-        // A Job created for a different attempt of the same revision is not this run's Job, even
-        // though it shares the plan, the execution hash and the attempt number.
+        // A Job created for a different run of the same revision is not this run's Job, even
+        // though it shares the plan, the execution hash and the run number.
         assert!(matches!(
             validate_selected_job(&job, &plan, hash, 1, "run-2", "play-uid"),
             Err(ReconcileError::PreconditionFailed(
@@ -6423,7 +6726,12 @@ spec:
         ));
     }
 
-    fn finished_run(hash: ExecutionHash, attempt: u32, slot: DateTime<FixedOffset>) -> RecordedRun {
+    fn finished_run(
+        hash: ExecutionHash,
+        run_number: u32,
+        attempt: u32,
+        slot: DateTime<FixedOffset>,
+    ) -> RecordedRun {
         RecordedRun {
             execution_hash: hash,
             mirror: ActiveRun {
@@ -6432,6 +6740,7 @@ spec:
                 job_name: "apply-plan-1-3".into(),
                 play_uid: "play-uid".into(),
                 hosts: vec!["worker-1".into()],
+                run_number,
                 attempt,
                 triggered_slot: Some(slot),
             },
@@ -6439,43 +6748,119 @@ spec:
     }
 
     #[test]
-    fn finishing_the_same_revision_restores_its_slot_and_attempt() {
+    fn finishing_the_same_revision_restores_its_slot_and_run_number() {
         let slot = "2025-08-12T20:00:00Z"
             .parse::<DateTime<FixedOffset>>()
             .unwrap();
         let hash = ExecutionHash::from_hex("1").unwrap();
         let mut status = PlaybookPlanStatus {
             current_hash: hash.to_string(),
-            retry_count: 0,
+            last_run_number: 0,
             ..Default::default()
         };
 
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &finished_run(hash, 3, slot),
+            &finished_run(hash, 3, 2, slot),
             None,
         );
 
-        assert_eq!(status.retry_count, 3);
+        assert_eq!(status.last_run_number, 3);
+        // The try the run spent is claimed too, so a status that was behind it cannot offer the
+        // attempt budget a second time.
+        assert_eq!(status.retry_count, 2);
         // Still the desired revision, so the slot it consumed keeps it from re-triggering itself
         // inside its own grace window.
         assert_eq!(status.last_triggered_run, Some(slot));
     }
 
-    fn surviving_attempt(
-        hash: ExecutionHash,
-        slot: Option<DateTime<FixedOffset>>,
-    ) -> SurvivingAttempt {
-        surviving_attempt_in(v1beta1::PlayPhase::Running, hash, slot)
+    #[test]
+    fn attempt_budgets_default_per_mode_and_never_fall_to_zero() {
+        assert_eq!(max_attempts(&ExecutionMode::OneShot, None), 3);
+        assert_eq!(max_attempts(&ExecutionMode::Recurring, None), 1);
+        assert_eq!(max_attempts(&ExecutionMode::OneShot, Some(7)), 7);
+        // The CRD refuses it, but a cluster that ignores validation rules must not be able to
+        // configure a plan that can never run.
+        assert_eq!(max_attempts(&ExecutionMode::Recurring, Some(0)), 1);
     }
 
-    fn surviving_attempt_in(
+    #[test]
+    fn a_oneshot_plan_stops_once_its_revision_has_spent_its_tries() {
+        // Its failed hosts stay outdated, so the work gate never closes on its own: without the
+        // budget the plan numbers a fresh Job every tick, forever.
+        assert!(attempt_budget_available(&ExecutionMode::OneShot, 2, 3));
+        assert!(!attempt_budget_available(&ExecutionMode::OneShot, 3, 3));
+        // Raising the budget on a plan that already stopped lets it try again.
+        assert!(attempt_budget_available(&ExecutionMode::OneShot, 3, 5));
+
+        // Recurring is answered by the window gate instead — a spent tick must not stop the next
+        // one from starting, and this gate cannot tell the two apart.
+        assert!(attempt_budget_available(&ExecutionMode::Recurring, 9, 1));
+    }
+
+    #[test]
+    fn a_retry_is_due_only_after_a_failure_with_budget_left() {
+        assert!(retry_due(&Phase::Failed, 1, 3));
+        assert!(!retry_due(&Phase::Failed, 3, 3));
+        // Nothing to retry: these are plans that have not failed, and a succeeded plan with budget
+        // to spare must not be tried again.
+        assert!(!retry_due(&Phase::Succeeded, 0, 3));
+        assert!(!retry_due(&Phase::Applying, 1, 3));
+        assert!(!retry_due(&Phase::Delayed, 0, 3));
+    }
+
+    #[test]
+    fn a_terminal_failure_with_budget_left_wakes_the_plan_up_for_the_retry() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        for mode in [ExecutionMode::OneShot, ExecutionMode::Recurring] {
+            let outcome = decide_terminal(
+                &mode,
+                Some("0 3 * * *"),
+                &v1beta1::PlayPhase::Failed,
+                true,
+                1,
+                2,
+                now,
+            );
+
+            assert_eq!(outcome.phase, Phase::Failed);
+            // The retry is the next thing the plan does, so it is not advertised as a scheduled run
+            // — and the wait is short, because a scheduled retry has only the rest of its tick's
+            // grace window to start in.
+            assert_eq!(outcome.next_run, None);
+            assert_eq!(outcome.requeue, Some(RETRY_REQUEUE));
+        }
+    }
+
+    #[test]
+    fn a_new_recurring_tick_is_the_only_thing_that_restarts_the_try_count() {
+        let slot = |s: &str| Some(s.parse::<DateTime<FixedOffset>>().unwrap());
+        let first = slot("2025-08-12T20:00:00Z");
+        let second = slot("2025-08-13T20:00:00Z");
+
+        // A tick the plan has not run for begins a new execution with a full budget.
+        assert_eq!(next_attempt(&ExecutionMode::Recurring, 2, second, first), 1);
+        // Inside the tick it already ran for, a run is the next try of it.
+        assert_eq!(next_attempt(&ExecutionMode::Recurring, 2, first, first), 3);
+
+        // OneShot has no ticks to divide its revision into: a schedule says when it may run, not
+        // how often it may fail, so only an edit gives it a fresh budget.
+        assert_eq!(next_attempt(&ExecutionMode::OneShot, 2, second, first), 3);
+        assert_eq!(next_attempt(&ExecutionMode::OneShot, 0, None, None), 1);
+    }
+
+    fn surviving_run(hash: ExecutionHash, slot: Option<DateTime<FixedOffset>>) -> SurvivingRun {
+        surviving_run_in(v1beta1::PlayPhase::Running, hash, slot)
+    }
+
+    fn surviving_run_in(
         phase: v1beta1::PlayPhase,
         hash: ExecutionHash,
         slot: Option<DateTime<FixedOffset>>,
-    ) -> SurvivingAttempt {
-        SurvivingAttempt {
+    ) -> SurvivingRun {
+        SurvivingRun {
             run: RecordedRun {
                 execution_hash: hash,
                 mirror: ActiveRun {
@@ -6484,6 +6869,7 @@ spec:
                     job_name: "apply-plan-1-4".into(),
                     play_uid: "surviving-play-uid".into(),
                     hosts: vec!["worker-1".into()],
+                    run_number: 4,
                     attempt: 4,
                     triggered_slot: slot,
                 },
@@ -6493,11 +6879,11 @@ spec:
     }
 
     /// A terminal result is drained ahead of anything live, so a tick can apply one run's outcome
-    /// while a *different* attempt is still going. `lastTriggeredRun` is the only thing standing
-    /// between a schedule window and a second run inside it, so it must describe the attempt the
+    /// while a *different* run is still going. `lastTriggeredRun` is the only thing standing
+    /// between a schedule window and a second run inside it, so it must describe the run the
     /// plan is actually holding — not the one that has already finished.
     #[test]
-    fn a_finished_run_does_not_claim_the_slot_of_an_attempt_still_in_flight() {
+    fn a_finished_run_does_not_claim_the_slot_of_a_run_still_in_flight() {
         let finished_slot = "2025-08-12T20:00:00Z"
             .parse::<DateTime<FixedOffset>>()
             .unwrap();
@@ -6507,7 +6893,7 @@ spec:
         let hash = ExecutionHash::from_hex("1").unwrap();
         let mut status = PlaybookPlanStatus {
             current_hash: hash.to_string(),
-            retry_count: 0,
+            last_run_number: 0,
             last_triggered_run: Some(live_slot),
             ..Default::default()
         };
@@ -6515,25 +6901,25 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &finished_run(hash, 3, finished_slot),
-            Some(&surviving_attempt(hash, Some(live_slot))),
+            &finished_run(hash, 3, 2, finished_slot),
+            Some(&surviving_run(hash, Some(live_slot))),
         );
 
         assert_eq!(
             status.last_triggered_run,
             Some(live_slot),
-            "the slot must keep describing the attempt still in flight"
+            "the slot must keep describing the run still in flight"
         );
-        // The number is still claimed: it reserves a name against every later attempt, which is
+        // The number is still claimed: it reserves a name against every later run, which is
         // true of a finished run whatever else the plan is holding.
-        assert_eq!(status.retry_count, 3);
+        assert_eq!(status.last_run_number, 3);
     }
 
-    /// The surviving attempt's window is taken from its own record, so a plan status that has not
+    /// The surviving run's window is taken from its own record, so a plan status that has not
     /// caught up with it — the tick that created its Job failed before patching the plan, leaving
     /// the *previous* run's slot standing — is corrected rather than trusted.
     #[test]
-    fn draining_a_result_records_the_surviving_attempt_over_a_stale_marker() {
+    fn draining_a_result_records_the_surviving_run_over_a_stale_marker() {
         let finished_slot = "2025-08-12T20:00:00Z"
             .parse::<DateTime<FixedOffset>>()
             .unwrap();
@@ -6550,18 +6936,18 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &finished_run(hash, 3, finished_slot),
-            Some(&surviving_attempt(hash, Some(live_slot))),
+            &finished_run(hash, 3, 2, finished_slot),
+            Some(&surviving_run(hash, Some(live_slot))),
         );
 
         assert_eq!(status.last_triggered_run, Some(live_slot));
     }
 
-    /// An unscheduled attempt consumed no window, so it has none to record. The finished run's is
+    /// An unscheduled run consumed no window, so it has none to record. The finished run's is
     /// then the newest window the plan has used, and leaving the marker behind it would let its own
-    /// grace window trigger a second run once the attempt is out of the way.
+    /// grace window trigger a second run once the run is out of the way.
     #[test]
-    fn an_unscheduled_surviving_attempt_leaves_the_finished_window_standing() {
+    fn an_unscheduled_surviving_run_leaves_the_finished_window_standing() {
         let finished_slot = "2025-08-12T20:00:00Z"
             .parse::<DateTime<FixedOffset>>()
             .unwrap();
@@ -6574,21 +6960,21 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &finished_run(hash, 3, finished_slot),
-            Some(&surviving_attempt(hash, None)),
+            &finished_run(hash, 3, 2, finished_slot),
+            Some(&surviving_run(hash, None)),
         );
 
         assert_eq!(status.last_triggered_run, Some(finished_slot));
-        assert_eq!(status.retry_count, 3);
+        assert_eq!(status.last_run_number, 3);
     }
 
-    /// An attempt that has not launched a Job has consumed nothing, whatever its record says about
-    /// the window it was created for. Crediting it would let an attempt that is then abandoned — a
+    /// A run that has not launched a Job has consumed nothing, whatever its record says about
+    /// the window it was created for. Crediting it would let a run that is then abandoned — a
     /// plan suspended and resumed inside the window, or one left with no hosts to trigger — mark a
     /// window as used that nothing ever ran in, and no abandon path clears the marker again. The
-    /// tick that gives such an attempt a Job records the slot itself, so nothing is lost by waiting.
+    /// tick that gives such a run a Job records the slot itself, so nothing is lost by waiting.
     #[test]
-    fn an_attempt_without_a_job_claims_no_window() {
+    fn a_run_without_a_job_claims_no_window() {
         let finished_slot = "2025-08-12T20:00:00Z"
             .parse::<DateTime<FixedOffset>>()
             .unwrap();
@@ -6616,8 +7002,8 @@ spec:
             sync_desired_hash_after_finished_run(
                 &mut status,
                 &hash,
-                &finished_run(hash, 3, finished_slot),
-                Some(&surviving_attempt_in(phase.clone(), hash, Some(live_slot))),
+                &finished_run(hash, 3, 2, finished_slot),
+                Some(&surviving_run_in(phase.clone(), hash, Some(live_slot))),
             );
 
             assert_eq!(
@@ -6636,7 +7022,7 @@ spec:
         ));
     }
 
-    /// The other half of the same rule, and the one an adopted `Launching` attempt runs into: its
+    /// The other half of the same rule, and the one an adopted `Launching` run meets: its
     /// own Job exists, so it is allowed to finish, but the window is the replacement revision's.
     /// `update_desired_hash` cleared the marker for exactly that reason, and nothing would clear it
     /// a second time — the superseded run's own finalization leaves it standing, because its hash no
@@ -6664,17 +7050,17 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
-            &finished_run(old_hash, 3, slot),
+            &finished_run(old_hash, 3, 2, slot),
             None,
         );
 
         assert_eq!(status.last_triggered_run, None);
     }
 
-    /// An attempt still applying a superseded revision must not claim the window: the edit is owed a
+    /// A run still applying a superseded revision must not claim the window: the edit is owed a
     /// run inside the window it was made in, which is exactly what clearing the marker allows.
     #[test]
-    fn a_surviving_attempt_on_an_obsolete_revision_claims_no_window() {
+    fn a_surviving_run_on_an_obsolete_revision_claims_no_window() {
         let slot = "2025-08-12T20:00:00Z"
             .parse::<DateTime<FixedOffset>>()
             .unwrap();
@@ -6689,8 +7075,8 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
-            &finished_run(old_hash, 3, slot),
-            Some(&surviving_attempt(old_hash, Some(slot))),
+            &finished_run(old_hash, 3, 2, slot),
+            Some(&surviving_run(old_hash, Some(slot))),
         );
 
         assert_eq!(status.last_triggered_run, None);
@@ -6705,7 +7091,7 @@ spec:
         let new_hash = ExecutionHash::from_hex("2").unwrap();
         let mut status = PlaybookPlanStatus {
             current_hash: old_hash.to_string(),
-            retry_count: 3,
+            last_run_number: 3,
             last_triggered_run: Some(slot),
             ..Default::default()
         };
@@ -6713,12 +7099,12 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
-            &finished_run(old_hash, 3, slot),
+            &finished_run(old_hash, 3, 2, slot),
             None,
         );
 
         assert_eq!(status.current_hash, new_hash.to_string());
-        assert_eq!(status.retry_count, 0);
+        assert_eq!(status.last_run_number, 0);
         // The replacement revision may start straight away, in the same window.
         assert_eq!(status.last_triggered_run, None);
     }
@@ -6726,7 +7112,15 @@ spec:
     #[test]
     fn decide_terminal_oneshot_all_current_succeeds() {
         let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let outcome = decide_terminal(&ExecutionMode::OneShot, None, 0, 3, now);
+        let outcome = decide_terminal(
+            &ExecutionMode::OneShot,
+            None,
+            &v1beta1::PlayPhase::Succeeded,
+            false,
+            0,
+            3,
+            now,
+        );
 
         assert_eq!(outcome.phase, Phase::Succeeded);
         assert_eq!(outcome.next_run, None);
@@ -6735,11 +7129,19 @@ spec:
     }
 
     #[test]
-    fn decide_terminal_oneshot_with_outdated_fails_and_never_reschedules() {
+    fn decide_terminal_oneshot_failed_run_fails_and_never_reschedules() {
         let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
         // A schedule is irrelevant in OneShot — even with one set it must resolve terminally and
         // never reschedule.
-        let outcome = decide_terminal(&ExecutionMode::OneShot, Some("0 3 * * *"), 1, 3, now);
+        let outcome = decide_terminal(
+            &ExecutionMode::OneShot,
+            Some("0 3 * * *"),
+            &v1beta1::PlayPhase::Failed,
+            false,
+            1,
+            3,
+            now,
+        );
 
         assert_eq!(outcome.phase, Phase::Failed);
         assert_eq!(outcome.next_run, None);
@@ -6748,32 +7150,103 @@ spec:
     }
 
     #[test]
-    fn decide_terminal_recurring_with_schedule_reschedules_to_next_slot() {
+    fn decide_terminal_recurring_keeps_the_verdict_and_names_the_next_slot() {
         let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let outcome = decide_terminal(&ExecutionMode::Recurring, Some("0 3 * * *"), 0, 2, now);
-
-        assert_eq!(outcome.phase, Phase::Scheduled);
-        assert_eq!(
-            outcome.next_run,
-            Some(
-                "2025-08-13T03:00:00Z"
-                    .parse::<DateTime<FixedOffset>>()
-                    .unwrap()
-            )
+        let next_slot = Some(
+            "2025-08-13T03:00:00Z"
+                .parse::<DateTime<FixedOffset>>()
+                .unwrap(),
         );
-        // Overrides the caller's default requeue so the plan wakes up at the next slot.
-        assert!(outcome.requeue.is_some());
+
+        for (outcome, expected) in [
+            (v1beta1::PlayPhase::Succeeded, Phase::Succeeded),
+            (v1beta1::PlayPhase::Failed, Phase::Failed),
+        ] {
+            let terminal = decide_terminal(
+                &ExecutionMode::Recurring,
+                Some("0 3 * * *"),
+                &outcome,
+                false,
+                0,
+                2,
+                now,
+            );
+
+            // The result of the run that just finished stands between slots; `next_run` is what
+            // says another one is coming.
+            assert_eq!(terminal.phase, expected);
+            assert_eq!(terminal.next_run, next_slot);
+            // Overrides the caller's default requeue so the plan wakes up at the next slot.
+            assert!(terminal.requeue.is_some());
+        }
+    }
+
+    /// A `Recurring` run that fails leaves every host on the `lastAppliedHash` an earlier run gave
+    /// it, so nothing is outdated — the verdict has to come from the run, not from the drift.
+    #[test]
+    fn decide_terminal_reports_a_failed_run_that_left_no_drift_behind() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let outcome = decide_terminal(
+            &ExecutionMode::Recurring,
+            Some("0 3 * * *"),
+            &v1beta1::PlayPhase::Failed,
+            false,
+            0,
+            2,
+            now,
+        );
+
+        assert_eq!(outcome.phase, Phase::Failed);
+        assert_eq!(outcome.summary, "2/2 up-to-date");
+        assert!(outcome.next_run.is_some());
+    }
+
+    /// A recap that could not be read is not evidence that the hosts were reached.
+    #[test]
+    fn decide_terminal_reports_an_unreadable_recap_as_failed() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let outcome = decide_terminal(
+            &ExecutionMode::OneShot,
+            None,
+            &v1beta1::PlayPhase::Unknown,
+            false,
+            0,
+            2,
+            now,
+        );
+
+        assert_eq!(outcome.phase, Phase::Failed);
     }
 
     #[test]
-    fn decide_terminal_recurring_without_schedule_is_a_dead_end() {
+    fn decide_terminal_recurring_without_schedule_keeps_the_verdict() {
         let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let outcome = decide_terminal(&ExecutionMode::Recurring, None, 0, 2, now);
+        let succeeded = decide_terminal(
+            &ExecutionMode::Recurring,
+            None,
+            &v1beta1::PlayPhase::Succeeded,
+            false,
+            0,
+            2,
+            now,
+        );
+        let failed = decide_terminal(
+            &ExecutionMode::Recurring,
+            None,
+            &v1beta1::PlayPhase::Failed,
+            false,
+            0,
+            2,
+            now,
+        );
 
-        // Nothing to reschedule against, so the plan holds at Applying (the eligibility gate
-        // normally prevents a schedule-less Recurring plan from ever starting a run).
-        assert_eq!(outcome.phase, Phase::Applying);
-        assert_eq!(outcome.next_run, None);
-        assert_eq!(outcome.requeue, None);
+        // Nothing to reschedule against (the start gate normally prevents a schedule-less Recurring
+        // plan from ever starting a run), but the run that did happen keeps its verdict.
+        assert_eq!(succeeded.phase, Phase::Succeeded);
+        assert_eq!(succeeded.next_run, None);
+        assert_eq!(succeeded.requeue, None);
+        assert_eq!(failed.phase, Phase::Failed);
+        assert_eq!(failed.next_run, None);
+        assert_eq!(failed.requeue, None);
     }
 }

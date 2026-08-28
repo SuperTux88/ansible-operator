@@ -252,17 +252,17 @@ pub fn renewal_decision(existing: Option<&Lease>, holder_identity: &str) -> Rene
 /// What one pass of [`renew_locks`] found across a run's whole host set.
 ///
 /// The distinction between the two contended variants is the point: only `Lost` is evidence that
-/// this run no longer protects a host, and only evidence justifies abandoning an attempt.
+/// this run no longer protects a host, and only evidence justifies abandoning it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RenewalOutcome {
     /// Every requested lock is (still) this run's.
     Held,
     /// Another holder was observed on one of them — its lease lapsed and a competing run took it
-    /// over. Nothing can reclaim it from here; a caller whose Job does not exist yet should give the
-    /// attempt up rather than run a second playbook against that host.
+    /// over. Nothing can reclaim it from here; a caller whose Job does not exist yet should give
+    /// its run up rather than run a second playbook against that host.
     Lost(BlockedBy),
     /// A write race left one lock's ownership unconfirmed this tick. Nothing was seen to have taken
-    /// it, so this is a reason to look again shortly, never a reason to give an attempt up.
+    /// it, so this is a reason to look again shortly, never a reason to give a run up.
     Unconfirmed(BlockedBy),
 }
 
@@ -290,7 +290,7 @@ impl RenewalOutcome {
 /// a run up: [`RenewalOutcome::Lost`] means another holder was *observed* on the Lease, while
 /// [`RenewalOutcome::Unconfirmed`] means a write race left this tick unable to say — nothing was seen
 /// to have taken the lock over. Collapsing the second into the first would let a transient 409 tear
-/// down a healthy attempt's proxy infrastructure.
+/// down a healthy run's proxy infrastructure.
 pub async fn renew_locks(
     api: &Api<Lease>,
     target_hosts: &[String],
@@ -400,7 +400,7 @@ pub async fn release_locks(
             Err(err) if is_conflict(&err) => {
                 debug!("Lease {name} changed while it was being released; leaving it alone");
             }
-            // Already gone — released by an earlier attempt at this same cleanup, or reclaimed.
+            // Already gone — released by an earlier run at this same cleanup, or reclaimed.
             Err(err) if is_not_found(&err) => {}
             Err(err) => return Err(err.into()),
         }

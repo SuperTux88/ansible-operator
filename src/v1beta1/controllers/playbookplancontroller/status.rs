@@ -73,7 +73,7 @@ pub fn apply_terminal_play_status(
         }
     };
 
-    clear_attempt_conditions(status);
+    clear_run_conditions(status);
     let hosts_status = status.hosts_status.get_or_insert_default();
     for (host, result) in &play_status.hosts {
         let entry = hosts_status.entry(host.clone()).or_default();
@@ -104,7 +104,7 @@ pub fn apply_terminal_play_status(
 /// a per-host lock held by another run (locks are global per node — see `locking::ensure_locks`).
 /// `Some(blocked)` sets it `True` with the offending host and, when known, the holding run named in
 /// the message; `None` — the run holds (or could take) all its locks — sets it `False`. The `phase`
-/// stays whatever it was (typically `Scheduled`): being blocked is an orthogonal, transient overlay
+/// stays whatever it was (typically `Applying`): being blocked is an orthogonal, transient overlay
 /// on the plan's lifecycle, not a lifecycle state of its own, so a condition models it better than a
 /// phase would.
 pub fn set_blocked_condition(status: &mut PlaybookPlanStatus, blocked: Option<&BlockedBy>) {
@@ -171,7 +171,7 @@ pub fn set_waiting_for_nodes_condition(
     upsert_condition(&mut status.conditions, condition);
 }
 
-pub fn clear_attempt_conditions(status: &mut PlaybookPlanStatus) {
+pub fn clear_run_conditions(status: &mut PlaybookPlanStatus) {
     set_blocked_condition(status, None);
     set_waiting_for_nodes_condition(status, None);
 }
@@ -529,7 +529,7 @@ mod tests {
         assert_eq!(ready.reason.as_deref(), Some("RecapUnavailable"));
     }
 
-    /// A new attempt flips `Running` in place and leaves the previous run's `Ready` verdict exactly
+    /// A new run flips `Running` in place and leaves the previous run's `Ready` verdict exactly
     /// as it was. `Ready` is a printer column that nothing else rewrites between runs, so blanking
     /// or restating it at the start of a run would replace the last known state of the hosts with
     /// "unknown" for the whole of that run — and a restated one would also move
