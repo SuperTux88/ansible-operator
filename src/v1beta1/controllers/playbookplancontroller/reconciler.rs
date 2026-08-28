@@ -3517,10 +3517,11 @@ struct RecordedRun {
 impl RecordedRun {
     /// Reconstructs a run from the plan status' mirror of it — the one path that does not start
     /// from a `Play`, and so the one place a hand-edited status is caught.
-    fn from_mirror(mirror: ActiveRun) -> Result<Self, ReconcileError> {
+    fn from_mirror(mut mirror: ActiveRun) -> Result<Self, ReconcileError> {
         let execution_hash = ExecutionHash::from_hex(&mirror.execution_hash).ok_or(
             ReconcileError::PreconditionFailed("run has an invalid execution hash"),
         )?;
+        mirror.execution_hash = execution_hash.to_string();
         Ok(Self {
             mirror,
             execution_hash,
@@ -7338,6 +7339,11 @@ spec:
         assert_eq!(run.mirror.play_uid, "play-uid");
         assert_eq!(run.mirror.hosts, vec!["worker-1", "worker-2"]);
         assert_eq!(run.mirror.run_number, 2);
+
+        let mut hand_edited_mirror = run.mirror.clone();
+        hand_edited_mirror.execution_hash = "+1A".into();
+        let mirrored_run = RecordedRun::from_mirror(hand_edited_mirror).unwrap();
+        assert_eq!(mirrored_run.mirror.execution_hash, "1a");
 
         // The record is only a run's identity if it can be tied back to a specific object.
         let mut uidless = play.clone();
