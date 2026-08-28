@@ -374,9 +374,14 @@ eyeball new cross-page links (or run the `mdbook-linkcheck` backend if installed
 ## Testing & workflow
 
 - `cargo test` — unit tests colocated in `#[cfg(test)] mod tests` at the bottom of each file
-  (no `tests/` dir); follow this convention. Prefer extracting a small pure function (as
+  (no `tests/` dir for Rust); follow this convention. Prefer extracting a small pure function (as
   `execution_evaluator`, `triggers`, `status`, `nodeselector`, `node_access::clamp_*`,
   `job_builder::extract_file_volumes` do) over testing through the full `reconcile()`.
+- `just test-python` — the embedded Python scripts, which cargo does not compile and therefore
+  does not cover. `tests/python/`, stdlib `unittest`, no dependencies and nothing to install:
+  keep it that way, so the suite stays runnable wherever a `python3` is. The preflight gate's
+  tests dial a real listener rather than feeding a parser byte strings — what the gate exists to
+  judge is wire behaviour, and a fake would only test the half that was never in doubt.
 - `managed_ssh::container_tests` is an `#[ignore]`d testcontainers test that boots the real
   proxy sshd image and asserts per-run cert isolation (INV-4). It needs a Docker/Podman socket
   and an `ssh` client; it validates cert *logic*, not the on-cluster Secret-mount permissions
@@ -385,14 +390,16 @@ eyeball new cross-page links (or run the `mdbook-linkcheck` backend if installed
   `#[allow(clippy::too_many_arguments)]` on `ensure_proxy_infra` is the only deliberate
   exception). Run `cargo build` + `cargo test` + `cargo clippy` before proposing changes — and
   the guide build (`just docs`) if you touched `docs/` or user-facing behaviour/CRDs/chart.
-  `just check` runs everything (build + test + clippy + guide + apidoc); see the `Justfile` for recipes.
+  `just check` runs everything (build + both test suites + clippy + guide + apidoc); see the
+  `Justfile` for recipes.
 - `./ansible-operator crds` dumps all **five** CRDs (PlaybookPlan, Play, ClusterInventory,
   StaticInventory, NodeAccessPolicy) — check this path after changing any `CustomResource` type.
 - The chart renders `managedSsh.proxyImage` and `watchNamespaces` into the operator ConfigMap;
   `helm template ./chart -s templates/configmap.yaml` (and `templates/role.yaml`) is the quick
   way to sanity-check chart wiring.
-- CI (`.github/workflows/build-test-push.yml`): `cargo test` + `cargo build --release`, then a
-  Containerfile distroless image (binary copied in, no cargo build inside the image).
+- CI (`.github/workflows/build-test-push.yml`): `cargo test` and the Python suite as separate
+  parallel jobs, + `cargo build --release`, then a Containerfile distroless image (binary copied
+  in, no cargo build inside the image).
 - `.agents/skills/` is a vendored skill pack (rust-skills), unrelated to this project's domain —
   not something to modify as part of feature work.
 ```

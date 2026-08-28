@@ -60,12 +60,26 @@ jobs:
       - name: Run tests
         run: cargo test
 
+  # The embedded Python scripts are not compiled by cargo and so are not covered by the job
+  # above. Deliberately a job of its own rather than a step in it: it needs no Rust toolchain and
+  # no cache, it runs in seconds, and keeping it separate means a broken gate script is reported as
+  # itself rather than as "tests failed". Stdlib `unittest` only, so the runner's python3 is the
+  # whole dependency.
+  test-python:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run Python tests
+        run: python3 -m unittest discover --start-directory tests/python --verbose
+
   # Release build. Only runs for real releases (v*.*.* tags) or an explicit manual build —
   # `cargo build --release` never runs on ordinary commits. Compiled in bookworm so the
   # binary's glibc matches the distroless/cc-debian12 runtime it is COPY'd into.
   compile:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    needs: [test, chart]
+    needs: [test, test-python, chart]
     runs-on: ubuntu-latest
 
     container:
