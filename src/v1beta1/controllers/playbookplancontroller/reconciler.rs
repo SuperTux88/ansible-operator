@@ -27,7 +27,7 @@ use crate::v1beta1::{
     playbookplancontroller::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
         locking, managed_ssh,
-        triggers::{Timing, evaluate_schedule, forecast_next_run},
+        triggers::{Schedule, Timing, evaluate_schedule, forecast_next_run},
         workspace::render_secret,
     },
 };
@@ -110,6 +110,12 @@ struct RunContext<'a> {
     /// is later judged against.
     preparation_fingerprint: &'a str,
     triggered_slot: Option<DateTime<FixedOffset>>,
+}
+
+#[derive(Debug)]
+struct SchedulingConfiguration {
+    time_zone: chrono_tz::Tz,
+    schedule: Option<Schedule>,
 }
 
 pub fn new(
@@ -286,6 +292,8 @@ async fn reconcile(
         }
         return Ok(Action::await_change());
     }
+
+    let scheduling_configuration = validate_scheduling_configuration(&object, Utc::now());
 
     let secrets_api = Api::<Secret>::namespaced(context.client.clone(), namespace);
 
@@ -479,6 +487,43 @@ async fn reconcile(
         retry_prune = prune_history(&context, &object).await;
     }
 
+    let scheduling_configuration = match scheduling_configuration {
+        Ok(configuration) => configuration,
+        Err(summary) => {
+            handle_invalid_scheduling_configuration(
+                &context,
+                &object,
+                &api,
+                unlaunched_run.as_ref(),
+                finished_active_run.as_ref(),
+                &mut resource_status,
+                summary,
+            )
+            .await?;
+            let deferred_terminal_record = finished_records
+                .iter()
+                .any(|finished| finished.record == TerminalRecord::Present);
+            let requeue_after = invalid_scheduling_requeue(
+                &resource_status,
+                recovered_a_run,
+                deferred_terminal_record,
+            );
+            return finish_reconcile_tick(
+                &context,
+                &object,
+                &mut resource_status,
+                // A replayable terminal receipt cannot be acknowledged until valid scheduling lets
+                // the normal hash-aware terminal path classify it. A lost receipt has nothing to
+                // replay and was classified above from its recorded run identity.
+                &[],
+                recovered_a_run,
+                retry_prune,
+                requeue_after,
+            )
+            .await;
+        }
+    };
+
     // Read alongside the desired inputs, and reported the same way, because it answers the same
     // question: whether there is an executable desired state at all. Nothing here touches the
     // cluster — it is the plan's own spec — but a spec that cannot produce a valid Job has to be
@@ -584,7 +629,7 @@ async fn reconcile(
     }
 
     // Step 1: compute outdated hosts and evaluate the schedule.
-    let tz = object.timezone().unwrap();
+    let tz = scheduling_configuration.time_zone;
     let now = || Utc::now().with_timezone(&tz);
     let time_window = chrono::Duration::seconds(
         object
@@ -593,7 +638,40 @@ async fn reconcile(
             .unwrap_or(DEFAULT_STARTING_DEADLINE_SECONDS)
             .into(),
     );
-    let timing = evaluate_schedule(object.spec.schedule.as_deref(), now(), time_window);
+    let Some(timing) = evaluate_schedule(
+        scheduling_configuration.schedule.as_ref(),
+        now(),
+        time_window,
+    ) else {
+        handle_invalid_scheduling_configuration(
+            &context,
+            &object,
+            &api,
+            unlaunched_run.as_ref(),
+            finished_active_run.as_ref(),
+            &mut resource_status,
+            format!(
+                "spec.schedule {:?} has no future occurrence",
+                object.spec.schedule.as_deref().unwrap_or_default()
+            ),
+        )
+        .await?;
+        let deferred_terminal_record = finished_records
+            .iter()
+            .any(|finished| finished.record == TerminalRecord::Present);
+        let requeue_after =
+            invalid_scheduling_requeue(&resource_status, recovered_a_run, deferred_terminal_record);
+        return finish_reconcile_tick(
+            &context,
+            &object,
+            &mut resource_status,
+            &[],
+            recovered_a_run,
+            retry_prune,
+            requeue_after,
+        )
+        .await;
+    };
     let outdated_hosts = find_outdated_hosts(&resource_status, &execution_hash);
     let all_hosts = find_all_hosts(&resource_status);
 
@@ -601,6 +679,7 @@ async fn reconcile(
     // stale. Retired here, after the hash has settled, because that is what decides which hosts are
     // current and therefore what the restated verdict is. A `Ready` written from a terminal `Play`
     // earlier in this tick is not the overlay and is left alone.
+    clear_scheduling_configuration_failure(&mut resource_status, outdated_hosts.len());
     status::clear_inputs_unavailable_condition(&mut resource_status, outdated_hosts.len());
 
     let hosts_to_trigger = match object.spec.mode {
@@ -782,7 +861,7 @@ async fn reconcile(
             }
             let outcome = decide_terminal(
                 &object.spec.mode,
-                object.spec.schedule.as_deref(),
+                scheduling_configuration.schedule.as_ref(),
                 &finished.outcome,
                 retry_due(
                     &phase_for_finished_run(&finished.outcome),
@@ -858,9 +937,10 @@ async fn reconcile(
                     // `evaluate_schedule` keeps returning `Now` for the rest of that window, so
                     // don't start another — sleep until the next slot instead. Without this a run
                     // that finishes inside its own grace window is immediately re-triggered.
-                    if let Some(schedule) = object.spec.schedule.as_deref() {
-                        let next =
-                            forecast_next_run(schedule, now(), Some(chrono::Duration::seconds(-5)));
+                    if let Some(schedule) = scheduling_configuration.schedule.as_ref()
+                        && let Some(next) =
+                            forecast_next_run(schedule, now(), Some(chrono::Duration::seconds(-5)))
+                    {
                         requeue_after = (next - now()).to_std().unwrap_or_default();
                         resource_status.next_run = Some(next.fixed_offset());
                     }
@@ -887,7 +967,7 @@ async fn reconcile(
 
     if let Some(until_next_run) = update_idle_recurring_status(
         &object.spec.mode,
-        object.spec.schedule.as_deref(),
+        scheduling_configuration.schedule.as_ref(),
         object.spec.suspend,
         !hosts_to_trigger.is_empty(),
         now(),
@@ -896,18 +976,34 @@ async fn reconcile(
         requeue_after = requeue_after.min(until_next_run);
     }
 
-    // Given back the moment the plan holds nothing outside its own namespace, so deleting an idle
-    // plan never waits on this operator. Deliberately conservative about *when* that is: a tick that
-    // recovered anything keeps it, even if the run finished on this very tick, because the release
-    // it just performed is the last thing that needed the finalizer and one extra tick costs nothing.
+    finish_reconcile_tick(
+        &context,
+        &object,
+        &mut resource_status,
+        &finished_records,
+        recovered_a_run,
+        retry_prune,
+        Some(requeue_after),
+    )
+    .await
+}
+
+async fn finish_reconcile_tick(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    resource_status: &mut PlaybookPlanStatus,
+    finished_records: &[FinishedRecord],
+    recovered_a_run: bool,
+    mut retry_prune: bool,
+    requeue_after: Option<std::time::Duration>,
+) -> Result<Action, ReconcileError> {
+    let (namespace, name) = namespace_and_name(object)?;
+    let api = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace);
     let release_finalizer = !recovered_a_run && resource_status.active_run.is_none();
 
-    patch_status(&api, &object, resource_status.clone()).await?;
+    patch_status(&api, object, resource_status.clone()).await?;
 
-    // The complete terminal verdict, summary, retry budget, and schedule state are durable now.
-    // Only now may the receipts stop recovery from replaying their results. A failed acknowledgement
-    // leaves its record recoverable for the next tick.
-    for finished in &finished_records {
+    for finished in finished_records {
         if finished.record == TerminalRecord::Present
             && let Err(error) = play_history::acknowledge_finished(
                 &context.client,
@@ -919,28 +1015,26 @@ async fn reconcile(
         {
             return Err(report_failed_finalization(
                 &api,
-                &object,
+                object,
                 &finished.run,
-                &mut resource_status,
+                resource_status,
                 error,
             )
             .await);
         }
     }
     if !finished_records.is_empty() {
-        retry_prune |= prune_history(&context, &object).await;
-    }
-    if retry_prune {
-        requeue_after = prune_retry_after(requeue_after);
+        retry_prune |= prune_history(context, object).await;
     }
 
-    // After the plan has been told what this tick decided and its terminal receipts have been handed
-    // back to history, never at either's expense. This is a version-checked write (see
-    // `patch_finalizers`) against an object the operator has just written the status of, so it loses
-    // that race routinely — and losing it must cost one more tick before an idle plan can be deleted,
-    // not the whole tick's account of the plan. Doing it the other way round is what left a plan
-    // advertising a `nextRun` it would never reach.
-    if release_finalizer && let Err(error) = drop_run_cleanup_finalizer(&api, &object).await {
+    let mut requeue_after = requeue_after;
+    if retry_prune {
+        requeue_after = Some(prune_retry_after(
+            requeue_after.unwrap_or(std::time::Duration::from_secs(15)),
+        ));
+    }
+
+    if release_finalizer && let Err(error) = drop_run_cleanup_finalizer(&api, object).await {
         if !error.is_conflict() {
             return Err(error);
         }
@@ -948,10 +1042,14 @@ async fn reconcile(
             "Could not give back the run-cleanup finalizer of {namespace}/{name}: the plan changed \
              underneath this tick; retrying shortly"
         );
-        requeue_after = requeue_after.min(std::time::Duration::from_secs(5));
+        requeue_after = Some(
+            requeue_after
+                .unwrap_or(std::time::Duration::from_secs(5))
+                .min(std::time::Duration::from_secs(5)),
+        );
     }
 
-    Ok(Action::requeue(requeue_after))
+    Ok(requeue_after.map_or_else(Action::await_change, Action::requeue))
 }
 
 /// Whether the current schedule slot (`start`, the grace window's start) is the recorded slot.
@@ -1262,7 +1360,7 @@ fn phase_while_waiting_for_schedule(current: &Phase) -> Phase {
 /// [`phase_while_waiting_for_schedule`]; the summary is what reports why no run is starting now.
 fn update_idle_recurring_status<Tz: TimeZone>(
     mode: &ExecutionMode,
-    schedule: Option<&str>,
+    schedule: Option<&Schedule>,
     suspend: bool,
     has_hosts_to_trigger: bool,
     now: DateTime<Tz>,
@@ -1287,7 +1385,7 @@ fn update_idle_recurring_status<Tz: TimeZone>(
     }
 
     status.phase = phase_while_waiting_for_schedule(&status.phase);
-    let next = forecast_next_run(schedule, now.clone(), None);
+    let next = forecast_next_run(schedule, now.clone(), None)?;
     status.next_run = Some(next.fixed_offset());
     (next - now).to_std().ok()
 }
@@ -3443,6 +3541,19 @@ fn update_desired_hash(status: &mut PlaybookPlanStatus, execution_hash: &Executi
     }
 }
 
+/// Retires the scheduling-specific readiness overlay and restores an idle summary without erasing a
+/// real failed-run verdict. Ordinary inventory and Secret outages use their own overlay and path.
+fn clear_scheduling_configuration_failure(status: &mut PlaybookPlanStatus, outdated_count: usize) {
+    let failed = status.phase == Phase::Failed;
+    let recovering =
+        status::clear_invalid_scheduling_configuration_condition(status, outdated_count);
+
+    if recovering && status.active_run.is_none() {
+        let total_count = distinct_host_count(&status.eligible_hosts);
+        status.summary = Some(plan_summary(outdated_count, total_count, failed));
+    }
+}
+
 /// Restores the terminal verdict a `OneShot` plan had before a failed input read cleared it.
 ///
 /// The conditions under which that is the right thing to do — idle, `OneShot`, no outdated hosts,
@@ -4170,7 +4281,7 @@ struct TerminalOutcome {
 
 fn decide_terminal<Tz: TimeZone>(
     mode: &ExecutionMode,
-    schedule: Option<&str>,
+    schedule: Option<&Schedule>,
     outcome: &v1beta1::PlayPhase,
     retry_due: bool,
     outdated_count: usize,
@@ -4202,8 +4313,16 @@ fn decide_terminal<Tz: TimeZone>(
                 if let Some(retrying) = retrying {
                     return retrying;
                 }
-                let next =
-                    forecast_next_run(schedule, now.clone(), Some(chrono::Duration::seconds(-5)));
+                let Some(next) =
+                    forecast_next_run(schedule, now.clone(), Some(chrono::Duration::seconds(-5)))
+                else {
+                    return TerminalOutcome {
+                        phase,
+                        next_run: None,
+                        summary,
+                        requeue: None,
+                    };
+                };
                 let requeue = (next.clone() - now).to_std().ok();
                 TerminalOutcome {
                     phase,
@@ -4728,6 +4847,130 @@ pub(crate) fn playbookplan_owner_ref(
 /// subdomain, so the two are the same anyway.
 fn plan_name_within_label_limit(name: &str) -> bool {
     name.chars().count() <= v1beta1::MAX_PLAN_NAME_LEN
+}
+
+fn validate_scheduling_configuration(
+    object: &PlaybookPlan,
+    now: DateTime<Utc>,
+) -> Result<SchedulingConfiguration, String> {
+    let time_zone = object.timezone().map_err(|error| {
+        format!(
+            "spec.timeZone {:?} is not a recognized IANA time zone: {error}",
+            object.spec.time_zone.as_deref().unwrap_or_default()
+        )
+    })?;
+    let schedule = object
+        .spec
+        .schedule
+        .as_deref()
+        .map(Schedule::parse)
+        .transpose()
+        .map_err(|error| {
+            format!(
+                "spec.schedule {:?} is not a valid 5-field cron expression: {error}",
+                object.spec.schedule.as_deref().unwrap_or_default()
+            )
+        })?;
+
+    if let Some(schedule) = &schedule
+        && forecast_next_run(schedule, now.with_timezone(&time_zone), None).is_none()
+    {
+        return Err(format!(
+            "spec.schedule {:?} has no future occurrence",
+            object.spec.schedule.as_deref().unwrap_or_default()
+        ));
+    }
+
+    Ok(SchedulingConfiguration {
+        time_zone,
+        schedule,
+    })
+}
+
+async fn handle_invalid_scheduling_configuration(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    api: &Api<PlaybookPlan>,
+    unlaunched: Option<&UnlaunchedRun>,
+    finished_run: Option<&FinishedRun>,
+    resource_status: &mut PlaybookPlanStatus,
+    summary: String,
+) -> Result<(), ReconcileError> {
+    record_invalid_scheduling_configuration(resource_status, finished_run, summary.clone());
+
+    if let Some(unlaunched) = unlaunched {
+        if unlaunched.phase == v1beta1::PlayPhase::Launching {
+            let (outcome, _requeue) =
+                resume_launching_run(context, object, api, &unlaunched.run, None, resource_status)
+                    .await?;
+            match outcome {
+                JobPresenceAction::Adopt => {
+                    resource_status.summary = Some(format!(
+                        "adopted the started run; the scheduling configuration is invalid: {summary}"
+                    ));
+                }
+                JobPresenceAction::Abandon => {
+                    resource_status.summary = Some(format!("aborted the run because {summary}"));
+                }
+                JobPresenceAction::Contested | JobPresenceAction::Proceed => {}
+            }
+        } else {
+            abandon_unlaunched_run(
+                context,
+                object,
+                api,
+                &unlaunched.run,
+                unlaunched.phase.clone(),
+                format!("aborted the run because {summary}"),
+                resource_status,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Reports invalid mutable scheduling inputs without hiding run lifecycle state. A finished run is
+/// applied only when it belongs to `currentHash`; replayable records remain unacknowledged until a
+/// corrected tick can classify them through the full desired-input path.
+fn record_invalid_scheduling_configuration(
+    status: &mut PlaybookPlanStatus,
+    finished_run: Option<&FinishedRun>,
+    summary: String,
+) {
+    status::set_invalid_scheduling_configuration_condition(status, &summary);
+    status.summary = Some(summary);
+    status.next_run = None;
+    if status.active_run.is_none() {
+        status.phase = finished_run.map_or_else(
+            || match status.phase {
+                Phase::Succeeded | Phase::Failed => status.phase.clone(),
+                _ => Phase::Pending,
+            },
+            |finished| {
+                if finished.run.mirror.execution_hash == status.current_hash {
+                    phase_for_finished_run(&finished.outcome)
+                } else {
+                    Phase::Pending
+                }
+            },
+        );
+    }
+}
+
+fn invalid_scheduling_requeue(
+    status: &PlaybookPlanStatus,
+    recovered_a_run: bool,
+    deferred_terminal_record: bool,
+) -> Option<std::time::Duration> {
+    if status.active_run.is_some() {
+        Some(std::time::Duration::from_secs(15))
+    } else if recovered_a_run && !deferred_terminal_record {
+        Some(std::time::Duration::from_secs(1))
+    } else {
+        None
+    }
 }
 
 /// The plan's namespace and name — the two things almost every step needs to address its resources.
@@ -6209,6 +6452,256 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn scheduling_configuration_rejects_invalid_fields_without_panicking() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let mut plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+
+        plan.spec.time_zone = Some("Nowhere".into());
+        assert!(
+            validate_scheduling_configuration(&plan, now)
+                .unwrap_err()
+                .contains("spec.timeZone")
+        );
+
+        plan.spec.time_zone = Some("Europe/Berlin".into());
+        plan.spec.schedule = Some("not a cron".into());
+        assert!(
+            validate_scheduling_configuration(&plan, now)
+                .unwrap_err()
+                .contains("spec.schedule")
+        );
+
+        plan.spec.schedule = Some("0 3 * * * 2030".into());
+        assert!(
+            validate_scheduling_configuration(&plan, now)
+                .unwrap_err()
+                .contains("exactly 5 fields")
+        );
+
+        plan.spec.schedule = Some("0 0 31 2 *".into());
+        assert!(
+            validate_scheduling_configuration(&plan, now)
+                .unwrap_err()
+                .contains("no future occurrence")
+        );
+    }
+
+    #[test]
+    fn invalid_scheduling_preserves_idle_verdicts_and_correction_restores_summaries() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut idle = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            phase: Phase::Succeeded,
+            next_run: Some(
+                "2025-08-13T20:00:00Z"
+                    .parse::<DateTime<FixedOffset>>()
+                    .unwrap(),
+            ),
+            eligible_hosts: vec![ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["worker-1".into()],
+            }],
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".into(),
+                v1beta1::HostStatus {
+                    last_applied_hash: hash.to_string(),
+                    last_outcome: v1beta1::HostOutcome::Succeeded,
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        record_invalid_scheduling_configuration(&mut idle, None, "spec.schedule is invalid".into());
+        assert_eq!(idle.phase, Phase::Succeeded);
+        assert_eq!(idle.next_run, None);
+        assert_eq!(
+            idle.conditions
+                .iter()
+                .find(|condition| condition.type_ == "Ready")
+                .and_then(|condition| condition.reason.as_deref()),
+            Some("InvalidSchedulingConfiguration")
+        );
+
+        let outdated = find_outdated_hosts(&idle, &hash);
+        assert!(outdated.is_empty());
+        clear_scheduling_configuration_failure(&mut idle, outdated.len());
+
+        assert_eq!(idle.phase, Phase::Succeeded);
+        assert_eq!(idle.summary.as_deref(), Some("1/1 up-to-date"));
+
+        let mut exhausted = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            phase: Phase::Failed,
+            retry_count: DEFAULT_ONESHOT_ATTEMPTS,
+            eligible_hosts: idle.eligible_hosts.clone(),
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".into(),
+                v1beta1::HostStatus::default(),
+            )])),
+            ..Default::default()
+        };
+        record_invalid_scheduling_configuration(
+            &mut exhausted,
+            None,
+            "spec.schedule is invalid".into(),
+        );
+        assert_eq!(exhausted.phase, Phase::Failed);
+
+        let outdated = find_outdated_hosts(&exhausted, &hash);
+        assert_eq!(outdated.len(), 1);
+        clear_scheduling_configuration_failure(&mut exhausted, outdated.len());
+
+        assert_eq!(exhausted.phase, Phase::Failed);
+        assert_eq!(
+            exhausted.summary.as_deref(),
+            Some("0/1 up-to-date (1 outdated, last run failed)")
+        );
+
+        let mut recurring = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            phase: Phase::Succeeded,
+            eligible_hosts: idle.eligible_hosts.clone(),
+            hosts_status: idle.hosts_status.clone(),
+            ..Default::default()
+        };
+        record_invalid_scheduling_configuration(
+            &mut recurring,
+            None,
+            "spec.timeZone is invalid".into(),
+        );
+        assert_eq!(recurring.phase, Phase::Succeeded);
+        clear_scheduling_configuration_failure(&mut recurring, 0);
+        recurring.phase = phase_while_waiting_for_schedule(&recurring.phase);
+
+        assert_eq!(recurring.phase, Phase::Succeeded);
+        assert_eq!(recurring.summary.as_deref(), Some("1/1 up-to-date"));
+
+        recurring.phase = Phase::Failed;
+        record_invalid_scheduling_configuration(
+            &mut recurring,
+            None,
+            "spec.timeZone is invalid".into(),
+        );
+        assert_eq!(recurring.phase, Phase::Failed);
+        clear_scheduling_configuration_failure(&mut recurring, 0);
+
+        assert_eq!(recurring.phase, Phase::Failed);
+        assert_eq!(
+            recurring.summary.as_deref(),
+            Some("1/1 up-to-date (last run failed)")
+        );
+
+        let mut applying = PlaybookPlanStatus {
+            phase: Phase::Applying,
+            active_run: Some(ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-1".into(),
+                job_name: "apply-web-1-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: None,
+            }),
+            ..Default::default()
+        };
+        record_invalid_scheduling_configuration(
+            &mut applying,
+            None,
+            "spec.timeZone is invalid".into(),
+        );
+        assert_eq!(applying.phase, Phase::Applying);
+        assert_eq!(
+            applying.summary.as_deref(),
+            Some("spec.timeZone is invalid")
+        );
+        assert_eq!(
+            invalid_scheduling_requeue(&applying, true, false),
+            Some(std::time::Duration::from_secs(15))
+        );
+        assert_eq!(
+            invalid_scheduling_requeue(&idle, true, false),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(invalid_scheduling_requeue(&idle, false, false), None);
+        assert_eq!(invalid_scheduling_requeue(&idle, true, true), None);
+
+        let abandoned = RecordedRun {
+            mirror: applying.active_run.clone().unwrap(),
+            execution_hash: hash,
+        };
+        let mut abandoning = applying.clone();
+        let diagnostic = "spec.schedule is invalid";
+        record_invalid_scheduling_configuration(&mut abandoning, None, diagnostic.into());
+        abandoning.summary = Some(format!("aborted the run because {diagnostic}"));
+        apply_abandoned_run_status(&mut abandoning, &abandoned);
+        status::clear_run_conditions(&mut abandoning);
+
+        assert_eq!(
+            abandoning.summary.as_deref(),
+            Some("aborted the run because spec.schedule is invalid")
+        );
+        assert_eq!(
+            abandoning
+                .conditions
+                .iter()
+                .find(|condition| condition.type_ == "Ready")
+                .and_then(|condition| condition.reason.as_deref()),
+            Some("InvalidSchedulingConfiguration")
+        );
+
+        let mut just_finished = applying;
+        just_finished.active_run = None;
+        just_finished.current_hash = "1".into();
+        record_invalid_scheduling_configuration(
+            &mut just_finished,
+            Some(&FinishedRun {
+                run: RecordedRun {
+                    mirror: ActiveRun {
+                        execution_hash: "1".into(),
+                        run_id: "run-1".into(),
+                        job_name: "apply-web-1-1".into(),
+                        play_uid: "play-uid".into(),
+                        hosts: vec!["worker-1".into()],
+                        run_number: 1,
+                        attempt: 1,
+                        triggered_slot: None,
+                    },
+                    execution_hash: hash,
+                },
+                outcome: v1beta1::PlayPhase::Failed,
+            }),
+            "spec.timeZone is invalid".into(),
+        );
+
+        assert_eq!(just_finished.phase, Phase::Failed);
+
+        just_finished.current_hash = "2".into();
+        record_invalid_scheduling_configuration(
+            &mut just_finished,
+            Some(&FinishedRun {
+                run: RecordedRun {
+                    mirror: ActiveRun {
+                        execution_hash: "1".into(),
+                        run_id: "run-1".into(),
+                        job_name: "apply-web-1-1".into(),
+                        play_uid: "play-uid".into(),
+                        hosts: vec!["worker-1".into()],
+                        run_number: 1,
+                        attempt: 1,
+                        triggered_slot: None,
+                    },
+                    execution_hash: hash,
+                },
+                outcome: v1beta1::PlayPhase::Unknown,
+            }),
+            "spec.timeZone is invalid".into(),
+        );
+
+        assert_eq!(just_finished.phase, Phase::Pending);
+    }
+
     /// Every label an accepted plan name is written into, and every selector that matches on it, has
     /// to stay valid at the boundary — this is the case the guard exists to make safe, so it is
     /// asserted on the real objects rather than on the guard alone.
@@ -6444,7 +6937,7 @@ spec:
 
         let requeue = update_idle_recurring_status(
             &ExecutionMode::Recurring,
-            Some("0 20 * * *"),
+            Some(&Schedule::parse("0 20 * * *").unwrap()),
             false,
             false,
             now,
@@ -6462,7 +6955,7 @@ spec:
         let mut never_run = PlaybookPlanStatus::default();
         update_idle_recurring_status(
             &ExecutionMode::Recurring,
-            Some("0 20 * * *"),
+            Some(&Schedule::parse("0 20 * * *").unwrap()),
             false,
             false,
             now,
@@ -6486,7 +6979,7 @@ spec:
         assert_eq!(
             update_idle_recurring_status(
                 &ExecutionMode::Recurring,
-                Some("0 20 * * *"),
+                Some(&Schedule::parse("0 20 * * *").unwrap()),
                 true,
                 false,
                 now,
@@ -6520,7 +7013,7 @@ spec:
         assert_eq!(
             update_idle_recurring_status(
                 &ExecutionMode::Recurring,
-                Some("0 20 * * *"),
+                Some(&Schedule::parse("0 20 * * *").unwrap()),
                 false,
                 false,
                 now,
@@ -7612,7 +8105,7 @@ spec:
         for mode in [ExecutionMode::OneShot, ExecutionMode::Recurring] {
             let outcome = decide_terminal(
                 &mode,
-                Some("0 3 * * *"),
+                Some(&Schedule::parse("0 3 * * *").unwrap()),
                 &v1beta1::PlayPhase::Failed,
                 true,
                 1,
@@ -7983,7 +8476,7 @@ spec:
         // never reschedule.
         let outcome = decide_terminal(
             &ExecutionMode::OneShot,
-            Some("0 3 * * *"),
+            Some(&Schedule::parse("0 3 * * *").unwrap()),
             &v1beta1::PlayPhase::Failed,
             false,
             1,
@@ -8015,7 +8508,7 @@ spec:
         ] {
             let terminal = decide_terminal(
                 &ExecutionMode::Recurring,
-                Some("0 3 * * *"),
+                Some(&Schedule::parse("0 3 * * *").unwrap()),
                 &outcome,
                 false,
                 0,
@@ -8039,7 +8532,7 @@ spec:
         let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let outcome = decide_terminal(
             &ExecutionMode::Recurring,
-            Some("0 3 * * *"),
+            Some(&Schedule::parse("0 3 * * *").unwrap()),
             &v1beta1::PlayPhase::Failed,
             false,
             0,

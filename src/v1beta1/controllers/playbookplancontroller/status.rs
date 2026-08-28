@@ -218,12 +218,26 @@ pub fn set_job_identity_mismatch_condition(status: &mut PlaybookPlanStatus, job_
 /// Marks the plan as not ready because one of its desired inputs could not be read. The message is
 /// the same diagnostic shown in the plan summary.
 pub fn set_inputs_unavailable_condition(status: &mut PlaybookPlanStatus, message: &str) {
+    set_ready_overlay(status, "InputsUnavailable", message);
+}
+
+/// Marks the plan as not ready because its schedule or time zone is invalid. The message is the
+/// same diagnostic shown in the plan summary.
+pub fn set_invalid_scheduling_configuration_condition(
+    status: &mut PlaybookPlanStatus,
+    message: &str,
+) {
+    set_ready_overlay(status, "InvalidSchedulingConfiguration", message);
+}
+
+/// Temporarily replaces the host-derived `Ready` verdict with a configuration failure.
+fn set_ready_overlay(status: &mut PlaybookPlanStatus, reason: &str, message: &str) {
     upsert_condition(
         &mut status.conditions,
         PlaybookPlanCondition {
             type_: "Ready".into(),
             status: "False".into(),
-            reason: Some("InputsUnavailable".into()),
+            reason: Some(reason.into()),
             message: Some(message.into()),
             last_transition_time: Some(chrono::Local::now().fixed_offset()),
         },
@@ -231,16 +245,31 @@ pub fn set_inputs_unavailable_condition(status: &mut PlaybookPlanStatus, message
 }
 
 /// Retires the [`set_inputs_unavailable_condition`] overlay once the desired inputs read cleanly
-/// again, restating `Ready` from the plan's own per-host results.
+/// again.
+pub fn clear_inputs_unavailable_condition(status: &mut PlaybookPlanStatus, outdated_count: usize) {
+    clear_ready_overlay(status, outdated_count, "InputsUnavailable");
+}
+
+/// Retires the invalid-scheduling overlay once the schedule and time zone are valid, returning
+/// whether that overlay was present so the caller only replaces its matching plan summary.
+pub fn clear_invalid_scheduling_configuration_condition(
+    status: &mut PlaybookPlanStatus,
+    outdated_count: usize,
+) -> bool {
+    clear_ready_overlay(status, outdated_count, "InvalidSchedulingConfiguration")
+}
+
+/// Retires one temporary readiness overlay, restating `Ready` from the plan's per-host results.
+/// Returns whether the named overlay was present and therefore changed.
 ///
-/// Needed for every mode, not only the one that can also restore a phase: `Ready` is a printer
-/// column, and nothing else rewrites it between runs. A `Recurring` plan would advertise a resolved
-/// outage until its next slot completed, which for a daily schedule is a day of a false negative.
+/// Needed for every mode, not only one that also restores a phase: `Ready` is a printer column, and
+/// nothing else rewrites it between runs. A `Recurring` plan would advertise a resolved outage until
+/// its next slot completed, which for a daily schedule is a day of a false negative.
 ///
 /// The results are the ones [`apply_terminal_play_status`] already folded into the plan: a host is
 /// current exactly when its last run succeeded at this revision, which is what `outdated_count`
 /// counts the complement of. A plan that has never run has no verdict to restate — and carried no
-/// `Ready` condition before the outage — so it gets none back rather than an invented one.
+/// `Ready` condition before the overlay — so it gets none back rather than an invented one.
 ///
 /// It is deliberately said in its **own** reason and wording rather than borrowed from
 /// [`apply_terminal_play_status`], because the two count different populations and only one of them
@@ -251,19 +280,24 @@ pub fn set_inputs_unavailable_condition(status: &mut PlaybookPlanStatus, message
 /// hosts and failed one read "1/2 hosts completed successfully", then "9/10 hosts completed
 /// successfully" once an unrelated input outage cleared, with nothing having run in between. Nothing
 /// *did* complete in between, which is why this no longer claims it did.
-pub fn clear_inputs_unavailable_condition(status: &mut PlaybookPlanStatus, outdated_count: usize) {
-    let overlaid = status.conditions.iter().any(|condition| {
-        condition.type_ == "Ready" && condition.reason.as_deref() == Some("InputsUnavailable")
-    });
+fn clear_ready_overlay(
+    status: &mut PlaybookPlanStatus,
+    outdated_count: usize,
+    reason: &str,
+) -> bool {
+    let overlaid = status
+        .conditions
+        .iter()
+        .any(|condition| condition.type_ == "Ready" && condition.reason.as_deref() == Some(reason));
     if !overlaid {
-        return;
+        return false;
     }
 
     if status.hosts_status.is_none() {
         status
             .conditions
             .retain(|condition| condition.type_ != "Ready");
-        return;
+        return true;
     }
 
     let total = distinct_host_count(&status.eligible_hosts);
@@ -285,6 +319,7 @@ pub fn clear_inputs_unavailable_condition(status: &mut PlaybookPlanStatus, outda
     };
 
     upsert_condition(&mut status.conditions, condition);
+    true
 }
 
 #[cfg(test)]
