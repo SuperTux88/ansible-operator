@@ -391,8 +391,9 @@ instead, and `.status.activeRun` names the run it is waiting on:
 - **"aborted the run: the plan was suspended before its Job was created"** — `spec.suspend` was set
   while a run was still preparing, so it was dropped rather than left to launch whenever it
   became able to. Unlike the other "aborted the run…" messages this one is a *resting* state: the
-  plan goes to `Pending` and stays there until you resume it. See [Suspending a
-  plan](./scheduling-and-modes.md#suspending-a-plan).
+  plan stays idle until you resume it. It returns to `Pending` if this was the execution's first
+  attempt, or to the preceding `Failed` verdict if an unlaunched retry was dropped. See [Suspending
+  a plan](./scheduling-and-modes.md#suspending-a-plan).
 - **"released the abandoned run …"** — cleanup of a run abandoned by an earlier tick has now
   finished. Only seen after a "could not release the abandoned run …" below, or after a restart
   interrupted a teardown; the plan re-evaluates immediately.
