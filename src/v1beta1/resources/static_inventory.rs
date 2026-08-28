@@ -9,7 +9,9 @@ use crate::v1beta1::{AnsibleInventory, GenericMap, ResolvedHosts, SecretRef};
     group = "ansible.cloudbending.dev",
     version = "v1beta1",
     kind = "StaticInventory",
-    status = "StaticInventoryStatus",
+    // No status subresource: nothing resolves a StaticInventory. Its hosts are literals the user
+    // wrote, so there is nothing for a controller to compute back onto it, and the operator holds no
+    // `staticinventories/status` grant to write one with (see the chart's ClusterRole).
     namespaced
 )]
 #[serde(rename_all = "camelCase")]
@@ -44,12 +46,6 @@ pub struct StaticInventoryGroup {
 pub struct SshConfig {
     pub user: String,
     pub secret_ref: SecretRef,
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct StaticInventoryStatus {
-    pub host_count: usize,
 }
 
 impl AnsibleInventory for StaticInventory {
