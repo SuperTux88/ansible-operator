@@ -71,6 +71,11 @@ pods this inventory creates. `tolerations: [{ operator: Exists }]` tolerates eve
 safe here because each proxy pod is pinned to one exact Node, so tolerating all taints only lets it
 schedule onto *that* Node.
 
+A plan may target Nodes through several inventories at once, and each Node's proxy gets the
+tolerations of the inventories that name it. A Node named by more than one gets all of theirs
+together — for the same reason: a toleration it does not need cannot send its proxy anywhere else,
+while a missing one would leave that Node unreachable for the run.
+
 ```yaml
 spec:
   tolerations:

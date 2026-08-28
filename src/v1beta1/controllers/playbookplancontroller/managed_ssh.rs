@@ -105,6 +105,17 @@ impl ProxyGracePolicy {
     }
 }
 
+/// A Node this run needs a proxy pod on, and the tolerations that pod must carry to land there.
+///
+/// The tolerations travel per host because that is how the user sets them — on the
+/// `ClusterInventory` that names the Node — and a run may span several inventories with different
+/// ones. A Node reached through more than one carries the union of theirs; see
+/// `reconciler::managed_ssh_proxy_hosts` for why that is the safe direction to merge in.
+pub struct ProxyHost {
+    pub name: String,
+    pub tolerations: Vec<Toleration>,
+}
+
 pub struct ProxyPodInfo {
     pub host: String,
     pub pod_ip: String,
@@ -280,12 +291,9 @@ fn proxy_wait_age_secs(pod: &Pod, state: &PodReadyState, now_epoch_secs: i64) ->
 /// Node taints Kubernetes auto-applies to a `NotReady` node tolerated by every proxy pod, merged with
 /// any user `spec.tolerations`. A user toleration for the same key wins (we skip our default for it).
 /// See [`NODE_NOT_READY_TAINT`] for why the effect is left empty.
-fn merge_default_tolerations(
-    user: Option<&[Toleration]>,
-) -> Vec<k8s_openapi::api::core::v1::Toleration> {
-    let mut merged: Vec<k8s_openapi::api::core::v1::Toleration> = user
-        .map(|ts| ts.iter().map(|t| t.clone().into()).collect())
-        .unwrap_or_default();
+fn merge_default_tolerations(user: &[Toleration]) -> Vec<k8s_openapi::api::core::v1::Toleration> {
+    let mut merged: Vec<k8s_openapi::api::core::v1::Toleration> =
+        user.iter().map(|t| t.clone().into()).collect();
 
     let existing_keys: std::collections::BTreeSet<String> =
         merged.iter().filter_map(|t| t.key.clone()).collect();
@@ -578,7 +586,7 @@ fn build_pod(
     execution_hash: &ExecutionHash,
     run_id: &str,
     host: &str,
-    tolerations: Option<&[Toleration]>,
+    tolerations: &[Toleration],
     proxy_image: &str,
 ) -> Pod {
     let secret_volume = Volume {
@@ -855,8 +863,7 @@ pub async fn ensure_proxy_infra(
     job_namespace: &str,
     execution_hash: &ExecutionHash,
     run_id: &str,
-    hosts: &[String],
-    tolerations: Option<&[Toleration]>,
+    hosts: &[ProxyHost],
     grace_policy: &ProxyGracePolicy,
     ca: &CertificateAuthority,
     proxy_image: &str,
@@ -899,7 +906,11 @@ pub async fn ensure_proxy_infra(
     let mut unreachable = Vec::new();
     let mut waiting = Vec::new();
 
-    for host in hosts {
+    for ProxyHost {
+        name: host,
+        tolerations,
+    } in hosts
+    {
         let name = resource_name(host, run_id);
 
         match secrets_api.get_opt(&name).await? {
@@ -949,6 +960,7 @@ pub async fn ensure_proxy_infra(
                     tolerations,
                     proxy_image,
                 );
+
                 pods_api.create(&PostParams::default(), &pod).await?
             }
         };
@@ -1162,7 +1174,7 @@ mod tests {
             &hash,
             "run-1",
             "worker-1",
-            None,
+            &[],
             "proxy:latest",
         );
 
@@ -1277,7 +1289,7 @@ mod tests {
 
         // Both objects, because both are what an administrator finds when looking for a node's proxy
         // infrastructure, and the label on each may be the shortened form.
-        let pod = build_pod(&name, &name, &hash, "run-1", &long, None, "proxy:latest");
+        let pod = build_pod(&name, &name, &hash, "run-1", &long, &[], "proxy:latest");
         let secret = build_secret(
             &name,
             &hash,
@@ -1378,7 +1390,7 @@ mod tests {
             &hash,
             run_id,
             "worker-1",
-            None,
+            &[],
             "proxy:latest",
         );
         let proxy_labels = proxy.metadata.labels.as_ref().unwrap();
@@ -1404,7 +1416,7 @@ mod tests {
             &hash,
             "run-1",
             "worker-1",
-            None,
+            &[],
             "proxy:latest",
         );
         let spec = pod.spec.as_ref().unwrap();
@@ -1555,7 +1567,7 @@ mod tests {
 
     #[test]
     fn default_tolerations_cover_notready_taints_in_every_effect() {
-        let merged = merge_default_tolerations(None);
+        let merged = merge_default_tolerations(&[]);
 
         for key in [NODE_NOT_READY_TAINT, NODE_UNREACHABLE_TAINT] {
             let t = merged
@@ -1580,7 +1592,7 @@ mod tests {
             // A user-supplied not-ready toleration must win — no duplicate default for it.
             toleration(NODE_NOT_READY_TAINT),
         ];
-        let merged = merge_default_tolerations(Some(&user));
+        let merged = merge_default_tolerations(&user);
 
         assert_eq!(
             merged
