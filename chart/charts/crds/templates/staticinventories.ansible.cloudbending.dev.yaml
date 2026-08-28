@@ -68,21 +68,9 @@ spec:
             - hosts
             - ssh
             type: object
-          status:
-            nullable: true
-            properties:
-              hostCount:
-                format: uint
-                minimum: 0.0
-                type: integer
-            required:
-            - hostCount
-            type: object
         required:
         - spec
         title: StaticInventory
         type: object
     served: true
     storage: true
-    subresources:
-      status: {}
