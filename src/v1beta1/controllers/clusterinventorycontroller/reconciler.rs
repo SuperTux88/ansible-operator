@@ -18,6 +18,7 @@ use crate::v1beta1::{
     self, ClusterInventory, ClusterInventoryStatus,
     clusterinventorycontroller::mappers,
     controllers::{nodeselector::node_matches, reconcile_error::ReconcileError},
+    distinct_host_count,
 };
 
 struct ReconciliationContext {
@@ -100,7 +101,10 @@ async fn reconcile(
         })
         .collect();
 
-    let host_count: usize = resolved_hosts.iter().map(|group| group.hosts.len()).sum();
+    // Over the distinct Nodes, not the group memberships: a Node matched by two groups is listed
+    // in both, and this column sits directly above the plan's `n/m hosts` summaries, which have
+    // always counted it once.
+    let host_count = distinct_host_count(&resolved_hosts);
 
     let next_status = ClusterInventoryStatus {
         host_count,

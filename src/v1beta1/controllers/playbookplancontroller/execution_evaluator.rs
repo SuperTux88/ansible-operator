@@ -5,7 +5,7 @@ use std::{
 
 use k8s_openapi::ByteString;
 
-use crate::v1beta1;
+use crate::v1beta1::{self, distinct_hosts};
 
 #[derive(PartialEq, Debug, Copy, Clone)]
 pub struct ExecutionHash(u64);
@@ -60,28 +60,6 @@ impl ExecutionHash {
 
         ExecutionHash(self.0.wrapping_add(extra))
     }
-}
-
-/// The hosts a group list names, each one exactly once, in first-seen order.
-///
-/// A node reachable through two inventory groups is listed twice in the flat `ResolvedHosts`
-/// projection, but it is one host to Ansible and one host to whoever reads an `n/m hosts` summary.
-/// Every population the plan reports on is therefore taken over the distinct names, which is also
-/// what `play_history` has always counted per record — the two surfaces sit next to each other in
-/// `kubectl` output and must not disagree about how many hosts a plan has.
-pub fn distinct_hosts(groups: &[v1beta1::ResolvedHosts]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    groups
-        .iter()
-        .flat_map(|group| group.hosts.iter())
-        .filter(|host| seen.insert(host.as_str()))
-        .cloned()
-        .collect()
-}
-
-/// How many distinct hosts a group list names — see [`distinct_hosts`].
-pub fn distinct_host_count(groups: &[v1beta1::ResolvedHosts]) -> usize {
-    distinct_hosts(groups).len()
 }
 
 /// Returns an iterator over hosts where the PlaybookPlan needs to be (re)applied.
@@ -316,7 +294,7 @@ mod tests {
             vec!["node-a".to_string(), "node-b".into(), "node-c".into()],
             "first-seen order, so group membership still reads naturally"
         );
-        assert_eq!(distinct_host_count(&overlapping), 3);
+        assert_eq!(crate::v1beta1::distinct_host_count(&overlapping), 3);
 
         let hash = ExecutionHash(1);
         let mut status = PlaybookPlanStatus {
