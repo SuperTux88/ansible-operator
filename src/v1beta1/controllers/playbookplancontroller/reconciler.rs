@@ -1508,6 +1508,13 @@ async fn abandon_unlaunched_run(
 /// fresh one mints it and writes the record. Everything after the locks is identical, so it lives in
 /// one place — an operator restart mid-setup must not take a different code path than the tick it
 /// interrupted.
+///
+/// **The ordering is a contract, not a sequence that happens to work.** The run is recorded, then
+/// mirrored onto the plan's status, and only then does it acquire anything: nothing that outlives
+/// this process is created while the plan has no persisted handle on it. Both writes are made on the
+/// resumed path too — the tick being resumed may be one that failed at the barrier — and both are
+/// idempotent. Moving lock acquisition or proxy creation above the barrier reopens the leak the
+/// barrier's own comment describes.
 async fn try_start_run(
     context: &ReconciliationContext,
     run: &RunContext<'_>,
@@ -1578,6 +1585,27 @@ async fn try_start_run(
     resource_status.summary = Some(applying_summary(&active_run.mirror));
     resource_status.next_run = None;
     resource_status.active_run = Some(active_run.mirror.clone());
+
+    // The barrier: the mirror reaches the apiserver before this run holds anything, and a failure to
+    // write it stops the run here rather than proceeding on a handle only this process has.
+    //
+    // The run's `Play` is written first and would be the handle — except that it is a *dependent* of
+    // the plan. A `--cascade=foreground` deletion has the garbage collector remove dependents before
+    // the owner, and the run-cleanup finalizer does not stop that: it keeps the plan object around
+    // while it happens. So a plan deleted that way in the window between `record_prepared` and the
+    // tick's closing status write would lose its only handle on a run that by then holds host Leases
+    // and node-root proxy pods — resources in the *operator's* namespace, which carry no owner
+    // reference (they cannot: owner references do not cross namespaces) and which nothing else will
+    // ever collect. `release_deleted_plan` would find neither record nor mirror, conclude there was
+    // nothing to release, and give the finalizer back.
+    //
+    // The mirror is not a dependent. It is a field of the plan, so it survives for exactly as long as
+    // the plan does, which the finalizer already guarantees is until the operator says otherwise.
+    // Writing it here — before the first Lease, not after the last proxy pod — is what makes that
+    // guarantee cover everything a run creates. Nothing above this line is privileged: a `Play`
+    // collected in the newly narrow window before the barrier leaves nothing behind to strand, and
+    // recovery resumes or abandons one that survives.
+    patch_status(&plan_api, object, resource_status.clone()).await?;
 
     if prepared.is_some_and(|run| run.phase == v1beta1::PlayPhase::Starting) {
         // A resumed `Starting` run already holds its locks, so this re-asserts them rather than
@@ -2782,12 +2810,13 @@ async fn release_deleted_plan(
 /// Every run of a deleted plan that may still hold resources, newest handle first.
 ///
 /// The records are listed before anything is released and a failure to list them ends the teardown,
-/// because they are not a supplement to the status mirror — they are the *only* handle on a run
-/// during the window between `record_prepared` and the status write that mirrors it. A run in
-/// that window already holds host Leases and node-root proxy pods, so a teardown that saw only the
-/// (still empty) mirror and then dropped the finalizer would strand them where nothing can reach
-/// them again. Every discovery failure that a later tick could clear is therefore kept as one, in
-/// the same way [`release_run_infrastructure`]'s failures are.
+/// because they are not a supplement to the status mirror — they are the only handle on a run
+/// during the window between `record_prepared` and the barrier that mirrors it ([`try_start_run`]).
+/// That window is deliberately narrow: it closes before the run acquires a single Lease, so a run
+/// inside it holds nothing yet, and a run that holds something is one the mirror describes. What the
+/// records still cover is the run that reached its record and no further — one whose barrier write
+/// failed, or whose tick died between the two. Every discovery failure that a later tick could clear
+/// is therefore kept as one, in the same way [`release_run_infrastructure`]'s failures are.
 async fn runs_to_release(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -5353,8 +5382,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        // The window this exists for: the record is written before the locks and the proxy pods, the
-        // mirror only at the end of the tick.
+        // The window this exists for: the record is written first, and the barrier that mirrors it
+        // onto the plan is a separate write that can fail or be interrupted. A run there holds
+        // nothing yet — the barrier precedes the locks and the proxy pods — but it is still this
+        // plan's run, and releasing it is how the record itself is cleaned up.
         assert_eq!(
             run_ids(&plan, &[play("apply-plan-abc-1", "run-a", "1a")]),
             vec!["run-a"],
