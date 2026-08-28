@@ -263,6 +263,25 @@ class ReadEndpointsTest(unittest.TestCase):
     def test_an_empty_file_yields_nothing_to_wait_for(self):
         self.assertEqual(preflight.read_endpoints(self.write("")), [])
 
+    def test_a_malformed_port_is_reported_without_discarding_other_endpoints(self):
+        path = self.write(
+            "node-a\t10.42.1.7\t22\n"
+            "node-b\t10.42.2.8\tnot-a-port\n"
+            "node-c\t10.42.3.9\t2222\n"
+        )
+
+        with mock.patch.object(preflight, "log") as log:
+            endpoints = preflight.read_endpoints(path)
+
+        self.assertEqual(
+            endpoints,
+            [("node-a", "10.42.1.7", 22), ("node-c", "10.42.3.9", 2222)],
+        )
+        log.assert_called_once_with(
+            "ignoring malformed endpoint on line 2: "
+            "'node-b\\t10.42.2.8\\tnot-a-port'"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
