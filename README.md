@@ -19,7 +19,7 @@ You create three kinds of custom resource:
 
 For each run the operator renders a workspace (playbook, inventory, variables, recap callback) into
 a Secret, records the run as a `Play`, ensures the hosts are reachable, and launches a single Job
-that applies the playbook to every targeted host. The `Play` is a write-ahead recovery record, so an
+that applies the playbook to every targeted host. The `Play` is a write-ahead recovery record, so a
 run survives operator restarts without being confused with a newer plan revision. When the Job
 finishes the operator parses a compact per-host recap, updates the `PlaybookPlan` status, and retains
 the `Play` as bounded run history.

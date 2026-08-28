@@ -23,11 +23,11 @@ per-host status, and the summary line.
 
 | Phase | Meaning |
 |---|---|
-| `Pending` | Triggers not yet evaluated — the resting state right after creation, after the inputs changed, or while an input [cannot be read](#the-plans-inputs-cannot-be-read). |
+| `Pending` | Triggers not yet evaluated — the resting state right after creation, after the inputs changed, or while unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent a plan with no run verdict from starting. |
 | `Delayed` | The plan is waiting for its scheduled time and has no result yet under the current playbook and inputs. |
 | `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has seen the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name. |
-| `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. |
-| `Failed` | The latest run did not succeed on every host, or its recap could not be read. A `Recurring` plan keeps this result between ticks the same way. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
+| `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. |
+| `Failed` | The latest run did not succeed on every host, or its recap could not be read. A `Recurring` plan keeps this result between ticks the same way. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
 | `UnauthorizedNamespace` | The plan's namespace is not enrolled for the operator — it will not run. See below. |
 
 ## Summary
@@ -211,6 +211,30 @@ The name is used as a label value on every object a run creates, and Kubernetes 
 63 characters. An object's name cannot be changed, so recreate the plan under a shorter one — a
 `kubectl edit` will not clear this.
 
+### The plan's schedule or time zone is invalid
+
+The operator cannot determine when the plan should run when its scheduling configuration is invalid.
+Its summary reports one of these diagnostics:
+
+- **`spec.timeZone "…" is not a recognized IANA time zone: …`** — use an IANA time-zone name such
+  as `Europe/Berlin`, or remove `spec.timeZone` to use UTC.
+- **`spec.schedule "…" is not a valid 5-field cron expression: …`** — provide exactly the minute,
+  hour, day-of-month, month, and day-of-week fields; seconds and year fields are not supported.
+- **`spec.schedule "…" has no future occurrence`** — the expression is syntactically valid but
+  cannot produce another date; replace it with one that can.
+
+The plan starts no new runs and clears `.status.nextRun` until the field is corrected. `Ready=False`
+with reason `InvalidSchedulingConfiguration` carries the same diagnostic as the summary. An idle plan
+without a run verdict moves to `Pending`, but a real `Succeeded` or `Failed` verdict from its latest
+run remains visible rather than being hidden by the configuration error.
+
+A run whose Job already exists is still allowed to finish, so its phase remains `Applying` until the
+run completes. A run that has not created its Job is abandoned instead, following the same boundary
+as any other spec edit; see [Editing a plan while a run is in
+flight](./scheduling-and-modes.md#editing-a-plan-while-a-run-is-in-flight). Correcting the field clears
+the readiness reason and restores the plan's host verdict or next scheduled time on the next
+reconcile.
+
 ### The plan's inputs cannot be read
 
 Two summaries report that the operator could not read what the plan says it should be running, and
@@ -228,14 +252,13 @@ resource is permanent and supersedes a run that has not launched, while anything
 transient and holds it.
 
 Neither starts a run and neither changes `.status.hostsStatus`, so the plan holds its previous
-per-host results until the read succeeds; the operator retries every tick. The phase does go back to
-`Pending` and `.status.nextRun` is cleared, so a plan in this state does not keep advertising the
-last run's verdict or a scheduled slot it will not be able to act on. If a run was already in flight
-when this happened it keeps its own phase, and it is *not* dropped for a transient error — see [The
-plan is stuck in `Applying`](#the-plan-is-stuck-in-applying). When the inputs become readable again,
-an idle `OneShot` plan whose hosts are still current restores `Succeeded` and its up-to-date summary;
-it does not need a spec or Secret change to recover its visible status. While the inputs are
-unavailable, `Ready=False` with reason `InputsUnavailable` makes that temporary uncertainty explicit.
+per-host results until the read succeeds; the operator retries every tick. `.status.nextRun` is
+cleared because the plan cannot act on that slot. A real `Succeeded` or `Failed` verdict remains
+visible because the outage does not undo the latest run; a plan without one uses `Pending`. If a run
+was already in flight when this happened it keeps its own phase, and it is *not* dropped for a
+transient error — see [The plan is stuck in `Applying`](#the-plan-is-stuck-in-applying). While the
+inputs are unavailable, `Ready=False` with reason `InputsUnavailable` and the summary make the
+temporary uncertainty explicit.
 
 That reason is retired on the first tick that reads the inputs cleanly, in every mode, and `Ready`
 goes back to describing the hosts: `True`/`HostsUpToDate` when every eligible host is at the current
@@ -243,8 +266,9 @@ revision, `False`/`HostsOutdated` counting how many are, with the message `n/m h
 revision`. That is deliberately not the wording a finished run uses — nothing ran, so it does not
 claim anything completed, and it covers the whole plan rather than the subset one run targeted. A
 plan that had not yet run when the outage started is left without a `Ready` condition, as it was
-before. This matters most for `Recurring` plans, which have no idle verdict to restore and would
-otherwise advertise a resolved outage in their `READY` column until their next slot finished.
+before. The summary is restored from the same host state on that first clean read, including whether
+the latest run failed, so every mode stops advertising the resolved outage without waiting for
+another run.
 
 ### A plan is not starting and its `Blocked` condition is `True`
 
@@ -605,10 +629,24 @@ needs, or the Job pod was killed before it could write its termination message (
 that took down its own runner is one way). Inspect the (not-yet-reaped) Job pod; raising
 `spec.ttlSecondsAfterFinished` buys time to look before it is cleaned up.
 
-If *every* host of one run shows `Unknown` at once, the likely cause is different: the run's `Play`
-was deleted while the run was still live. That record is the only thing the run can be recovered
-from, so the operator releases the run's locks and proxy pods and reports the whole run as unknown
-rather than leaving the plan stuck. The next run reports these hosts normally.
+If *every* host of one run shows `Unknown` at once, check these causes first:
+
+- **The managed-SSH preflight init container could not start.** On a plan targeting cluster Nodes,
+  `managed-ssh-preflight` runs `python3` from the plan's execution image before Ansible starts. A
+  fresh image without `python3` on `PATH` therefore produces no recap and reports every host as
+  `Unknown`. Inspect the init container's logs and status:
+
+  ```sh
+  kubectl logs job/<job-name> -c managed-ssh-preflight
+  kubectl get pod <pod-name> -o jsonpath='{.status.initContainerStatuses}'
+  ```
+
+  See [`python3` must be on `PATH`](./playbook-plans.md#python3-must-be-on-path) for the image
+  requirement and a local verification command.
+- **The run's `Play` was deleted while the run was still live.** That record is the only thing the
+  run can be recovered from, so the operator releases the run's locks and proxy pods and reports
+  the whole run as unknown rather than leaving the plan stuck. The next run reports these hosts
+  normally.
 
 ### A change is not being picked up
 

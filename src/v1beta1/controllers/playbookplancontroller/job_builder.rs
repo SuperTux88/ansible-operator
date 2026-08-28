@@ -628,20 +628,57 @@ fn distinct_static_inventory_ssh_configs(
 /// resource-name-keyed path (`paths::static_inventory_ssh_dir`) so multiple StaticInventories
 /// with different credentials can coexist in the same Job pod without colliding.
 fn configure_job_for_ssh(job: &mut Job, ssh_configs: &[(String, SshConfig)]) {
-    job.spec.as_mut().and_then(|spec| {
-        spec.template.spec.as_mut().map(|pod_spec| {
-            let main_container = pod_spec
-                .containers
-                .first_mut()
-                .expect("job should have a container");
+    job.spec
+        .as_mut()
+        .and_then(|spec| {
+            spec.template.spec.as_mut().map(|pod_spec| {
+                let main_container = pod_spec
+                    .containers
+                    .first_mut()
+                    .expect("job should have a container");
 
-            for (static_inventory_name, config) in ssh_configs {
-                let volume_name = volume_name("ssh", static_inventory_name);
+                for (static_inventory_name, config) in ssh_configs {
+                    let volume_name = volume_name("ssh", static_inventory_name);
+
+                    pod_spec.volumes.get_or_insert_default().push(Volume {
+                        name: volume_name.clone(),
+                        secret: Some(SecretVolumeSource {
+                            secret_name: Some(config.secret_ref.name.clone()),
+                            default_mode: Some(0o0400),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+
+                    main_container.volume_mounts.get_or_insert_default().push(
+                        kcore::v1::VolumeMount {
+                            name: volume_name,
+                            mount_path: paths::static_inventory_ssh_dir(static_inventory_name),
+                            ..Default::default()
+                        },
+                    );
+                }
+            })
+        })
+        .expect("a built Job always has a spec and pod spec");
+}
+
+/// Mounts this run's managed-ssh client identity. The Secret is expected to already exist by the
+/// time the Job is created (`managed_ssh::ensure_proxy_infra`'s `ensure_client_cert` step).
+fn configure_job_for_managed_ssh_client_cert(job: &mut Job, secret_name: &str) {
+    job.spec
+        .as_mut()
+        .and_then(|spec| {
+            spec.template.spec.as_mut().map(|pod_spec| {
+                let main_container = pod_spec
+                    .containers
+                    .first_mut()
+                    .expect("job should have a container");
 
                 pod_spec.volumes.get_or_insert_default().push(Volume {
-                    name: volume_name.clone(),
+                    name: "managed-ssh-client".into(),
                     secret: Some(SecretVolumeSource {
-                        secret_name: Some(config.secret_ref.name.clone()),
+                        secret_name: Some(secret_name.to_string()),
                         default_mode: Some(0o0400),
                         ..Default::default()
                     }),
@@ -652,45 +689,13 @@ fn configure_job_for_ssh(job: &mut Job, ssh_configs: &[(String, SshConfig)]) {
                     .volume_mounts
                     .get_or_insert_default()
                     .push(kcore::v1::VolumeMount {
-                        name: volume_name,
-                        mount_path: paths::static_inventory_ssh_dir(static_inventory_name),
+                        name: "managed-ssh-client".into(),
+                        mount_path: paths::MANAGED_SSH_CLIENT_DIR.into(),
                         ..Default::default()
                     });
-            }
+            })
         })
-    });
-}
-
-/// Mounts this run's managed-ssh client identity. The Secret is expected to already exist by the
-/// time the Job is created (`managed_ssh::ensure_proxy_infra`'s `ensure_client_cert` step).
-fn configure_job_for_managed_ssh_client_cert(job: &mut Job, secret_name: &str) {
-    job.spec.as_mut().and_then(|spec| {
-        spec.template.spec.as_mut().map(|pod_spec| {
-            let main_container = pod_spec
-                .containers
-                .first_mut()
-                .expect("job should have a container");
-
-            pod_spec.volumes.get_or_insert_default().push(Volume {
-                name: "managed-ssh-client".into(),
-                secret: Some(SecretVolumeSource {
-                    secret_name: Some(secret_name.to_string()),
-                    default_mode: Some(0o0400),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-
-            main_container
-                .volume_mounts
-                .get_or_insert_default()
-                .push(kcore::v1::VolumeMount {
-                    name: "managed-ssh-client".into(),
-                    mount_path: paths::MANAGED_SSH_CLIENT_DIR.into(),
-                    ..Default::default()
-                });
-        })
-    });
+        .expect("a built Job always has a spec and pod spec");
 }
 
 /// Appends the init container that holds `ansible-playbook` back until every managed-ssh proxy of
@@ -711,42 +716,45 @@ fn configure_job_for_managed_ssh_client_cert(job: &mut Job, secret_name: &str) {
 /// [`create_job_blueprint`] must stay pure — see `workspace::render_preflight_endpoints`. Only
 /// constants are baked into the spec.
 fn configure_job_for_managed_ssh_preflight(job: &mut Job, plan: &v1beta1::PlaybookPlan) {
-    job.spec.as_mut().and_then(|spec| {
-        spec.template.spec.as_mut().map(|pod_spec| {
-            pod_spec
-                .init_containers
-                .get_or_insert_default()
-                .push(kcore::v1::Container {
-                    name: MANAGED_SSH_PREFLIGHT_CONTAINER_NAME.into(),
-                    image: Some(plan.spec.image.clone()),
-                    working_dir: Some(paths::WORKSPACE_MOUNT_PATH.into()),
-                    // The plan's own image is the one already being pulled for this run, and
-                    // ansible-core *is* Python, so the gate needs no second image to mirror and no
-                    // extra pull. What that does not guarantee is the *name*: an image whose
-                    // interpreter is only reachable inside a virtualenv or as `python` fails here,
-                    // before the script's own fail-open handler can run, and the run produces no
-                    // recap at all. `python3` on `PATH` is therefore part of the documented image
-                    // contract (`playbook-plans.md`), not an assumption this code may widen.
-                    command: Some(vec![
-                        "python3".into(),
-                        paths::managed_ssh_preflight_script_path(),
-                        paths::managed_ssh_preflight_endpoints_path(),
-                    ]),
-                    env: Some(vec![EnvVar {
-                        name: "ANSIBLE_OPERATOR_PREFLIGHT_TIMEOUT_SECONDS".into(),
-                        value: Some(MANAGED_SSH_PREFLIGHT_TIMEOUT_SECONDS.to_string()),
+    job.spec
+        .as_mut()
+        .and_then(|spec| {
+            spec.template.spec.as_mut().map(|pod_spec| {
+                pod_spec
+                    .init_containers
+                    .get_or_insert_default()
+                    .push(kcore::v1::Container {
+                        name: MANAGED_SSH_PREFLIGHT_CONTAINER_NAME.into(),
+                        image: Some(plan.spec.image.clone()),
+                        working_dir: Some(paths::WORKSPACE_MOUNT_PATH.into()),
+                        // The plan's own image is the one already being pulled for this run, and
+                        // ansible-core *is* Python, so the gate needs no second image to mirror and no
+                        // extra pull. What that does not guarantee is the *name*: an image whose
+                        // interpreter is only reachable inside a virtualenv or as `python` fails here,
+                        // before the script's own fail-open handler can run, and the run produces no
+                        // recap at all. `python3` on `PATH` is therefore part of the documented image
+                        // contract (`playbook-plans.md`), not an assumption this code may widen.
+                        command: Some(vec![
+                            "python3".into(),
+                            paths::managed_ssh_preflight_script_path(),
+                            paths::managed_ssh_preflight_endpoints_path(),
+                        ]),
+                        env: Some(vec![EnvVar {
+                            name: "ANSIBLE_OPERATOR_PREFLIGHT_TIMEOUT_SECONDS".into(),
+                            value: Some(MANAGED_SSH_PREFLIGHT_TIMEOUT_SECONDS.to_string()),
+                            ..Default::default()
+                        }]),
+                        volume_mounts: Some(vec![kcore::v1::VolumeMount {
+                            name: WORKSPACE_VOLUME_NAME.into(),
+                            mount_path: paths::WORKSPACE_MOUNT_PATH.into(),
+                            ..Default::default()
+                        }]),
+                        security_context: plan.spec.security_context.as_ref().map(Into::into),
                         ..Default::default()
-                    }]),
-                    volume_mounts: Some(vec![kcore::v1::VolumeMount {
-                        name: WORKSPACE_VOLUME_NAME.into(),
-                        mount_path: paths::WORKSPACE_MOUNT_PATH.into(),
-                        ..Default::default()
-                    }]),
-                    security_context: plan.spec.security_context.as_ref().map(Into::into),
-                    ..Default::default()
-                });
+                    });
+            })
         })
-    });
+        .expect("a built Job always has a spec and pod spec");
 }
 
 /// Sets the env vars that make Ansible load and use the operator's per-host-outcome recap

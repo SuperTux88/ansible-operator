@@ -85,7 +85,7 @@ src/v1beta1/
     workspace.rs                     renders the per-plan workspace Secret (playbook.yml/inventory.yml/recap plugin/vars), owner-ref'd to the plan
     execution_evaluator.rs           ExecutionHash over playbook + referenced Secrets (excludes the self-rendered workspace Secret)
     callback_output.rs               parses the recap the callback wrote to the pod termination message
-    triggers.rs                      cron schedule eval (evaluate_schedule / forecast_next_run), timezone-aware
+    triggers.rs                      validated 5-field Schedule newtype + total evaluate_schedule / forecast_next_run, timezone-aware
     status.rs                        folds a terminal Play's per-host results into PlaybookPlanStatus conditions (the only place run outcomes reach the plan)
     paths.rs                         shared mount-path conventions between workspace/inventory_renderer/job_builder
   ansible/
@@ -120,23 +120,28 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    covers), `Running` ⇒ carry on, `Aborted` ⇒ `abandon_run`, terminal-but-unacknowledged ⇒
    apply its result to the plan.
    A recovery failure is reported on the plan (`summary`) *before* the tick aborts.
-3. **Steps 0 + 0b — resolve inventory, then clamp it (INV-2/3/5).**
+3. **Scheduling validation boundary.** `validate_scheduling_configuration` is evaluated before
+   recovery, so no unvalidated tenant string reaches schedule evaluation, but its result is acted on
+   only after recovery and active-Job advancement. Invalid mutable scheduling fields therefore block
+   new runs without preventing an existing Job from finishing or its privileged resources from being
+   recovered and released. The runtime guard covers objects that predate or bypass CRD validation.
+4. **Steps 0 + 0b — resolve inventory, then clamp it (INV-2/3/5).**
    `resolve_authorized_inventory` runs `resolve_inventory` → `Vec<ResolvedInventoryGroup>`
    (`ClusterInventory` ⇒ `ManagedSsh`, `StaticInventory` ⇒ `Ssh`, preserving which resource each
    group came from) and then `node_access::enforce`, which clamps managed-ssh nodes to the
    fail-closed intersection of the plan namespace's allowed nodes. One step on purpose: nothing may
    observe the unclamped result. `warn!`s excluded nodes; sets `status.eligible_hosts`.
-4. **Execution hash.** `ExecutionHash` over the playbook text + contents of every referenced
+5. **Execution hash.** `ExecutionHash` over the playbook text + contents of every referenced
    Secret (variables + files), order-insensitive; deliberately **excludes** the workspace
    Secret (its content — proxy IPs — legitimately changes each run). Hash change ⇒
    `last_run_number` reset to 0, `last_triggered_run` cleared (so an edit can start inside the
    window its predecessor used, and a revert is just another change), and `Phase::Pending`
    **only when there is no `active_run`** — an in-flight run keeps `Applying` and its own hash
    (which lives in its `Play`), and the new revision waits for it.
-5. **Step 1 — schedule + outdated hosts.** `triggers::evaluate_schedule` in the plan's
+6. **Step 1 — schedule + outdated hosts.** `triggers::evaluate_schedule` in the plan's
    timezone within a 15s window; `hosts_to_trigger` = outdated hosts (`OneShot`) or all hosts
    (`Recurring`).
-6. **`try_start_run` (steps 2–5)** when eligible and nothing is active: `select_job` numbers
+7. **`try_start_run` (steps 2–5)** when eligible and nothing is active: `select_job` numbers
    the run one past everything still claiming a name (Jobs *and* retained `Play`s — it
    never adopts a running Job, see below), `play_history::record_prepared` writes the
    immutable record, then acquire per-host **Leases** (`locking.rs`) and `commit_starting`.
@@ -149,7 +154,7 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    `try_start_run` with its recorded identity. A `Launching` run first checks whether the Job
    already exists; an absent Job re-enters `ensure_infra_and_launch`, while an existing one is
    adopted without depending on the newly desired inventory.
-7. **`advance_active_run`** once the Job is terminal: parse the per-host recap
+8. **`advance_active_run`** once the Job is terminal: parse the per-host recap
    from the pod's **termination message** (`callback_output.rs`, written by the callback
    plugin — not from logs, no `pods/log` access), `cleanup_proxy_infra`, release Leases,
    `record_finished` on the `Play`, fold it into the plan via
@@ -160,7 +165,7 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    This is also where a run whose `Play` is gone is `finalize_lost_run`'d (infra released, hosts
    `Unknown`) — not in step 0a: recovery has no record left to dispatch on, so it is the *mirror*
    in `status.activeRun` that brings the run here to be released.
-8. **`patch_status`** — JSON **merge patch** (not `replace_status`); many async steps pass
+9. **`patch_status`** — JSON **merge patch** (not `replace_status`); many async steps pass
    between read and write, so a version-checked PUT would routinely 409. It is also where the
    suspension contract is held (`suspended_advertises_no_next_run`): a tick has several ways to write
    a status and only one way to reach the end of the pipeline, so "a suspended plan advertises no
@@ -328,6 +333,11 @@ dedicated to Ansible ops (see `THREAT_MODEL.md` §6 / T-INFO-1).
 
 ## Known rough edges / things to know before touching related code
 
+- **Raw cron strings cross one validation boundary.** `cron::Schedule::from_str` must only be called
+  by `triggers::Schedule::parse`, which enforces the public five-field contract before adapting it to
+  the cron crate's seconds field. `evaluate_schedule` and `forecast_next_run` must remain total: a
+  syntactically valid expression can have no future occurrence, and that must return `None` for the
+  reconciler to report, never panic and put the whole operator into CrashLoopBackOff on tenant input.
 - **Status writes on the reconciled primary object are JSON merge patches** in all three
   controllers (`patch_status` → `Patch::Merge({"status": …})`), not `Api::replace_status` (a
   version-checked PUT that would routinely 409 across a reconcile's many async steps). Only the

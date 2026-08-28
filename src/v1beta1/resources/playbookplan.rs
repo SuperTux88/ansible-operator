@@ -107,10 +107,15 @@ pub struct PlaybookPlanSpec {
     #[serde(default)]
     pub suspend: bool,
 
-    /// 5-part cron expression that tells at which time the playbook may execute
+    /// 5-field cron expression (`minute hour day-of-month month day-of-week`) that tells at which
+    /// time the playbook may execute.
+    #[schemars(pattern(
+        r"^[0-9*/,-]+[ \t]+[0-9*/,-]+[ \t]+[0-9?*/,-]+[ \t]+[0-9A-Za-z*/,-]+[ \t]+[0-9A-Za-z?*/,-]+$"
+    ))]
     pub schedule: Option<String>,
 
-    /// Time zone for the _schedule_ field, if unset UTC is assumed
+    /// IANA time zone for the `schedule` field, if unset UTC is assumed.
+    #[schemars(with = "Option<TimeZoneSchema>")]
     pub time_zone: Option<String>,
 
     /// Grace window, in seconds, after a scheduled tick during which a run may still start. The
@@ -516,6 +521,28 @@ impl PlaybookPlan {
     }
 }
 
+struct TimeZoneSchema;
+
+impl JsonSchema for TimeZoneSchema {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("TimeZone")
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "enum": chrono_tz::TZ_VARIANTS
+                .iter()
+                .map(|time_zone| time_zone.name())
+                .collect::<Vec<_>>()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,6 +579,30 @@ mod tests {
                 .is_some_and(|message| message.contains("label value")),
             "the message has to say why, or the cap reads as arbitrary"
         );
+    }
+
+    #[test]
+    fn crd_rejects_non_five_field_schedules_and_unknown_time_zones() {
+        use kube::CustomResourceExt as _;
+
+        let crd = serde_json::to_value(PlaybookPlan::crd()).unwrap();
+        let spec = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"];
+
+        assert_eq!(
+            spec["schedule"]["pattern"],
+            r"^[0-9*/,-]+[ \t]+[0-9*/,-]+[ \t]+[0-9?*/,-]+[ \t]+[0-9A-Za-z*/,-]+[ \t]+[0-9A-Za-z?*/,-]+$"
+        );
+
+        let time_zones = spec["timeZone"]["enum"].as_array().unwrap();
+        assert!(time_zones.contains(&serde_json::json!("UTC")));
+        assert!(time_zones.contains(&serde_json::json!("Europe/Berlin")));
+        assert!(!time_zones.contains(&serde_json::json!("Nowhere")));
+
+        let required = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(!required.contains(&serde_json::json!("timeZone")));
     }
 
     #[test]

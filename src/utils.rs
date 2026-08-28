@@ -12,7 +12,7 @@ pub const MAX_DNS_LABEL_LEN: usize = 63;
 #[cfg(test)]
 pub const MAX_DNS_SUBDOMAIN_LEN: usize = 253;
 
-/// The readable half of a generated resource name or label value: at most `budget` characters, and
+/// The readable half of a generated resource name or label value: at most `budget` bytes, and
 /// safe to concatenate a `-`-prefixed suffix onto. The suffix that follows it is usually a
 /// [`generate_id`] short id or a hash, and the budget is usually what [`MAX_DNS_LABEL_LEN`] leaves
 /// after it.
@@ -26,9 +26,18 @@ pub const MAX_DNS_SUBDOMAIN_LEN: usize = 253;
 /// produce a doubled separator. A label *value* has no segments to protect, but it does have to end
 /// alphanumeric, which the same trim gives it.
 pub fn readable_name_segment(name: &str, budget: usize) -> String {
+    let mut budget_left = budget;
     name.chars()
         .map(|character| if character == '.' { '-' } else { character })
-        .take(budget)
+        .take_while(
+            |character| match budget_left.checked_sub(character.len_utf8()) {
+                Some(remaining) => {
+                    budget_left = remaining;
+                    true
+                }
+                None => false,
+            },
+        )
         .collect::<String>()
         .trim_end_matches('-')
         .to_string()
@@ -337,6 +346,8 @@ mod tests {
     fn a_truncated_name_segment_stays_safe_to_append_a_suffix_to() {
         assert_eq!(readable_name_segment("web", 63), "web");
         assert_eq!(readable_name_segment("my-plan", 4), "my-p");
+        assert_eq!(readable_name_segment("éé", 3), "é");
+        assert_eq!(readable_name_segment("éé", 1), "");
 
         // Dots are folded rather than kept, so the cut cannot land between segments.
         assert_eq!(

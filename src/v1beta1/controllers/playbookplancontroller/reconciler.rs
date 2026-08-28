@@ -27,7 +27,7 @@ use crate::v1beta1::{
     playbookplancontroller::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
         locking, managed_ssh,
-        triggers::{Timing, evaluate_schedule, forecast_next_run},
+        triggers::{Schedule, Timing, evaluate_schedule, forecast_next_run},
         workspace::render_secret,
     },
 };
@@ -110,6 +110,12 @@ struct RunContext<'a> {
     /// is later judged against.
     preparation_fingerprint: &'a str,
     triggered_slot: Option<DateTime<FixedOffset>>,
+}
+
+#[derive(Debug)]
+struct SchedulingConfiguration {
+    time_zone: chrono_tz::Tz,
+    schedule: Option<Schedule>,
 }
 
 pub fn new(
@@ -287,6 +293,8 @@ async fn reconcile(
         return Ok(Action::await_change());
     }
 
+    let scheduling_configuration = validate_scheduling_configuration(&object, Utc::now());
+
     let secrets_api = Api::<Secret>::namespaced(context.client.clone(), namespace);
 
     let mut requeue_after = std::time::Duration::from_secs(3600);
@@ -328,7 +336,9 @@ async fn reconcile(
         // Re-asserted rather than assumed: a plan that lost the finalizer — stripped by hand, or
         // adopted from a release that predates it — would otherwise keep the run it is holding
         // outside the contract for as long as that run lasts.
-        ensure_run_cleanup_finalizer(&api, &object).await?;
+        ensure_run_cleanup_finalizer(&api, &object)
+            .await
+            .or_else(|error| error.is_conflict().then_some(()).ok_or(error))?;
     }
     if let Some(recovered) = recovered {
         match recovered {
@@ -477,6 +487,43 @@ async fn reconcile(
         retry_prune = prune_history(&context, &object).await;
     }
 
+    let scheduling_configuration = match scheduling_configuration {
+        Ok(configuration) => configuration,
+        Err(summary) => {
+            handle_invalid_scheduling_configuration(
+                &context,
+                &object,
+                &api,
+                unlaunched_run.as_ref(),
+                finished_active_run.as_ref(),
+                &mut resource_status,
+                summary,
+            )
+            .await?;
+            let deferred_terminal_record = finished_records
+                .iter()
+                .any(|finished| finished.record == TerminalRecord::Present);
+            let requeue_after = invalid_scheduling_requeue(
+                &resource_status,
+                recovered_a_run,
+                deferred_terminal_record,
+            );
+            return finish_reconcile_tick(
+                &context,
+                &object,
+                &mut resource_status,
+                // A replayable terminal receipt cannot be acknowledged until valid scheduling lets
+                // the normal hash-aware terminal path classify it. A lost receipt has nothing to
+                // replay and was classified above from its recorded run identity.
+                &[],
+                recovered_a_run,
+                retry_prune,
+                requeue_after,
+            )
+            .await;
+        }
+    };
+
     // Read alongside the desired inputs, and reported the same way, because it answers the same
     // question: whether there is an executable desired state at all. Nothing here touches the
     // cluster — it is the plan's own spec — but a spec that cannot produce a valid Job has to be
@@ -582,7 +629,7 @@ async fn reconcile(
     }
 
     // Step 1: compute outdated hosts and evaluate the schedule.
-    let tz = object.timezone().unwrap();
+    let tz = scheduling_configuration.time_zone;
     let now = || Utc::now().with_timezone(&tz);
     let time_window = chrono::Duration::seconds(
         object
@@ -591,7 +638,40 @@ async fn reconcile(
             .unwrap_or(DEFAULT_STARTING_DEADLINE_SECONDS)
             .into(),
     );
-    let timing = evaluate_schedule(object.spec.schedule.as_deref(), now(), time_window);
+    let Some(timing) = evaluate_schedule(
+        scheduling_configuration.schedule.as_ref(),
+        now(),
+        time_window,
+    ) else {
+        handle_invalid_scheduling_configuration(
+            &context,
+            &object,
+            &api,
+            unlaunched_run.as_ref(),
+            finished_active_run.as_ref(),
+            &mut resource_status,
+            format!(
+                "spec.schedule {:?} has no future occurrence",
+                object.spec.schedule.as_deref().unwrap_or_default()
+            ),
+        )
+        .await?;
+        let deferred_terminal_record = finished_records
+            .iter()
+            .any(|finished| finished.record == TerminalRecord::Present);
+        let requeue_after =
+            invalid_scheduling_requeue(&resource_status, recovered_a_run, deferred_terminal_record);
+        return finish_reconcile_tick(
+            &context,
+            &object,
+            &mut resource_status,
+            &[],
+            recovered_a_run,
+            retry_prune,
+            requeue_after,
+        )
+        .await;
+    };
     let outdated_hosts = find_outdated_hosts(&resource_status, &execution_hash);
     let all_hosts = find_all_hosts(&resource_status);
 
@@ -599,7 +679,8 @@ async fn reconcile(
     // stale. Retired here, after the hash has settled, because that is what decides which hosts are
     // current and therefore what the restated verdict is. A `Ready` written from a terminal `Play`
     // earlier in this tick is not the overlay and is left alone.
-    status::clear_inputs_unavailable_condition(&mut resource_status, outdated_hosts.len());
+    clear_scheduling_configuration_failure(&mut resource_status, outdated_hosts.len());
+    clear_input_failure(&mut resource_status, outdated_hosts.len());
 
     let hosts_to_trigger = match object.spec.mode {
         ExecutionMode::OneShot => outdated_hosts.clone(),
@@ -780,7 +861,7 @@ async fn reconcile(
             }
             let outcome = decide_terminal(
                 &object.spec.mode,
-                object.spec.schedule.as_deref(),
+                scheduling_configuration.schedule.as_ref(),
                 &finished.outcome,
                 retry_due(
                     &phase_for_finished_run(&finished.outcome),
@@ -805,14 +886,15 @@ async fn reconcile(
         && resource_status.hosts_status.is_some()
         && resource_status.phase == Phase::Pending
     {
-        // A failed input read clears the visible terminal state, but not the per-host results. Once
-        // the inputs recover, restore the idle verdict instead of waiting for a hash change.
+        // A revision edit resets the visible terminal state, but not the per-host results. If it is
+        // reverted before another run starts, restore the idle verdict instead of waiting for a new
+        // hash change.
         let total_count = distinct_host_count(&resource_status.eligible_hosts);
         restore_idle_oneshot_status(&mut resource_status, total_count);
     } else if eligible_to_start && resource_status.active_run.is_none() {
         match timing {
             Timing::Delayed(until) => {
-                requeue_after = (until - now()).to_std().unwrap();
+                requeue_after = duration_until(&until, now());
                 resource_status.phase = phase_while_waiting_for_schedule(&resource_status.phase);
                 resource_status.next_run = Some(until.fixed_offset());
             }
@@ -856,9 +938,10 @@ async fn reconcile(
                     // `evaluate_schedule` keeps returning `Now` for the rest of that window, so
                     // don't start another — sleep until the next slot instead. Without this a run
                     // that finishes inside its own grace window is immediately re-triggered.
-                    if let Some(schedule) = object.spec.schedule.as_deref() {
-                        let next =
-                            forecast_next_run(schedule, now(), Some(chrono::Duration::seconds(-5)));
+                    if let Some(schedule) = scheduling_configuration.schedule.as_ref()
+                        && let Some(next) =
+                            forecast_next_run(schedule, now(), Some(chrono::Duration::seconds(-5)))
+                    {
                         requeue_after = (next - now()).to_std().unwrap_or_default();
                         resource_status.next_run = Some(next.fixed_offset());
                     }
@@ -885,7 +968,7 @@ async fn reconcile(
 
     if let Some(until_next_run) = update_idle_recurring_status(
         &object.spec.mode,
-        object.spec.schedule.as_deref(),
+        scheduling_configuration.schedule.as_ref(),
         object.spec.suspend,
         !hosts_to_trigger.is_empty(),
         now(),
@@ -894,18 +977,34 @@ async fn reconcile(
         requeue_after = requeue_after.min(until_next_run);
     }
 
-    // Given back the moment the plan holds nothing outside its own namespace, so deleting an idle
-    // plan never waits on this operator. Deliberately conservative about *when* that is: a tick that
-    // recovered anything keeps it, even if the run finished on this very tick, because the release
-    // it just performed is the last thing that needed the finalizer and one extra tick costs nothing.
+    finish_reconcile_tick(
+        &context,
+        &object,
+        &mut resource_status,
+        &finished_records,
+        recovered_a_run,
+        retry_prune,
+        Some(requeue_after),
+    )
+    .await
+}
+
+async fn finish_reconcile_tick(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    resource_status: &mut PlaybookPlanStatus,
+    finished_records: &[FinishedRecord],
+    recovered_a_run: bool,
+    mut retry_prune: bool,
+    requeue_after: Option<std::time::Duration>,
+) -> Result<Action, ReconcileError> {
+    let (namespace, name) = namespace_and_name(object)?;
+    let api = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace);
     let release_finalizer = !recovered_a_run && resource_status.active_run.is_none();
 
-    patch_status(&api, &object, resource_status.clone()).await?;
+    patch_status(&api, object, resource_status.clone()).await?;
 
-    // The complete terminal verdict, summary, retry budget, and schedule state are durable now.
-    // Only now may the receipts stop recovery from replaying their results. A failed acknowledgement
-    // leaves its record recoverable for the next tick.
-    for finished in &finished_records {
+    for finished in finished_records {
         if finished.record == TerminalRecord::Present
             && let Err(error) = play_history::acknowledge_finished(
                 &context.client,
@@ -917,28 +1016,26 @@ async fn reconcile(
         {
             return Err(report_failed_finalization(
                 &api,
-                &object,
+                object,
                 &finished.run,
-                &mut resource_status,
+                resource_status,
                 error,
             )
             .await);
         }
     }
     if !finished_records.is_empty() {
-        retry_prune |= prune_history(&context, &object).await;
-    }
-    if retry_prune {
-        requeue_after = prune_retry_after(requeue_after);
+        retry_prune |= prune_history(context, object).await;
     }
 
-    // After the plan has been told what this tick decided and its terminal receipts have been handed
-    // back to history, never at either's expense. This is a version-checked write (see
-    // `patch_finalizers`) against an object the operator has just written the status of, so it loses
-    // that race routinely — and losing it must cost one more tick before an idle plan can be deleted,
-    // not the whole tick's account of the plan. Doing it the other way round is what left a plan
-    // advertising a `nextRun` it would never reach.
-    if release_finalizer && let Err(error) = drop_run_cleanup_finalizer(&api, &object).await {
+    let mut requeue_after = requeue_after;
+    if retry_prune {
+        requeue_after = Some(prune_retry_after(
+            requeue_after.unwrap_or(std::time::Duration::from_secs(15)),
+        ));
+    }
+
+    if release_finalizer && let Err(error) = drop_run_cleanup_finalizer(&api, object).await {
         if !error.is_conflict() {
             return Err(error);
         }
@@ -946,10 +1043,14 @@ async fn reconcile(
             "Could not give back the run-cleanup finalizer of {namespace}/{name}: the plan changed \
              underneath this tick; retrying shortly"
         );
-        requeue_after = requeue_after.min(std::time::Duration::from_secs(5));
+        requeue_after = Some(
+            requeue_after
+                .unwrap_or(std::time::Duration::from_secs(5))
+                .min(std::time::Duration::from_secs(5)),
+        );
     }
 
-    Ok(Action::requeue(requeue_after))
+    Ok(requeue_after.map_or_else(Action::await_change, Action::requeue))
 }
 
 /// Whether the current schedule slot (`start`, the grace window's start) is the recorded slot.
@@ -1246,6 +1347,10 @@ fn phase_while_waiting_for_schedule(current: &Phase) -> Phase {
     }
 }
 
+fn duration_until<Tz: TimeZone>(until: &DateTime<Tz>, now: DateTime<Tz>) -> std::time::Duration {
+    (until.clone() - now).to_std().unwrap_or_default()
+}
+
 /// Keeps an idle `Recurring` plan scheduled even when its authorized inventory is empty.
 ///
 /// Zero hosts is not work a run can start: [`has_work_to_start`] must keep rejecting it so the
@@ -1260,7 +1365,7 @@ fn phase_while_waiting_for_schedule(current: &Phase) -> Phase {
 /// [`phase_while_waiting_for_schedule`]; the summary is what reports why no run is starting now.
 fn update_idle_recurring_status<Tz: TimeZone>(
     mode: &ExecutionMode,
-    schedule: Option<&str>,
+    schedule: Option<&Schedule>,
     suspend: bool,
     has_hosts_to_trigger: bool,
     now: DateTime<Tz>,
@@ -1285,7 +1390,7 @@ fn update_idle_recurring_status<Tz: TimeZone>(
     }
 
     status.phase = phase_while_waiting_for_schedule(&status.phase);
-    let next = forecast_next_run(schedule, now.clone(), None);
+    let next = forecast_next_run(schedule, now.clone(), None)?;
     status.next_run = Some(next.fixed_offset());
     (next - now).to_std().ok()
 }
@@ -1663,7 +1768,12 @@ async fn try_start_run(
     // Before the record, the locks and the proxy pods: from here on the plan owns resources its own
     // deletion cannot reach, and the finalizer is the only thing that will release them.
     let plan_api = Api::<PlaybookPlan>::namespaced(context.client.clone(), run.namespace);
-    ensure_run_cleanup_finalizer(&plan_api, object).await?;
+    if let Err(error) = ensure_run_cleanup_finalizer(&plan_api, object).await {
+        return error
+            .is_conflict()
+            .then_some(Some(RETRY_REQUEUE))
+            .ok_or(error);
+    }
 
     let run_groups = run.run_groups;
     let active_run = match prepared {
@@ -2686,15 +2796,15 @@ fn prune_retry_after(current: std::time::Duration) -> std::time::Duration {
 /// the operator's log. Without it the last successful run's summary keeps standing over a plan that
 /// has been failing every tick since, which reads as "nothing to do" rather than "broken".
 ///
-/// The phase and `nextRun` are reset for the same reason the summary is written: they are the other
-/// two printer columns, and leaving a `Succeeded`/`Delayed` phase over a plan that has not been
-/// able to read its own inputs since — pointing, in both cases, at a slot that will not fire — is
-/// exactly the "nothing to do" reading this exists to prevent. `hostsStatus` is left
-/// alone: the previous run's per-host results are still true, and nothing here re-ran anything.
+/// The summary and `Ready=False` condition make the outage explicit without erasing a real run
+/// verdict: `Succeeded` or `Failed` still says what the plan last did, which an unreadable input does
+/// not undo. A lifecycle phase resets to `Pending`, and `nextRun` is cleared because the advertised
+/// slot cannot fire. `hostsStatus` is left alone for the same reason as the verdict: the previous
+/// run's per-host results are still true, and nothing here re-ran anything.
 ///
 /// A run still in flight keeps its phase, matching [`update_desired_hash`]'s guard. The read failure
-/// does not stop a Job that is already executing, and reporting `Pending` over one would contradict
-/// the `activeRun` standing right next to it.
+/// does not stop a Job that is already executing, and changing its phase would contradict the
+/// `activeRun` standing right next to it.
 ///
 /// Best effort, and deliberately so: the reconcile fails on the original error either way, and a
 /// failure to report must not replace the diagnosis it was trying to surface. Same shape as
@@ -2720,7 +2830,7 @@ fn record_input_failure(status: &mut PlaybookPlanStatus, summary: String) {
     status::set_inputs_unavailable_condition(status, &summary);
     status.summary = Some(summary);
     if status.active_run.is_none() {
-        status.phase = Phase::Pending;
+        status.phase = phase_under_readiness_overlay(&status.phase);
         status.next_run = None;
     }
 }
@@ -3436,18 +3546,62 @@ fn update_desired_hash(status: &mut PlaybookPlanStatus, execution_hash: &Executi
     }
 }
 
-/// Restores the terminal verdict a `OneShot` plan had before a failed input read cleared it.
+/// Retires the scheduling-specific readiness overlay and restores an idle summary without erasing a
+/// real failed-run verdict. Ordinary inventory and Secret outages use their own overlay and path.
+fn clear_scheduling_configuration_failure(status: &mut PlaybookPlanStatus, outdated_count: usize) {
+    restore_summary_after_overlay(
+        status,
+        outdated_count,
+        status::clear_invalid_scheduling_configuration_condition,
+    );
+}
+
+/// Retires the desired-input readiness overlay and restores its idle summary without erasing a real
+/// failed-run verdict.
+fn clear_input_failure(status: &mut PlaybookPlanStatus, outdated_count: usize) {
+    restore_summary_after_overlay(
+        status,
+        outdated_count,
+        status::clear_inputs_unavailable_condition,
+    );
+}
+
+/// Restores the host-derived summary an overlay was covering once `clear` reports it was present.
+/// `failed` is read before the clear because that is where the verdict still is.
+fn restore_summary_after_overlay(
+    status: &mut PlaybookPlanStatus,
+    outdated_count: usize,
+    clear: impl FnOnce(&mut PlaybookPlanStatus, usize) -> bool,
+) {
+    let failed = status.phase == Phase::Failed;
+    if clear(status, outdated_count) && status.active_run.is_none() {
+        let total_count = distinct_host_count(&status.eligible_hosts);
+        status.summary = Some(plan_summary(outdated_count, total_count, failed));
+    }
+}
+
+/// Restores an idle `OneShot` verdict after a revision is changed and then reverted.
 ///
 /// The conditions under which that is the right thing to do — idle, `OneShot`, no outdated hosts,
-/// per-host results still on the plan, and a phase that a read failure reset to `Pending` — are the
+/// per-host results still on the plan, and a phase the revision edit reset to `Pending` — are the
 /// caller's `else if`, and are not restated here. They have to be the caller's: they select this
-/// branch out of the chain that also decides scheduling, so a plan that fails them must fall
-/// through to the next arm rather than reach a function that quietly does nothing.
+/// branch out of the chain that also decides scheduling, so a plan that fails them must fall through
+/// to the next arm rather than reach a function that quietly does nothing.
 fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usize) {
     status.phase = Phase::Succeeded;
     status.next_run = None;
     // Restoring the verdict of a plan that succeeded, so there is no failure to report.
     status.summary = Some(plan_summary(0, total_count, false));
+}
+
+/// The phase an idle plan keeps while a readiness overlay explains why it is not running. A real
+/// run verdict survives — it says what the plan last did, which an outage does not undo — while a
+/// lifecycle state resets to `Pending`.
+fn phase_under_readiness_overlay(current: &Phase) -> Phase {
+    match current {
+        Phase::Succeeded | Phase::Failed => current.clone(),
+        _ => Phase::Pending,
+    }
 }
 
 /// Puts a recovered run back onto the plan's status: the run itself, the `Applying` phase it
@@ -3510,10 +3664,11 @@ struct RecordedRun {
 impl RecordedRun {
     /// Reconstructs a run from the plan status' mirror of it — the one path that does not start
     /// from a `Play`, and so the one place a hand-edited status is caught.
-    fn from_mirror(mirror: ActiveRun) -> Result<Self, ReconcileError> {
+    fn from_mirror(mut mirror: ActiveRun) -> Result<Self, ReconcileError> {
         let execution_hash = ExecutionHash::from_hex(&mirror.execution_hash).ok_or(
             ReconcileError::PreconditionFailed("run has an invalid execution hash"),
         )?;
+        mirror.execution_hash = execution_hash.to_string();
         Ok(Self {
             mirror,
             execution_hash,
@@ -4162,7 +4317,7 @@ struct TerminalOutcome {
 
 fn decide_terminal<Tz: TimeZone>(
     mode: &ExecutionMode,
-    schedule: Option<&str>,
+    schedule: Option<&Schedule>,
     outcome: &v1beta1::PlayPhase,
     retry_due: bool,
     outdated_count: usize,
@@ -4194,8 +4349,16 @@ fn decide_terminal<Tz: TimeZone>(
                 if let Some(retrying) = retrying {
                     return retrying;
                 }
-                let next =
-                    forecast_next_run(schedule, now.clone(), Some(chrono::Duration::seconds(-5)));
+                let Some(next) =
+                    forecast_next_run(schedule, now.clone(), Some(chrono::Duration::seconds(-5)))
+                else {
+                    return TerminalOutcome {
+                        phase,
+                        next_run: None,
+                        summary,
+                        requeue: None,
+                    };
+                };
                 let requeue = (next.clone() - now).to_std().ok();
                 TerminalOutcome {
                     phase,
@@ -4720,6 +4883,127 @@ pub(crate) fn playbookplan_owner_ref(
 /// subdomain, so the two are the same anyway.
 fn plan_name_within_label_limit(name: &str) -> bool {
     name.chars().count() <= v1beta1::MAX_PLAN_NAME_LEN
+}
+
+fn validate_scheduling_configuration(
+    object: &PlaybookPlan,
+    now: DateTime<Utc>,
+) -> Result<SchedulingConfiguration, String> {
+    let time_zone = object.timezone().map_err(|error| {
+        format!(
+            "spec.timeZone {:?} is not a recognized IANA time zone: {error}",
+            object.spec.time_zone.as_deref().unwrap_or_default()
+        )
+    })?;
+    let schedule = object
+        .spec
+        .schedule
+        .as_deref()
+        .map(Schedule::parse)
+        .transpose()
+        .map_err(|error| {
+            format!(
+                "spec.schedule {:?} is not a valid 5-field cron expression: {error}",
+                object.spec.schedule.as_deref().unwrap_or_default()
+            )
+        })?;
+
+    if let Some(schedule) = &schedule
+        && forecast_next_run(schedule, now.with_timezone(&time_zone), None).is_none()
+    {
+        return Err(format!(
+            "spec.schedule {:?} has no future occurrence",
+            object.spec.schedule.as_deref().unwrap_or_default()
+        ));
+    }
+
+    Ok(SchedulingConfiguration {
+        time_zone,
+        schedule,
+    })
+}
+
+async fn handle_invalid_scheduling_configuration(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    api: &Api<PlaybookPlan>,
+    unlaunched: Option<&UnlaunchedRun>,
+    finished_run: Option<&FinishedRun>,
+    resource_status: &mut PlaybookPlanStatus,
+    summary: String,
+) -> Result<(), ReconcileError> {
+    record_invalid_scheduling_configuration(resource_status, finished_run, summary.clone());
+
+    if let Some(unlaunched) = unlaunched {
+        if unlaunched.phase == v1beta1::PlayPhase::Launching {
+            let (outcome, _requeue) =
+                resume_launching_run(context, object, api, &unlaunched.run, None, resource_status)
+                    .await?;
+            match outcome {
+                JobPresenceAction::Adopt => {
+                    resource_status.summary = Some(format!(
+                        "adopted the started run; the scheduling configuration is invalid: {summary}"
+                    ));
+                }
+                JobPresenceAction::Abandon => {
+                    resource_status.summary = Some(format!("aborted the run because {summary}"));
+                }
+                JobPresenceAction::Contested | JobPresenceAction::Proceed => {}
+            }
+        } else {
+            abandon_unlaunched_run(
+                context,
+                object,
+                api,
+                &unlaunched.run,
+                unlaunched.phase.clone(),
+                format!("aborted the run because {summary}"),
+                resource_status,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Reports invalid mutable scheduling inputs without hiding run lifecycle state. A finished run is
+/// applied only when it belongs to `currentHash`; replayable records remain unacknowledged until a
+/// corrected tick can classify them through the full desired-input path.
+fn record_invalid_scheduling_configuration(
+    status: &mut PlaybookPlanStatus,
+    finished_run: Option<&FinishedRun>,
+    summary: String,
+) {
+    status::set_invalid_scheduling_configuration_condition(status, &summary);
+    status.summary = Some(summary);
+    status.next_run = None;
+    if status.active_run.is_none() {
+        status.phase = finished_run.map_or_else(
+            || phase_under_readiness_overlay(&status.phase),
+            |finished| {
+                if finished.run.mirror.execution_hash == status.current_hash {
+                    phase_for_finished_run(&finished.outcome)
+                } else {
+                    Phase::Pending
+                }
+            },
+        );
+    }
+}
+
+fn invalid_scheduling_requeue(
+    status: &PlaybookPlanStatus,
+    recovered_a_run: bool,
+    deferred_terminal_record: bool,
+) -> Option<std::time::Duration> {
+    if status.active_run.is_some() {
+        Some(std::time::Duration::from_secs(15))
+    } else if recovered_a_run && !deferred_terminal_record {
+        Some(std::time::Duration::from_secs(1))
+    } else {
+        None
+    }
 }
 
 /// The plan's namespace and name — the two things almost every step needs to address its resources.
@@ -6201,6 +6485,256 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn scheduling_configuration_rejects_invalid_fields_without_panicking() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let mut plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+
+        plan.spec.time_zone = Some("Nowhere".into());
+        assert!(
+            validate_scheduling_configuration(&plan, now)
+                .unwrap_err()
+                .contains("spec.timeZone")
+        );
+
+        plan.spec.time_zone = Some("Europe/Berlin".into());
+        plan.spec.schedule = Some("not a cron".into());
+        assert!(
+            validate_scheduling_configuration(&plan, now)
+                .unwrap_err()
+                .contains("spec.schedule")
+        );
+
+        plan.spec.schedule = Some("0 3 * * * 2030".into());
+        assert!(
+            validate_scheduling_configuration(&plan, now)
+                .unwrap_err()
+                .contains("exactly 5 fields")
+        );
+
+        plan.spec.schedule = Some("0 0 31 2 *".into());
+        assert!(
+            validate_scheduling_configuration(&plan, now)
+                .unwrap_err()
+                .contains("no future occurrence")
+        );
+    }
+
+    #[test]
+    fn invalid_scheduling_preserves_idle_verdicts_and_correction_restores_summaries() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut idle = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            phase: Phase::Succeeded,
+            next_run: Some(
+                "2025-08-13T20:00:00Z"
+                    .parse::<DateTime<FixedOffset>>()
+                    .unwrap(),
+            ),
+            eligible_hosts: vec![ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["worker-1".into()],
+            }],
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".into(),
+                v1beta1::HostStatus {
+                    last_applied_hash: hash.to_string(),
+                    last_outcome: v1beta1::HostOutcome::Succeeded,
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        record_invalid_scheduling_configuration(&mut idle, None, "spec.schedule is invalid".into());
+        assert_eq!(idle.phase, Phase::Succeeded);
+        assert_eq!(idle.next_run, None);
+        assert_eq!(
+            idle.conditions
+                .iter()
+                .find(|condition| condition.type_ == "Ready")
+                .and_then(|condition| condition.reason.as_deref()),
+            Some("InvalidSchedulingConfiguration")
+        );
+
+        let outdated = find_outdated_hosts(&idle, &hash);
+        assert!(outdated.is_empty());
+        clear_scheduling_configuration_failure(&mut idle, outdated.len());
+
+        assert_eq!(idle.phase, Phase::Succeeded);
+        assert_eq!(idle.summary.as_deref(), Some("1/1 up-to-date"));
+
+        let mut exhausted = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            phase: Phase::Failed,
+            retry_count: DEFAULT_ONESHOT_ATTEMPTS,
+            eligible_hosts: idle.eligible_hosts.clone(),
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".into(),
+                v1beta1::HostStatus::default(),
+            )])),
+            ..Default::default()
+        };
+        record_invalid_scheduling_configuration(
+            &mut exhausted,
+            None,
+            "spec.schedule is invalid".into(),
+        );
+        assert_eq!(exhausted.phase, Phase::Failed);
+
+        let outdated = find_outdated_hosts(&exhausted, &hash);
+        assert_eq!(outdated.len(), 1);
+        clear_scheduling_configuration_failure(&mut exhausted, outdated.len());
+
+        assert_eq!(exhausted.phase, Phase::Failed);
+        assert_eq!(
+            exhausted.summary.as_deref(),
+            Some("0/1 up-to-date (1 outdated, last run failed)")
+        );
+
+        let mut recurring = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            phase: Phase::Succeeded,
+            eligible_hosts: idle.eligible_hosts.clone(),
+            hosts_status: idle.hosts_status.clone(),
+            ..Default::default()
+        };
+        record_invalid_scheduling_configuration(
+            &mut recurring,
+            None,
+            "spec.timeZone is invalid".into(),
+        );
+        assert_eq!(recurring.phase, Phase::Succeeded);
+        clear_scheduling_configuration_failure(&mut recurring, 0);
+        recurring.phase = phase_while_waiting_for_schedule(&recurring.phase);
+
+        assert_eq!(recurring.phase, Phase::Succeeded);
+        assert_eq!(recurring.summary.as_deref(), Some("1/1 up-to-date"));
+
+        recurring.phase = Phase::Failed;
+        record_invalid_scheduling_configuration(
+            &mut recurring,
+            None,
+            "spec.timeZone is invalid".into(),
+        );
+        assert_eq!(recurring.phase, Phase::Failed);
+        clear_scheduling_configuration_failure(&mut recurring, 0);
+
+        assert_eq!(recurring.phase, Phase::Failed);
+        assert_eq!(
+            recurring.summary.as_deref(),
+            Some("1/1 up-to-date (last run failed)")
+        );
+
+        let mut applying = PlaybookPlanStatus {
+            phase: Phase::Applying,
+            active_run: Some(ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-1".into(),
+                job_name: "apply-web-1-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: None,
+            }),
+            ..Default::default()
+        };
+        record_invalid_scheduling_configuration(
+            &mut applying,
+            None,
+            "spec.timeZone is invalid".into(),
+        );
+        assert_eq!(applying.phase, Phase::Applying);
+        assert_eq!(
+            applying.summary.as_deref(),
+            Some("spec.timeZone is invalid")
+        );
+        assert_eq!(
+            invalid_scheduling_requeue(&applying, true, false),
+            Some(std::time::Duration::from_secs(15))
+        );
+        assert_eq!(
+            invalid_scheduling_requeue(&idle, true, false),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(invalid_scheduling_requeue(&idle, false, false), None);
+        assert_eq!(invalid_scheduling_requeue(&idle, true, true), None);
+
+        let abandoned = RecordedRun {
+            mirror: applying.active_run.clone().unwrap(),
+            execution_hash: hash,
+        };
+        let mut abandoning = applying.clone();
+        let diagnostic = "spec.schedule is invalid";
+        record_invalid_scheduling_configuration(&mut abandoning, None, diagnostic.into());
+        abandoning.summary = Some(format!("aborted the run because {diagnostic}"));
+        apply_abandoned_run_status(&mut abandoning, &abandoned);
+        status::clear_run_conditions(&mut abandoning);
+
+        assert_eq!(
+            abandoning.summary.as_deref(),
+            Some("aborted the run because spec.schedule is invalid")
+        );
+        assert_eq!(
+            abandoning
+                .conditions
+                .iter()
+                .find(|condition| condition.type_ == "Ready")
+                .and_then(|condition| condition.reason.as_deref()),
+            Some("InvalidSchedulingConfiguration")
+        );
+
+        let mut just_finished = applying;
+        just_finished.active_run = None;
+        just_finished.current_hash = "1".into();
+        record_invalid_scheduling_configuration(
+            &mut just_finished,
+            Some(&FinishedRun {
+                run: RecordedRun {
+                    mirror: ActiveRun {
+                        execution_hash: "1".into(),
+                        run_id: "run-1".into(),
+                        job_name: "apply-web-1-1".into(),
+                        play_uid: "play-uid".into(),
+                        hosts: vec!["worker-1".into()],
+                        run_number: 1,
+                        attempt: 1,
+                        triggered_slot: None,
+                    },
+                    execution_hash: hash,
+                },
+                outcome: v1beta1::PlayPhase::Failed,
+            }),
+            "spec.timeZone is invalid".into(),
+        );
+
+        assert_eq!(just_finished.phase, Phase::Failed);
+
+        just_finished.current_hash = "2".into();
+        record_invalid_scheduling_configuration(
+            &mut just_finished,
+            Some(&FinishedRun {
+                run: RecordedRun {
+                    mirror: ActiveRun {
+                        execution_hash: "1".into(),
+                        run_id: "run-1".into(),
+                        job_name: "apply-web-1-1".into(),
+                        play_uid: "play-uid".into(),
+                        hosts: vec!["worker-1".into()],
+                        run_number: 1,
+                        attempt: 1,
+                        triggered_slot: None,
+                    },
+                    execution_hash: hash,
+                },
+                outcome: v1beta1::PlayPhase::Unknown,
+            }),
+            "spec.timeZone is invalid".into(),
+        );
+
+        assert_eq!(just_finished.phase, Phase::Pending);
+    }
+
     /// Every label an accepted plan name is written into, and every selector that matches on it, has
     /// to stay valid at the boundary — this is the case the guard exists to make safe, so it is
     /// asserted on the real objects rather than on the guard alone.
@@ -6436,7 +6970,7 @@ spec:
 
         let requeue = update_idle_recurring_status(
             &ExecutionMode::Recurring,
-            Some("0 20 * * *"),
+            Some(&Schedule::parse("0 20 * * *").unwrap()),
             false,
             false,
             now,
@@ -6454,13 +6988,21 @@ spec:
         let mut never_run = PlaybookPlanStatus::default();
         update_idle_recurring_status(
             &ExecutionMode::Recurring,
-            Some("0 20 * * *"),
+            Some(&Schedule::parse("0 20 * * *").unwrap()),
             false,
             false,
             now,
             &mut never_run,
         );
         assert_eq!(never_run.phase, Phase::Delayed);
+    }
+
+    #[test]
+    fn a_schedule_deadline_crossed_during_reconcile_requeues_immediately() {
+        let until = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let now = "2025-08-12T20:00:01Z".parse::<DateTime<Utc>>().unwrap();
+
+        assert_eq!(duration_until(&until, now), std::time::Duration::ZERO);
     }
 
     #[test]
@@ -6478,7 +7020,7 @@ spec:
         assert_eq!(
             update_idle_recurring_status(
                 &ExecutionMode::Recurring,
-                Some("0 20 * * *"),
+                Some(&Schedule::parse("0 20 * * *").unwrap()),
                 true,
                 false,
                 now,
@@ -6512,7 +7054,7 @@ spec:
         assert_eq!(
             update_idle_recurring_status(
                 &ExecutionMode::Recurring,
-                Some("0 20 * * *"),
+                Some(&Schedule::parse("0 20 * * *").unwrap()),
                 false,
                 false,
                 now,
@@ -6885,14 +7427,14 @@ spec:
         assert_eq!(idle.retry_count_slot, None);
     }
 
-    /// A plan that cannot read its own inputs must not keep advertising the last run's verdict. The
-    /// summary alone is not enough — `phase` and `nextRun` are the other two printer columns, and a
-    /// `Succeeded`/`Delayed` plan pointing at a slot that will never fire reads as healthy.
+    /// A plan that cannot read its own inputs reports the outage without erasing what its last run
+    /// did. The summary and `Ready` condition carry the current failure; `nextRun` is cleared because
+    /// that slot cannot fire, while a terminal verdict remains true.
     ///
     /// The exception is a run still in flight: the read failure did not stop its Job, so it keeps
     /// its phase, exactly as `update_desired_hash` leaves an active run alone.
     #[test]
-    fn an_unreadable_input_stops_the_plan_advertising_the_previous_verdict() {
+    fn an_unreadable_input_preserves_a_verdict_but_clears_the_next_run() {
         let slot = "2025-08-12T20:00:00Z"
             .parse::<DateTime<FixedOffset>>()
             .unwrap();
@@ -6915,7 +7457,7 @@ spec:
             ..Default::default()
         };
         record_input_failure(&mut idle, "cannot read referenced Secrets: nope".into());
-        assert_eq!(idle.phase, Phase::Pending);
+        assert_eq!(idle.phase, Phase::Succeeded);
         assert_eq!(idle.next_run, None);
         assert_eq!(
             idle.summary.as_deref(),
@@ -6934,6 +7476,18 @@ spec:
         );
         // The previous run's per-host results are still true — nothing here re-ran anything.
         assert!(idle.hosts_status.unwrap().contains_key("worker-1"));
+
+        let mut waiting = PlaybookPlanStatus {
+            phase: Phase::Delayed,
+            next_run: Some(slot),
+            ..Default::default()
+        };
+        record_input_failure(
+            &mut waiting,
+            "cannot resolve the plan's inventories: nope".into(),
+        );
+        assert_eq!(waiting.phase, Phase::Pending);
+        assert_eq!(waiting.next_run, None);
 
         let mut applying = PlaybookPlanStatus {
             active_run: Some(ActiveRun {
@@ -6954,6 +7508,82 @@ spec:
             "cannot resolve the plan's inventories: nope".into(),
         );
         assert_eq!(applying.phase, Phase::Applying);
+    }
+
+    /// Once desired inputs are readable, an idle Recurring plan must replace the outage summary
+    /// immediately rather than carrying it until the next scheduled run. Preserving the verdict is
+    /// what lets a failed plan keep saying that its last run failed in the restored summary.
+    #[test]
+    fn recovered_recurring_inputs_restore_successful_and_failed_summaries() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let eligible_hosts = vec![ResolvedHosts {
+            name: "workers".into(),
+            hosts: vec!["worker-1".into()],
+        }];
+        let slot = "2025-08-13T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+
+        let mut succeeded = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            phase: Phase::Succeeded,
+            next_run: Some(slot),
+            eligible_hosts: eligible_hosts.clone(),
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".into(),
+                v1beta1::HostStatus {
+                    last_applied_hash: hash.to_string(),
+                    last_outcome: v1beta1::HostOutcome::Succeeded,
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        record_input_failure(
+            &mut succeeded,
+            "cannot read referenced Secrets: temporary failure".into(),
+        );
+        assert_eq!(succeeded.phase, Phase::Succeeded);
+        assert_eq!(succeeded.next_run, None);
+
+        let outdated = find_outdated_hosts(&succeeded, &hash);
+        clear_input_failure(&mut succeeded, outdated.len());
+        succeeded.phase = phase_while_waiting_for_schedule(&succeeded.phase);
+
+        assert_eq!(succeeded.phase, Phase::Succeeded);
+        assert_eq!(succeeded.summary.as_deref(), Some("1/1 up-to-date"));
+
+        let mut failed = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            phase: Phase::Failed,
+            next_run: Some(slot),
+            eligible_hosts,
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".into(),
+                v1beta1::HostStatus {
+                    last_applied_hash: hash.to_string(),
+                    last_outcome: v1beta1::HostOutcome::Failed,
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        record_input_failure(
+            &mut failed,
+            "cannot resolve the plan's inventories: temporary failure".into(),
+        );
+        assert_eq!(failed.phase, Phase::Failed);
+        assert_eq!(failed.next_run, None);
+
+        let outdated = find_outdated_hosts(&failed, &hash);
+        clear_input_failure(&mut failed, outdated.len());
+        failed.phase = phase_while_waiting_for_schedule(&failed.phase);
+
+        assert_eq!(failed.phase, Phase::Failed);
+        assert_eq!(
+            failed.summary.as_deref(),
+            Some("1/1 up-to-date (last run failed)")
+        );
     }
 
     /// An outage reported while an unlaunched run is being decided has to survive that decision.
@@ -6995,11 +7625,12 @@ spec:
         );
     }
 
-    /// Once desired inputs are readable again, an idle OneShot plan with no outdated hosts restores
-    /// the successful status it had before the read failure.
+    /// Reverting a revision before its first run makes the old per-host results current again, so an
+    /// idle OneShot plan restores the successful status that `update_desired_hash` cleared.
     #[test]
-    fn a_recovered_idle_oneshot_restores_its_successful_verdict() {
+    fn a_reverted_idle_oneshot_restores_its_successful_verdict() {
         let hash = ExecutionHash::from_hex("1").unwrap();
+        let replacement_hash = ExecutionHash::from_hex("2").unwrap();
         let mut status = PlaybookPlanStatus {
             current_hash: hash.to_string(),
             phase: Phase::Succeeded,
@@ -7018,36 +7649,17 @@ spec:
             ..Default::default()
         };
 
-        record_input_failure(
-            &mut status,
-            "cannot read referenced Secrets: temporary failure".into(),
-        );
+        update_desired_hash(&mut status, &replacement_hash);
         assert_eq!(status.phase, Phase::Pending);
-        assert_eq!(
-            status.summary.as_deref(),
-            Some("cannot read referenced Secrets: temporary failure")
-        );
 
         update_desired_hash(&mut status, &hash);
         let outdated = find_outdated_hosts(&status, &hash);
         assert!(outdated.is_empty());
-        status::clear_inputs_unavailable_condition(&mut status, outdated.len());
         restore_idle_oneshot_status(&mut status, 1);
 
         assert_eq!(status.phase, Phase::Succeeded);
         assert_eq!(status.next_run, None);
         assert_eq!(status.summary.as_deref(), Some("1/1 up-to-date"));
-        let ready = status
-            .conditions
-            .iter()
-            .find(|condition| condition.type_ == "Ready")
-            .unwrap();
-        assert_eq!(ready.status, "True");
-        assert_eq!(ready.reason.as_deref(), Some("HostsUpToDate"));
-        assert_eq!(
-            ready.message.as_deref(),
-            Some("1/1 hosts on the current revision")
-        );
     }
 
     /// A recovered run is put back onto the plan whole, but its retry number only counts towards
@@ -7332,6 +7944,11 @@ spec:
         assert_eq!(run.mirror.hosts, vec!["worker-1", "worker-2"]);
         assert_eq!(run.mirror.run_number, 2);
 
+        let mut hand_edited_mirror = run.mirror.clone();
+        hand_edited_mirror.execution_hash = "+1A".into();
+        let mirrored_run = RecordedRun::from_mirror(hand_edited_mirror).unwrap();
+        assert_eq!(mirrored_run.mirror.execution_hash, "1a");
+
         // The record is only a run's identity if it can be tied back to a specific object.
         let mut uidless = play.clone();
         uidless.metadata.uid = None;
@@ -7581,8 +8198,8 @@ spec:
             current,
             3,
         ));
-        // `Pending` is not enough to prove a refund: an input outage can hide a successful verdict
-        // after its Play was pruned, so the persisted nonzero count must still close the window.
+        // `Pending` alone is not enough to prove the slot is free: a lifecycle transition can
+        // replace the verdict after the run spent budget, so the persisted count still closes it.
         assert!(retry_budget_closes_window(
             &Phase::Pending,
             1,
@@ -7599,7 +8216,7 @@ spec:
         for mode in [ExecutionMode::OneShot, ExecutionMode::Recurring] {
             let outcome = decide_terminal(
                 &mode,
-                Some("0 3 * * *"),
+                Some(&Schedule::parse("0 3 * * *").unwrap()),
                 &v1beta1::PlayPhase::Failed,
                 true,
                 1,
@@ -7970,7 +8587,7 @@ spec:
         // never reschedule.
         let outcome = decide_terminal(
             &ExecutionMode::OneShot,
-            Some("0 3 * * *"),
+            Some(&Schedule::parse("0 3 * * *").unwrap()),
             &v1beta1::PlayPhase::Failed,
             false,
             1,
@@ -8002,7 +8619,7 @@ spec:
         ] {
             let terminal = decide_terminal(
                 &ExecutionMode::Recurring,
-                Some("0 3 * * *"),
+                Some(&Schedule::parse("0 3 * * *").unwrap()),
                 &outcome,
                 false,
                 0,
@@ -8026,7 +8643,7 @@ spec:
         let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let outcome = decide_terminal(
             &ExecutionMode::Recurring,
-            Some("0 3 * * *"),
+            Some(&Schedule::parse("0 3 * * *").unwrap()),
             &v1beta1::PlayPhase::Failed,
             false,
             0,
