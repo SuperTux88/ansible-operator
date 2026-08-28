@@ -53,7 +53,19 @@ MAX_CONCURRENT_DIALS = 32
 # sshd sends its identification string as soon as the connection is accepted. Requiring it rules out
 # a half-programmed datapath where the SYN is answered but sshd is not actually serving us yet.
 BANNER_PREFIX = b"SSH-"
+
+# Bytes per read. The identification string is far shorter, so this is one read in practice.
 BANNER_BYTES = 256
+
+# Bounds on what a peer can make this spend before it is judged unreachable. Both are generous
+# against the ~21 bytes and single line an OpenSSH proxy actually sends, and neither is a diagnosis:
+# a peer that talks past them is answered `False`, the same as one that says nothing at all.
+#
+# RFC 4253 lets a server send other lines before its identification string, which the proxies this
+# dials never do — the allowance costs one counter and spares the alternative rule, "the first chunk
+# must start with SSH-, except when TCP splits it".
+MAX_BANNER_BYTES = 4096
+MAX_BANNER_LINES = 8
 
 
 def log(message):
@@ -99,15 +111,57 @@ def reachable(address, port, deadline):
 
     try:
         with socket.create_connection((address, port), timeout=connect_timeout) as sock:
-            read_timeout = dial_timeout(deadline)
-            if read_timeout is None:
-                return False
-            sock.settimeout(read_timeout)
-            banner = sock.recv(BANNER_BYTES)
+            return read_banner(sock, deadline)
     except OSError:
         return False
 
-    return banner.startswith(BANNER_PREFIX)
+
+def read_banner(sock, deadline):
+    """Whether the peer identifies itself as an SSH server before the deadline.
+
+    Reads rather than peeks at a single chunk, because one `recv` is not the same question: TCP may
+    hand back part of the identification string, and judging a proxy unreachable over a segment
+    boundary means retrying it every poll interval — or, if the split is deterministic, spending the
+    gate's whole budget on a proxy that was serving all along.
+
+    A partial first line is accepted as soon as it starts with `SSH-`, without waiting for the
+    newline that would complete it: those four bytes are the whole question, and the rest of the
+    string says nothing this gate acts on. Complete lines that are *not* the identification string
+    are skipped, which is what RFC 4253 permits a server to send first.
+
+    Every way this can end is `False` rather than an exception: the deadline passing, EOF from a peer
+    that accepted and closed (a proxy mid-restart does exactly that, and it must be a definite answer
+    or the loop spins against a closed socket), or a peer that exceeds either cap. The caller treats
+    them alike — the host is dialled again on the next sweep.
+    """
+    line = b""
+    read = 0
+    skipped = 0
+
+    while True:
+        timeout = dial_timeout(deadline)
+        if timeout is None:
+            return False
+
+        sock.settimeout(timeout)
+        chunk = sock.recv(BANNER_BYTES)
+        if not chunk:
+            return False
+
+        read += len(chunk)
+        line += chunk
+        while b"\n" in line:
+            complete, line = line.split(b"\n", 1)
+            if complete.startswith(BANNER_PREFIX):
+                return True
+            skipped += 1
+            if skipped >= MAX_BANNER_LINES:
+                return False
+
+        if line.startswith(BANNER_PREFIX):
+            return True
+        if read >= MAX_BANNER_BYTES:
+            return False
 
 
 def wait_for(endpoints, timeout):
