@@ -37,20 +37,21 @@ surfaces it in `kubectl get playbookplan`.
 
 Because a run may start anywhere inside that window, the operator has to remember that the window has
 already been used — otherwise a run finishing inside its own window would immediately re-trigger
-itself. `.status.lastTriggeredRun` records the tick a run was last started for, and a tick that
-matches it is skipped.
+itself. `.status.lastTriggeredRun` records the tick a run was last started for. The attempt budget
+also records its tick in `.status.retryCountSlot`, so the operator can distinguish a retry in the
+current tick from the first attempt in the next one even if the run-start marker is stale.
 
 That memory is per revision, not per window: any change to the [execution hash](#drift-detection)
 clears `lastTriggeredRun`, so an edit made moments after a run started takes effect right away rather
 than waiting for the next tick. Reverting to an earlier revision is a change like any other and runs
 again too.
 
-`lastTriggeredRun` is a summary of something the run records already say, and it is the records that
-decide. Every run writes down the revision and the schedule tick it was started for before
-anything is created for it, so before the operator starts a run for a tick it also checks whether one
-of the plan's own [`Play` records](./results-and-troubleshooting.md) already took that tick at the
-current revision. A status update the operator has not caught up with, or one lost to a competing
-write, therefore cannot cost you a second run of the same tick.
+`lastTriggeredRun` is a summary of something the run records already say. Every run writes down the
+revision and schedule tick before anything is created, so before the operator starts a run for a tick
+it also checks whether one of the plan's own
+[`Play` records](./results-and-troubleshooting.md) already took that tick at the current revision.
+The slot-scoped attempt counter remains after old records are pruned. Together they keep a lagging or
+competing status write from granting an extra attempt.
 
 ## Suspending a plan
 
@@ -193,8 +194,8 @@ the two always match.
 A run that fails is tried again, up to `spec.maxAttempts` tries counting the first one — so
 `maxAttempts: 1` means no retry at all. Each try is a run in its own right: its own Job, its own
 `Play` record, its own run number. `.status.retryCount` says how many of the budget the plan has
-spent so far, and the `Play`'s `Try` column (`kubectl get plays -o wide`) says which try each run
-was.
+spent so far, `.status.retryCountSlot` identifies the schedule tick that count belongs to, and the
+`Play`'s `Try` column (`kubectl get plays -o wide`) says which try each run was.
 
 What the budget covers depends on the mode, because what counts as "the same piece of work" does:
 

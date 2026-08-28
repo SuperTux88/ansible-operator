@@ -196,8 +196,10 @@ host on the hash an earlier run applied, so drift would report it as a success.
 Tries per *execution*, counting the first run: the current hash for `OneShot` (default 3), one
 schedule tick for `Recurring` (default 1). Every try is a full run — own `Play`, own `runId`, own
 Job, own run number — and `status.retryCount` counts them within the execution, restarting on a hash
-change (`update_desired_hash`) and, for `Recurring`, at each tick (`next_attempt`). It is written
-from the run's record, never re-derived, so a lagging status cannot hand the budget back.
+change (`update_desired_hash`) and, for `Recurring`, at each tick (`next_attempt`).
+`status.retryCountSlot` identifies the schedule tick that a recurring count belongs to, so the count
+remains meaningful when `lastTriggeredRun` is stale or absent. Both are written from the run's
+record, never re-derived.
 
 Two gates, deliberately: `attempt_budget_available` at `may_start_new_run` is the whole answer for
 `OneShot` (nothing else ever stops it — its failed hosts stay outdated), while `Recurring` is
@@ -228,19 +230,17 @@ handful of decisions that are easy to undo by accident:
 - **Only `Prepared` is gated on the schedule window** and the rest of `has_work_to_start`.
   `Starting`/`Launching` wait on proxy pods, which routinely outlasts `startingDeadlineSeconds`;
   gating them would leave a scheduled plan unable to launch.
-- **The schedule window is gated on the records, not only on `lastTriggeredRun`.** That marker is a
-  *derived* view of "a run for this slot got a Job", written onto a status read from the
-  reflector cache and re-stated from it by every merge patch — so a tick running behind the write, or
-  one whose write was lost to a conflict, would start a second run for one slot.
+- **The schedule window is gated on slot-scoped budget state and records, not only on
+  `lastTriggeredRun`.** That marker is a *derived* view of "a run for this slot got a Job", written
+  onto a status read from the reflector cache and re-stated from it by every merge patch — so a tick
+  running behind the write, or one whose write was lost to a conflict, cannot be trusted alone.
   `schedule_window_already_taken`/`window_taken_by_a_record` re-ask the question of the plan's own
   `Play`s (which book revision and slot before anything is created) before a new run is prepared.
   Since `maxAttempts` the question is no longer "did a run take this slot" but "is there anything
   left for a run to do in it": a record still `Running` or one that `Succeeded` closes the window,
-  while failures close it only once they have spent the budget. `retry_due` closes a window from
-  status only while `lastTriggeredRun` still identifies that slot; when the marker is absent, the
-  retained records decide alone. Pruning every record for an active slot removes that backstop and
-  can admit another try, because `retryCount` by itself cannot distinguish this slot from the
-  previous one.
+  while failures close it only once they have spent the budget. `retryCountSlot` binds
+  `retryCount` to its recurring execution, so status can close an exhausted window after its records
+  have been pruned and `next_attempt` does not restart at one when `lastTriggeredRun` is stale.
 - **`spec.suspend` is decided before the inventory is read** (`resolve_unlaunched_before_inputs`),
   for every phase — dropping an unlaunched run needs no inventory, and deferring it would leave a
   suspended plan sitting on its host Leases behind a read that may never succeed. That is why
