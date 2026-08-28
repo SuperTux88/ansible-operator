@@ -66,6 +66,7 @@ jobs:
           cargo clippy -- -D warnings
 
       - name: Verify generated CRDs are current
+        shell: bash
         run: |
           set -euo pipefail
           tmp_dir="$(mktemp -d)"
