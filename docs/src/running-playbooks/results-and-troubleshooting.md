@@ -605,10 +605,24 @@ needs, or the Job pod was killed before it could write its termination message (
 that took down its own runner is one way). Inspect the (not-yet-reaped) Job pod; raising
 `spec.ttlSecondsAfterFinished` buys time to look before it is cleaned up.
 
-If *every* host of one run shows `Unknown` at once, the likely cause is different: the run's `Play`
-was deleted while the run was still live. That record is the only thing the run can be recovered
-from, so the operator releases the run's locks and proxy pods and reports the whole run as unknown
-rather than leaving the plan stuck. The next run reports these hosts normally.
+If *every* host of one run shows `Unknown` at once, check these causes first:
+
+- **The managed-SSH preflight init container could not start.** On a plan targeting cluster Nodes,
+  `managed-ssh-preflight` runs `python3` from the plan's execution image before Ansible starts. A
+  fresh image without `python3` on `PATH` therefore produces no recap and reports every host as
+  `Unknown`. Inspect the init container's logs and status:
+
+  ```sh
+  kubectl logs job/<job-name> -c managed-ssh-preflight
+  kubectl get pod <pod-name> -o jsonpath='{.status.initContainerStatuses}'
+  ```
+
+  See [`python3` must be on `PATH`](./playbook-plans.md#python3-must-be-on-path) for the image
+  requirement and a local verification command.
+- **The run's `Play` was deleted while the run was still live.** That record is the only thing the
+  run can be recovered from, so the operator releases the run's locks and proxy pods and reports
+  the whole run as unknown rather than leaving the plan stuck. The next run reports these hosts
+  normally.
 
 ### A change is not being picked up
 
