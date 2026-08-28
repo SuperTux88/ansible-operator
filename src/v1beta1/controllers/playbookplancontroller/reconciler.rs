@@ -915,6 +915,17 @@ async fn reconcile(
         };
     }
 
+    if let Some(until_next_run) = update_idle_recurring_status(
+        &object.spec.mode,
+        object.spec.schedule.as_deref(),
+        object.spec.suspend,
+        !hosts_to_trigger.is_empty(),
+        now(),
+        &mut resource_status,
+    ) {
+        requeue_after = requeue_after.min(until_next_run);
+    }
+
     if retry_prune {
         requeue_after = prune_retry_after(requeue_after);
     }
@@ -1238,6 +1249,50 @@ fn phase_while_waiting_for_schedule(current: &Phase) -> Phase {
         Phase::Succeeded | Phase::Failed => current.clone(),
         _ => Phase::Delayed,
     }
+}
+
+/// Keeps an idle `Recurring` plan scheduled even when its authorized inventory is empty.
+///
+/// Zero hosts is not work a run can start: [`has_work_to_start`] must keep rejecting it so the
+/// operator neither creates an empty Job nor resumes a `Prepared` run whose hosts disappeared. It
+/// is still a valid observation of a scheduled plan, though, and needs its own status. Otherwise the
+/// start gate also blocks schedule maintenance, leaving the last run's summary and `nextRun`
+/// standing indefinitely after a selector or `NodeAccessPolicy` change removes every host.
+///
+/// The next *future* occurrence is advertised rather than a slot whose grace window is currently
+/// open: there is nothing to run in that slot. Another reconcile can still start the current slot if
+/// hosts return before its grace window closes. A previous verdict remains the phase, following
+/// [`phase_while_waiting_for_schedule`]; the summary is what reports why no run is starting now.
+fn update_idle_recurring_status<Tz: TimeZone>(
+    mode: &ExecutionMode,
+    schedule: Option<&str>,
+    suspend: bool,
+    has_hosts_to_trigger: bool,
+    now: DateTime<Tz>,
+    status: &mut PlaybookPlanStatus,
+) -> Option<std::time::Duration> {
+    if !matches!(mode, ExecutionMode::Recurring)
+        || has_hosts_to_trigger
+        || status.active_run.is_some()
+    {
+        return None;
+    }
+
+    status.summary = Some("plan currently resolves to no hosts".to_string());
+
+    let Some(schedule) = schedule else {
+        status.next_run = None;
+        return None;
+    };
+    if suspend {
+        status.next_run = None;
+        return None;
+    }
+
+    status.phase = phase_while_waiting_for_schedule(&status.phase);
+    let next = forecast_next_run(schedule, now.clone(), None);
+    status.next_run = Some(next.fixed_offset());
+    (next - now).to_std().ok()
 }
 
 /// The other half of the suspension contract: while suspended, the plan advertises no next run. The
@@ -6327,6 +6382,116 @@ spec:
         assert!(has_work_to_start(&ExecutionMode::Recurring, true, true));
         // ...but still only when there are hosts to trigger.
         assert!(!has_work_to_start(&ExecutionMode::Recurring, true, false));
+    }
+
+    #[test]
+    fn an_idle_recurring_plan_without_hosts_still_forecasts_its_next_run() {
+        let now = "2025-08-12T20:00:10Z".parse::<DateTime<Utc>>().unwrap();
+        let next = "2025-08-13T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Succeeded,
+            next_run: Some(
+                "2025-08-12T20:00:00Z"
+                    .parse::<DateTime<FixedOffset>>()
+                    .unwrap(),
+            ),
+            summary: Some("3/3 up-to-date".into()),
+            ..Default::default()
+        };
+
+        let requeue = update_idle_recurring_status(
+            &ExecutionMode::Recurring,
+            Some("0 20 * * *"),
+            false,
+            false,
+            now,
+            &mut status,
+        );
+
+        assert_eq!(status.phase, Phase::Succeeded);
+        assert_eq!(status.next_run, Some(next));
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("plan currently resolves to no hosts")
+        );
+        assert_eq!(requeue, Some(std::time::Duration::from_secs(86_390)));
+
+        let mut never_run = PlaybookPlanStatus::default();
+        update_idle_recurring_status(
+            &ExecutionMode::Recurring,
+            Some("0 20 * * *"),
+            false,
+            false,
+            now,
+            &mut never_run,
+        );
+        assert_eq!(never_run.phase, Phase::Delayed);
+    }
+
+    #[test]
+    fn an_empty_recurring_plan_does_not_override_suspension_or_an_active_run() {
+        let now = "2025-08-12T19:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let old_next = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let mut suspended = PlaybookPlanStatus {
+            phase: Phase::Pending,
+            next_run: Some(old_next),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            update_idle_recurring_status(
+                &ExecutionMode::Recurring,
+                Some("0 20 * * *"),
+                true,
+                false,
+                now,
+                &mut suspended,
+            ),
+            None
+        );
+        assert_eq!(suspended.phase, Phase::Pending);
+        assert_eq!(suspended.next_run, None);
+        assert_eq!(
+            suspended.summary.as_deref(),
+            Some("plan currently resolves to no hosts")
+        );
+
+        let mut active = PlaybookPlanStatus {
+            phase: Phase::Applying,
+            active_run: Some(ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-1".into(),
+                job_name: "apply-plan-1-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: Some(old_next),
+            }),
+            summary: Some("applying run apply-plan-1-1".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            update_idle_recurring_status(
+                &ExecutionMode::Recurring,
+                Some("0 20 * * *"),
+                false,
+                false,
+                now,
+                &mut active,
+            ),
+            None
+        );
+        assert_eq!(active.phase, Phase::Applying);
+        assert_eq!(
+            active.summary.as_deref(),
+            Some("applying run apply-plan-1-1")
+        );
     }
 
     #[test]
