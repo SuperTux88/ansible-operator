@@ -17,6 +17,15 @@ pub enum ReconcileError {
     #[error("Referenced Secret {name:?} does not exist")]
     SecretNotFound { name: String },
 
+    #[error(
+        "{kind} {name:?} already exists but is not this run's managed-ssh proxy for host {host:?}"
+    )]
+    ForeignProxyResource {
+        kind: &'static str,
+        name: String,
+        host: String,
+    },
+
     #[error(transparent)]
     RenderError(#[from] ansible::RenderError),
 
