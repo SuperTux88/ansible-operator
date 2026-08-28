@@ -236,8 +236,11 @@ handful of decisions that are easy to undo by accident:
   `Play`s (which book revision and slot before anything is created) before a new run is prepared.
   Since `maxAttempts` the question is no longer "did a run take this slot" but "is there anything
   left for a run to do in it": a record still `Running` or one that `Succeeded` closes the window,
-  while failures close it only once they have spent the budget. `retry_due` (status) and the record
-  count are both consulted, so pruned history cannot grant a try the status says was spent.
+  while failures close it only once they have spent the budget. `retry_due` closes a window from
+  status only while `lastTriggeredRun` still identifies that slot; when the marker is absent, the
+  retained records decide alone. Pruning every record for an active slot removes that backstop and
+  can admit another try, because `retryCount` by itself cannot distinguish this slot from the
+  previous one.
 - **`spec.suspend` is decided before the inventory is read** (`resolve_unlaunched_before_inputs`),
   for every phase — dropping an unlaunched run needs no inventory, and deferring it would leave a
   suspended plan sitting on its host Leases behind a read that may never succeed. That is why
