@@ -850,6 +850,10 @@ fn extract_file_volumes(
     })
 }
 
+/// Ten symbols matches the run-name discriminator: five has only about 14 million values, and a
+/// collision here leaves a run holding host Leases and proxy pods behind an uncreatable Job.
+const VOLUME_ID_LENGTH: usize = 10;
+
 /// A Pod volume name for the Secret or file entry the volume mounts.
 ///
 /// Volume names are RFC 1123 *labels*: at most 63 characters of `[a-z0-9-]`. The things they are
@@ -860,7 +864,7 @@ fn extract_file_volumes(
 /// with a rejection no retry could ever clear.
 ///
 /// So the name is derived: every character a label cannot carry folded to `-`, truncated to fit, and
-/// a short id of the *original* string appended. The id is what keeps `edge.keys` and `edge-keys`
+/// a ten-symbol id of the *original* string appended. The id is what keeps `edge.keys` and `edge-keys`
 /// apart once folding has made them look alike, and the readable half is what lets somebody reading
 /// `kubectl describe pod` see which Secret a volume belongs to. The names the user actually chose
 /// stay where they are visible and where they are contracts: in `secretName`, and in the mount paths
@@ -868,7 +872,7 @@ fn extract_file_volumes(
 fn volume_name(prefix: &str, source: &str) -> String {
     let mut hasher = twox_hash::XxHash3_64::new();
     source.hash(&mut hasher);
-    let id = utils::generate_id(hasher.finish());
+    let id = utils::generate_id_with_length(hasher.finish(), VOLUME_ID_LENGTH);
 
     // Both separators, so the budget holds whether or not the readable half survives folding.
     let budget = utils::MAX_DNS_LABEL_LEN.saturating_sub(prefix.len() + id.len() + 2);
@@ -966,6 +970,11 @@ mod tests {
 
         // Ordinary names stay readable — the point of not hashing the whole thing.
         assert!(super::volume_name("vars", "app-config").starts_with("vars-app-config-"));
+        // When folding leaves nothing readable, the full ten-symbol discriminator is still present.
+        assert_eq!(
+            super::volume_name("files", "...").len(),
+            "files-".len() + super::VOLUME_ID_LENGTH
+        );
 
         for source in [
             "edge.keys",      // a Secret name is a DNS subdomain: dots are legal
