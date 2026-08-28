@@ -161,17 +161,11 @@ Plays beyond these limits are pruned automatically as new runs finish. The opera
 retention pass on ordinary reconciles if a deletion fails, so a temporary API error does not
 permanently leave old records behind. Deleting the `PlaybookPlan` removes all of its Plays.
 
-These records also backstop the schedule-slot marker when deciding whether a `Recurring` plan may
-retry. If a stale status write loses that marker after every failed record for the active slot has
-been pruned, the remaining retry counter cannot identify which slot spent it and the operator may
-admit another try. When strictly enforcing `maxAttempts` within a tick matters, keep
-`failedPlaysHistoryLimit` at least as large as `maxAttempts`; setting the history limit to zero
-removes this backstop as soon as each failed result is recorded on the plan.
-
 Only *finished* Plays are counted against the history limits, and a finished one is temporarily kept
-until its result has been folded into the plan — so the limits can never discard the only surviving
-copy of a run's recap. Once acknowledged, an old record whose deletion failed remains eligible for
-the next retention pass, including when a history limit is zero. An `Aborted` record is deleted after
+until its complete result, including the terminal phase and retry status, has been persisted on the
+plan — so the limits can never discard the only surviving copy of a run's recap. Once acknowledged,
+an old record whose deletion failed remains eligible for the next retention pass, including when a
+history limit is zero. An `Aborted` record is deleted after
 its resources are cleaned up rather than by history pruning. If cleanup keeps failing, the record
 deliberately remains as the retry handle for resources that may still be privileged. Deleting a Play by
 hand is safe once its
@@ -199,6 +193,13 @@ admin which policy applies to your namespace (see
 [Node access policies](../cluster-operators/node-access-policies.md)). The `ClusterInventory`'s own
 `.status.hostCount` shows how many Nodes match *before* policy clamping, which helps localise the
 problem.
+
+An idle `Recurring` plan does not create an empty Job when this happens. It reports **"plan
+currently resolves to no hosts"** in `.status.summary` and continues to forecast
+`.status.nextRun`. While it is not suspended, a previous run's `Succeeded` or `Failed` phase remains
+visible; a plan that has never run is `Delayed`. If matching, authorized hosts return, the plan can
+run on a later tick or in the current tick's grace window if it reconciles again before that window
+closes.
 
 ### The plan's name is too long
 
@@ -390,8 +391,9 @@ instead, and `.status.activeRun` names the run it is waiting on:
 - **"aborted the run: the plan was suspended before its Job was created"** — `spec.suspend` was set
   while a run was still preparing, so it was dropped rather than left to launch whenever it
   became able to. Unlike the other "aborted the run…" messages this one is a *resting* state: the
-  plan goes to `Pending` and stays there until you resume it. See [Suspending a
-  plan](./scheduling-and-modes.md#suspending-a-plan).
+  plan stays idle until you resume it. It returns to `Pending` if this was the execution's first
+  attempt, or to the preceding `Failed` verdict if an unlaunched retry was dropped. See [Suspending
+  a plan](./scheduling-and-modes.md#suspending-a-plan).
 - **"released the abandoned run …"** — cleanup of a run abandoned by an earlier tick has now
   finished. Only seen after a "could not release the abandoned run …" below, or after a restart
   interrupted a teardown; the plan re-evaluates immediately.

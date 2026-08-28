@@ -44,8 +44,8 @@ jobs:
           test "$(helm template ansible-operator chart --namespace ansible-system | grep -c '^kind: CustomResourceDefinition$')" -eq 5
           test "$(helm template ansible-operator chart --namespace ansible-system --set crds.install=false | grep -c '^kind: CustomResourceDefinition$')" -eq 0
 
-  # Sole validation for ordinary commits (PRs, main pushes): compiles the crate once, in
-  # the test profile, and runs the tests.
+  # Rust-backed validation for ordinary commits (PRs and main pushes): runs the tests and
+  # verifies that the checked-in chart CRDs still match the Rust resource definitions.
   test:
     runs-on: ubuntu-latest
 
@@ -59,6 +59,31 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+      - name: Run Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Verify generated CRDs are current
+        run: |
+          set -euo pipefail
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          mkdir -p "$tmp_dir/templates"
+          cat > "$tmp_dir/annotation" <<'ANNOTATION'
+            {{- if .Values.keep }}
+            annotations:
+              helm.sh/resource-policy: keep
+            {{- end }}
+          ANNOTATION
+          cargo run --quiet -- crds > "$tmp_dir/all-crds.yaml"
+          csplit -z -f "$tmp_dir/crd-" "$tmp_dir/all-crds.yaml" '/^---$/' '{*}' > /dev/null
+          for file in "$tmp_dir"/crd-*; do
+            name="$(grep -m1 '^  name:' "$file" | awk '{print $2}')"
+            sed -i '/^---$/d' "$file"
+            sed -i "/^metadata:$/r $tmp_dir/annotation" "$file"
+            cp "$file" "$tmp_dir/templates/${name}.yaml"
+          done
+          diff -rs "$tmp_dir/templates" chart/charts/crds/templates
 
   # The embedded Python scripts are not compiled by cargo and so are not covered by the job
   # above. Deliberately a job of its own rather than a step in it: it needs no Rust toolchain and

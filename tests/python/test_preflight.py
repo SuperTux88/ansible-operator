@@ -18,6 +18,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = (
     Path(__file__).resolve().parents[2]
@@ -213,6 +214,27 @@ class WaitForTest(unittest.TestCase):
         self.assertEqual(len(pending), len(endpoints))
         self.assertLess(elapsed, 3.0, "batches must share one deadline, not each get their own")
 
+    def test_refused_connection_retries_are_bounded_by_the_poll_interval(self):
+        listener = Listener(lambda connection, stop: None)
+        port = listener.port
+        listener.close()
+        calls = []
+        original_reachable = preflight.reachable
+
+        def counted_reachable(*args):
+            calls.append(args)
+            return original_reachable(*args)
+
+        endpoint = [("node", "127.0.0.1", port)]
+        with mock.patch.object(preflight, "reachable", side_effect=counted_reachable):
+            pending, _ = preflight.wait_for(endpoint, 1.0)
+
+        self.assertEqual(pending, endpoint)
+        self.assertLessEqual(
+            len(calls), int(1.0 / preflight.POLL_INTERVAL_SECONDS) + 1,
+            "a refused connection must not make the polling loop free-run",
+        )
+
 
 class ReadEndpointsTest(unittest.TestCase):
     def write(self, contents):
@@ -240,6 +262,25 @@ class ReadEndpointsTest(unittest.TestCase):
 
     def test_an_empty_file_yields_nothing_to_wait_for(self):
         self.assertEqual(preflight.read_endpoints(self.write("")), [])
+
+    def test_a_malformed_port_is_reported_without_discarding_other_endpoints(self):
+        path = self.write(
+            "node-a\t10.42.1.7\t22\n"
+            "node-b\t10.42.2.8\tnot-a-port\n"
+            "node-c\t10.42.3.9\t2222\n"
+        )
+
+        with mock.patch.object(preflight, "log") as log:
+            endpoints = preflight.read_endpoints(path)
+
+        self.assertEqual(
+            endpoints,
+            [("node-a", "10.42.1.7", 22), ("node-c", "10.42.3.9", 2222)],
+        )
+        log.assert_called_once_with(
+            "ignoring malformed endpoint on line 2: "
+            "'node-b\\t10.42.2.8\\tnot-a-port'"
+        )
 
 
 if __name__ == "__main__":

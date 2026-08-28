@@ -374,10 +374,10 @@ pub struct PlaybookPlanStatus {
     #[schemars(with = "Option<String>")]
     pub next_run: Option<DateTime<FixedOffset>>,
     /// The start of the schedule slot (`Timing::Now`'s window start) that a run was last started
-    /// for. The trigger gate compares the current slot against this so a run that completes inside
-    /// its grace window isn't immediately re-triggered by the next reconcile within that same
-    /// window. Cleared whenever `currentHash` changes, so an edit takes effect inside the window it
-    /// was made in; `None` for unscheduled plans (no slot to dedupe against).
+    /// for. This is the observable run-start marker; the trigger gate also checks the slot-scoped
+    /// retry budget and immutable `Play` records so a lagging marker cannot admit a duplicate run.
+    /// Cleared whenever `currentHash` changes, so an edit takes effect inside the window it was made
+    /// in; `None` for unscheduled plans.
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub last_triggered_run: Option<DateTime<FixedOffset>>,
@@ -408,6 +408,12 @@ pub struct PlaybookPlanStatus {
     #[serde(default)]
     #[schemars(with = "UnsignedInt")]
     pub retry_count: u32,
+    /// The schedule slot to which `retryCount` belongs. Set for scheduled runs and used by
+    /// `Recurring` plans to distinguish retries in the current tick from the first attempt in the
+    /// next one. `None` for an execution that has not started or an unscheduled run.
+    #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
+    #[schemars(with = "Option<String>")]
+    pub retry_count_slot: Option<DateTime<FixedOffset>>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]

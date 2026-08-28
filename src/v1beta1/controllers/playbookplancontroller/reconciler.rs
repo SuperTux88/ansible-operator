@@ -297,6 +297,10 @@ async fn reconcile(
     // needs the resolved, policy-clamped groups its fingerprint covers.
     let mut unlaunched_run: Option<UnlaunchedRun> = None;
     let mut finished_active_run: Option<FinishedRun> = None;
+    // Terminal records stay unacknowledged until the complete plan status has been persisted at the
+    // end of the tick. That keeps their outcomes replayable if any intervening input read or status
+    // write fails.
+    let mut finished_records = Vec::new();
     // Recovery drives the privileged parts of a run (Job creation, proxy infra, locks), so a failure
     // here aborts the tick before the final `patch_status`. Report it on the plan first, otherwise a
     // run that can't be recovered — a rejected Job, a revoked node grant — is only ever visible in
@@ -316,7 +320,6 @@ async fn reconcile(
     // it: the plan is emphatically not finished, so the terminal classification below is skipped,
     // and the schedule window that run holds is what the plan records.
     let mut surviving_run: Option<Box<SurvivingRun>> = None;
-    let mut finalized_run = false;
     // Whether this tick found the plan holding a run at all. Recovery is the only complete answer:
     // a record whose result has not been drained, or one being given up, owns resources while the
     // status mirror may already have moved on — so the finalizer is kept until a tick finds neither.
@@ -360,36 +363,18 @@ async fn reconcile(
                 // Adopted *before* the result is persisted, so the plan never goes a tick describing
                 // a run it is holding with no `activeRun` to reach it by: the mirror is the only
                 // handle `finalize_lost_run` has if that run's record is deleted while it runs.
-                // It also settles what `finalize_finished_run` may give up — the mirror now names a
+                // It also settles what `stage_finished_run` may give up — the mirror now names a
                 // different run than the one finishing, which is exactly when it keeps it.
                 if let Some(surviving) = &surviving {
                     adopt_recovered_run(&mut resource_status, &surviving.run.mirror);
                 }
-                match finalize_finished_run(
-                    &context,
-                    &object,
-                    &api,
-                    &finished,
+                stage_finished_run(&finished, &mut resource_status);
+                finished_records.push(FinishedRecord {
+                    run: finished.clone(),
                     // Drained straight off its own record, which is therefore still there to
-                    // acknowledge — that acknowledgement is what stops it being drained again.
-                    TerminalRecord::Present,
-                    &mut resource_status,
-                )
-                .await
-                {
-                    Ok(prune_failed) => retry_prune |= prune_failed,
-                    Err(error) => {
-                        return Err(report_failed_finalization(
-                            &api,
-                            &object,
-                            &finished,
-                            &mut resource_status,
-                            error,
-                        )
-                        .await);
-                    }
-                }
-                finalized_run = true;
+                    // acknowledge after the complete plan status is durable.
+                    record: TerminalRecord::Present,
+                });
                 finished_active_run = Some(FinishedRun {
                     outcome: status.phase,
                     run: finished,
@@ -464,29 +449,11 @@ async fn reconcile(
             } => {
                 resource_status.summary =
                     Some("previous run finished; evaluating desired revision".to_string());
-                match finalize_finished_run(
-                    &context,
-                    &object,
-                    &api,
-                    &finished,
+                stage_finished_run(&finished, &mut resource_status);
+                finished_records.push(FinishedRecord {
+                    run: finished.clone(),
                     record,
-                    &mut resource_status,
-                )
-                .await
-                {
-                    Ok(prune_failed) => retry_prune |= prune_failed,
-                    Err(error) => {
-                        return Err(report_failed_finalization(
-                            &api,
-                            &object,
-                            &finished,
-                            &mut resource_status,
-                            error,
-                        )
-                        .await);
-                    }
-                }
-                finalized_run = true;
+                });
                 finished_active_run = Some(FinishedRun {
                     run: finished,
                     outcome,
@@ -498,14 +465,15 @@ async fn reconcile(
         }
     }
 
-    // After both finalization paths, because each ends in a retention pass of its own and running
-    // one here as well would list and delete the same history twice on the tick a run completes.
+    // Finished records are retained until the final status patch below, then acknowledged and
+    // pruned. Running a standalone pass here as well would list the same history twice on the tick a
+    // run completes.
     // Restricted to an *idle* plan for the reason in `prune_history`: retention only ever gains work
     // when a run finishes, and a plan with a run in flight is polled every few seconds, so
     // listing its history on each of those ticks is a steady apiserver cost that can find nothing to
     // do. A deletion that failed is retried on the first tick without a run, which is exactly the
     // state the standalone pass exists for.
-    if !finalized_run && resource_status.active_run.is_none() {
+    if finished_records.is_empty() && resource_status.active_run.is_none() {
         retry_prune = prune_history(&context, &object).await;
     }
 
@@ -851,43 +819,38 @@ async fn reconcile(
             Timing::Now(start) => {
                 let this_slot = start.map(|s| s.fixed_offset());
 
-                // The marker first, because it answers from state this tick already holds; the
-                // records only when it settles nothing on its own, so the extra read happens once
-                // per window rather than on every tick of it.
+                // The slot-scoped budget first, because it answers from state this tick already
+                // holds; the records only when it settles nothing on its own, so the extra read
+                // happens once per window rather than on every tick of it.
                 //
-                // What the marker settles is narrower than it looks: it says a run for this window
-                // got a Job, which used to end the question and now only ends it while no retry is
-                // due. A retry *is* a second run for the window, so once one is due the records —
-                // which know what each of those runs did and how many there were — are what decide.
-                let retry_is_due = retry_due(
+                // What the budget settles is narrower than it looks: a finished execution closes
+                // the window, while a failed execution with budget left still needs the records to
+                // decide whether a retry is free, already running, or has succeeded.
+                let window_taken = if retry_budget_closes_window(
                     &resource_status.phase,
                     resource_status.retry_count,
+                    resource_status.retry_count_slot,
+                    this_slot,
                     max_attempts,
-                );
-                let window_taken =
-                    if slot_already_triggered(this_slot, resource_status.last_triggered_run)
-                        && !retry_is_due
-                    {
-                        true
-                    } else if let Some(slot) = this_slot {
-                        schedule_window_already_taken(
-                            &context,
-                            &object,
-                            slot,
-                            &execution_hash,
-                            max_attempts,
-                        )
-                        .await?
-                    } else {
-                        // Unscheduled plans have no window to take. `OneShot` is the only mode that
-                        // gets here, and its budget was already spent at the start gate.
-                        false
-                    };
+                ) {
+                    true
+                } else if let Some(slot) = this_slot {
+                    schedule_window_already_taken(
+                        &context,
+                        &object,
+                        slot,
+                        &execution_hash,
+                        max_attempts,
+                    )
+                    .await?
+                } else {
+                    // Unscheduled plans have no window to take. `OneShot` is the only mode that
+                    // gets here, and its budget was already spent at the start gate.
+                    false
+                };
 
                 if window_taken {
-                    // Writes the marker back when it was the records that answered, so the rest of
-                    // the window is decided from the status again — and so a marker lost to a
-                    // conflicting write is repaired rather than left to be re-derived every tick.
+                    // Keep the observable marker in sync when the records or budget answered.
                     record_triggered_slot(&mut resource_status, this_slot);
                     // A run for this scheduled slot already started within its grace window;
                     // `evaluate_schedule` keeps returning `Now` for the rest of that window, so
@@ -920,8 +883,15 @@ async fn reconcile(
         };
     }
 
-    if retry_prune {
-        requeue_after = prune_retry_after(requeue_after);
+    if let Some(until_next_run) = update_idle_recurring_status(
+        &object.spec.mode,
+        object.spec.schedule.as_deref(),
+        object.spec.suspend,
+        !hosts_to_trigger.is_empty(),
+        now(),
+        &mut resource_status,
+    ) {
+        requeue_after = requeue_after.min(until_next_run);
     }
 
     // Given back the moment the plan holds nothing outside its own namespace, so deleting an idle
@@ -930,13 +900,44 @@ async fn reconcile(
     // it just performed is the last thing that needed the finalizer and one extra tick costs nothing.
     let release_finalizer = !recovered_a_run && resource_status.active_run.is_none();
 
-    patch_status(&api, &object, resource_status).await?;
+    patch_status(&api, &object, resource_status.clone()).await?;
 
-    // After the plan has been told what this tick decided, and never at its expense. This is a
-    // version-checked write (see `patch_finalizers`) against an object the operator has just written
-    // the status of, so it loses that race routinely — and losing it must cost one more tick before
-    // an idle plan can be deleted, not the whole tick's account of the plan. Doing it the other way
-    // round is what left a plan advertising a `nextRun` it would never reach.
+    // The complete terminal verdict, summary, retry budget, and schedule state are durable now.
+    // Only now may the receipts stop recovery from replaying their results. A failed acknowledgement
+    // leaves its record recoverable for the next tick.
+    for finished in &finished_records {
+        if finished.record == TerminalRecord::Present
+            && let Err(error) = play_history::acknowledge_finished(
+                &context.client,
+                namespace,
+                &finished.run.mirror.job_name,
+                &finished.run.mirror.play_uid,
+            )
+            .await
+        {
+            return Err(report_failed_finalization(
+                &api,
+                &object,
+                &finished.run,
+                &mut resource_status,
+                error,
+            )
+            .await);
+        }
+    }
+    if !finished_records.is_empty() {
+        retry_prune |= prune_history(&context, &object).await;
+    }
+    if retry_prune {
+        requeue_after = prune_retry_after(requeue_after);
+    }
+
+    // After the plan has been told what this tick decided and its terminal receipts have been handed
+    // back to history, never at either's expense. This is a version-checked write (see
+    // `patch_finalizers`) against an object the operator has just written the status of, so it loses
+    // that race routinely — and losing it must cost one more tick before an idle plan can be deleted,
+    // not the whole tick's account of the plan. Doing it the other way round is what left a plan
+    // advertising a `nextRun` it would never reach.
     if release_finalizer && let Err(error) = drop_run_cleanup_finalizer(&api, &object).await {
         if !error.is_conflict() {
             return Err(error);
@@ -951,19 +952,18 @@ async fn reconcile(
     Ok(Action::requeue(requeue_after))
 }
 
-/// Whether the current schedule slot (`start`, the grace window's start) already had a run started
-/// for it, per the persisted `last_triggered_run`. Unscheduled ticks carry no slot (`None`) and are
-/// never suppressed — there is nothing to dedupe against. `DateTime` equality compares instants, so
-/// the offset the two timestamps carry is irrelevant.
+/// Whether the current schedule slot (`start`, the grace window's start) is the recorded slot.
+/// Unscheduled ticks carry no slot (`None`) and never match — there is nothing to identify.
+/// `DateTime` equality compares instants, so the offset the two timestamps carry is irrelevant.
 ///
-/// The slot alone is the whole dedupe key: `update_desired_hash` clears it whenever the desired
-/// revision moves, so an edit takes effect inside the window it was made in, and reverting to an
-/// earlier revision is a change like any other and runs again.
+/// The slot alone is the whole comparison key. Both status markers that carry one are cleared when
+/// `update_desired_hash` moves to a new desired revision, so an edit takes effect inside the window
+/// it was made in, and reverting to an earlier revision is a change like any other and runs again.
 fn slot_already_triggered(
     start: Option<DateTime<FixedOffset>>,
-    last_triggered_run: Option<DateTime<FixedOffset>>,
+    recorded_slot: Option<DateTime<FixedOffset>>,
 ) -> bool {
-    start.is_some() && start == last_triggered_run
+    start.is_some() && start == recorded_slot
 }
 
 /// The second half of the start gate: whether one of this plan's own `Play` records already took
@@ -1014,11 +1014,10 @@ async fn schedule_window_already_taken(
 /// once its Job is known to be absent — and cannot be seen here anyway: a record still in flight is
 /// dispatched long before the start gate is reached.
 ///
-/// Counting the failures here rather than trusting `status.retryCount` alone is what keeps the
-/// window honest when the status lags: the marker and the counter are both written onto a status
-/// read from the reflector cache, while the records are written before anything a run creates. The
-/// counter is still consulted by the caller, so history pruning cannot *grant* tries the status says
-/// were already spent — the two gates only ever agree to a run when both do.
+/// Counting the failures here rather than trusting status alone is what keeps the window honest when
+/// the status lags: the records are written before anything a run creates. The caller's
+/// `retryCountSlot`-scoped counter remains authoritative after those records are pruned, so retention
+/// cannot hand back tries the status says this slot already spent.
 fn window_taken_by_a_record(
     plays: &[Play],
     plan: &PlaybookPlan,
@@ -1115,9 +1114,9 @@ fn validate_file_entries(plan: &PlaybookPlan) -> Result<(), ReconcileError> {
 ///     gated purely on there being outdated hosts left (which is exactly `has_hosts_to_trigger`).
 ///   - Recurring runs on every schedule tick regardless of host hashes (a successful run marks all
 ///     hosts up-to-date, so an outdated-based gate would fire once and never again). It's gated only
-///     on having a schedule to tick on; slot dedup via `last_triggered_run` is what stops a single
-///     tick from starting more than one run, and without a schedule there'd be no slot to dedup
-///     against — it would busy-loop. That's why the schedule check lives here.
+///     on having a schedule to tick on; the slot-scoped budget and run records stop a single tick
+///     from starting more runs than its budget, and without a schedule there'd be no slot to scope
+///     that budget to — it would busy-loop. That's why the schedule check lives here.
 ///
 /// Deliberately excludes `spec.suspend`. Suspending has to drop a run that has not launched
 /// yet, and that decision is made *before* the inventory is resolved
@@ -1191,20 +1190,36 @@ fn retry_due(phase: &Phase, tries_spent: u32, max_attempts: u32) -> bool {
     phase == &Phase::Failed && tries_spent < max_attempts
 }
 
+/// Whether the persisted attempt budget proves that the current schedule window has no run left to
+/// start. The slot makes `retryCount` self-describing after its `Play` records have been pruned.
+fn retry_budget_closes_window(
+    phase: &Phase,
+    tries_spent: u32,
+    budget_slot: Option<DateTime<FixedOffset>>,
+    current_slot: Option<DateTime<FixedOffset>>,
+    max_attempts: u32,
+) -> bool {
+    tries_spent > 0
+        && slot_already_triggered(current_slot, budget_slot)
+        && !retry_due(phase, tries_spent, max_attempts)
+}
+
 /// Which try a run about to start is, from the budget the plan has already spent.
 ///
 /// A `Recurring` run reaching a tick the plan has not run for starts a new execution and so a new
-/// budget; every other run continues the one in progress. `OneShot` has no ticks to divide its
-/// revision into, and gets a fresh budget only from an edit (`update_desired_hash`) — including when
-/// it has a schedule, since a schedule says when a `OneShot` plan may run, not how often it may fail.
+/// budget; every other run continues the one in progress. The budget's own slot, rather than the
+/// separately persisted run-start marker, identifies that execution. `OneShot` has no ticks to
+/// divide its revision into, and gets a fresh budget only from an edit (`update_desired_hash`) —
+/// including when it has a schedule, since a schedule says when a `OneShot` plan may run, not how
+/// often it may fail.
 fn next_attempt(
     mode: &ExecutionMode,
     tries_spent: u32,
     slot: Option<DateTime<FixedOffset>>,
-    last_triggered_run: Option<DateTime<FixedOffset>>,
+    retry_count_slot: Option<DateTime<FixedOffset>>,
 ) -> u32 {
-    let new_execution = matches!(mode, ExecutionMode::Recurring)
-        && !slot_already_triggered(slot, last_triggered_run);
+    let new_execution =
+        matches!(mode, ExecutionMode::Recurring) && !slot_already_triggered(slot, retry_count_slot);
     if new_execution {
         1
     } else {
@@ -1229,6 +1244,50 @@ fn phase_while_waiting_for_schedule(current: &Phase) -> Phase {
         Phase::Succeeded | Phase::Failed => current.clone(),
         _ => Phase::Delayed,
     }
+}
+
+/// Keeps an idle `Recurring` plan scheduled even when its authorized inventory is empty.
+///
+/// Zero hosts is not work a run can start: [`has_work_to_start`] must keep rejecting it so the
+/// operator neither creates an empty Job nor resumes a `Prepared` run whose hosts disappeared. It
+/// is still a valid observation of a scheduled plan, though, and needs its own status. Otherwise the
+/// start gate also blocks schedule maintenance, leaving the last run's summary and `nextRun`
+/// standing indefinitely after a selector or `NodeAccessPolicy` change removes every host.
+///
+/// The next *future* occurrence is advertised rather than a slot whose grace window is currently
+/// open: there is nothing to run in that slot. Another reconcile can still start the current slot if
+/// hosts return before its grace window closes. A previous verdict remains the phase, following
+/// [`phase_while_waiting_for_schedule`]; the summary is what reports why no run is starting now.
+fn update_idle_recurring_status<Tz: TimeZone>(
+    mode: &ExecutionMode,
+    schedule: Option<&str>,
+    suspend: bool,
+    has_hosts_to_trigger: bool,
+    now: DateTime<Tz>,
+    status: &mut PlaybookPlanStatus,
+) -> Option<std::time::Duration> {
+    if !matches!(mode, ExecutionMode::Recurring)
+        || has_hosts_to_trigger
+        || status.active_run.is_some()
+    {
+        return None;
+    }
+
+    status.summary = Some("plan currently resolves to no hosts".to_string());
+
+    let Some(schedule) = schedule else {
+        status.next_run = None;
+        return None;
+    };
+    if suspend {
+        status.next_run = None;
+        return None;
+    }
+
+    status.phase = phase_while_waiting_for_schedule(&status.phase);
+    let next = forecast_next_run(schedule, now.clone(), None);
+    status.next_run = Some(next.fixed_offset());
+    (next - now).to_std().ok()
 }
 
 /// The other half of the suspension contract: while suspended, the plan advertises no next run. The
@@ -1628,7 +1687,7 @@ async fn try_start_run(
                 &object.spec.mode,
                 resource_status.retry_count,
                 run.triggered_slot,
-                resource_status.last_triggered_run,
+                resource_status.retry_count_slot,
             );
             // The recorded inventory — not `hosts_to_trigger` — is what every later step reads the
             // run's host set back from, so it is also what the initial host count is taken from.
@@ -1657,7 +1716,11 @@ async fn try_start_run(
     resource_status.last_run_number = active_run.mirror.run_number;
     // From the record either way: a resumed run's try was numbered on the tick that prepared it, and
     // re-deriving it here would hand its budget back on every tick it spends waiting for locks.
-    resource_status.retry_count = active_run.mirror.attempt;
+    record_retry_budget(
+        resource_status,
+        active_run.mirror.attempt,
+        active_run.mirror.triggered_slot,
+    );
     resource_status.phase = Phase::Applying;
     resource_status.summary = Some(applying_summary(&active_run.mirror));
     resource_status.next_run = None;
@@ -1991,7 +2054,7 @@ fn own_record(found: Option<Play>, expected_uid: &str) -> Option<Play> {
 }
 
 /// Whether the plan's `activeRun` mirror is `run`'s — the question both paths that *stop* driving a
-/// run have to answer before clearing it ([`finalize_finished_run`], [`abandon_run`]).
+/// run have to answer before clearing it ([`stage_finished_run`], [`abandon_run`]).
 ///
 /// An absent mirror answers yes: the tick that finishes a run clears it before either path is reached
 /// (`advance_active_run`), and that case still has to reset the phase. What the guard excludes is a mirror
@@ -2014,18 +2077,44 @@ fn mirrors_run(status: &PlaybookPlanStatus, run: &RecordedRun) -> bool {
 /// A run spends its attempt while it is prepared so recovery cannot offer the same budget twice
 /// while it waits for locks or proxy pods. If it is abandoned before its Job exists, that attempt
 /// was never made and is returned here. The revision, attempt and mirror guards make replay a no-op
-/// and prevent an old aborted record from returning a newer run's budget.
+/// and prevent an old aborted record from returning a newer run's budget. Returning a retry restores
+/// the preceding `Failed` verdict, which is what keeps the remaining budget available; a first try
+/// has no preceding verdict and returns to `Pending`.
 fn apply_abandoned_run_status(status: &mut PlaybookPlanStatus, run: &RecordedRun) {
     if !mirrors_run(status, run) {
         return;
     }
 
-    if status.current_hash == run.mirror.execution_hash && status.retry_count == run.mirror.attempt
-    {
-        status.retry_count = run.mirror.attempt.saturating_sub(1);
+    let retiring_mirrored_run = status
+        .active_run
+        .as_ref()
+        .is_some_and(|mirrored| mirrored.play_uid == run.mirror.play_uid);
+    let remaining_attempts = run.mirror.attempt.saturating_sub(1);
+    let remaining_slot = if remaining_attempts == 0 {
+        None
+    } else {
+        run.mirror.triggered_slot
+    };
+    let same_execution = status.current_hash == run.mirror.execution_hash;
+    let refund_due = same_execution
+        && status.retry_count == run.mirror.attempt
+        && status.retry_count_slot == run.mirror.triggered_slot;
+    let already_refunded = same_execution
+        && status.retry_count == remaining_attempts
+        && status.retry_count_slot == remaining_slot;
+    if refund_due {
+        record_retry_budget(status, remaining_attempts, remaining_slot);
+    }
+    if refund_due || already_refunded {
+        status.phase = if remaining_attempts > 0 {
+            Phase::Failed
+        } else {
+            Phase::Pending
+        };
+    } else if retiring_mirrored_run {
+        status.phase = Phase::Pending;
     }
     status.active_run = None;
-    status.phase = Phase::Pending;
     status.next_run = None;
 }
 
@@ -2400,16 +2489,16 @@ async fn resume_launching_run(
 /// makes the cleanup retryable, so it must outlive every step that can fail.
 ///
 /// `reason` becomes the plan's summary, and taking it as a parameter is what makes that
-/// unconditional. The phase this leaves behind (`Pending`) says only that nothing is happening, and
-/// a plan can rest there indefinitely — a suspended one, or a `OneShot` with nothing left to do —
-/// so an abandon that wrote no summary would leave whatever the last one happened to say standing
-/// as the explanation for a state it does not describe.
+/// unconditional. The phase this leaves behind says only whether an earlier failed try still has
+/// budget; it cannot explain why the current run stopped. An abandon that wrote no summary would
+/// therefore leave whatever the last one happened to say standing as the explanation for a state it
+/// does not describe.
 ///
 /// Both fallible steps report themselves on the plan before handing the error back. This is the path
 /// that gives up a run's node-root proxy pods and host Leases, so "it did not work" has to be
 /// readable on the resource too, not only in the operator's log.
 ///
-/// The mirror is given up only when it is *this* run's, exactly as in [`finalize_finished_run`]: it
+/// The mirror is given up only when it is *this* run's, exactly as in [`stage_finished_run`]: it
 /// is what lets the operator release a run whose `Play` was deleted out from under it
 /// ([`finalize_lost_run`]), so clearing it for a run it does not describe would leave that run's
 /// host Leases and node-root proxy pods with nothing pointing at them. Every caller reached through
@@ -2477,9 +2566,10 @@ async fn report_failed_abandon(
 ///
 /// Covers everything between "the Job reached a terminal state" and "the record has been handed back
 /// to history": releasing the run's proxy pods and host Leases, stamping the recap onto its `Play`,
-/// persisting that to the plan, and acknowledging it. Until those succeed, the run still owns
-/// node-root resources — so the plan must say so rather than standing at "applying run …" while only
-/// the log knows. They are all retried through the run's recovery record.
+/// persisting that to the plan, and acknowledging it. Cleanup failures leave privileged resources to
+/// recover; acknowledgement failures happen after cleanup and leave the terminal record replayable.
+/// Either way the plan reports the incomplete boundary rather than leaving the diagnosis only in the
+/// log.
 ///
 /// Deliberately *not* reached by a failure of the retention pass that follows acknowledgement. By
 /// then the run is genuinely complete: its recap is on the plan and its record is acknowledged, so
@@ -2545,17 +2635,14 @@ fn record_failed_run_preparation(
     ));
 }
 
-/// The history-retention pass, run either as the last step of [`finalize_finished_run`] or — on a
-/// tick that finalized nothing and has no run in flight — standalone from `reconcile`. The two are
+/// The history-retention pass, run either after finished records are acknowledged or — on a tick
+/// that finalized nothing and has no run in flight — standalone from `reconcile`. The two are
 /// mutually exclusive, so the tick a run completes does not also list and delete the same history
 /// standalone.
 ///
-/// That is not the same as "once per tick", and it is worth not claiming it is. One tick can finalize
-/// *two* runs — a terminal record queued behind a live run is drained first, and the run it
-/// was queued behind can reach its own terminal state in the same tick — and each finalization prunes
-/// after acknowledging its own result. The second pass is a redundant list on a rare tick rather than
-/// a correctness problem: the pass is idempotent, and it has to follow acknowledgement, so it cannot
-/// simply be hoisted out of finalization and run once at the end.
+/// One tick can finish *two* runs — a terminal record queued behind a live run is drained first, and
+/// the run it was queued behind can reach its own terminal state in the same tick. Both records are
+/// acknowledged after the complete status write, then one retention pass handles them together.
 ///
 /// It has to be reachable from an ordinary reconcile and not only from finalization: a terminal
 /// Play is acknowledged *before* the pass that would delete it, so a deletion that fails leaves an
@@ -3339,7 +3426,7 @@ fn update_desired_hash(status: &mut PlaybookPlanStatus, execution_hash: &Executi
     status.last_run_number = 0;
     // A new revision is a new execution, and its budget is its own: the tries the previous one spent
     // say nothing about a playbook that has since been fixed.
-    status.retry_count = 0;
+    record_retry_budget(status, 0, None);
     // Clearing the slot is what lets an edit take effect inside the very window it was made in: the
     // dedupe exists to stop one revision re-triggering itself, not to stop a different one from
     // running. Reverting to an earlier revision is a change like any other, so it runs again too.
@@ -3370,7 +3457,7 @@ fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usi
 fn adopt_recovered_run(status: &mut PlaybookPlanStatus, active_run: &ActiveRun) {
     if status.current_hash == active_run.execution_hash {
         status.last_run_number = status.last_run_number.max(active_run.run_number);
-        status.retry_count = active_run.attempt;
+        record_retry_budget(status, active_run.attempt, active_run.triggered_slot);
     }
     status.phase = Phase::Applying;
     status.summary = Some(applying_summary(active_run));
@@ -3445,17 +3532,15 @@ struct FinishedRun {
     outcome: v1beta1::PlayPhase,
 }
 
-/// Persists a run's terminal result and hands its record back to history. Returns whether the
-/// closing retention pass failed and should be retried with a shortened requeue — see
-/// [`prune_history`] for why that is a return value rather than an error.
-///
-/// The plan is written **first** and the record acknowledged **second**, so a crash in between
-/// replays the (idempotent) result rather than losing it. History pruning follows acknowledgement and
-/// is also retried independently on ordinary reconciles once nothing is in flight, so a deletion
-/// failure cannot block the run's result from being durable or leave old records behind forever. Persisting before the caller goes on
-/// to resolve the replacement revision also means a broken new inventory cannot make the completed run
-/// look active again on the next tick. Both the tick that finishes a run and the tick that recovers an
-/// already-finished one come through here, so that ordering cannot drift between them.
+struct FinishedRecord {
+    run: RecordedRun,
+    record: TerminalRecord,
+}
+
+/// Stages a finished run for the remainder of the reconcile. Its terminal record is deliberately
+/// left unacknowledged until the final status patch has persisted the complete verdict, summary,
+/// retry budget, and schedule state. Any failure before that boundary therefore replays the record
+/// on the next tick instead of stranding the plan in a provisional phase.
 ///
 /// The mirror is only given up when it is *this* run's. A terminal result is drained ahead of
 /// anything live (`recover_active_run`), so the plan may well still be mirroring a different run
@@ -3464,64 +3549,37 @@ struct FinishedRun {
 /// would leave that run's host Leases and node-root proxy pods with nothing pointing at them.
 /// The drain path adopts the surviving run before calling this, so an absent mirror there means
 /// there is genuinely nothing left in flight rather than a plan that has not caught up.
-async fn finalize_finished_run(
-    context: &ReconciliationContext,
-    object: &PlaybookPlan,
-    api: &Api<PlaybookPlan>,
-    finished: &RecordedRun,
-    record: TerminalRecord,
-    resource_status: &mut PlaybookPlanStatus,
-) -> Result<bool, ReconcileError> {
-    let (namespace, _) = namespace_and_name(object)?;
-
+fn stage_finished_run(finished: &RecordedRun, resource_status: &mut PlaybookPlanStatus) {
     if mirrors_run(resource_status, finished) {
         resource_status.active_run = None;
-        resource_status.phase = Phase::Pending;
         resource_status.next_run = None;
     }
-    patch_status(api, object, resource_status.clone()).await?;
-
-    // A run finalized without its record has nothing to acknowledge, and must not try: the name may
-    // now hold a *replacement* run's `Play`, and a version-checked write aimed at that would fail
-    // as "Play UID changed" — reporting a teardown problem for a run that is complete, and delaying
-    // the replacement's own recovery by a tick. Retention still runs: the plan gained a result.
-    if record == TerminalRecord::Present {
-        play_history::acknowledge_finished(
-            &context.client,
-            namespace,
-            &finished.mirror.job_name,
-            &finished.mirror.play_uid,
-        )
-        .await?;
-    }
-    Ok(prune_history(context, object).await)
 }
 
 /// Folds a finished run's revision bookkeeping into the plan.
 ///
 /// `surviving` is the *different* run the plan still holds behind this result, if any — a
 /// terminal record is drained ahead of anything live, so a tick can apply one run's outcome while
-/// another is genuinely running. `lastTriggeredRun` is the sole dedupe key for "one run per schedule
-/// window", so it has to describe the newest run of the desired revision the plan is holding:
-/// stamping the finished run's window over a live run's would describe a run that is already
-/// over. That is taken from the surviving run's own record rather than from whatever the last
-/// status write left behind, because a tick that failed between marking the run `Running` and
-/// patching the plan leaves the *previous* run's slot standing. A surviving run with no slot of
-/// its own consumed none, so the finished run's remains the newest window there was.
+/// another is genuinely running. `lastTriggeredRun` has to describe the newest run of the desired
+/// revision the plan is holding: stamping the finished run's window over a live run's would describe
+/// a run that is already over. That is taken from the surviving run's own record rather than from
+/// whatever the last status write left behind, because a tick that failed between marking the run
+/// `Running` and patching the plan leaves the *previous* run's slot standing. A surviving run with
+/// no slot of its own consumed none, so the finished run's remains the newest window there was.
 ///
 /// The run number is claimed either way, because it answers a different question: it reserves a
 /// name against every later run, and a finished run holds its number whatever else is in flight.
 /// The attempt is not a high-water mark: a new `Recurring` slot restarts it, so the current-revision
 /// surviving run is authoritative when present, and the finished run is authoritative otherwise.
+/// Its slot travels with it so a pruned record cannot leave an unscoped count behind.
 fn sync_desired_hash_after_finished_run(
     status: &mut PlaybookPlanStatus,
     desired_hash: &ExecutionHash,
     finished: &RecordedRun,
     surviving: Option<&SurvivingRun>,
 ) {
-    // Clears the slot when the desired revision has moved on, so the replacement can start inside
-    // the window the finished run used. When it hasn't, the slot is re-recorded below instead, which
-    // is what stops a run that completes inside its own grace window from re-triggering itself.
+    // Clears the schedule bookkeeping when the desired revision has moved on, so the replacement can
+    // start inside the window the finished run used. When it hasn't, the slots are re-recorded below.
     update_desired_hash(status, desired_hash);
     let surviving_slot = surviving
         .filter(|surviving| {
@@ -3539,13 +3597,30 @@ fn sync_desired_hash_after_finished_run(
         record_triggered_slot(status, surviving_slot);
     }
 
-    if let Some(attempt) = surviving
+    if let Some((attempt, slot)) = surviving
         .filter(|surviving| surviving.run.execution_hash == *desired_hash)
-        .map(|surviving| surviving.run.mirror.attempt)
-        .or_else(|| (finished.execution_hash == *desired_hash).then_some(finished.mirror.attempt))
+        .map(|surviving| {
+            (
+                surviving.run.mirror.attempt,
+                surviving.run.mirror.triggered_slot,
+            )
+        })
+        .or_else(|| {
+            (finished.execution_hash == *desired_hash)
+                .then_some((finished.mirror.attempt, finished.mirror.triggered_slot))
+        })
     {
-        status.retry_count = attempt;
+        record_retry_budget(status, attempt, slot);
     }
+}
+
+fn record_retry_budget(
+    status: &mut PlaybookPlanStatus,
+    attempts: u32,
+    slot: Option<DateTime<FixedOffset>>,
+) {
+    status.retry_count = attempts;
+    status.retry_count_slot = slot;
 }
 
 fn record_triggered_slot(status: &mut PlaybookPlanStatus, slot: Option<DateTime<FixedOffset>>) {
@@ -5428,11 +5503,11 @@ mod tests {
         assert_ne!(TerminalRecord::Lost, TerminalRecord::Present);
     }
 
-    /// The guard both `finalize_finished_run` and `abandon_run` clear the mirror behind. A mirror
+    /// The guard both `stage_finished_run` and `abandon_run` clear the mirror behind. A mirror
     /// naming a *different* run is the one thing that must survive: it is genuinely in flight,
     /// and it is the only handle `finalize_lost_run` has for releasing its host Leases and node-root
     /// proxy pods if its `Play` is deleted. An absent mirror still answers yes, because the tick that
-    /// finishes a run clears it before either path runs and the phase reset still has to happen.
+    /// finishes a run clears it before either path runs and terminal staging still has to happen.
     #[test]
     fn only_the_mirror_describing_this_run_is_given_up_with_it() {
         let run = |play_uid: &str| RecordedRun {
@@ -5457,7 +5532,7 @@ mod tests {
         assert!(mirrors_run(&mirroring(Some(&this_run)), &this_run));
         assert!(
             mirrors_run(&mirroring(None), &this_run),
-            "an already-cleared mirror still has to reach the phase reset"
+            "an already-cleared mirror still has to reach terminal staging"
         );
         assert!(
             !mirrors_run(&mirroring(Some(&run("other-play-uid"))), &this_run),
@@ -5479,6 +5554,41 @@ mod tests {
         );
     }
 
+    /// Staging happens before desired inputs, retry state, and scheduling have been evaluated. It
+    /// must therefore only retire this run's mirror; publishing a provisional `Pending` phase here
+    /// would make that phase durable before the terminal record can safely be acknowledged.
+    #[test]
+    fn terminal_staging_does_not_publish_a_provisional_phase() {
+        let run = RecordedRun {
+            execution_hash: ExecutionHash::from_hex("1").unwrap(),
+            mirror: ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-1".into(),
+                job_name: "apply-web-abc-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: None,
+            },
+        };
+        let next_run = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let mut status = PlaybookPlanStatus {
+            active_run: Some(run.mirror.clone()),
+            phase: Phase::Applying,
+            next_run: Some(next_run),
+            ..Default::default()
+        };
+
+        stage_finished_run(&run, &mut status);
+
+        assert!(status.active_run.is_none());
+        assert_eq!(status.phase, Phase::Applying);
+        assert_eq!(status.next_run, None);
+    }
+
     #[test]
     fn an_abandoned_run_returns_only_its_own_unspent_attempt() {
         let run = |hash: &str, play_uid: &str, attempt: u32| RecordedRun {
@@ -5494,10 +5604,15 @@ mod tests {
                 triggered_slot: None,
             },
         };
-        let abandoned = run("1", "abandoned", 3);
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let mut abandoned = run("1", "abandoned", 3);
+        abandoned.mirror.triggered_slot = Some(slot);
         let status = |mirrored: &RecordedRun| PlaybookPlanStatus {
             current_hash: "1".into(),
-            retry_count: 3,
+            retry_count: mirrored.mirror.attempt,
+            retry_count_slot: mirrored.mirror.triggered_slot,
             last_run_number: 8,
             phase: Phase::Applying,
             active_run: Some(mirrored.mirror.clone()),
@@ -5507,22 +5622,42 @@ mod tests {
         let mut matching = status(&abandoned);
         apply_abandoned_run_status(&mut matching, &abandoned);
         assert_eq!(matching.retry_count, 2);
+        assert_eq!(matching.retry_count_slot, Some(slot));
         assert_eq!(matching.last_run_number, 8);
-        assert_eq!(matching.phase, Phase::Pending);
+        assert_eq!(matching.phase, Phase::Failed);
         assert!(matching.active_run.is_none());
+        assert!(!retry_budget_closes_window(
+            &matching.phase,
+            matching.retry_count,
+            matching.retry_count_slot,
+            Some(slot),
+            3,
+        ));
 
         apply_abandoned_run_status(&mut matching, &abandoned);
         assert_eq!(matching.retry_count, 2, "replay must not refund twice");
+        assert_eq!(matching.phase, Phase::Failed);
+
+        matching.active_run = Some(abandoned.mirror.clone());
+        apply_abandoned_run_status(&mut matching, &abandoned);
+        assert_eq!(
+            matching.retry_count, 2,
+            "a stale mirror must not refund twice"
+        );
+        assert_eq!(matching.phase, Phase::Failed);
+        assert!(matching.active_run.is_none());
 
         let mut newer_attempt = status(&abandoned);
         newer_attempt.retry_count = 4;
         apply_abandoned_run_status(&mut newer_attempt, &abandoned);
         assert_eq!(newer_attempt.retry_count, 4);
+        assert_eq!(newer_attempt.retry_count_slot, Some(slot));
 
         let mut newer_revision = status(&abandoned);
         newer_revision.current_hash = "2".into();
         apply_abandoned_run_status(&mut newer_revision, &abandoned);
         assert_eq!(newer_revision.retry_count, 3);
+        assert_eq!(newer_revision.retry_count_slot, Some(slot));
 
         let surviving = run("1", "surviving", 3);
         let mut different_mirror = status(&surviving);
@@ -5536,6 +5671,14 @@ mod tests {
                 .map(|run| run.play_uid.as_str()),
             Some("surviving")
         );
+
+        let mut first_attempt = run("1", "first", 1);
+        first_attempt.mirror.triggered_slot = Some(slot);
+        let mut first_status = status(&first_attempt);
+        apply_abandoned_run_status(&mut first_status, &first_attempt);
+        assert_eq!(first_status.retry_count, 0);
+        assert_eq!(first_status.retry_count_slot, None);
+        assert_eq!(first_status.phase, Phase::Pending);
     }
 
     /// The finalizer edits must be surgical: the list they rewrite also holds Kubernetes' own
@@ -6275,6 +6418,116 @@ spec:
     }
 
     #[test]
+    fn an_idle_recurring_plan_without_hosts_still_forecasts_its_next_run() {
+        let now = "2025-08-12T20:00:10Z".parse::<DateTime<Utc>>().unwrap();
+        let next = "2025-08-13T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Succeeded,
+            next_run: Some(
+                "2025-08-12T20:00:00Z"
+                    .parse::<DateTime<FixedOffset>>()
+                    .unwrap(),
+            ),
+            summary: Some("3/3 up-to-date".into()),
+            ..Default::default()
+        };
+
+        let requeue = update_idle_recurring_status(
+            &ExecutionMode::Recurring,
+            Some("0 20 * * *"),
+            false,
+            false,
+            now,
+            &mut status,
+        );
+
+        assert_eq!(status.phase, Phase::Succeeded);
+        assert_eq!(status.next_run, Some(next));
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("plan currently resolves to no hosts")
+        );
+        assert_eq!(requeue, Some(std::time::Duration::from_secs(86_390)));
+
+        let mut never_run = PlaybookPlanStatus::default();
+        update_idle_recurring_status(
+            &ExecutionMode::Recurring,
+            Some("0 20 * * *"),
+            false,
+            false,
+            now,
+            &mut never_run,
+        );
+        assert_eq!(never_run.phase, Phase::Delayed);
+    }
+
+    #[test]
+    fn an_empty_recurring_plan_does_not_override_suspension_or_an_active_run() {
+        let now = "2025-08-12T19:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let old_next = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let mut suspended = PlaybookPlanStatus {
+            phase: Phase::Pending,
+            next_run: Some(old_next),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            update_idle_recurring_status(
+                &ExecutionMode::Recurring,
+                Some("0 20 * * *"),
+                true,
+                false,
+                now,
+                &mut suspended,
+            ),
+            None
+        );
+        assert_eq!(suspended.phase, Phase::Pending);
+        assert_eq!(suspended.next_run, None);
+        assert_eq!(
+            suspended.summary.as_deref(),
+            Some("plan currently resolves to no hosts")
+        );
+
+        let mut active = PlaybookPlanStatus {
+            phase: Phase::Applying,
+            active_run: Some(ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-1".into(),
+                job_name: "apply-plan-1-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: Some(old_next),
+            }),
+            summary: Some("applying run apply-plan-1-1".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            update_idle_recurring_status(
+                &ExecutionMode::Recurring,
+                Some("0 20 * * *"),
+                false,
+                false,
+                now,
+                &mut active,
+            ),
+            None
+        );
+        assert_eq!(active.phase, Phase::Applying);
+        assert_eq!(
+            active.summary.as_deref(),
+            Some("applying run apply-plan-1-1")
+        );
+    }
+
+    #[test]
     fn a_plan_waiting_for_its_first_run_is_delayed_and_then_keeps_its_verdict() {
         // Nothing has been applied under this revision yet — an untouched plan, one whose edit just
         // reset it, and one whose run was given up before it launched all read the same way.
@@ -6588,6 +6841,8 @@ spec:
             phase: Phase::Applying,
             last_run_number: 1,
             last_triggered_run: Some(slot),
+            retry_count: 1,
+            retry_count_slot: Some(slot),
             ..Default::default()
         };
 
@@ -6597,6 +6852,8 @@ spec:
         assert_eq!(status.phase, Phase::Applying);
         assert_eq!(status.last_run_number, 0);
         assert_eq!(status.last_triggered_run, None);
+        assert_eq!(status.retry_count, 0);
+        assert_eq!(status.retry_count_slot, None);
         assert_eq!(
             status.active_run.as_ref().unwrap().execution_hash,
             old_hash.to_string()
@@ -6616,12 +6873,16 @@ spec:
             phase: Phase::Succeeded,
             last_run_number: 3,
             last_triggered_run: Some(slot),
+            retry_count: 2,
+            retry_count_slot: Some(slot),
             ..Default::default()
         };
         update_desired_hash(&mut idle, &new_hash);
         assert_eq!(idle.phase, Phase::Pending);
         assert_eq!(idle.last_run_number, 0);
         assert_eq!(idle.last_triggered_run, None);
+        assert_eq!(idle.retry_count, 0);
+        assert_eq!(idle.retry_count_slot, None);
     }
 
     /// A plan that cannot read its own inputs must not keep advertising the last run's verdict. The
@@ -6794,6 +7055,9 @@ spec:
     /// replacement's first run skip numbers for no reason.
     #[test]
     fn a_recovered_run_is_readopted_and_keeps_its_number_only_for_its_own_revision() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
         let active_run = ActiveRun {
             execution_hash: "1".into(),
             run_id: "run-1".into(),
@@ -6802,7 +7066,7 @@ spec:
             hosts: vec!["worker-1".into()],
             run_number: 4,
             attempt: 4,
-            triggered_slot: None,
+            triggered_slot: Some(slot),
         };
         let mut matching = PlaybookPlanStatus {
             current_hash: "1".into(),
@@ -6813,6 +7077,7 @@ spec:
         adopt_recovered_run(&mut matching, &active_run);
         assert_eq!(matching.last_run_number, 4);
         assert_eq!(matching.retry_count, 4);
+        assert_eq!(matching.retry_count_slot, Some(slot));
         assert_eq!(matching.phase, Phase::Applying);
         assert_eq!(
             matching
@@ -6826,11 +7091,16 @@ spec:
             current_hash: "2".into(),
             last_run_number: 0,
             retry_count: 2,
+            retry_count_slot: Some(slot - chrono::Duration::days(1)),
             ..Default::default()
         };
         adopt_recovered_run(&mut replacement, &active_run);
         assert_eq!(replacement.last_run_number, 0);
         assert_eq!(replacement.retry_count, 2);
+        assert_eq!(
+            replacement.retry_count_slot,
+            Some(slot - chrono::Duration::days(1))
+        );
         assert!(replacement.active_run.is_some());
     }
 
@@ -6909,6 +7179,7 @@ spec:
         );
         assert_eq!(status.phase, Phase::Applying);
         assert_eq!(status.retry_count, 2);
+        assert_eq!(status.retry_count_slot, None);
         assert_eq!(status.last_run_number, 4);
         assert_eq!(
             status
@@ -7200,6 +7471,7 @@ spec:
         // The try the run spent is claimed too, so a status that was behind it cannot offer the
         // attempt budget a second time.
         assert_eq!(status.retry_count, 2);
+        assert_eq!(status.retry_count_slot, Some(slot));
         // Still the desired revision, so the slot it consumed keeps it from re-triggering itself
         // inside its own grace window.
         assert_eq!(status.last_triggered_run, Some(slot));
@@ -7230,6 +7502,34 @@ spec:
     }
 
     #[test]
+    fn an_exhausted_oneshot_keeps_the_failed_terminal_status() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let max_attempts = 3;
+
+        assert!(!attempt_budget_available(
+            &ExecutionMode::OneShot,
+            max_attempts,
+            max_attempts,
+        ));
+        let outcome = decide_terminal(
+            &ExecutionMode::OneShot,
+            None,
+            &v1beta1::PlayPhase::Failed,
+            retry_due(&Phase::Failed, max_attempts, max_attempts),
+            1,
+            1,
+            now,
+        );
+
+        assert_eq!(outcome.phase, Phase::Failed);
+        assert_eq!(
+            outcome.summary,
+            "0/1 up-to-date (1 outdated, last run failed)"
+        );
+        assert_eq!(outcome.requeue, None);
+    }
+
+    #[test]
     fn a_retry_is_due_only_after_a_failure_with_budget_left() {
         assert!(retry_due(&Phase::Failed, 1, 3));
         assert!(!retry_due(&Phase::Failed, 3, 3));
@@ -7238,6 +7538,58 @@ spec:
         assert!(!retry_due(&Phase::Succeeded, 0, 3));
         assert!(!retry_due(&Phase::Applying, 1, 3));
         assert!(!retry_due(&Phase::Delayed, 0, 3));
+    }
+
+    #[test]
+    fn a_recurring_budget_closes_only_the_slot_it_describes() {
+        let slot = |value: &str| Some(value.parse::<DateTime<FixedOffset>>().unwrap());
+        let current = slot("2025-08-12T20:00:00Z");
+        let previous = slot("2025-08-11T20:00:00Z");
+
+        assert!(retry_budget_closes_window(
+            &Phase::Failed,
+            3,
+            current,
+            current,
+            3,
+        ));
+        assert!(!retry_budget_closes_window(
+            &Phase::Failed,
+            2,
+            current,
+            current,
+            3,
+        ));
+        assert!(retry_budget_closes_window(
+            &Phase::Succeeded,
+            1,
+            current,
+            current,
+            3,
+        ));
+        assert!(!retry_budget_closes_window(
+            &Phase::Failed,
+            3,
+            previous,
+            current,
+            3,
+        ));
+        assert!(!retry_budget_closes_window(
+            &Phase::Pending,
+            0,
+            current,
+            current,
+            3,
+        ));
+        // `Pending` is not enough to prove a refund: an input outage can hide a successful verdict
+        // after its Play was pruned, so the persisted nonzero count must still close the window.
+        assert!(retry_budget_closes_window(
+            &Phase::Pending,
+            1,
+            current,
+            current,
+            3,
+        ));
     }
 
     #[test]
@@ -7265,14 +7617,15 @@ spec:
     }
 
     #[test]
-    fn a_new_recurring_tick_is_the_only_thing_that_restarts_the_try_count() {
+    fn the_retry_budget_slot_decides_when_the_try_count_restarts() {
         let slot = |s: &str| Some(s.parse::<DateTime<FixedOffset>>().unwrap());
         let first = slot("2025-08-12T20:00:00Z");
         let second = slot("2025-08-13T20:00:00Z");
 
         // A tick the plan has not run for begins a new execution with a full budget.
         assert_eq!(next_attempt(&ExecutionMode::Recurring, 2, second, first), 1);
-        // Inside the tick it already ran for, a run is the next try of it.
+        // Inside the budget's tick, a run is the next try even if the separate run-start marker was
+        // lost or stale.
         assert_eq!(next_attempt(&ExecutionMode::Recurring, 2, first, first), 3);
 
         // OneShot has no ticks to divide its revision into: a schedule says when it may run, not
@@ -7309,9 +7662,8 @@ spec:
     }
 
     /// A terminal result is drained ahead of anything live, so a tick can apply one run's outcome
-    /// while a *different* run is still going. `lastTriggeredRun` is the only thing standing
-    /// between a schedule window and a second run inside it, so it must describe the run the
-    /// plan is actually holding — not the one that has already finished.
+    /// while a *different* run is still going. Both schedule markers must describe the run the plan
+    /// is actually holding — not the one that has already finished.
     #[test]
     fn a_finished_run_does_not_claim_the_slot_of_a_run_still_in_flight() {
         let finished_slot = "2025-08-12T20:00:00Z"
@@ -7345,6 +7697,7 @@ spec:
         // true of a finished run whatever else the plan is holding.
         assert_eq!(status.last_run_number, 3);
         assert_eq!(status.retry_count, 4);
+        assert_eq!(status.retry_count_slot, Some(live_slot));
     }
 
     /// The surviving run's window is taken from its own record, so a plan status that has not
@@ -7373,6 +7726,7 @@ spec:
         );
 
         assert_eq!(status.last_triggered_run, Some(live_slot));
+        assert_eq!(status.retry_count_slot, Some(live_slot));
     }
 
     /// An unscheduled run consumed no window, so it has none to record. The finished run's is
@@ -7398,6 +7752,7 @@ spec:
 
         assert_eq!(status.last_triggered_run, Some(finished_slot));
         assert_eq!(status.last_run_number, 3);
+        assert_eq!(status.retry_count_slot, None);
     }
 
     /// A run that has not launched a Job has consumed nothing, whatever its record says about
@@ -7487,6 +7842,7 @@ spec:
         );
 
         assert_eq!(status.last_triggered_run, None);
+        assert_eq!(status.retry_count_slot, None);
     }
 
     /// A run still applying a superseded revision must not claim the window: the edit is owed a
@@ -7514,6 +7870,7 @@ spec:
 
         assert_eq!(status.last_triggered_run, None);
         assert_eq!(status.retry_count, 0);
+        assert_eq!(status.retry_count_slot, None);
     }
 
     #[test]

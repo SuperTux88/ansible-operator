@@ -86,7 +86,12 @@ def read_endpoints(path):
             log(f"ignoring malformed endpoint on line {number}: {line!r}")
             continue
         host, address, port = fields
-        endpoints.append((host, address, int(port)))
+        try:
+            port = int(port)
+        except ValueError:
+            log(f"ignoring malformed endpoint on line {number}: {line!r}")
+            continue
+        endpoints.append((host, address, port))
 
     return endpoints
 
@@ -189,8 +194,11 @@ def wait_for(endpoints, timeout):
                     still_pending.append(endpoint)
             pending = still_pending
 
-            if pending and time.monotonic() + POLL_INTERVAL_SECONDS < deadline:
-                time.sleep(POLL_INTERVAL_SECONDS)
+            if pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(POLL_INTERVAL_SECONDS, remaining))
 
     return pending, time.monotonic() - started
 
