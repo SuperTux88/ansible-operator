@@ -60,6 +60,11 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Run Clippy
+        run: |
+          rustup component add clippy
+          cargo clippy -- -D warnings
+
       - name: Verify generated CRDs are current
         run: |
           set -euo pipefail
