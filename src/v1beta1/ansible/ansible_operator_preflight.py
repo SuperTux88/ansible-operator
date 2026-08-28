@@ -86,7 +86,12 @@ def read_endpoints(path):
             log(f"ignoring malformed endpoint on line {number}: {line!r}")
             continue
         host, address, port = fields
-        endpoints.append((host, address, int(port)))
+        try:
+            port = int(port)
+        except ValueError:
+            log(f"ignoring malformed endpoint on line {number}: {line!r}")
+            continue
+        endpoints.append((host, address, port))
 
     return endpoints
 
