@@ -893,7 +893,7 @@ async fn reconcile(
     } else if eligible_to_start && resource_status.active_run.is_none() {
         match timing {
             Timing::Delayed(until) => {
-                requeue_after = (until - now()).to_std().unwrap();
+                requeue_after = duration_until(&until, now());
                 resource_status.phase = phase_while_waiting_for_schedule(&resource_status.phase);
                 resource_status.next_run = Some(until.fixed_offset());
             }
@@ -1344,6 +1344,10 @@ fn phase_while_waiting_for_schedule(current: &Phase) -> Phase {
         Phase::Succeeded | Phase::Failed => current.clone(),
         _ => Phase::Delayed,
     }
+}
+
+fn duration_until<Tz: TimeZone>(until: &DateTime<Tz>, now: DateTime<Tz>) -> std::time::Duration {
+    (until.clone() - now).to_std().unwrap_or_default()
 }
 
 /// Keeps an idle `Recurring` plan scheduled even when its authorized inventory is empty.
@@ -6962,6 +6966,14 @@ spec:
             &mut never_run,
         );
         assert_eq!(never_run.phase, Phase::Delayed);
+    }
+
+    #[test]
+    fn a_schedule_deadline_crossed_during_reconcile_requeues_immediately() {
+        let until = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let now = "2025-08-12T20:00:01Z".parse::<DateTime<Utc>>().unwrap();
+
+        assert_eq!(duration_until(&until, now), std::time::Duration::ZERO);
     }
 
     #[test]
