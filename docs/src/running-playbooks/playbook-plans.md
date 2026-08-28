@@ -15,7 +15,7 @@ validation rules, the operator refuses the plan instead and says so in `.status.
 
 | Field | Required | Meaning |
 |---|---|---|
-| `image` | yes | An OCI image that has `ansible-playbook` and every collection your playbook uses. The Job runs this image. |
+| `image` | yes | An OCI image that has `ansible-playbook` on `PATH`, `python3` on `PATH`, and every collection your playbook uses. The Job runs this image. |
 | `securityContext` | no | Container security context applied to the playbook and collection-installer containers. |
 | `serviceAccountName` | no | ServiceAccount the run's pod uses, so tasks can reach the Kubernetes API. Unset means no API token is mounted — see [Managing Kubernetes resources](#managing-kubernetes-resources). |
 | `inventoryRefs` | yes | Which inventories to target — one entry per referenced `ClusterInventory` or `StaticInventory`. |
@@ -53,6 +53,28 @@ template:
 Baking collections into the image is faster and more reproducible than installing them on every run;
 use `requirements` for collections you cannot or do not want to pre-bake.
 
+### `python3` must be on `PATH`
+
+Two commands are run from your image, and both must resolve on `PATH`: `ansible-playbook`, and
+`python3` for the [preflight connectivity check](./cluster-nodes.md#preflight-connectivity-check)
+that runs before Ansible on plans targeting cluster Nodes. The operator reuses your image for that
+check rather than pulling one of its own, which keeps a run to a single image — and Ansible is itself
+a Python program, so an image that can run `ansible-playbook` practically always ships an
+interpreter.
+
+Practically always is not always, though. If Ansible is installed into a virtual environment that is
+not on the image's `PATH`, or the interpreter is only reachable as `python`, the check cannot start:
+the init container exits immediately, `ansible-playbook` never runs, and the run finishes with no
+recap — every host reported [`Unknown`](./results-and-troubleshooting.md#hosts-show-unknown). Verify
+it the way the Job will:
+
+```sh
+podman run --rm <your-image> python3 --version
+```
+
+If it fails, add a `python3` to the image or symlink the interpreter you have onto `PATH` under that
+name. Plans that target only `StaticInventory` hosts never run the check and are unaffected.
+
 The execution image also determines which container security settings it supports. Configure them
 on the plan so they stay coupled to that image:
 
@@ -67,9 +89,10 @@ spec:
       type: RuntimeDefault
 ```
 
-The context is applied to both the `ansible-playbook` container and the optional
-`download-collections` init container. Changing the security context affects future Jobs but does
-not itself cause hosts that already succeeded to run again.
+The context is applied to every container of the run: the `ansible-playbook` container, the
+optional `download-collections` init container, and the `managed-ssh-preflight` init container that
+plans targeting cluster Nodes get. Changing the security context affects future Jobs but does not
+itself cause hosts that already succeeded to run again.
 
 ## The playbook
 

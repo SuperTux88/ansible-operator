@@ -7,10 +7,12 @@ programming that rule on the proxies' nodes once the Job pod exists. Until it ha
 refuses or drops the connection even though kubelet reports the pod Ready — kubelet probes from the
 node, not from this network namespace.
 
-Never fails the run. On timeout the still-unreachable hosts are left to Ansible, which records them
-`unreachable` exactly as it would have without this gate; the run is retried later. An unexpected
-error here is reported on stderr and otherwise ignored, because a broken preflight must not be able
-to wedge a Job that would have worked.
+Never fails the run once it is running. On timeout the still-unreachable hosts are left to Ansible,
+which records them `unreachable` exactly as it would have without this gate; the run is retried
+later. An unexpected error here is reported on stderr and otherwise ignored, because a broken
+preflight must not be able to wedge a Job that would have worked. What this cannot cover is failing
+to start at all — an image with no `python3` on `PATH` never reaches this code, which is why the
+image contract requires one.
 
 Invoked as `<interpreter> <this file> <endpoints file>`. The endpoints file is rendered into the
 workspace Secret by the operator (see `workspace.rs`) and holds one `host<TAB>ip<TAB>port` line per
