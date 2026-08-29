@@ -317,11 +317,7 @@ async fn reconcile(
     let recovered = match recover_active_run(&context, &object).await {
         Ok(recovered) => recovered,
         Err(error) => {
-            resource_status.summary = Some(format!("run recovery failed: {error}"));
-            if let Err(patch_error) = patch_status(&api, &object, resource_status).await {
-                warn!("Could not report the recovery failure on {namespace}/{name}: {patch_error}");
-            }
-            return Err(error);
+            return Err(report_recovery_failure(&api, &object, &mut resource_status, error).await);
         }
     };
     // Set when the tick drained a finished run's result but the plan still has a live run behind
@@ -426,7 +422,14 @@ async fn reconcile(
     if unlaunched_run.is_none()
         && let Some(mirror) = resource_status.active_run.clone()
     {
-        let active_run = RecordedRun::from_mirror(mirror)?;
+        let active_run = match RecordedRun::from_mirror(mirror) {
+            Ok(active_run) => active_run,
+            Err(error) => {
+                return Err(
+                    report_recovery_failure(&api, &object, &mut resource_status, error).await,
+                );
+            }
+        };
         // Reported on the plan before the tick aborts, like recovery above: this is where a finished
         // run's node-root proxy pods and host Leases are given back, so a teardown that will not
         // complete has to be readable on the resource and not only in the operator's log.
@@ -2672,6 +2675,26 @@ async fn report_failed_abandon(
     error
 }
 
+/// Records why run recovery could not proceed on the plan and hands the error straight back.
+///
+/// Best effort, and deliberately so: the reconcile fails on `error` either way, and a failure to
+/// report must not replace the diagnosis it was trying to surface.
+async fn report_recovery_failure(
+    api: &Api<PlaybookPlan>,
+    object: &PlaybookPlan,
+    resource_status: &mut PlaybookPlanStatus,
+    error: ReconcileError,
+) -> ReconcileError {
+    resource_status.summary = Some(format!("run recovery failed: {error}"));
+    if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
+        warn!(
+            "Could not report the recovery failure on {:?}/{:?}: {patch_error}",
+            object.metadata.namespace, object.metadata.name
+        );
+    }
+    error
+}
+
 /// Records why a finished run could not be completed on the plan and hands the error straight back.
 ///
 /// Covers everything between "the Job reached a terminal state" and "the record has been handed back
@@ -3664,11 +3687,10 @@ struct RecordedRun {
 impl RecordedRun {
     /// Reconstructs a run from the plan status' mirror of it — the one path that does not start
     /// from a `Play`, and so the one place a hand-edited status is caught.
-    fn from_mirror(mut mirror: ActiveRun) -> Result<Self, ReconcileError> {
+    fn from_mirror(mirror: ActiveRun) -> Result<Self, ReconcileError> {
         let execution_hash = ExecutionHash::from_hex(&mirror.execution_hash).ok_or(
             ReconcileError::PreconditionFailed("run has an invalid execution hash"),
         )?;
-        mirror.execution_hash = execution_hash.to_string();
         Ok(Self {
             mirror,
             execution_hash,
@@ -7908,11 +7930,10 @@ spec:
 
     /// Recovery reads a run's revision back out of two persisted, hand-editable places — the `Play`
     /// spec and the Job's hash label — and both go through `ExecutionHash::from_hex`. Each has to
-    /// canonicalize what it accepts, so the value compares equal to a freshly computed hash however
-    /// it was written down, and each has to refuse a value that is not a hash at all rather than
-    /// silently scoping a run's resources to something else.
+    /// accept only canonical lowercase hexadecimal, and each has to refuse a value that is not a
+    /// canonical hash rather than silently scoping a run's resources to something else.
     #[test]
-    fn a_persisted_execution_hash_is_canonicalized_or_refused() {
+    fn a_persisted_execution_hash_is_canonical_or_refused() {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
         let mut play = Play::new(
@@ -7920,7 +7941,7 @@ spec:
             v1beta1::PlaySpec {
                 playbook_plan: "plan".into(),
                 playbook_plan_uid: "plan-uid".into(),
-                execution_hash: "00001A".into(),
+                execution_hash: "1a".into(),
                 run_id: "run-2".into(),
                 preparation_fingerprint: "fingerprint".into(),
                 run_number: 2,
@@ -7946,8 +7967,12 @@ spec:
 
         let mut hand_edited_mirror = run.mirror.clone();
         hand_edited_mirror.execution_hash = "+1A".into();
-        let mirrored_run = RecordedRun::from_mirror(hand_edited_mirror).unwrap();
-        assert_eq!(mirrored_run.mirror.execution_hash, "1a");
+        assert!(matches!(
+            RecordedRun::from_mirror(hand_edited_mirror),
+            Err(ReconcileError::PreconditionFailed(
+                "run has an invalid execution hash"
+            ))
+        ));
 
         // The record is only a run's identity if it can be tied back to a specific object.
         let mut uidless = play.clone();
@@ -7962,11 +7987,19 @@ spec:
             ))
         ));
 
+        play.spec.execution_hash = "00001a".into();
+        assert!(matches!(
+            recorded_run_from_play(&play),
+            Err(ReconcileError::PreconditionFailed(
+                "active Play has an invalid execution hash"
+            ))
+        ));
+
         let mut job = Job {
             metadata: ObjectMeta {
                 labels: Some(BTreeMap::from([(
                     labels::PLAYBOOKPLAN_HASH.into(),
-                    "00001A".into(),
+                    "1a".into(),
                 )])),
                 ..Default::default()
             },
@@ -7980,6 +8013,18 @@ spec:
             .as_mut()
             .unwrap()
             .insert(labels::PLAYBOOKPLAN_HASH.into(), "not-a-hash".into());
+        assert!(matches!(
+            job_execution_hash(&job),
+            Err(ReconcileError::PreconditionFailed(
+                "active Job has no valid execution hash"
+            ))
+        ));
+
+        job.metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(labels::PLAYBOOKPLAN_HASH.into(), "1A".into());
         assert!(matches!(
             job_execution_hash(&job),
             Err(ReconcileError::PreconditionFailed(

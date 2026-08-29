@@ -25,10 +25,10 @@ impl std::ops::Deref for ExecutionHash {
 }
 
 impl ExecutionHash {
-    /// Reconstructs a persisted execution hash. Hashes are serialized as lowercase hexadecimal
-    /// strings by `Display`, so this accepts the status representation used by `ActiveRun`.
+    /// Reconstructs a persisted execution hash from its canonical lowercase hexadecimal form.
     pub fn from_hex(value: &str) -> Option<Self> {
-        u64::from_str_radix(value, 16).ok().map(Self)
+        let parsed = u64::from_str_radix(value, 16).ok()?;
+        (format!("{parsed:x}") == value).then_some(Self(parsed))
     }
 
     /// Folds inventory-author group variables into an existing hash. Kept separate from
