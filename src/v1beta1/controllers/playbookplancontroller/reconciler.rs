@@ -2775,6 +2775,8 @@ async fn abandon_run(
     Ok(())
 }
 
+const ABANDON_FAILURE_SUMMARY_PREFIX: &str = "could not release the abandoned run ";
+
 /// Records why an abandon could not complete on the plan and hands the error straight back.
 ///
 /// Best effort, and deliberately so: the reconcile fails on `error` either way, and a failure to
@@ -2788,7 +2790,7 @@ async fn report_failed_abandon(
     error: ReconcileError,
 ) -> ReconcileError {
     resource_status.summary = Some(format!(
-        "could not release the abandoned run {}: {error}",
+        "{ABANDON_FAILURE_SUMMARY_PREFIX}{}: {error}",
         run.mirror.job_name
     ));
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
@@ -2899,7 +2901,7 @@ fn record_failed_run_preparation(status: &mut PlaybookPlanStatus, error: &Reconc
         || status
             .summary
             .as_deref()
-            .is_some_and(|summary| summary.starts_with("could not release the abandoned run "))
+            .is_some_and(|summary| summary.starts_with(ABANDON_FAILURE_SUMMARY_PREFIX))
     {
         return false;
     }
