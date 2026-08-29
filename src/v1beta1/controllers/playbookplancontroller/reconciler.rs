@@ -508,14 +508,8 @@ async fn reconcile(
                 summary,
             )
             .await?;
-            let deferred_terminal_record = finished_records
-                .iter()
-                .any(|finished| finished.record == TerminalRecord::Present);
-            let requeue_after = invalid_scheduling_requeue(
-                &resource_status,
-                recovered_a_run,
-                deferred_terminal_record,
-            );
+            let handover = invalid_scheduling_handover(recovered_a_run, &finished_records);
+            let requeue_after = invalid_scheduling_requeue(&resource_status, handover);
             return finish_reconcile_tick(
                 &context,
                 &object,
@@ -524,7 +518,7 @@ async fn reconcile(
                 // the normal hash-aware terminal path classify it. A lost receipt has nothing to
                 // replay and was classified above from its recorded run identity.
                 &[],
-                recovered_a_run,
+                handover,
                 retry_prune,
                 requeue_after,
             )
@@ -626,7 +620,9 @@ async fn reconcile(
         sync_desired_hash_after_finished_run(
             &mut resource_status,
             &execution_hash,
+            &object.spec.mode,
             &finished.run,
+            &finished.outcome,
             surviving_run.as_deref(),
         );
     } else {
@@ -664,17 +660,14 @@ async fn reconcile(
             ),
         )
         .await?;
-        let deferred_terminal_record = finished_records
-            .iter()
-            .any(|finished| finished.record == TerminalRecord::Present);
-        let requeue_after =
-            invalid_scheduling_requeue(&resource_status, recovered_a_run, deferred_terminal_record);
+        let handover = invalid_scheduling_handover(recovered_a_run, &finished_records);
+        let requeue_after = invalid_scheduling_requeue(&resource_status, handover);
         return finish_reconcile_tick(
             &context,
             &object,
             &mut resource_status,
             &[],
-            recovered_a_run,
+            handover,
             retry_prune,
             requeue_after,
         )
@@ -768,7 +761,7 @@ async fn reconcile(
             }
             UnlaunchedAction::ResumeLaunching { may_proceed } => {
                 let resume_with = may_proceed.then_some(run_groups.as_slice());
-                let (_action, requeue) = resume_launching_run(
+                let resume = resume_launching_run(
                     &context,
                     &object,
                     &api,
@@ -776,7 +769,19 @@ async fn reconcile(
                     resume_with,
                     &mut resource_status,
                 )
-                .await?;
+                .await;
+                let (_action, requeue) = match resume {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return Err(report_failed_run_preparation(
+                            &api,
+                            &object,
+                            &mut resource_status,
+                            error,
+                        )
+                        .await);
+                    }
+                };
                 if let Some(requeue) = requeue {
                     requeue_after = requeue;
                 } else if resource_status.active_run.is_some()
@@ -801,15 +806,27 @@ async fn reconcile(
                     triggered_slot: unlaunched.run.mirror.triggered_slot,
                     ..base_run
                 };
-                if let Some(requeue) = try_start_run(
+                let started = try_start_run(
                     &context,
                     &resumed,
                     &object,
                     &mut resource_status,
                     Some(&unlaunched),
                 )
-                .await?
-                {
+                .await;
+                let requeue = match started {
+                    Ok(requeue) => requeue,
+                    Err(error) => {
+                        return Err(report_failed_run_preparation(
+                            &api,
+                            &object,
+                            &mut resource_status,
+                            error,
+                        )
+                        .await);
+                    }
+                };
+                if let Some(requeue) = requeue {
                     requeue_after = requeue;
                 } else {
                     // The Job exists now, so this run has consumed its slot — recorded here and
@@ -958,9 +975,21 @@ async fn reconcile(
                         triggered_slot: this_slot,
                         ..base_run
                     };
-                    if let Some(d) =
-                        try_start_run(&context, &run, &object, &mut resource_status, None).await?
-                    {
+                    let started =
+                        try_start_run(&context, &run, &object, &mut resource_status, None).await;
+                    let requeue = match started {
+                        Ok(requeue) => requeue,
+                        Err(error) => {
+                            return Err(report_failed_run_preparation(
+                                &api,
+                                &object,
+                                &mut resource_status,
+                                error,
+                            )
+                            .await);
+                        }
+                    };
+                    if let Some(d) = requeue {
                         requeue_after = d;
                     } else {
                         // `try_start_run` ran to completion (the Job was created or an active one
@@ -990,7 +1019,13 @@ async fn reconcile(
         &object,
         &mut resource_status,
         &finished_records,
-        recovered_a_run,
+        // This exit acknowledges every terminal record it was given, so a run recovered by this tick
+        // is one the next will not find again.
+        if recovered_a_run {
+            RunHandover::Retired
+        } else {
+            RunHandover::NothingHeld
+        },
         retry_prune,
         Some(requeue_after),
     )
@@ -1002,13 +1037,16 @@ async fn finish_reconcile_tick(
     object: &PlaybookPlan,
     resource_status: &mut PlaybookPlanStatus,
     finished_records: &[FinishedRecord],
-    recovered_a_run: bool,
+    handover: RunHandover,
     mut retry_prune: bool,
     requeue_after: Option<std::time::Duration>,
 ) -> Result<Action, ReconcileError> {
     let (namespace, name) = namespace_and_name(object)?;
     let api = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace);
-    let release_finalizer = !recovered_a_run && resource_status.active_run.is_none();
+
+    let release_finalizer =
+        handover == RunHandover::NothingHeld && resource_status.active_run.is_none();
+    let defer_finalizer_release = defers_finalizer_release(object, resource_status, handover);
 
     patch_status(&api, object, resource_status.clone()).await?;
 
@@ -1043,6 +1081,10 @@ async fn finish_reconcile_tick(
         ));
     }
 
+    if defer_finalizer_release {
+        requeue_after = Some(finalizer_release_retry_after(requeue_after));
+    }
+
     if release_finalizer && let Err(error) = drop_run_cleanup_finalizer(&api, object).await {
         if !error.is_conflict() {
             return Err(error);
@@ -1051,14 +1093,67 @@ async fn finish_reconcile_tick(
             "Could not give back the run-cleanup finalizer of {namespace}/{name}: the plan changed \
              underneath this tick; retrying shortly"
         );
-        requeue_after = Some(
-            requeue_after
-                .unwrap_or(std::time::Duration::from_secs(5))
-                .min(std::time::Duration::from_secs(5)),
-        );
+        requeue_after = Some(finalizer_release_retry_after(requeue_after));
     }
 
     Ok(requeue_after.map_or_else(Action::await_change, Action::requeue))
+}
+
+/// How long a tick that owes the run-cleanup finalizer back waits before looking again.
+const FINALIZER_RELEASE_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn finalizer_release_retry_after(current: Option<std::time::Duration>) -> std::time::Duration {
+    current
+        .unwrap_or(FINALIZER_RELEASE_RETRY)
+        .min(FINALIZER_RELEASE_RETRY)
+}
+
+/// What a tick did with the run it recovered, as far as the *next* tick is concerned. Both finalizer
+/// decisions read it, so they cannot disagree about whether another tick is worth waking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunHandover {
+    /// The tick found no run at all, so the plan holds nothing and may have its finalizer back.
+    NothingHeld,
+    /// A run was recovered and this tick disposed of it — acknowledged, released or given up. The
+    /// next tick finds nothing and hands the finalizer back, so it is worth coming back for.
+    Retired,
+    /// A run was recovered and deliberately left in place: a terminal record this tick is not
+    /// allowed to acknowledge yet. Every later tick recovers that record again and reaches the same
+    /// decision, so nothing about waking sooner brings the finalizer back — only the correction the
+    /// plan is waiting for does.
+    Retained,
+}
+
+/// Whether this tick owes the plan its run-cleanup finalizer back but may not give it yet.
+///
+/// The release is deferred by one tick on purpose: a recovered terminal record's acknowledgement can
+/// still fail, so only a tick that finds no run at all may let the plan go. What that leaves is the
+/// *interval* until that tick, and it cannot be the caller's — a finished `OneShot` plan asks for the
+/// hour-long idle requeue and a `Recurring` one for the time until its next slot. Inheriting either
+/// would keep a finalizer on a plan that holds nothing for that whole span, and a plan carrying one
+/// cannot be deleted while the operator is down — precisely what [`RUN_CLEANUP_FINALIZER`] is scoped
+/// to a live run to avoid.
+///
+/// Only [`RunHandover::Retired`] qualifies, and that is the whole point of the distinction. Waking
+/// sooner is worth it exactly when the next tick can finish the job. A `Retained` record is one this
+/// tick was not permitted to acknowledge — the invalid-scheduling exits give up before that path —
+/// so every later tick recovers it and defers again: polling would spin at five seconds for as long
+/// as the plan's scheduling stays broken, re-listing records and re-reading inventories and Secrets
+/// each time, and would never release anything. Those exits ask for `await_change` deliberately, and
+/// this must not talk them out of it.
+///
+/// Stated over the same state the release itself reads, and decided beside it, so the two describe
+/// one snapshot. With no run left, `NothingHeld` releases and `Retired` defers — never both, never
+/// neither. A run still in flight belongs to neither: the finalizer is legitimately held, and
+/// answering `true` there would poll every busy plan every five seconds for the whole of its run.
+fn defers_finalizer_release(
+    object: &PlaybookPlan,
+    resource_status: &PlaybookPlanStatus,
+    handover: RunHandover,
+) -> bool {
+    holds_run_cleanup_finalizer(object)
+        && handover == RunHandover::Retired
+        && resource_status.active_run.is_none()
 }
 
 /// Whether the current schedule slot (`start`, the grace window's start) is the recorded slot.
@@ -1158,7 +1253,8 @@ fn window_taken_by_a_record(
 }
 
 /// Checks that every `spec.template.files` entry can name a directory of its own under the
-/// workspace, and that no two of them claim the same one.
+/// workspace, that no two claim the same one, and that each body describes one usable Kubernetes
+/// volume source.
 ///
 /// The name is a path component, not decoration: each entry is mounted at
 /// `{workspace}/files/{name}`, which is where the guide tells playbooks to read their files from.
@@ -1174,18 +1270,13 @@ fn window_taken_by_a_record(
 /// something the user did not ask for.
 fn validate_file_entries(plan: &PlaybookPlan) -> Result<(), ReconcileError> {
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let files = plan.spec.template.files.as_deref().unwrap_or_default();
 
-    for name in plan
-        .spec
-        .template
-        .files
-        .iter()
-        .flatten()
-        .map(|source| match source {
-            v1beta1::FilesSource::Secret { name, .. }
-            | v1beta1::FilesSource::Other { name, .. } => name,
-        })
-    {
+    for name in files.iter().map(|source| match source {
+        v1beta1::FilesSource::Secret { name, .. } | v1beta1::FilesSource::Other { name, .. } => {
+            name
+        }
+    }) {
         let invalid = |reason| {
             Err(ReconcileError::InvalidFileEntry {
                 name: name.clone(),
@@ -1209,6 +1300,26 @@ fn validate_file_entries(plan: &PlaybookPlan) -> Result<(), ReconcileError> {
         }
         if !seen.insert(name) {
             return invalid("two entries cannot share a name");
+        }
+    }
+
+    for (source, extracted) in files.iter().zip(job_builder::extract_file_volumes(plan)) {
+        let name = match source {
+            v1beta1::FilesSource::Secret { name, .. }
+            | v1beta1::FilesSource::Other { name, .. } => name,
+        };
+        let invalid = |reason| ReconcileError::InvalidFileEntry {
+            name: name.clone(),
+            reason,
+        };
+        let (_, volume) = extracted
+            .map_err(|_| invalid("its fields cannot be decoded as a Kubernetes volume"))?;
+        let usable = job_builder::file_volume_is_usable(source, &volume)
+            .map_err(|_| invalid("its fields cannot be encoded as a Kubernetes volume"))?;
+        if !usable {
+            return Err(invalid(
+                "it must contain exactly one recognized Kubernetes volume source with no unrecognized fields",
+            ));
         }
     }
 
@@ -1270,9 +1381,11 @@ fn max_attempts(mode: &ExecutionMode, configured: Option<u32>) -> u32 {
 /// Whether the plan's attempt budget allows starting a run *here*, at the gate that decides whether
 /// a new run may begin at all.
 ///
-/// It is the whole answer for `OneShot`, whose budget spans the revision: once its tries are spent
-/// the plan is finished, and without this it would keep numbering a fresh Job every tick — its hosts
-/// stay outdated precisely *because* the runs failed, so the work gate never closes on its own.
+/// It is the whole answer for `OneShot`, whose budget spans a failed execution: once its tries are
+/// spent the plan is finished, and without this it would keep numbering a fresh Job every tick — its
+/// hosts stay outdated precisely *because* the runs failed, so the work gate never closes on its own.
+/// A successful execution resets the budget when its terminal result is synchronized, so hosts added
+/// to the inventory afterwards can start a new execution.
 ///
 /// For `Recurring` it is deliberately not asked here, and the answer is always yes. Its budget spans
 /// one schedule tick, and the gate that knows about ticks is the window gate below: a plan whose
@@ -1318,9 +1431,9 @@ fn retry_budget_closes_window(
 /// A `Recurring` run reaching a tick the plan has not run for starts a new execution and so a new
 /// budget; every other run continues the one in progress. The budget's own slot, rather than the
 /// separately persisted run-start marker, identifies that execution. `OneShot` has no ticks to
-/// divide its revision into, and gets a fresh budget only from an edit (`update_desired_hash`) —
-/// including when it has a schedule, since a schedule says when a `OneShot` plan may run, not how
-/// often it may fail.
+/// divide its revision into, and gets a fresh budget after a successful execution or from an edit
+/// (`update_desired_hash`) — including when it has a schedule, since a schedule says when a `OneShot`
+/// plan may run, not how often it may fail.
 fn next_attempt(
     mode: &ExecutionMode,
     tries_spent: u32,
@@ -1992,7 +2105,7 @@ async fn ensure_infra_and_launch(
     )
     .await?;
 
-    let proxy_readiness = match managed_ssh::ensure_proxy_infra(
+    let proxy_readiness = managed_ssh::ensure_proxy_infra(
         &context.client,
         &context.operator_namespace,
         namespace,
@@ -2007,17 +2120,7 @@ async fn ensure_infra_and_launch(
         // before cleanup runs (the per-run delete in `cleanup_proxy_infra` is the primary path).
         &playbookplan_owner_ref(object)?,
     )
-    .await
-    {
-        Ok(readiness) => readiness,
-        Err(error @ ReconcileError::ForeignProxyResource { .. }) => {
-            let api = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace);
-            return Err(
-                report_failed_run_preparation(&api, object, run, resource_status, error).await,
-            );
-        }
-        Err(error) => return Err(error),
-    };
+    .await?;
 
     let (ready, unreachable) = match proxy_readiness {
         managed_ssh::ProxyReadiness::Pending { waiting } => {
@@ -2417,9 +2520,10 @@ async fn advance_active_run(
     })
 }
 
-/// Finalizes a run whose `Play` is gone: its infrastructure is released and every targeted host is
-/// reported `Unknown`, because without the record nothing about the run can be recovered. Wedging in
-/// `Applying` on a record that is never coming back would hold this plan's host locks indefinitely.
+/// Finalizes a run whose `Play` is gone: its Job is stopped first, then its infrastructure is
+/// released and every targeted host is reported `Unknown`, because without the record nothing about
+/// the run can be recovered. Wedging in `Applying` on a record that is never coming back would hold
+/// this plan's host locks indefinitely.
 ///
 /// First, though, it re-reads the plan **from the apiserver**. The run this is called for comes from
 /// the reflector-cached status, which lags this controller's own writes, so a tick that raced ahead
@@ -2452,6 +2556,21 @@ async fn finalize_lost_run(
         );
         *resource_status = live_status.unwrap_or_default();
         return Ok(ActiveRunProgress::AlreadyFinalized);
+    }
+
+    // The record may disappear after the Job was created. Stop and await that Job before releasing
+    // its host Leases, otherwise another run could reach the same nodes while Ansible is still
+    // executing under this run's credentials.
+    if cancel_run_job(context, object, run).await? {
+        status::clear_run_conditions(resource_status);
+        status::set_run_record_lost_condition(resource_status, &run.mirror.job_name);
+        resource_status.summary = Some(format!(
+            "run record is gone; cancelling Job {} before releasing its hosts",
+            run.mirror.job_name
+        ));
+        return Ok(ActiveRunProgress::Running(std::time::Duration::from_secs(
+            5,
+        )));
     }
 
     warn!(
@@ -2656,6 +2775,8 @@ async fn abandon_run(
     Ok(())
 }
 
+const ABANDON_FAILURE_SUMMARY_PREFIX: &str = "could not release the abandoned run ";
+
 /// Records why an abandon could not complete on the plan and hands the error straight back.
 ///
 /// Best effort, and deliberately so: the reconcile fails on `error` either way, and a failure to
@@ -2669,7 +2790,7 @@ async fn report_failed_abandon(
     error: ReconcileError,
 ) -> ReconcileError {
     resource_status.summary = Some(format!(
-        "could not release the abandoned run {}: {error}",
+        "{ABANDON_FAILURE_SUMMARY_PREFIX}{}: {error}",
         run.mirror.job_name
     ));
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
@@ -2739,39 +2860,57 @@ async fn report_failed_finalization(
     error
 }
 
-/// Records a proxy-provenance refusal on the plan and hands the error straight back.
+/// Records a failed attempt to prepare or launch a run on the plan and hands the error straight
+/// back.
 ///
-/// The run remains active and keeps its host locks: the operator cannot safely treat the object as
-/// this run's proxy, and retries after an administrator resolves the collision. Best-effort
-/// reporting must not replace the refusal with a status-write error.
+/// A run that crossed the status barrier remains active and keeps its host locks so the next tick
+/// can recover it. Failures before the barrier have no active identity to preserve, but still need a
+/// user-visible diagnosis. Best-effort reporting must not replace the original failure with a
+/// status-write error.
 async fn report_failed_run_preparation(
     api: &Api<PlaybookPlan>,
     object: &PlaybookPlan,
-    run: &RecordedRun,
     resource_status: &mut PlaybookPlanStatus,
     error: ReconcileError,
 ) -> ReconcileError {
-    record_failed_run_preparation(resource_status, run, &error);
+    if !record_failed_run_preparation(resource_status, &error) {
+        return error;
+    }
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
+        let run = resource_status
+            .active_run
+            .as_ref()
+            .map(|run| run.job_name.as_str())
+            .unwrap_or("<not yet recorded>");
         warn!(
-            "Could not report the failed preparation of run {} on {:?}/{:?}: {patch_error}",
-            run.mirror.job_name, object.metadata.namespace, object.metadata.name
+            "Could not report the failed preparation of run {run} on {:?}/{:?}: {patch_error}",
+            object.metadata.namespace, object.metadata.name
         );
     }
     error
 }
 
-/// The status half of [`report_failed_run_preparation`], split out to pin that reporting a refusal
-/// changes only the diagnosis and leaves the active run available for recovery.
-fn record_failed_run_preparation(
-    status: &mut PlaybookPlanStatus,
-    run: &RecordedRun,
-    error: &ReconcileError,
-) {
-    status.summary = Some(format!(
-        "could not prepare run {}: {error}",
-        run.mirror.job_name
-    ));
+/// The status half of [`report_failed_run_preparation`], split out to pin that reporting changes only
+/// the diagnosis and leaves the active run available for recovery. A step that already reported a
+/// more specific failure keeps its diagnosis.
+fn record_failed_run_preparation(status: &mut PlaybookPlanStatus, error: &ReconcileError) -> bool {
+    if status
+        .active_run
+        .as_ref()
+        .is_some_and(|run| !summary_unclaimed_since_adoption(status, run))
+        || status
+            .summary
+            .as_deref()
+            .is_some_and(|summary| summary.starts_with(ABANDON_FAILURE_SUMMARY_PREFIX))
+    {
+        return false;
+    }
+
+    status.summary = Some(match status.active_run.as_ref() {
+        Some(run) => format!("could not prepare run {}: {error}", run.job_name),
+        None => format!("could not prepare a run: {error}"),
+    });
+    true
 }
 
 /// The history-retention pass, run either after finished records are acknowledged or — on a tick
@@ -3135,11 +3274,12 @@ pub const RUN_CLEANUP_FINALIZER: &str = "ansible.cloudbending.dev/run-cleanup";
 /// handle: the `Play` records are owned by the plan and may already be halfway through their own
 /// cascade by the time this runs.
 ///
-/// The run's Job is cancelled and *awaited* before anything is released, because releasing a host
-/// Lease while Ansible may still be talking to that host is the one outcome the whole locking design
-/// exists to prevent. The wait is unbounded and renews the run's Leases while it lasts: a plan that
-/// will not finish deleting is visible and fixable, whereas a host handed to another plan while a
-/// playbook is still running against it is neither.
+/// The run's Job is cancelled if it is still running, and either way *awaited* — down to the pods
+/// that outlive it — before anything is released, because releasing a host Lease while Ansible may
+/// still be talking to that host is the one outcome the whole locking design exists to prevent. The
+/// wait is unbounded and renews the run's Leases while it lasts: a plan that will not finish
+/// deleting is visible and fixable, whereas a host handed to another plan while a playbook is still
+/// running against it is neither.
 async fn release_deleted_plan(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -3263,15 +3403,17 @@ fn dedupe_runs(runs: Vec<RecordedRun>) -> Vec<RecordedRun> {
         .collect()
 }
 
-/// Cancels a deleted plan's Job and reports whether Ansible may still be executing on its hosts.
+/// Cancels a run's Job and reports whether Ansible may still be executing on its hosts.
 ///
-/// Deleting the plan already makes Kubernetes reap the Job, but the propagation policy that reaps it
-/// is the deleting client's choice — an orphaning delete would leave the pod running with nothing
-/// pointing at it — so the Job is deleted here explicitly rather than assumed gone. Only this run's
-/// own Job is touched: a foreign Job at the recorded name belongs to something this plan never
-/// created, and neither its existence nor its pods say anything about this run.
+/// A deleted plan normally makes Kubernetes reap the Job, but the propagation policy that reaps it is
+/// the deleting client's choice. An orphaning delete would leave the pod running with nothing
+/// pointing at it, and a deleted `Play` gives the same missing-record signal during normal recovery,
+/// so the Job is deleted here explicitly rather than assumed gone. Only this run's own Job is
+/// touched: a foreign Job at the recorded name belongs to something this plan never created, and
+/// neither its existence nor its pods say anything about this run.
 ///
-/// The deletion is **foreground**, and the Job's own disappearance is the barrier this waits on.
+/// A non-terminal Job is deleted **foreground**, and its own disappearance is the barrier this waits
+/// on. A Job that already reached `Complete` or `Failed` is left for its TTL controller instead.
 /// Under foreground propagation the apiserver keeps the Job until garbage collection has deleted
 /// every dependent that blocks its owner — which is exactly the Job's pods — so a Job that is gone
 /// is proof that no pod of it survives. Background propagation gives no such ordering: the Job is
@@ -3282,8 +3424,8 @@ fn dedupe_runs(runs: Vec<RecordedRun>) -> Vec<RecordedRun> {
 ///
 /// The pods are still consulted once the Job is gone, because a pod outlives the Job object while it
 /// terminates — and it is the pod, not the Job, that holds the SSH session. The run's Leases are
-/// renewed for as long as either says the run is up, since the deletion path is the one place that
-/// would otherwise stop renewing them while a playbook is still running.
+/// renewed for as long as either says the run is up, since callers would otherwise stop renewing
+/// them while a playbook is still running.
 async fn cancel_run_job(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -3307,10 +3449,11 @@ async fn cancel_run_job(
     });
 
     if let Some(job) = &job
+        && !status::job_finished(job)
         && job.metadata.deletion_timestamp.is_none()
     {
         info!(
-            "PlaybookPlan {namespace}/{name} was deleted; cancelling its Job {}",
+            "PlaybookPlan {namespace}/{name}: cancelling Job {} before releasing its hosts",
             run.mirror.job_name
         );
         // The UID carries the identity `validate_selected_job` just established into the mutation
@@ -3339,18 +3482,20 @@ async fn cancel_run_job(
         }
     }
 
-    // The pod list is only reached once this run's Job is gone, so it answers the one question the
-    // Job can no longer answer — is a pod that outlived it still up? — instead of standing in for
-    // the Job's own cascade.
-    let executing = match job {
-        Some(_) => true,
-        None => {
-            let pods = pods_api
+    // The pod list is reached once this run's Job is gone or has reached a terminal state, so it
+    // answers whether a pod that outlived the Job or terminal transition is still up instead of
+    // standing in for the Job's own cascade.
+    let pods = if job.as_ref().is_some_and(|job| !status::job_finished(job)) {
+        None
+    } else {
+        Some(
+            pods_api
                 .list(&ListParams::default().labels(&run_pod_selector(&run.mirror.run_id)))
-                .await?;
-            pods.items.iter().any(pod_may_be_executing)
-        }
+                .await?,
+        )
     };
+    let pod_items: &[Pod] = pods.as_ref().map_or(&[], |pods| &pods.items);
+    let executing = run_may_be_executing(job.as_ref(), pod_items);
     if executing {
         let leases_api =
             Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
@@ -3362,7 +3507,7 @@ async fn cancel_run_job(
         .await
         {
             warn!(
-                "Could not renew the host locks of deleted plan {namespace}/{name}'s run {}: {error}",
+                "Could not renew the host locks of run {} on {namespace}/{name}: {error}",
                 run.mirror.job_name
             );
         }
@@ -3407,6 +3552,10 @@ fn pod_may_be_executing(pod: &Pod) -> bool {
             .and_then(|status| status.phase.as_deref()),
         Some("Succeeded" | "Failed")
     )
+}
+
+fn run_may_be_executing(job: Option<&Job>, pods: &[Pod]) -> bool {
+    job.is_some_and(|job| !status::job_finished(job)) || pods.iter().any(pod_may_be_executing)
 }
 
 fn holds_run_cleanup_finalizer(object: &PlaybookPlan) -> bool {
@@ -3754,13 +3903,16 @@ fn stage_finished_run(finished: &RecordedRun, resource_status: &mut PlaybookPlan
 ///
 /// The run number is claimed either way, because it answers a different question: it reserves a
 /// name against every later run, and a finished run holds its number whatever else is in flight.
-/// The attempt is not a high-water mark: a new `Recurring` slot restarts it, so the current-revision
-/// surviving run is authoritative when present, and the finished run is authoritative otherwise.
-/// Its slot travels with it so a pruned record cannot leave an unscoped count behind.
+/// The attempt is not a high-water mark: a new `Recurring` slot restarts it, and a successful
+/// `OneShot` execution is complete, so the current-revision surviving run is authoritative when
+/// present, and the finished run is authoritative otherwise. Its slot travels with it so a pruned
+/// record cannot leave an unscoped count behind.
 fn sync_desired_hash_after_finished_run(
     status: &mut PlaybookPlanStatus,
     desired_hash: &ExecutionHash,
+    mode: &ExecutionMode,
     finished: &RecordedRun,
+    finished_outcome: &v1beta1::PlayPhase,
     surviving: Option<&SurvivingRun>,
 ) {
     // Clears the schedule bookkeeping when the desired revision has moved on, so the replacement can
@@ -3782,20 +3934,30 @@ fn sync_desired_hash_after_finished_run(
         record_triggered_slot(status, surviving_slot);
     }
 
-    if let Some((attempt, slot)) = surviving
+    let surviving_attempt = surviving
         .filter(|surviving| surviving.run.execution_hash == *desired_hash)
         .map(|surviving| {
             (
                 surviving.run.mirror.attempt,
                 surviving.run.mirror.triggered_slot,
             )
-        })
-        .or_else(|| {
-            (finished.execution_hash == *desired_hash)
-                .then_some((finished.mirror.attempt, finished.mirror.triggered_slot))
-        })
-    {
+        });
+    if let Some((attempt, slot)) = surviving_attempt {
         record_retry_budget(status, attempt, slot);
+    } else if finished.execution_hash == *desired_hash {
+        if matches!(mode, ExecutionMode::OneShot)
+            && phase_for_finished_run(finished_outcome) == Phase::Succeeded
+        {
+            // A successful OneShot execution is complete. Reset its budget so inventory growth can
+            // trigger a new run for hosts that were not present in the completed execution.
+            record_retry_budget(status, 0, None);
+        } else {
+            record_retry_budget(
+                status,
+                finished.mirror.attempt,
+                finished.mirror.triggered_slot,
+            );
+        }
     }
 }
 
@@ -5057,15 +5219,36 @@ fn record_invalid_scheduling_configuration(
 
 fn invalid_scheduling_requeue(
     status: &PlaybookPlanStatus,
-    recovered_a_run: bool,
-    deferred_terminal_record: bool,
+    handover: RunHandover,
 ) -> Option<std::time::Duration> {
     if status.active_run.is_some() {
         Some(std::time::Duration::from_secs(15))
-    } else if recovered_a_run && !deferred_terminal_record {
+    } else if handover == RunHandover::Retired {
         Some(std::time::Duration::from_secs(1))
     } else {
         None
+    }
+}
+
+/// What the two invalid-scheduling exits leave behind, from what the tick recovered and what it is
+/// giving up before acknowledging.
+///
+/// Both exits describe the same tick — it read the plan's records, may have drained a terminal one,
+/// and is returning before the path that could acknowledge it — so the description is built once and
+/// the requeue and the finalizer both answer from it.
+fn invalid_scheduling_handover(
+    recovered_a_run: bool,
+    finished_records: &[FinishedRecord],
+) -> RunHandover {
+    if !recovered_a_run {
+        RunHandover::NothingHeld
+    } else if finished_records
+        .iter()
+        .any(|finished| finished.record == TerminalRecord::Present)
+    {
+        RunHandover::Retained
+    } else {
+        RunHandover::Retired
     }
 }
 
@@ -5688,6 +5871,42 @@ mod tests {
         );
     }
 
+    /// The fingerprint is strict on purpose, but it must not be strict about something no host can
+    /// observe. A group whose `variables` render nothing is a group with no variables to the
+    /// renderer and to the execution hash alike, so an author adding `variables: {}` while a run is
+    /// waiting on its locks or its proxy pods must not have that run torn down and rebuilt — which,
+    /// for a scheduled plan, can cost it the rest of its starting window and so the tick itself.
+    #[test]
+    fn a_variables_map_that_renders_nothing_does_not_move_the_fingerprint() {
+        let mut plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("uid".into());
+
+        let with_variables = |variables: Option<serde_json::Value>| {
+            vec![ResolvedInventoryGroup::ManagedSsh {
+                hosts: ResolvedHosts {
+                    name: "nodes".into(),
+                    hosts: vec!["a".into()],
+                },
+                tolerations: None,
+                variables: variables.map(GenericMap),
+            }]
+        };
+
+        let absent = preparation_fingerprint(&plan, &with_variables(None)).unwrap();
+        let empty =
+            preparation_fingerprint(&plan, &with_variables(Some(serde_json::json!({})))).unwrap();
+        assert_eq!(
+            absent, empty,
+            "an empty map renders and hashes as absence, so it must fingerprint as absence too"
+        );
+
+        // The canonicalization must not blunt the check it belongs to: real variables still move it.
+        let real =
+            preparation_fingerprint(&plan, &with_variables(Some(serde_json::json!({ "a": 1 }))))
+                .unwrap();
+        assert_ne!(absent, real, "variables a host will see still count");
+    }
+
     /// The load-bearing property behind dropping the Job snapshot from the `Play`: rebuilding the
     /// blueprint from the plan reproduces the prepared bytes exactly. `create_job_blueprint` must
     /// stay a pure function of the recorded identity plus the plan and groups the fingerprint
@@ -6115,6 +6334,166 @@ mod tests {
         assert!(without_run_cleanup_finalizer(&None).is_empty());
     }
 
+    fn plan_holding_the_run_cleanup_finalizer() -> PlaybookPlan {
+        let mut plan = PlaybookPlan::new("web", Default::default());
+        plan.metadata.finalizers = Some(vec![RUN_CLEANUP_FINALIZER.to_string()]);
+        plan
+    }
+
+    fn status_mirroring_a_run() -> PlaybookPlanStatus {
+        PlaybookPlanStatus {
+            active_run: Some(ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-a".into(),
+                job_name: "apply-web-abc-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The tick that finishes a run keeps the finalizer, so the *next* tick is what gives it back —
+    /// and that tick has to come soon. Left to the caller's interval it would be an hour away for a
+    /// finished `OneShot` plan and a whole schedule period away for a `Recurring` one, leaving a
+    /// plan that holds nothing carrying a finalizer that makes it undeletable while the operator is
+    /// down.
+    #[test]
+    fn a_plan_that_owes_its_finalizer_back_is_looked_at_again_promptly() {
+        assert!(defers_finalizer_release(
+            &plan_holding_the_run_cleanup_finalizer(),
+            &PlaybookPlanStatus::default(),
+            RunHandover::Retired,
+        ));
+
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(
+            finalizer_release_retry_after(Some(hour)),
+            FINALIZER_RELEASE_RETRY,
+            "the idle requeue must not decide when the finalizer comes back"
+        );
+        assert_eq!(
+            finalizer_release_retry_after(None),
+            FINALIZER_RELEASE_RETRY,
+            "a tick that would have slept until woken still has to come back for it"
+        );
+        let sooner = std::time::Duration::from_secs(1);
+        assert_eq!(
+            finalizer_release_retry_after(Some(sooner)),
+            sooner,
+            "a caller already coming back sooner keeps its own interval"
+        );
+    }
+
+    /// The other shapes a tick can have. Only a plan that has just stopped holding a run owes the
+    /// finalizer back; asking for the retry interval in any of these would poll a plan that has
+    /// nothing to hand over — and the first of them would do it for the whole of a live run.
+    #[test]
+    fn nothing_else_asks_for_the_finalizer_retry_interval() {
+        let held = plan_holding_the_run_cleanup_finalizer();
+
+        assert!(
+            !defers_finalizer_release(&held, &status_mirroring_a_run(), RunHandover::Retired),
+            "a run is still in flight, so the finalizer is legitimately held"
+        );
+        assert!(
+            !defers_finalizer_release(
+                &held,
+                &PlaybookPlanStatus::default(),
+                RunHandover::NothingHeld
+            ),
+            "nothing was recovered, so this tick gives the finalizer back itself"
+        );
+        assert!(
+            !defers_finalizer_release(
+                &PlaybookPlan::new("web", Default::default()),
+                &PlaybookPlanStatus::default(),
+                RunHandover::Retired,
+            ),
+            "there is no finalizer to give back"
+        );
+    }
+
+    /// A tick that is *not allowed* to acknowledge the record it drained leaves that record for the
+    /// next tick, which recovers it and reaches exactly the same decision. Waking sooner therefore
+    /// releases nothing and only re-lists records and re-reads inventories and Secrets, so the
+    /// invalid-scheduling exits ask for `await_change` and the finalizer must not talk them out of
+    /// it — otherwise a plan whose schedule stays broken polls every five seconds indefinitely.
+    #[test]
+    fn a_record_this_tick_may_not_acknowledge_does_not_buy_a_prompt_requeue() {
+        let idle = PlaybookPlanStatus::default();
+
+        assert!(
+            !defers_finalizer_release(
+                &plan_holding_the_run_cleanup_finalizer(),
+                &idle,
+                RunHandover::Retained,
+            ),
+            "no number of ticks releases a finalizer the plan's scheduling is holding"
+        );
+        assert_eq!(
+            invalid_scheduling_requeue(&idle, RunHandover::Retained),
+            None,
+            "the exit that produces a retained record parks until the plan is corrected"
+        );
+    }
+
+    /// The handover is what keeps the two apart, so it has to be read off the same tick the two exits
+    /// actually describe: only a drained record the tick may not acknowledge is `Retained`.
+    #[test]
+    fn only_an_unacknowledgeable_record_is_retained_across_an_invalid_scheduling_exit() {
+        let run = || RecordedRun {
+            mirror: status_mirroring_a_run().active_run.unwrap(),
+            execution_hash: ExecutionHash::from_hex("1").unwrap(),
+        };
+        let record = |record| FinishedRecord { run: run(), record };
+
+        assert_eq!(
+            invalid_scheduling_handover(false, &[]),
+            RunHandover::NothingHeld
+        );
+        assert_eq!(invalid_scheduling_handover(true, &[]), RunHandover::Retired);
+        assert_eq!(
+            invalid_scheduling_handover(true, &[record(TerminalRecord::Lost)]),
+            RunHandover::Retired,
+            "a lost receipt has nothing to acknowledge, so nothing is left to recover"
+        );
+        assert_eq!(
+            invalid_scheduling_handover(true, &[record(TerminalRecord::Present)]),
+            RunHandover::Retained
+        );
+    }
+
+    /// The pair has to partition the case it is decided in: with no run left, a tick either releases
+    /// the finalizer or owes it, and a version of either condition that let both — or neither —
+    /// answer would strand the finalizer or release it while a terminal record is still
+    /// unacknowledged. `Retained` is deliberately outside that partition: it neither releases (the
+    /// record is unacknowledged) nor defers (no later tick could finish the job).
+    #[test]
+    fn releasing_and_deferring_the_finalizer_are_exclusive_and_exhaustive() {
+        let held = plan_holding_the_run_cleanup_finalizer();
+        let idle = PlaybookPlanStatus::default();
+
+        for handover in [RunHandover::NothingHeld, RunHandover::Retired] {
+            let release = handover == RunHandover::NothingHeld && idle.active_run.is_none();
+            let defer = defers_finalizer_release(&held, &idle, handover);
+            assert_ne!(
+                release, defer,
+                "exactly one of the two must answer for an idle plan ({handover:?})"
+            );
+        }
+
+        let retained = RunHandover::Retained;
+        assert!(retained != RunHandover::NothingHeld);
+        assert!(
+            !defers_finalizer_release(&held, &idle, retained),
+            "a retained record neither releases the finalizer nor is worth waking for"
+        );
+    }
+
     /// The teardown a deleted plan performs is driven by two sources that overlap: the status mirror
     /// and the record it was built from name the same run. Releasing it twice is not harmful, but it
     /// spends a second round of deletes and Lease calls on resources the first pass already removed.
@@ -6256,10 +6635,11 @@ mod tests {
         );
     }
 
-    /// What the deletion path waits on before it releases a host: the playbook pod, not the proxy
-    /// pods that share its run ID, and not a pod that has already stopped talking to its hosts.
+    /// What a missing-record path waits on before it releases a host: the Job or playbook pod, not
+    /// the proxy pods that share its run ID, and not a pod that has already stopped talking to its
+    /// hosts.
     #[test]
-    fn only_a_live_playbook_pod_holds_a_deleted_plans_hosts() {
+    fn only_a_live_job_or_playbook_pod_holds_a_lost_runs_hosts() {
         let selector = run_pod_selector("run-a");
         assert!(selector.contains("ansible.cloudbending.dev/run-id=run-a"));
         assert!(
@@ -6278,7 +6658,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(pod_may_be_executing(&pod(Some("Running"))));
+        let running = pod(Some("Running"));
+        assert!(pod_may_be_executing(&running));
         assert!(pod_may_be_executing(&pod(Some("Pending"))));
         assert!(
             pod_may_be_executing(&pod(None)),
@@ -6298,6 +6679,25 @@ mod tests {
         // stopped, because everything else is only an absence of evidence.
         assert!(!pod_may_be_executing(&pod(Some("Succeeded"))));
         assert!(!pod_may_be_executing(&pod(Some("Failed"))));
+
+        assert!(run_may_be_executing(Some(&Job::default()), &[]));
+        let finished_job = Job {
+            status: Some(k8s_openapi::api::batch::v1::JobStatus {
+                conditions: Some(vec![k8s_openapi::api::batch::v1::JobCondition {
+                    type_: "Complete".into(),
+                    status: "True".into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!run_may_be_executing(Some(&finished_job), &[]));
+        assert!(run_may_be_executing(None, &[running]));
+        assert!(!run_may_be_executing(
+            None,
+            &[pod(Some("Succeeded")), pod(Some("Failed"))]
+        ));
     }
 
     #[test]
@@ -6759,15 +7159,21 @@ mod tests {
             Some("spec.timeZone is invalid")
         );
         assert_eq!(
-            invalid_scheduling_requeue(&applying, true, false),
+            invalid_scheduling_requeue(&applying, RunHandover::Retired),
             Some(std::time::Duration::from_secs(15))
         );
         assert_eq!(
-            invalid_scheduling_requeue(&idle, true, false),
+            invalid_scheduling_requeue(&idle, RunHandover::Retired),
             Some(std::time::Duration::from_secs(1))
         );
-        assert_eq!(invalid_scheduling_requeue(&idle, false, false), None);
-        assert_eq!(invalid_scheduling_requeue(&idle, true, true), None);
+        assert_eq!(
+            invalid_scheduling_requeue(&idle, RunHandover::NothingHeld),
+            None
+        );
+        assert_eq!(
+            invalid_scheduling_requeue(&idle, RunHandover::Retained),
+            None
+        );
 
         let abandoned = RecordedRun {
             mirror: applying.active_run.clone().unwrap(),
@@ -6997,9 +7403,11 @@ spec:
                     .iter()
                     .map(|name| v1beta1::FilesSource::Secret {
                         name: (*name).to_string(),
-                        secret_ref: v1beta1::SecretRef {
+                        secret_ref: v1beta1::FilesSecretRef {
                             name: "some-secret".into(),
+                            extra: BTreeMap::new(),
                         },
+                        extra: BTreeMap::new(),
                     })
                     .collect(),
             );
@@ -7026,6 +7434,49 @@ spec:
         // Two sources cannot share one directory, and choosing between them is not this operator's
         // call to make silently.
         assert!(validate_file_entries(&plan_with(&["tls", "tls"])).is_err());
+    }
+
+    #[test]
+    fn a_file_entry_requires_one_recognized_volume_source_without_ignored_fields() {
+        let plan_with = |yaml: &str| {
+            let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+            plan.spec.template.files = Some(vec![serde_yaml::from_str(yaml).unwrap()]);
+            plan
+        };
+
+        for source in [
+            "name: certs\nsecretRef:\n  name: app-certs",
+            "name: config\nconfigMap:\n  name: app-config",
+            "name: scratch\nemptyDir: {}",
+            "name: assets\nimage:\n  reference: registry.example/assets:v1",
+        ] {
+            assert!(
+                validate_file_entries(&plan_with(source)).is_ok(),
+                "{source:?} must be accepted as a complete volume"
+            );
+        }
+
+        let typo = plan_with("name: assets\nconfigMap:\n  nmae: app-config");
+        assert!(matches!(
+            validate_file_entries(&typo),
+            Err(ReconcileError::InvalidFileEntry { name, reason })
+                if name == "assets" && reason.contains("recognized Kubernetes volume source")
+        ));
+
+        for source in [
+            "name: assets\nconfigMpa:\n  name: app-config",
+            "name: assets",
+            "name: assets\nconfigMap:\n  name: app-config\nemptyDir: {}",
+            "name: assets\nconfigMap: false",
+            "name: assets\nconfigMap:\n  name: app-config\n  nmae: null",
+            "name: certs\nsecretRef:\n  name: app-certs\nemptyDir: {}",
+            "name: certs\nsecretRef:\n  name: app-certs\n  nmae: null",
+        ] {
+            assert!(
+                validate_file_entries(&plan_with(source)).is_err(),
+                "{source:?} must be rejected before a run starts"
+            );
+        }
     }
 
     /// A spec error no tick can clear: holding a run open against it would hold its host Leases for
@@ -7849,6 +8300,24 @@ spec:
 
         status.summary = Some("could not release the abandoned run apply-plan-1-4: boom".into());
         assert!(!summary_unclaimed_since_adoption(&status, &active_run));
+        assert!(!record_failed_run_preparation(
+            &mut status,
+            &ReconcileError::PreconditionFailed("fallback")
+        ));
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("could not release the abandoned run apply-plan-1-4: boom")
+        );
+
+        status.active_run = None;
+        assert!(!record_failed_run_preparation(
+            &mut status,
+            &ReconcileError::PreconditionFailed("fallback")
+        ));
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("could not release the abandoned run apply-plan-1-4: boom")
+        );
 
         // A summary left over from a *previous* tick describes a run that is no longer current, so
         // it is not a claim on this one and must not suppress the fallback.
@@ -7862,7 +8331,7 @@ spec:
     }
 
     #[test]
-    fn a_foreign_proxy_refusal_is_reported_without_giving_up_the_run() {
+    fn a_run_preparation_failure_is_reported_without_giving_up_the_run() {
         let run = RecordedRun {
             execution_hash: ExecutionHash::from_hex("1").unwrap(),
             mirror: ActiveRun {
@@ -7880,6 +8349,7 @@ spec:
             current_hash: "1".into(),
             phase: Phase::Applying,
             active_run: Some(run.mirror.clone()),
+            summary: Some(applying_summary(&run.mirror)),
             retry_count: 2,
             last_run_number: 4,
             ..Default::default()
@@ -7890,7 +8360,7 @@ spec:
             host: "worker-1".into(),
         };
 
-        record_failed_run_preparation(&mut status, &run, &error);
+        assert!(record_failed_run_preparation(&mut status, &error));
 
         assert_eq!(
             status.summary.as_deref(),
@@ -7909,6 +8379,20 @@ spec:
                 .map(|active| active.play_uid.as_str()),
             Some("play-uid")
         );
+    }
+
+    #[test]
+    fn a_start_failure_before_recording_still_gets_a_summary() {
+        let mut status = PlaybookPlanStatus::default();
+        let error = ReconcileError::PreconditionFailed("uid not set");
+
+        assert!(record_failed_run_preparation(&mut status, &error));
+
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("could not prepare a run: Precondition failed: uid not set")
+        );
+        assert!(status.active_run.is_none());
     }
 
     #[test]
@@ -8249,7 +8733,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
+            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, slot),
+            &v1beta1::PlayPhase::Failed,
             None,
         );
 
@@ -8261,6 +8747,74 @@ spec:
         // Still the desired revision, so the slot it consumed keeps it from re-triggering itself
         // inside its own grace window.
         assert_eq!(status.last_triggered_run, Some(slot));
+    }
+
+    #[test]
+    fn a_successful_oneshot_run_resets_budget_for_new_hosts() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            retry_count: 1,
+            retry_count_slot: Some(slot),
+            eligible_hosts: vec![ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["worker-1".into(), "worker-2".into()],
+            }],
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".into(),
+                v1beta1::HostStatus {
+                    last_applied_hash: hash.to_string(),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &ExecutionMode::OneShot,
+            &finished_run(hash, 3, 1, slot),
+            &v1beta1::PlayPhase::Succeeded,
+            None,
+        );
+
+        assert_eq!(status.retry_count, 0);
+        assert_eq!(status.retry_count_slot, None);
+        let outdated = find_outdated_hosts(&status, &hash);
+        assert_eq!(outdated, vec!["worker-2"]);
+        assert!(may_start_new_run(
+            false,
+            has_work_to_start(&ExecutionMode::OneShot, false, !outdated.is_empty()),
+            attempt_budget_available(&ExecutionMode::OneShot, status.retry_count, 1),
+        ));
+    }
+
+    #[test]
+    fn a_successful_recurring_run_keeps_its_slot_budget() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &ExecutionMode::Recurring,
+            &finished_run(hash, 3, 1, slot),
+            &v1beta1::PlayPhase::Succeeded,
+            None,
+        );
+
+        assert_eq!(status.retry_count, 1);
+        assert_eq!(status.retry_count_slot, Some(slot));
     }
 
     #[test]
@@ -8470,7 +9024,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
+            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
+            &v1beta1::PlayPhase::Failed,
             Some(&surviving_run(hash, Some(live_slot))),
         );
 
@@ -8507,7 +9063,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
+            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
+            &v1beta1::PlayPhase::Failed,
             Some(&surviving_run(hash, Some(live_slot))),
         );
 
@@ -8532,7 +9090,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
+            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
+            &v1beta1::PlayPhase::Failed,
             Some(&surviving_run(hash, None)),
         );
 
@@ -8575,7 +9135,9 @@ spec:
             sync_desired_hash_after_finished_run(
                 &mut status,
                 &hash,
+                &ExecutionMode::OneShot,
                 &finished_run(hash, 3, 2, finished_slot),
+                &v1beta1::PlayPhase::Failed,
                 Some(&surviving_run_in(phase.clone(), hash, Some(live_slot))),
             );
 
@@ -8623,7 +9185,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
+            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
+            &v1beta1::PlayPhase::Failed,
             None,
         );
 
@@ -8650,7 +9214,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
+            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
+            &v1beta1::PlayPhase::Failed,
             Some(&surviving_run(old_hash, Some(slot))),
         );
 
@@ -8677,7 +9243,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
+            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 3, slot),
+            &v1beta1::PlayPhase::Failed,
             Some(&surviving),
         );
 
@@ -8702,7 +9270,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
+            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
+            &v1beta1::PlayPhase::Failed,
             None,
         );
 

@@ -25,7 +25,7 @@ per-host status, and the summary line.
 |---|---|
 | `Pending` | Triggers not yet evaluated — the resting state right after creation, after the inputs changed, or while unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent a plan with no run verdict from starting. |
 | `Delayed` | The plan is waiting for its scheduled time and has no result yet under the current playbook and inputs. |
-| `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has created or identified the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name. |
+| `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has created or identified the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name, and with reason `RunRecordLost` that the run's `Play` record is gone and its Job is being stopped before its hosts are released. |
 | `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. |
 | `Failed` | The latest run did not succeed on every host, or its recap could not be read. A `Recurring` plan keeps this result between ticks the same way. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
 | `UnauthorizedNamespace` | The plan's namespace is not enrolled for the operator — it will not run. See below. |
@@ -70,8 +70,13 @@ printer columns:
   covers a Job that is still scheduling, pulling its image or
   starting its pod. `Running=False` with reason `JobIdentityMismatch` means something that is not this
   run's Job holds the name the run recorded: the plan stays `Applying` and waits, renewing its host
-  locks, because a contested name is never taken over or abandoned — the message names the Job. After
-  a run finishes, `Running=False` carries no reason.
+  locks, because a contested name is never taken over or abandoned — the message names the Job.
+  `Running=False` with reason `RunRecordLost` means the run's `Play` record has disappeared: the plan
+  stays `Applying` while the operator cancels that run's Job and waits for it to stop, still renewing
+  its host locks, and clears once the run is finalized with every targeted host `Unknown`. A
+  cancellation that never ends leaves this standing — `lastTransitionTime` is how long it has been
+  waiting, and the run's Job and pod are what to inspect. After a run finishes, `Running=False`
+  carries no reason.
 - **`Blocked`** — the run is due but waiting on a per-host lock held by another run; the condition
   message names the host and the run holding it. This one is not a column — read it with `kubectl
   describe` or `-o yaml`. It clears on its own once every lock the run needs is free. See
@@ -172,9 +177,12 @@ its resources are cleaned up rather than by history pruning. If cleanup keeps fa
 deliberately remains as the retry handle for resources that may still be privileged. Deleting a Play by
 hand is safe once its
 `.status.planStatusRecorded` is `true`, which is the operator's own marker that the run's results have
-reached the plan. Deleting one that still describes a live run — or a finished one whose results have
-not been folded in yet — is not, because that record is the only thing the run can be recovered from.
-See [The plan is stuck in `Applying`](#the-plan-is-stuck-in-applying).
+reached the plan. Deleting one that still describes a live run intentionally loses its recap: when the
+plan's `.status.activeRun` still names that run, the operator cancels its own Job, waits for it to stop
+(reporting that wait as `Running=False` with reason `RunRecordLost`), then releases the proxies and
+Leases and reports the targeted hosts as `Unknown`. Do not delete a live
+record as a first response to a stuck plan; inspect the run and Job first. See [The plan is stuck in
+`Applying`](#the-plan-is-stuck-in-applying).
 
 ## Troubleshooting
 
@@ -239,22 +247,28 @@ reconcile.
 
 ### The plan's inputs cannot be read
 
-Two summaries report that the operator could not read what the plan says it should be running, and
-so could not decide anything this tick:
+Three summaries report that the operator could not read or build what the plan says it should be
+running, and so could not decide anything this tick:
 
 - **"cannot resolve the plan's inventories: …"** — a referenced `ClusterInventory` or
-  `StaticInventory` could not be read. `Referenced ClusterInventory "…" does not exist` means the
-  reference is wrong or the inventory was deleted; anything else is an API error to retry.
+  `StaticInventory` could not be read, or one of them is not usable. Two forms need an edit rather
+  than a retry: `Referenced ClusterInventory "…" does not exist` (the reference is wrong or the
+  inventory was deleted) and `Inventory group "…" sets variable "…"` (a group sets one of the
+  connection variables the operator owns). Anything else is an API error to retry.
 - **"cannot read referenced Secrets: …"** — a Secret named by `spec.template.variables` or
   `spec.template.files` could not be read. `Referenced Secret "…" does not exist` means the reference
   is wrong or the Secret was deleted; anything else is an API error to retry.
+- **"spec.template.files entry … is not usable: …"** — a file entry has an invalid mount name or
+  does not describe exactly one recognized Kubernetes volume source without unknown fields. Correct
+  the named entry; a new run does not acquire host Leases or create managed-SSH proxy pods for this
+  invalid spec.
 
-Both reads are treated the same way, including for a run that is already in flight: a missing
-resource is permanent and supersedes a run that has not launched, while anything else is
-transient and holds it.
+A permanent problem — a missing resource, an inventory group that sets an operator-managed variable,
+or a file entry that cannot describe a volume — supersedes a run that has not launched; a transient
+read error holds it instead.
 
-Neither starts a run and neither changes `.status.hostsStatus`, so the plan holds its previous
-per-host results until the read succeeds; the operator retries every tick. `.status.nextRun` is
+None of them starts a run or changes `.status.hostsStatus`, so the plan holds its previous per-host
+results until the problem is resolved; the operator retries every tick. `.status.nextRun` is
 cleared because the plan cannot act on that slot. A real `Succeeded` or `Failed` verdict remains
 visible because the outage does not undo the latest run; a plan without one uses `Pending`. If a run
 was already in flight when this happened it keeps its own phase, and it is *not* dropped for a
@@ -288,6 +302,10 @@ A plan stays `Applying` for as long as a run is in flight, which for a long play
 normal — `.status.summary` then reads **"applying run …"**, naming the run, and the `Blocked` and
 `WaitingForNodes` conditions say whether it is waiting on a host lock or on proxy pods rather than
 executing.
+
+The related **"could not prepare a run: …"** summary, without a run name, means setup failed before
+the operator recorded an active run. There is no `Play`, host Lease, or managed-SSH proxy pod to
+recover in that case; the operator reports the error and retries normally.
 
 If it stays there with nothing progressing, `.status.summary` says which of the following it is
 instead, and `.status.activeRun` names the run it is waiting on:
@@ -352,13 +370,13 @@ instead, and `.status.activeRun` names the run it is waiting on:
   its own proxy resources and Leases. If the plan remains stuck after the foreign Job is gone, inspect
   the new `.status.summary` and operator logs rather than deleting the `Play`; it may be reporting a
   separate cleanup or API-permission problem.
-- **"could not prepare run …: Pod/Secret … already exists but is not this run's managed-ssh proxy
-  for host …"** — the operator found an object at a derived proxy-resource name in the operator
-  namespace, but could not prove that it belongs to this run and host. It refuses to treat the object
-  as this run's proxy because a managed-SSH proxy grants node-root access, keeps the run's host locks,
-  and retries the check.
+- **"could not prepare run …: …"** — setup or launch failed after the run was recorded. The run stays
+  recoverable and the operator retries every tick, so its host Leases and any managed-SSH proxy pods
+  already created remain in place. The rest of the message is the underlying API, admission,
+  workspace, proxy, Job, or run-record error to correct.
 
-  This can mean an object was planted or edited in the operator namespace. It can also mean two Node
+  The specific **"Pod/Secret … already exists but is not this run's managed-ssh proxy for host …"**
+  form can mean an object was planted or edited in the operator namespace. It can also mean two Node
   names produced the same shortened resource-name segment, which requires a deliberately constructed
   collision rather than an ordinary hash accident. Inspect the exact Pod or Secret named in the
   message. Its run ID, execution hash and component labels and its full target-host annotation must
@@ -653,9 +671,15 @@ If *every* host of one run shows `Unknown` at once, check these causes first:
 ### A change is not being picked up
 
 Only inputs that feed the [execution hash](./scheduling-and-modes.md#drift-detection) — the playbook
-text and the **contents** of referenced Secrets — trigger a re-run of already current hosts. Editing
-an unrelated `spec` field (or a schedule that has not fired yet) will not. Confirm
-`.status.currentHash` actually changed after your edit.
+text, the **contents** of referenced Secrets, and the `variables` set by the inventories the plan
+references — trigger a re-run of already current hosts. Editing an unrelated `spec` field (or a
+schedule that has not fired yet) will not. Confirm `.status.currentHash` actually changed after your
+edit.
+
+An inventory's group variables do count, but not at once: the operator does not watch
+`ClusterInventory` or `StaticInventory`, so such an edit waits for the plan's next reconcile, which
+is up to an hour for a settled `OneShot` plan. Touching the plan itself — any edit, an annotation
+included — wakes it immediately.
 
 ### It never seems to run
 

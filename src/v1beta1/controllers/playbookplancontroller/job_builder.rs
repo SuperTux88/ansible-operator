@@ -45,9 +45,9 @@ const WORKSPACE_VOLUME_NAME: &str = "playbook";
 
 /// `ttlSecondsAfterFinished` for the ansible Job: reaping a *finished* run is left to Kubernetes'
 /// TTL controller, so finished runs stay around briefly for inspection and then get reaped instead
-/// of accumulating forever. The operator deletes a Job only to cancel one that is still running when
-/// its plan is deleted (`cancel_run_job`), which is a different lifecycle — such a run never
-/// finishes, so this TTL never applies to it.
+/// of accumulating forever. The operator deletes a Job only to cancel one that is *still running*
+/// when its plan is deleted or its `Play` record disappears (`cancel_run_job`), which is a different
+/// lifecycle — a Job that already reached `Complete` or `Failed` is left to this TTL even there.
 ///
 /// Default `ttlSecondsAfterFinished` when a `PlaybookPlan` doesn't set `spec.ttlSecondsAfterFinished`.
 ///
@@ -820,42 +820,82 @@ pub fn extract_secret_names_for_files(pp: &PlaybookPlan) -> impl Iterator<Item =
 /// the currently targeted Kubernetes version supports. This can fail if the user tries
 /// to use a volume kind that does not exist, hence each item in the Iterator has its
 /// own Result.
-fn extract_file_volumes(
+pub(super) fn extract_file_volumes(
     pp: &PlaybookPlan,
 ) -> impl Iterator<Item = Result<(String, Volume), serde_json::Error>> {
     let files = pp.spec.template.files.as_ref();
 
     files.into_iter().flatten().map(|source| {
-        let (entry_name, value) = match source {
-            FilesSource::Secret { name, secret_ref } => (
-                name,
-                serde_json::to_value(kcore::v1::Volume {
-                    name: volume_name("files", name),
-                    secret: Some(SecretVolumeSource {
-                        secret_name: Some(secret_ref.name.to_owned()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                })?,
-            ),
-            FilesSource::Other { name, extra } => {
-                let mut volume = serde_json::to_value(extra)?;
-                // Set, not defaulted: the entry's `name` is the one the mount path is built from,
-                // so a `name` inside the free-form fields would otherwise name a volume that
-                // nothing mounts.
-                volume.as_object_mut().unwrap().insert(
-                    "name".into(),
-                    serde_json::to_value(volume_name("files", name))?,
-                );
-
-                (name, volume)
-            }
-        };
+        let (entry_name, value) = file_volume_value(source)?;
         Ok((
             entry_name.to_owned(),
             serde_json::from_value::<Volume>(value)?,
         ))
     })
+}
+
+fn file_volume_value(source: &FilesSource) -> Result<(&str, serde_json::Value), serde_json::Error> {
+    let (entry_name, value) = match source {
+        FilesSource::Secret {
+            name, secret_ref, ..
+        } => (
+            name.as_str(),
+            serde_json::to_value(kcore::v1::Volume {
+                name: volume_name("files", name),
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(secret_ref.name.to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })?,
+        ),
+        FilesSource::Other { name, extra } => {
+            let mut volume = serde_json::to_value(extra)?;
+            // Set, not defaulted: the entry's `name` is the one the mount path is built from,
+            // so a `name` inside the free-form fields would otherwise name a volume that
+            // nothing mounts.
+            volume.as_object_mut().unwrap().insert(
+                "name".into(),
+                serde_json::to_value(volume_name("files", name))?,
+            );
+
+            (name.as_str(), volume)
+        }
+    };
+    Ok((entry_name, value))
+}
+
+/// Whether a file entry survived conversion to the Kubernetes `Volume` type without losing fields
+/// and names exactly one recognized source.
+pub(super) fn file_volume_is_usable(
+    source: &FilesSource,
+    volume: &Volume,
+) -> Result<bool, serde_json::Error> {
+    if matches!(
+        source,
+        FilesSource::Secret {
+            secret_ref,
+            extra,
+            ..
+        } if !secret_ref.extra.is_empty() || !extra.is_empty()
+    ) {
+        return Ok(false);
+    }
+
+    let (_, requested) = file_volume_value(source)?;
+    let rendered = serde_json::to_value(volume)?;
+
+    let source_count = rendered
+        .as_object()
+        .map(|fields| {
+            fields
+                .keys()
+                .filter(|field| field.as_str() != "name")
+                .count()
+        })
+        .unwrap_or_default();
+
+    Ok(source_count == 1 && requested == rendered)
 }
 
 /// Ten symbols matches the run-name discriminator: five has only about 14 million values, and a

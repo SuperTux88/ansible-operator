@@ -150,10 +150,10 @@ untrusted principals `create` on `batch/jobs` there.
 Two of those grants are wider than what the operator does with them, because RBAC cannot express the
 narrower rule:
 
-- **`delete` on `batch/jobs`** cancels the run of a plan that is deleted mid-run, rather than leaving
-  its pod to the deleting client's propagation policy. The operator deletes only a Job whose identity
-  it has validated, and passes that Job's UID as a delete precondition, but the grant itself covers
-  every Job in the namespace.
+- **`delete` on `batch/jobs`** cancels the run of a plan that is deleted mid-run, or whose `Play` record
+  is removed, rather than leaving its pod to the deleting client's propagation policy. The operator
+  deletes only a Job whose identity it has validated, and passes that Job's UID as a delete
+  precondition, but the grant itself covers every Job in the namespace.
 - **`patch` on `playbookplans`** carries the `ansible.cloudbending.dev/run-cleanup` finalizer, which
   is what keeps a deleted plan alive until its node-root proxy pods and host Leases are released.
   RBAC cannot restrict a patch to `metadata.finalizers`, so the grant permits writing the spec and

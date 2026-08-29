@@ -293,12 +293,24 @@ pub struct PlaybookTemplate {
 #[serde(untagged)]
 pub enum FilesSource {
     #[serde(rename_all = "camelCase")]
-    Secret { name: String, secret_ref: SecretRef },
+    Secret {
+        name: String,
+        secret_ref: FilesSecretRef,
+        #[serde(flatten)]
+        extra: BTreeMap<String, serde_json::Value>,
+    },
     Other {
         name: String,
         #[serde(flatten)]
         extra: BTreeMap<String, serde_json::Value>,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FilesSecretRef {
+    pub name: String,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
@@ -379,10 +391,9 @@ pub struct PlaybookPlanStatus {
     #[schemars(with = "Option<String>")]
     pub next_run: Option<DateTime<FixedOffset>>,
     /// The start of the schedule slot (`Timing::Now`'s window start) that a run was last started
-    /// for. This is the observable run-start marker; the trigger gate also checks the slot-scoped
-    /// retry budget and immutable `Play` records so a lagging marker cannot admit a duplicate run.
-    /// Cleared whenever `currentHash` changes, so an edit takes effect inside the window it was made
-    /// in; `None` for unscheduled plans.
+    /// for. This is an observable run-start marker only; the trigger gate uses the slot-scoped retry
+    /// budget and immutable `Play` records instead. Cleared whenever `currentHash` changes, so an
+    /// edit takes effect inside the window it was made in; `None` for unscheduled plans.
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub last_triggered_run: Option<DateTime<FixedOffset>>,
@@ -406,7 +417,8 @@ pub struct PlaybookPlanStatus {
     /// How many tries the current execution has spent of its `spec.maxAttempts` budget, the latest
     /// run included. Unlike `lastRunNumber` this counts, and it counts within one execution only:
     /// it restarts at 1 whenever `currentHash` changes and, for `Recurring` plans, whenever a new
-    /// schedule tick starts a run — the two events that begin a new execution.
+    /// schedule tick starts a run — the two events that begin a new execution. A successful
+    /// `OneShot` execution resets it to 0 so newly eligible hosts can begin a new execution.
     ///
     /// Written from the run's own `Play` record, so a status that lags a run in flight cannot hand
     /// the budget back by forgetting a try that was already made.
@@ -635,9 +647,11 @@ mod tests {
                     }]),
                     files: Some(vec![FilesSource::Secret {
                         name: "some-name".into(),
-                        secret_ref: SecretRef {
+                        secret_ref: FilesSecretRef {
                             name: "secret-with-files".into(),
+                            extra: BTreeMap::new(),
                         },
+                        extra: BTreeMap::new(),
                     }]),
                     playbook: r#"
 - tasks:
@@ -703,7 +717,8 @@ spec:
             files.first().unwrap(),
             FilesSource::Secret {
                 name,
-                secret_ref: _
+                secret_ref: _,
+                extra: _
             } if name == "some-configs"
         ));
 

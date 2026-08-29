@@ -82,7 +82,8 @@ pub struct PlaySpec {
     /// Which try of its execution this run is: 1 for the first, one more for each retry of a failed
     /// one, up to the plan's `spec.maxAttempts`. An execution is the current playbook and inputs
     /// for a `OneShot` plan and one schedule tick for a `Recurring` one, so this restarts at 1
-    /// whenever the plan is edited and, for `Recurring`, at every tick.
+    /// whenever the plan is edited, after a successful `OneShot` execution, and — for `Recurring` —
+    /// at every tick.
     ///
     /// Orthogonal to `runNumber`, which every try advances because every try *is* a run — with its
     /// own record, its own `runId` and its own Job. This says which try of its execution that run

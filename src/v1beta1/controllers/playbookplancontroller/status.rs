@@ -215,6 +215,28 @@ pub fn set_job_identity_mismatch_condition(status: &mut PlaybookPlanStatus, job_
     );
 }
 
+/// Withdraws `Running` while a run whose `Play` record is gone is being stopped before its hosts
+/// are released.
+///
+/// The wait spans as many ticks as the Job's cancellation takes, and there is nothing else on the
+/// plan that would say why: the mirror still names the run, so an earlier tick's
+/// `JobRunning`/"the run's Job exists and has not finished" would otherwise stand for the whole
+/// teardown and describe a run that is being killed as one that is progressing.
+pub fn set_run_record_lost_condition(status: &mut PlaybookPlanStatus, job_name: &str) {
+    upsert_condition(
+        &mut status.conditions,
+        PlaybookPlanCondition {
+            type_: "Running".into(),
+            status: "False".into(),
+            reason: Some("RunRecordLost".into()),
+            message: Some(format!(
+                "the Play record of run {job_name} is gone; its Job is being cancelled before its hosts are released"
+            )),
+            last_transition_time: Some(chrono::Local::now().fixed_offset()),
+        },
+    );
+}
+
 /// Marks the plan as not ready because one of its desired inputs could not be read. The message is
 /// the same diagnostic shown in the plan summary.
 pub fn set_inputs_unavailable_condition(status: &mut PlaybookPlanStatus, message: &str) {
@@ -654,6 +676,72 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("plan-abc123-1"))
         );
+    }
+
+    /// A run being stopped because its record is gone must stop advertising itself as running, and
+    /// must keep saying so without re-dating the claim: the cancellation is polled every few
+    /// seconds, and `lastTransitionTime` is what a reader ages a stuck teardown by. Once the run is
+    /// finalized, its terminal result retires the condition like any other run's.
+    #[test]
+    fn a_lost_record_withdraws_a_running_claim_until_the_run_is_finalized() {
+        let mut status = PlaybookPlanStatus::default();
+        set_running_condition(&mut status);
+
+        set_run_record_lost_condition(&mut status, "plan-abc123-1");
+        let first = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Running")
+            .unwrap()
+            .clone();
+        assert_eq!(first.status, "False");
+        assert_eq!(first.reason.as_deref(), Some("RunRecordLost"));
+        assert!(
+            first
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("plan-abc123-1"))
+        );
+
+        set_run_record_lost_condition(&mut status, "plan-abc123-1");
+        let second = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Running")
+            .unwrap();
+        assert_eq!(second.last_transition_time, first.last_transition_time);
+        assert_eq!(
+            status
+                .conditions
+                .iter()
+                .filter(|c| c.type_ == "Running")
+                .count(),
+            1
+        );
+
+        apply_terminal_play_status(
+            &hash(),
+            &PlayStatus {
+                phase: PlayPhase::Unknown,
+                host_count: 1,
+                hosts: BTreeMap::from([(
+                    "host-1".into(),
+                    crate::v1beta1::PlayHostResult {
+                        outcome: HostOutcome::Unknown,
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+            &mut status,
+        );
+        let finalized = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Running")
+            .unwrap();
+        assert_eq!(finalized.status, "False");
+        assert_eq!(finalized.reason, None);
     }
 
     /// A second, *different* outage under the same reason has to replace the message. The summary is

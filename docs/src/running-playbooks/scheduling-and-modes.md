@@ -39,23 +39,24 @@ surfaces it in `kubectl get playbookplan`.
 
 ### One tick, one run per revision
 
-Because a run may start anywhere inside that window, the operator has to remember that the window has
-already been used — otherwise a run finishing inside its own window would immediately re-trigger
-itself. `.status.lastTriggeredRun` records the tick a run was last started for. The attempt budget
-also records its tick in `.status.retryCountSlot`, so the operator can distinguish a retry in the
-current tick from the first attempt in the next one even if the run-start marker is stale.
+Because a run may start anywhere inside that window, the trigger gate has to remember that the window
+has already been used — otherwise a run finishing inside its own window would immediately re-trigger
+itself. The gate uses the attempt budget's `.status.retryCountSlot` and the plan's immutable `Play`
+records to identify the current tick. `.status.lastTriggeredRun` records the tick a run was last
+started for as an observable marker only; it is not a gate input.
 
-That memory is per revision, not per window: any change to the [execution hash](#drift-detection)
-clears `lastTriggeredRun`, so an edit made moments after a run started takes effect right away rather
-than waiting for the next tick. Reverting to an earlier revision is a change like any other and runs
-again too.
+That gating state is per revision, not per window: any change to the [execution hash](#drift-detection)
+clears the retry budget and makes prior `Play` records inapplicable, so an edit made moments after a
+run started takes effect right away rather than waiting for the next tick. `lastTriggeredRun` is
+cleared with the revision as an informational status update. Reverting to an earlier revision is a
+change like any other and runs again too.
 
-`lastTriggeredRun` is a summary of something the run records already say. Every run writes down the
-revision and schedule tick before anything is created, so before the operator starts a run for a tick
-it also checks whether one of the plan's own
+Every run writes down the revision and schedule tick before anything is created, so before the
+operator starts a run for a tick it checks whether one of the plan's own
 [`Play` records](./results-and-troubleshooting.md) already took that tick at the current revision.
 The slot-scoped attempt counter remains after old records are pruned. Together they keep a lagging or
-competing status write from granting an extra attempt.
+competing status write from granting an extra attempt; `lastTriggeredRun` remains a summary for
+observers rather than another source of gating decisions.
 
 ## Suspending a plan
 
@@ -104,17 +105,33 @@ repeating work: nightly package upgrades, drift correction, health tasks. A `Rec
 ## Drift detection
 
 To decide which hosts are out of date, the operator computes an **execution hash** over the playbook
-text **plus the contents of every referenced Secret** (variables and files). The hash is
-order-insensitive, so reordering inputs does not count as a change, and it excludes the internally
-rendered workspace, whose content (e.g. proxy pod IPs) legitimately changes every run.
+text, **the contents of every referenced Secret** (variables and files), and the group variables set
+by the inventories the plan references
+([cluster nodes](./cluster-nodes.md#group-variables), [external hosts](./external-hosts.md#group-variables)).
+The hash is order-insensitive, so reordering inputs does not count as a change, and it excludes the
+internally rendered workspace, whose content (e.g. proxy pod IPs) legitimately changes every run.
+
+The inventories contribute their `variables` only, keyed by group name, so a group that sets none —
+omitting the field or writing an empty `{}`, which render identically — contributes nothing at all.
+Which *hosts* a group resolves to is deliberately not part of the hash: a
+node joining or leaving changes who the plan targets, not what it applies, and a new node is already
+out of date because it has no recorded hash of its own.
 
 - Each host records the hash it **last succeeded on** (`.status.hostsStatus.<host>.lastAppliedHash`).
 - A host whose last-applied hash equals the current hash is **current** and is skipped (in
   `OneShot`).
-- When you edit the playbook, or change a referenced variables/files Secret, the hash changes: the
-  desired hash, run numbering and [consumed schedule slot](#one-tick-one-run-per-revision) update
-  immediately. An in-flight run keeps its own hash, target inventory, run number, and schedule
-  slot in an immutable `Play`, so the edit does not disturb it — see [Editing a plan while a run is in
+- When you edit the playbook or change a referenced variables/files Secret, the hash changes **at
+  once**: the operator watches the plan and the Secrets it names, so the desired hash, run numbering
+  and [consumed schedule slot](#one-tick-one-run-per-revision) update on the spot.
+- Changing an inventory's group variables changes the hash too, but **not at once**. The operator
+  does not watch `ClusterInventory` or `StaticInventory` resources, so the plan picks such a change
+  up at its next reconcile — which is seconds away for a plan with a run in flight, the next
+  scheduled tick for a `Recurring` plan (when it would re-apply anyway), and up to an hour for an
+  idle `OneShot` plan that has settled. The same delay applies to the hosts a group resolves to, for
+  the same reason. If you need the change applied now, touch the plan itself: any edit to it, an
+  annotation included, wakes it immediately.
+- An in-flight run keeps its own hash, target inventory, run number, and schedule slot in an
+  immutable `Play`, so none of these edits disturb it — see [Editing a plan while a run is in
   flight](#editing-a-plan-while-a-run-is-in-flight).
 
 This is what makes `OneShot` idempotent and cheap: editing an unrelated field does not re-run
@@ -207,8 +224,9 @@ What the budget covers depends on the mode, because what counts as "the same pie
   spent the plan stays `Failed` and starts nothing further — that is the point: its hosts are still
   out of date precisely *because* the runs failed, so nothing else would stop it. Editing the
   playbook or a referenced Secret changes the execution hash and hands it a fresh budget; so does
-  raising `maxAttempts`. A `schedule` does not: it says when a `OneShot` plan may run, not how often
-  it may fail.
+  raising `maxAttempts`. A successful run also closes that execution and resets the budget, so hosts
+  added to the inventory later can run without an unrelated plan edit. A `schedule` does not reset a
+  failed execution: it says when a `OneShot` plan may run, not how often it may fail.
 - **`Recurring`** spends its budget on one schedule tick, and defaults to `1` — no retry, since the
   next tick re-applies the same playbook anyway. With a higher `maxAttempts` a failed run is retried
   within the current tick, and the next tick starts over with a full budget whatever the previous one
