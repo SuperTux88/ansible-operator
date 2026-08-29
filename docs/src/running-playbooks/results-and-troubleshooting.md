@@ -158,8 +158,9 @@ Retention is per plan and split by outcome, so failures stay visible longer than
 | `spec.failedPlaysHistoryLimit` | 10 | most recent **failed / unknown** Plays |
 
 Plays beyond these limits are pruned automatically as new runs finish. The operator also retries the
-retention pass on ordinary reconciles if a deletion fails, so a temporary API error does not
-permanently leave old records behind. Deleting the `PlaybookPlan` removes all of its Plays.
+retention pass on ordinary reconciles if a deletion fails or is skipped because the record changed
+underneath it, so a temporary API error does not permanently leave old records behind. Deleting the
+`PlaybookPlan` removes all of its Plays.
 
 Only *finished* Plays are counted against the history limits, and a finished one is temporarily kept
 until its complete result, including the terminal phase and retry status, has been persisted on the

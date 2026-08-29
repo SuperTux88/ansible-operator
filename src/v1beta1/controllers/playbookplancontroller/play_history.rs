@@ -319,12 +319,19 @@ fn decide_transition(
 /// failure mode is an unrepairable `PreconditionFailed` on that run number.
 fn same_run_record(existing: &Play, desired: &Play) -> bool {
     existing_owner_matches(existing, desired)
-        && existing.spec.playbook_plan == desired.spec.playbook_plan
-        && existing.spec.playbook_plan_uid == desired.spec.playbook_plan_uid
+        && play_belongs_to_plan(
+            existing,
+            &desired.spec.playbook_plan,
+            &desired.spec.playbook_plan_uid,
+        )
         && existing.spec.execution_hash == desired.spec.execution_hash
         && existing.spec.run_id == desired.spec.run_id
         && existing.spec.run_number == desired.spec.run_number
         && existing.spec.preparation_fingerprint == desired.spec.preparation_fingerprint
+}
+
+pub(super) fn play_belongs_to_plan(play: &Play, plan_name: &str, plan_uid: &str) -> bool {
+    play.spec.playbook_plan == plan_name && play.spec.playbook_plan_uid == plan_uid
 }
 
 fn existing_owner_matches(existing: &Play, desired: &Play) -> bool {
@@ -504,38 +511,54 @@ pub async fn record_finished(
 }
 
 /// Deletes the oldest `Play`s for `plan` beyond its success/failure history limits.
+///
+/// Returns whether a concurrent update skipped a deletion and retention should be retried soon.
 pub async fn prune(
     client: &kube::Client,
     namespace: &str,
     plan: &PlaybookPlan,
-) -> Result<(), ReconcileError> {
+) -> Result<bool, ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
 
     let plan_name = plan
         .name()
         .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
+    let plan_uid = plan
+        .uid()
+        .ok_or(ReconcileError::PreconditionFailed("uid not set"))?;
 
     let api = Api::<Play>::namespaced(client.clone(), namespace);
-    let plays = api
+    let mut plays = api
         .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
         .await?;
+    // The label is only a discovery index: a plan name can be reused after deletion.
+    plays
+        .items
+        .retain(|play| play_belongs_to_plan(play, plan_name.as_ref(), plan_uid.as_ref()));
 
     let (successful_limit, failed_limit) = effective_limits(plan);
 
+    let mut retry = false;
     for play in plays_to_prune(&plays.items, successful_limit, failed_limit) {
         let Some(name) = play.metadata.name.as_deref() else {
             continue;
         };
         debug!("Pruning old Play {name}");
-        // Tolerate a concurrent delete: another tick (or GC) may have removed it already.
-        if let Err(err) = api.delete(name, &DeleteParams::default()).await
-            && !is_not_found(&err)
-        {
-            return Err(err.into());
+        let params = DeleteParams::default().preconditions(Preconditions {
+            uid: play.metadata.uid.clone(),
+            resource_version: play.metadata.resource_version.clone(),
+        });
+        // The list may be stale: never delete a replacement at this name, and let a concurrent
+        // update or delete be re-evaluated on the next retention pass.
+        match api.delete(name, &params).await {
+            Ok(_) => {}
+            Err(err) if is_not_found(&err) => {}
+            Err(err) if is_conflict(&err) => retry = true,
+            Err(err) => return Err(err.into()),
         }
     }
 
-    Ok(())
+    Ok(retry)
 }
 
 /// Effective (defaulted) `(successful, failed)` history limits for a plan.
@@ -561,17 +584,21 @@ fn effective_limits(plan: &PlaybookPlan) -> (u32, u32) {
 ///     and deleting it would send the next reconcile down `finalize_lost_run`, discarding a
 ///     successful run's results and reporting every host `Unknown`. Callers happen to acknowledge
 ///     before pruning, but retention must not depend on that ordering.
+///   - Terminal Plays without a creation timestamp are not classified for pruning and are kept.
 ///   - `Succeeded` Plays fill the `successful_limit` bucket.
 ///   - `Failed` and `Unknown` Plays share the `failed_limit` bucket — `Unknown` is a finished run
 ///     whose recap was lost, kept in the problem bucket rather than discarded as a success.
 ///
-/// Within each bucket the newest (by `creationTimestamp`) are kept; the oldest beyond the limit are
-/// returned for deletion.
+/// Within each bucket the newest (by `creationTimestamp`, then `run_number`) are kept; the oldest
+/// beyond the limit are returned for deletion.
 fn plays_to_prune(plays: &[Play], successful_limit: u32, failed_limit: u32) -> Vec<&Play> {
     let mut succeeded: Vec<&Play> = Vec::new();
     let mut failed: Vec<&Play> = Vec::new();
 
     for play in plays {
+        if play.metadata.creation_timestamp.is_none() {
+            continue;
+        }
         // Its recap has not reached the plan yet — treat it as in-flight, not as history.
         if needs_recovery(play) {
             continue;
@@ -588,7 +615,10 @@ fn plays_to_prune(plays: &[Play], successful_limit: u32, failed_limit: u32) -> V
     for (mut bucket, limit) in [(succeeded, successful_limit), (failed, failed_limit)] {
         // Newest first, so everything past `limit` is the oldest.
         bucket.sort_by_key(|p| {
-            std::cmp::Reverse(p.metadata.creation_timestamp.as_ref().map(|t| t.0))
+            std::cmp::Reverse((
+                p.metadata.creation_timestamp.as_ref().map(|t| t.0),
+                p.spec.run_number,
+            ))
         });
         to_prune.extend(bucket.into_iter().skip(limit as usize));
     }
@@ -1255,6 +1285,60 @@ mod tests {
         assert!(plays_to_prune(&plays, 10, 10).is_empty());
     }
 
+    #[test]
+    fn plays_to_prune_uses_run_number_when_creation_timestamps_tie() {
+        let mut first = recorded_play("s-run-1", 100, PlayPhase::Succeeded);
+        first.spec.run_number = 1;
+        let mut second = recorded_play("s-run-2", 100, PlayPhase::Succeeded);
+        second.spec.run_number = 2;
+
+        let plays = [first, second];
+        let names: Vec<&str> = plays_to_prune(&plays, 1, 1)
+            .iter()
+            .filter_map(|play| play.metadata.name.as_deref())
+            .collect();
+
+        assert_eq!(names, vec!["s-run-1"]);
+    }
+
+    #[test]
+    fn plays_to_prune_never_prunes_a_terminal_play_without_creation_timestamp() {
+        let timestamped = recorded_play("s-timestamped", 100, PlayPhase::Succeeded);
+        let mut timestampless = recorded_play("s-timestampless", 200, PlayPhase::Succeeded);
+        timestampless.metadata.creation_timestamp = None;
+
+        let plays = [timestamped, timestampless];
+        let names: Vec<&str> = plays_to_prune(&plays, 0, 0)
+            .iter()
+            .filter_map(|play| play.metadata.name.as_deref())
+            .collect();
+
+        assert_eq!(names, vec!["s-timestamped"]);
+    }
+
+    #[test]
+    fn pruning_ignores_a_predecessor_with_the_same_plan_name() {
+        let mut predecessor = recorded_play("predecessor", 100, PlayPhase::Succeeded);
+        predecessor.spec.playbook_plan = "web".into();
+        predecessor.spec.playbook_plan_uid = "old-uid".into();
+
+        let mut current = recorded_play("current", 200, PlayPhase::Succeeded);
+        current.spec.playbook_plan = "web".into();
+        current.spec.playbook_plan_uid = "new-uid".into();
+
+        let plays = vec![predecessor, current];
+        let current_generation: Vec<Play> = plays
+            .into_iter()
+            .filter(|play| play_belongs_to_plan(play, "web", "new-uid"))
+            .collect();
+        let names: Vec<&str> = plays_to_prune(&current_generation, 0, 0)
+            .iter()
+            .filter_map(|play| play.metadata.name.as_deref())
+            .collect();
+
+        assert_eq!(names, vec!["current"]);
+    }
+
     /// The record of a terminal run whose recap has not reached the plan yet is the only copy of
     /// that recap. Pruning it would send the next reconcile down `finalize_lost_run` and report a
     /// successful run's hosts as `Unknown`, so retention must hold it back regardless of the limits.
@@ -1304,6 +1388,7 @@ mod tests {
     #[test]
     fn terminal_recovery_uses_status_acknowledgement_and_retention_can_follow() {
         let mut play = Play::new("run", PlaySpec::default());
+        play.metadata.creation_timestamp = Some(Time(Timestamp::from_second(100).unwrap()));
         play.status = Some(PlayStatus {
             phase: PlayPhase::Succeeded,
             plan_status_recorded: false,

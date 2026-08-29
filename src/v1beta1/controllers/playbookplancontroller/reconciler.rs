@@ -1136,7 +1136,7 @@ fn window_taken_by_a_record(
     };
     let mut failures = 0;
     for play in plays.iter().filter(|play| {
-        play_belongs_to_plan(play, plan_name, uid)
+        play_history::play_belongs_to_plan(play, plan_name, uid)
             && play.spec.triggered_slot == Some(slot)
             && play.spec.execution_hash == desired_hash.to_string()
     }) {
@@ -2780,8 +2780,8 @@ fn record_failed_run_preparation(
 /// acknowledged after the complete status write, then one retention pass handles them together.
 ///
 /// It has to be reachable from an ordinary reconcile and not only from finalization: a terminal
-/// Play is acknowledged *before* the pass that would delete it, so a deletion that fails leaves an
-/// idle plan with no event that would ever retry it.
+/// Play is acknowledged *before* the pass that would delete it, so a deletion that fails or is
+/// skipped by a concurrent update leaves an idle plan with no event that would ever retry it.
 ///
 /// That is also the whole of what the standalone pass is for, which is why the caller runs it only
 /// while nothing is in flight. Retention gains work only when a run finishes, and a plan with an
@@ -2799,14 +2799,16 @@ async fn prune_history(context: &ReconciliationContext, object: &PlaybookPlan) -
     let Some(namespace) = object.metadata.namespace.as_deref() else {
         return false;
     };
-    if let Err(error) = play_history::prune(&context.client, namespace, object).await {
-        warn!(
-            "Could not prune Play history for {:?}/{:?}: {error}",
-            object.metadata.namespace, object.metadata.name
-        );
-        return true;
+    match play_history::prune(&context.client, namespace, object).await {
+        Ok(retry) => retry,
+        Err(error) => {
+            warn!(
+                "Could not prune Play history for {:?}/{:?}: {error}",
+                object.metadata.namespace, object.metadata.name
+            );
+            true
+        }
     }
-    false
 }
 
 fn prune_retry_after(current: std::time::Duration) -> std::time::Duration {
@@ -4138,7 +4140,7 @@ fn recoverable_plays_for_plan<'a>(plays: &'a [Play], plan: &PlaybookPlan) -> Vec
     let mut recoverable: Vec<&Play> = plays
         .iter()
         .filter(|play| {
-            play_belongs_to_plan(play, plan_name, uid)
+            play_history::play_belongs_to_plan(play, plan_name, uid)
                 && (play.status.as_ref().is_none_or(|status| {
                     matches!(
                         status.phase,
@@ -4151,7 +4153,12 @@ fn recoverable_plays_for_plan<'a>(plays: &'a [Play], plan: &PlaybookPlan) -> Vec
                 }) || play_history::needs_recovery(play))
         })
         .collect();
-    recoverable.sort_by_key(|play| play.metadata.creation_timestamp.as_ref().map(|time| time.0));
+    recoverable.sort_by_key(|play| {
+        (
+            play.metadata.creation_timestamp.as_ref().map(|time| time.0),
+            play.spec.run_number,
+        )
+    });
     recoverable
 }
 
@@ -4273,10 +4280,6 @@ async fn launch_recorded_job(
         run_number: run.mirror.run_number,
     };
     spawn_ansible_job(jobs_api, object, &selected, &run.mirror.play_uid, job).await
-}
-
-fn play_belongs_to_plan(play: &Play, plan_name: &str, plan_uid: &str) -> bool {
-    play.spec.playbook_plan == plan_name && play.spec.playbook_plan_uid == plan_uid
 }
 
 fn job_belongs_to_plan(job: &Job, plan_name: &str, plan_uid: &str) -> bool {
@@ -5123,7 +5126,9 @@ async fn select_job(
     let max_recorded_run_number = plays
         .items
         .iter()
-        .filter(|play| play_belongs_to_plan(play, plan_name.as_ref(), plan_uid.as_ref()))
+        .filter(|play| {
+            play_history::play_belongs_to_plan(play, plan_name.as_ref(), plan_uid.as_ref())
+        })
         .map(|play| play.spec.run_number)
         .max()
         .unwrap_or_default();
@@ -5457,9 +5462,9 @@ mod tests {
         let mut play = Play::new("apply-web-abc-1", PlaySpec::default());
         play.spec.playbook_plan = "web".into();
         play.spec.playbook_plan_uid = "uid-1".into();
-        assert!(play_belongs_to_plan(&play, "web", "uid-1"));
-        assert!(!play_belongs_to_plan(&play, "web", "uid-2"));
-        assert!(!play_belongs_to_plan(&play, "other", "uid-1"));
+        assert!(play_history::play_belongs_to_plan(&play, "web", "uid-1"));
+        assert!(!play_history::play_belongs_to_plan(&play, "web", "uid-2"));
+        assert!(!play_history::play_belongs_to_plan(&play, "other", "uid-1"));
     }
 
     #[test]
@@ -7851,6 +7856,7 @@ spec:
             name: &str,
             owner_uid: &str,
             created_secs: i64,
+            run_number: u32,
             phase: Option<v1beta1::PlayPhase>,
         ) -> Play {
             let mut play = Play::new(
@@ -7861,7 +7867,7 @@ spec:
                     execution_hash: "1a".into(),
                     run_id: "run-1".into(),
                     preparation_fingerprint: "fingerprint".into(),
-                    run_number: 1,
+                    run_number,
                     attempt: 1,
                     inventory: vec![ResolvedHosts {
                         name: "workers".into(),
@@ -7895,29 +7901,55 @@ spec:
             "acknowledged",
             "plan-uid",
             350,
+            1,
             Some(v1beta1::PlayPhase::Succeeded),
         );
         acknowledged.status.as_mut().unwrap().plan_status_recorded = true;
+        let same_second_newer = play(
+            "same-second-newer",
+            "plan-uid",
+            250,
+            2,
+            Some(v1beta1::PlayPhase::Succeeded),
+        );
+        let same_second_older = play(
+            "same-second-older",
+            "plan-uid",
+            250,
+            1,
+            Some(v1beta1::PlayPhase::Succeeded),
+        );
         let plays = vec![
-            play("legacy", "plan-uid", 100, Some(v1beta1::PlayPhase::Running)),
+            play(
+                "legacy",
+                "plan-uid",
+                100,
+                1,
+                Some(v1beta1::PlayPhase::Running),
+            ),
+            same_second_newer,
+            same_second_older,
             play(
                 "other-owner",
                 "other-uid",
                 200,
+                1,
                 Some(v1beta1::PlayPhase::Running),
             ),
             play(
                 "finished",
                 "plan-uid",
                 300,
+                1,
                 Some(v1beta1::PlayPhase::Succeeded),
             ),
             acknowledged,
-            play("prepared", "plan-uid", 400, None),
+            play("prepared", "plan-uid", 400, 1, None),
             play(
                 "running",
                 "plan-uid",
                 500,
+                1,
                 Some(v1beta1::PlayPhase::Running),
             ),
         ];
@@ -7927,7 +7959,17 @@ spec:
             .filter_map(|play| play.metadata.name.as_deref())
             .collect();
 
-        assert_eq!(names, vec!["legacy", "finished", "prepared", "running"]);
+        assert_eq!(
+            names,
+            vec![
+                "legacy",
+                "same-second-older",
+                "same-second-newer",
+                "finished",
+                "prepared",
+                "running"
+            ]
+        );
     }
 
     /// Recovery reads a run's revision back out of two persisted, hand-editable places — the `Play`
