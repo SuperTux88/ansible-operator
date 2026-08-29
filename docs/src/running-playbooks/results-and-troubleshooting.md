@@ -25,7 +25,7 @@ per-host status, and the summary line.
 |---|---|
 | `Pending` | Triggers not yet evaluated — the resting state right after creation, after the inputs changed, or while unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent a plan with no run verdict from starting. |
 | `Delayed` | The plan is waiting for its scheduled time and has no result yet under the current playbook and inputs. |
-| `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has created or identified the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name. |
+| `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has created or identified the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name, and with reason `RunRecordLost` that the run's `Play` record is gone and its Job is being stopped before its hosts are released. |
 | `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. |
 | `Failed` | The latest run did not succeed on every host, or its recap could not be read. A `Recurring` plan keeps this result between ticks the same way. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
 | `UnauthorizedNamespace` | The plan's namespace is not enrolled for the operator — it will not run. See below. |
@@ -70,8 +70,13 @@ printer columns:
   covers a Job that is still scheduling, pulling its image or
   starting its pod. `Running=False` with reason `JobIdentityMismatch` means something that is not this
   run's Job holds the name the run recorded: the plan stays `Applying` and waits, renewing its host
-  locks, because a contested name is never taken over or abandoned — the message names the Job. After
-  a run finishes, `Running=False` carries no reason.
+  locks, because a contested name is never taken over or abandoned — the message names the Job.
+  `Running=False` with reason `RunRecordLost` means the run's `Play` record has disappeared: the plan
+  stays `Applying` while the operator cancels that run's Job and waits for it to stop, still renewing
+  its host locks, and clears once the run is finalized with every targeted host `Unknown`. A
+  cancellation that never ends leaves this standing — `lastTransitionTime` is how long it has been
+  waiting, and the run's Job and pod are what to inspect. After a run finishes, `Running=False`
+  carries no reason.
 - **`Blocked`** — the run is due but waiting on a per-host lock held by another run; the condition
   message names the host and the run holding it. This one is not a column — read it with `kubectl
   describe` or `-o yaml`. It clears on its own once every lock the run needs is free. See
@@ -172,9 +177,12 @@ its resources are cleaned up rather than by history pruning. If cleanup keeps fa
 deliberately remains as the retry handle for resources that may still be privileged. Deleting a Play by
 hand is safe once its
 `.status.planStatusRecorded` is `true`, which is the operator's own marker that the run's results have
-reached the plan. Deleting one that still describes a live run — or a finished one whose results have
-not been folded in yet — is not, because that record is the only thing the run can be recovered from.
-See [The plan is stuck in `Applying`](#the-plan-is-stuck-in-applying).
+reached the plan. Deleting one that still describes a live run intentionally loses its recap: when the
+plan's `.status.activeRun` still names that run, the operator cancels its own Job, waits for it to stop
+(reporting that wait as `Running=False` with reason `RunRecordLost`), then releases the proxies and
+Leases and reports the targeted hosts as `Unknown`. Do not delete a live
+record as a first response to a stuck plan; inspect the run and Job first. See [The plan is stuck in
+`Applying`](#the-plan-is-stuck-in-applying).
 
 ## Troubleshooting
 

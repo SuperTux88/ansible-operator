@@ -45,9 +45,9 @@ const WORKSPACE_VOLUME_NAME: &str = "playbook";
 
 /// `ttlSecondsAfterFinished` for the ansible Job: reaping a *finished* run is left to Kubernetes'
 /// TTL controller, so finished runs stay around briefly for inspection and then get reaped instead
-/// of accumulating forever. The operator deletes a Job only to cancel one that is still running when
-/// its plan is deleted (`cancel_run_job`), which is a different lifecycle — such a run never
-/// finishes, so this TTL never applies to it.
+/// of accumulating forever. The operator deletes a Job only to cancel one that is *still running*
+/// when its plan is deleted or its `Play` record disappears (`cancel_run_job`), which is a different
+/// lifecycle — a Job that already reached `Complete` or `Failed` is left to this TTL even there.
 ///
 /// Default `ttlSecondsAfterFinished` when a `PlaybookPlan` doesn't set `spec.ttlSecondsAfterFinished`.
 ///

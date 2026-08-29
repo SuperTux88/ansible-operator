@@ -95,12 +95,12 @@ another Job-create grant through a namespaced `Role`, `RoleBinding`, `ClusterRol
 as described in
 [Deployment → protect operator-created Jobs](./deployment.md#protect-operator-created-jobs).
 
-The `delete` grant exists so a plan deleted mid-run has its Job cancelled explicitly instead of being
-left to the deleting client's propagation policy, which may orphan the pod. The operator only ever
-deletes a Job it has validated as its own run's, passing that Job's UID as a delete precondition so a
-replacement at the same name cannot be caught by it — but RBAC cannot express that restriction, so
-the ServiceAccount's authority covers every Job in an enrolled namespace. Finished Jobs are reaped by
-their own `ttlSecondsAfterFinished`, not by the operator.
+The `delete` grant exists so a plan deleted mid-run, or a run whose `Play` record was removed, has its
+Job cancelled explicitly instead of being left to the deleting client's propagation policy, which may
+orphan the pod. The operator only ever deletes a Job it has validated as its own run's, passing that
+Job's UID as a delete precondition so a replacement at the same name cannot be caught by it — but RBAC
+cannot express that restriction, so the ServiceAccount's authority covers every Job in an enrolled
+namespace. Finished Jobs are reaped by their own `ttlSecondsAfterFinished`, not by the operator.
 
 If unrelated workloads must create Jobs in an enrolled namespace, enforce the same boundary with an
 admission policy: only the operator ServiceAccount may create Jobs carrying the operator's reserved

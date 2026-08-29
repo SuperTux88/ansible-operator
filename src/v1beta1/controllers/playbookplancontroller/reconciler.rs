@@ -2417,9 +2417,10 @@ async fn advance_active_run(
     })
 }
 
-/// Finalizes a run whose `Play` is gone: its infrastructure is released and every targeted host is
-/// reported `Unknown`, because without the record nothing about the run can be recovered. Wedging in
-/// `Applying` on a record that is never coming back would hold this plan's host locks indefinitely.
+/// Finalizes a run whose `Play` is gone: its Job is stopped first, then its infrastructure is
+/// released and every targeted host is reported `Unknown`, because without the record nothing about
+/// the run can be recovered. Wedging in `Applying` on a record that is never coming back would hold
+/// this plan's host locks indefinitely.
 ///
 /// First, though, it re-reads the plan **from the apiserver**. The run this is called for comes from
 /// the reflector-cached status, which lags this controller's own writes, so a tick that raced ahead
@@ -2452,6 +2453,21 @@ async fn finalize_lost_run(
         );
         *resource_status = live_status.unwrap_or_default();
         return Ok(ActiveRunProgress::AlreadyFinalized);
+    }
+
+    // The record may disappear after the Job was created. Stop and await that Job before releasing
+    // its host Leases, otherwise another run could reach the same nodes while Ansible is still
+    // executing under this run's credentials.
+    if cancel_run_job(context, object, run).await? {
+        status::clear_run_conditions(resource_status);
+        status::set_run_record_lost_condition(resource_status, &run.mirror.job_name);
+        resource_status.summary = Some(format!(
+            "run record is gone; cancelling Job {} before releasing its hosts",
+            run.mirror.job_name
+        ));
+        return Ok(ActiveRunProgress::Running(std::time::Duration::from_secs(
+            5,
+        )));
     }
 
     warn!(
@@ -3135,11 +3151,12 @@ pub const RUN_CLEANUP_FINALIZER: &str = "ansible.cloudbending.dev/run-cleanup";
 /// handle: the `Play` records are owned by the plan and may already be halfway through their own
 /// cascade by the time this runs.
 ///
-/// The run's Job is cancelled and *awaited* before anything is released, because releasing a host
-/// Lease while Ansible may still be talking to that host is the one outcome the whole locking design
-/// exists to prevent. The wait is unbounded and renews the run's Leases while it lasts: a plan that
-/// will not finish deleting is visible and fixable, whereas a host handed to another plan while a
-/// playbook is still running against it is neither.
+/// The run's Job is cancelled if it is still running, and either way *awaited* — down to the pods
+/// that outlive it — before anything is released, because releasing a host Lease while Ansible may
+/// still be talking to that host is the one outcome the whole locking design exists to prevent. The
+/// wait is unbounded and renews the run's Leases while it lasts: a plan that will not finish
+/// deleting is visible and fixable, whereas a host handed to another plan while a playbook is still
+/// running against it is neither.
 async fn release_deleted_plan(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -3263,15 +3280,17 @@ fn dedupe_runs(runs: Vec<RecordedRun>) -> Vec<RecordedRun> {
         .collect()
 }
 
-/// Cancels a deleted plan's Job and reports whether Ansible may still be executing on its hosts.
+/// Cancels a run's Job and reports whether Ansible may still be executing on its hosts.
 ///
-/// Deleting the plan already makes Kubernetes reap the Job, but the propagation policy that reaps it
-/// is the deleting client's choice — an orphaning delete would leave the pod running with nothing
-/// pointing at it — so the Job is deleted here explicitly rather than assumed gone. Only this run's
-/// own Job is touched: a foreign Job at the recorded name belongs to something this plan never
-/// created, and neither its existence nor its pods say anything about this run.
+/// A deleted plan normally makes Kubernetes reap the Job, but the propagation policy that reaps it is
+/// the deleting client's choice. An orphaning delete would leave the pod running with nothing
+/// pointing at it, and a deleted `Play` gives the same missing-record signal during normal recovery,
+/// so the Job is deleted here explicitly rather than assumed gone. Only this run's own Job is
+/// touched: a foreign Job at the recorded name belongs to something this plan never created, and
+/// neither its existence nor its pods say anything about this run.
 ///
-/// The deletion is **foreground**, and the Job's own disappearance is the barrier this waits on.
+/// A non-terminal Job is deleted **foreground**, and its own disappearance is the barrier this waits
+/// on. A Job that already reached `Complete` or `Failed` is left for its TTL controller instead.
 /// Under foreground propagation the apiserver keeps the Job until garbage collection has deleted
 /// every dependent that blocks its owner — which is exactly the Job's pods — so a Job that is gone
 /// is proof that no pod of it survives. Background propagation gives no such ordering: the Job is
@@ -3282,8 +3301,8 @@ fn dedupe_runs(runs: Vec<RecordedRun>) -> Vec<RecordedRun> {
 ///
 /// The pods are still consulted once the Job is gone, because a pod outlives the Job object while it
 /// terminates — and it is the pod, not the Job, that holds the SSH session. The run's Leases are
-/// renewed for as long as either says the run is up, since the deletion path is the one place that
-/// would otherwise stop renewing them while a playbook is still running.
+/// renewed for as long as either says the run is up, since callers would otherwise stop renewing
+/// them while a playbook is still running.
 async fn cancel_run_job(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -3307,10 +3326,11 @@ async fn cancel_run_job(
     });
 
     if let Some(job) = &job
+        && !status::job_finished(job)
         && job.metadata.deletion_timestamp.is_none()
     {
         info!(
-            "PlaybookPlan {namespace}/{name} was deleted; cancelling its Job {}",
+            "PlaybookPlan {namespace}/{name}: cancelling Job {} before releasing its hosts",
             run.mirror.job_name
         );
         // The UID carries the identity `validate_selected_job` just established into the mutation
@@ -3339,18 +3359,20 @@ async fn cancel_run_job(
         }
     }
 
-    // The pod list is only reached once this run's Job is gone, so it answers the one question the
-    // Job can no longer answer — is a pod that outlived it still up? — instead of standing in for
-    // the Job's own cascade.
-    let executing = match job {
-        Some(_) => true,
-        None => {
-            let pods = pods_api
+    // The pod list is reached once this run's Job is gone or has reached a terminal state, so it
+    // answers whether a pod that outlived the Job or terminal transition is still up instead of
+    // standing in for the Job's own cascade.
+    let pods = if job.as_ref().is_some_and(|job| !status::job_finished(job)) {
+        None
+    } else {
+        Some(
+            pods_api
                 .list(&ListParams::default().labels(&run_pod_selector(&run.mirror.run_id)))
-                .await?;
-            pods.items.iter().any(pod_may_be_executing)
-        }
+                .await?,
+        )
     };
+    let pod_items: &[Pod] = pods.as_ref().map_or(&[], |pods| &pods.items);
+    let executing = run_may_be_executing(job.as_ref(), pod_items);
     if executing {
         let leases_api =
             Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
@@ -3362,7 +3384,7 @@ async fn cancel_run_job(
         .await
         {
             warn!(
-                "Could not renew the host locks of deleted plan {namespace}/{name}'s run {}: {error}",
+                "Could not renew the host locks of run {} on {namespace}/{name}: {error}",
                 run.mirror.job_name
             );
         }
@@ -3407,6 +3429,10 @@ fn pod_may_be_executing(pod: &Pod) -> bool {
             .and_then(|status| status.phase.as_deref()),
         Some("Succeeded" | "Failed")
     )
+}
+
+fn run_may_be_executing(job: Option<&Job>, pods: &[Pod]) -> bool {
+    job.is_some_and(|job| !status::job_finished(job)) || pods.iter().any(pod_may_be_executing)
 }
 
 fn holds_run_cleanup_finalizer(object: &PlaybookPlan) -> bool {
@@ -6256,10 +6282,11 @@ mod tests {
         );
     }
 
-    /// What the deletion path waits on before it releases a host: the playbook pod, not the proxy
-    /// pods that share its run ID, and not a pod that has already stopped talking to its hosts.
+    /// What a missing-record path waits on before it releases a host: the Job or playbook pod, not
+    /// the proxy pods that share its run ID, and not a pod that has already stopped talking to its
+    /// hosts.
     #[test]
-    fn only_a_live_playbook_pod_holds_a_deleted_plans_hosts() {
+    fn only_a_live_job_or_playbook_pod_holds_a_lost_runs_hosts() {
         let selector = run_pod_selector("run-a");
         assert!(selector.contains("ansible.cloudbending.dev/run-id=run-a"));
         assert!(
@@ -6278,7 +6305,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(pod_may_be_executing(&pod(Some("Running"))));
+        let running = pod(Some("Running"));
+        assert!(pod_may_be_executing(&running));
         assert!(pod_may_be_executing(&pod(Some("Pending"))));
         assert!(
             pod_may_be_executing(&pod(None)),
@@ -6298,6 +6326,25 @@ mod tests {
         // stopped, because everything else is only an absence of evidence.
         assert!(!pod_may_be_executing(&pod(Some("Succeeded"))));
         assert!(!pod_may_be_executing(&pod(Some("Failed"))));
+
+        assert!(run_may_be_executing(Some(&Job::default()), &[]));
+        let finished_job = Job {
+            status: Some(k8s_openapi::api::batch::v1::JobStatus {
+                conditions: Some(vec![k8s_openapi::api::batch::v1::JobCondition {
+                    type_: "Complete".into(),
+                    status: "True".into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!run_may_be_executing(Some(&finished_job), &[]));
+        assert!(run_may_be_executing(None, &[running]));
+        assert!(!run_may_be_executing(
+            None,
+            &[pod(Some("Succeeded")), pod(Some("Failed"))]
+        ));
     }
 
     #[test]
