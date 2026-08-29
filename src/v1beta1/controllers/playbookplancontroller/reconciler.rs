@@ -2078,6 +2078,7 @@ async fn ensure_infra_and_launch(
         &run.mirror.play_uid,
     )
     .await?;
+    status::set_running_condition(resource_status);
 
     Ok(None)
 }

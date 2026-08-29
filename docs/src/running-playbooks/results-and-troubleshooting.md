@@ -25,7 +25,7 @@ per-host status, and the summary line.
 |---|---|
 | `Pending` | Triggers not yet evaluated — the resting state right after creation, after the inputs changed, or while unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent a plan with no run verdict from starting. |
 | `Delayed` | The plan is waiting for its scheduled time and has no result yet under the current playbook and inputs. |
-| `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has seen the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name. |
+| `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has created or identified the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name. |
 | `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. |
 | `Failed` | The latest run did not succeed on every host, or its recap could not be read. A `Recurring` plan keeps this result between ticks the same way. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
 | `UnauthorizedNamespace` | The plan's namespace is not enrolled for the operator — it will not run. See below. |
@@ -64,13 +64,14 @@ printer columns:
   differently on purpose: `n/m hosts completed successfully` is a statement about an execution,
   `n/m hosts on the current revision` about the plan's standing, and the second is not a claim that
   anything ran.
-- **`Running`** — the operator has observed this run's own Job in a non-terminal state
-  (`JobRunning`). It is set from an observation, not from Job creation, so it lags by a reconcile and
-  covers a Job that is still scheduling, pulling its image or starting its pod. `Running=False` with
-  reason `JobIdentityMismatch` means something that is not this run's Job holds the name the run
-  recorded: the plan stays `Applying` and waits, renewing its host locks, because a contested name is
-  never taken over or abandoned — the message names the Job. After a run finishes, `Running=False`
-  carries no reason.
+- **`Running`** — the operator has identified this run's own Job in a non-terminal state
+  (`JobRunning`). It is set in the same reconcile that creates the Job (a run adopted during recovery
+  picks it up on the next tick), and re-asserted on every tick that observes it unfinished, so it
+  covers a Job that is still scheduling, pulling its image or
+  starting its pod. `Running=False` with reason `JobIdentityMismatch` means something that is not this
+  run's Job holds the name the run recorded: the plan stays `Applying` and waits, renewing its host
+  locks, because a contested name is never taken over or abandoned — the message names the Job. After
+  a run finishes, `Running=False` carries no reason.
 - **`Blocked`** — the run is due but waiting on a per-host lock held by another run; the condition
   message names the host and the run holding it. This one is not a column — read it with `kubectl
   describe` or `-o yaml`. It clears on its own once every lock the run needs is free. See

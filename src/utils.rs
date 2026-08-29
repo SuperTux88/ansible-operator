@@ -296,7 +296,7 @@ mod tests {
         let mut conditions = vec![ready(
             "True",
             Some("JobRunning"),
-            Some("the run's Job is still active"),
+            Some("the run's Job exists and has not finished"),
             "2026-08-26T10:00:00+02:00",
         )];
 
@@ -305,7 +305,7 @@ mod tests {
             ready(
                 "True",
                 Some("JobRunning"),
-                Some("the run's Job is still active"),
+                Some("the run's Job exists and has not finished"),
                 "2026-08-26T11:00:00+02:00",
             ),
         );

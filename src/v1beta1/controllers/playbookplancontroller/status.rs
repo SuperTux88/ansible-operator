@@ -190,7 +190,7 @@ pub fn set_running_condition(status: &mut PlaybookPlanStatus) {
             type_: "Running".into(),
             status: "True".into(),
             reason: Some("JobRunning".into()),
-            message: Some("the run's Job is still active".into()),
+            message: Some("the run's Job exists and has not finished".into()),
             last_transition_time: Some(chrono::Local::now().fixed_offset()),
         },
     );
@@ -199,9 +199,9 @@ pub fn set_running_condition(status: &mut PlaybookPlanStatus) {
 /// Withdraws `Running` while the run's Job name is held by something that failed the identity check.
 ///
 /// An earlier tick may have seen this run's own Job and set `Running` from it; leaving that standing
-/// would seat `JobRunning`/"the run's Job is still active" beside a summary saying the opposite, for
-/// as long as the contested name survives — which, since such a name is never abandoned, can be
-/// indefinitely.
+/// would seat `JobRunning`/"the run's Job exists and has not finished" beside a summary saying the
+/// opposite, for as long as the contested name survives — which, since such a name is never abandoned,
+/// can be indefinitely.
 pub fn set_job_identity_mismatch_condition(status: &mut PlaybookPlanStatus, job_name: &str) {
     upsert_condition(
         &mut status.conditions,
