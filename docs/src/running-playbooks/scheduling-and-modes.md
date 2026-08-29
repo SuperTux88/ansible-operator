@@ -104,17 +104,32 @@ repeating work: nightly package upgrades, drift correction, health tasks. A `Rec
 ## Drift detection
 
 To decide which hosts are out of date, the operator computes an **execution hash** over the playbook
-text **plus the contents of every referenced Secret** (variables and files). The hash is
-order-insensitive, so reordering inputs does not count as a change, and it excludes the internally
-rendered workspace, whose content (e.g. proxy pod IPs) legitimately changes every run.
+text, **the contents of every referenced Secret** (variables and files), and the group variables set
+by the inventories the plan references
+([cluster nodes](./cluster-nodes.md#group-variables), [external hosts](./external-hosts.md#group-variables)).
+The hash is order-insensitive, so reordering inputs does not count as a change, and it excludes the
+internally rendered workspace, whose content (e.g. proxy pod IPs) legitimately changes every run.
+
+The inventories contribute their `variables` only, keyed by group name, so a group that sets none
+contributes nothing at all. Which *hosts* a group resolves to is deliberately not part of the hash: a
+node joining or leaving changes who the plan targets, not what it applies, and a new node is already
+out of date because it has no recorded hash of its own.
 
 - Each host records the hash it **last succeeded on** (`.status.hostsStatus.<host>.lastAppliedHash`).
 - A host whose last-applied hash equals the current hash is **current** and is skipped (in
   `OneShot`).
-- When you edit the playbook, or change a referenced variables/files Secret, the hash changes: the
-  desired hash, run numbering and [consumed schedule slot](#one-tick-one-run-per-revision) update
-  immediately. An in-flight run keeps its own hash, target inventory, run number, and schedule
-  slot in an immutable `Play`, so the edit does not disturb it — see [Editing a plan while a run is in
+- When you edit the playbook or change a referenced variables/files Secret, the hash changes **at
+  once**: the operator watches the plan and the Secrets it names, so the desired hash, run numbering
+  and [consumed schedule slot](#one-tick-one-run-per-revision) update on the spot.
+- Changing an inventory's group variables changes the hash too, but **not at once**. The operator
+  does not watch `ClusterInventory` or `StaticInventory` resources, so the plan picks such a change
+  up at its next reconcile — which is seconds away for a plan with a run in flight, the next
+  scheduled tick for a `Recurring` plan (when it would re-apply anyway), and up to an hour for an
+  idle `OneShot` plan that has settled. The same delay applies to the hosts a group resolves to, for
+  the same reason. If you need the change applied now, touch the plan itself: any edit to it, an
+  annotation included, wakes it immediately.
+- An in-flight run keeps its own hash, target inventory, run number, and schedule slot in an
+  immutable `Play`, so none of these edits disturb it — see [Editing a plan while a run is in
   flight](#editing-a-plan-while-a-run-is-in-flight).
 
 This is what makes `OneShot` idempotent and cheap: editing an unrelated field does not re-run

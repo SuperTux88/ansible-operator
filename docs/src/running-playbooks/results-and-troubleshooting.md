@@ -661,9 +661,15 @@ If *every* host of one run shows `Unknown` at once, check these causes first:
 ### A change is not being picked up
 
 Only inputs that feed the [execution hash](./scheduling-and-modes.md#drift-detection) — the playbook
-text and the **contents** of referenced Secrets — trigger a re-run of already current hosts. Editing
-an unrelated `spec` field (or a schedule that has not fired yet) will not. Confirm
-`.status.currentHash` actually changed after your edit.
+text, the **contents** of referenced Secrets, and the `variables` set by the inventories the plan
+references — trigger a re-run of already current hosts. Editing an unrelated `spec` field (or a
+schedule that has not fired yet) will not. Confirm `.status.currentHash` actually changed after your
+edit.
+
+An inventory's group variables do count, but not at once: the operator does not watch
+`ClusterInventory` or `StaticInventory`, so such an edit waits for the plan's next reconcile, which
+is up to an hour for a settled `OneShot` plan. Touching the plan itself — any edit, an annotation
+included — wakes it immediately.
 
 ### It never seems to run
 
