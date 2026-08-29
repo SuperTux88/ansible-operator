@@ -317,11 +317,7 @@ async fn reconcile(
     let recovered = match recover_active_run(&context, &object).await {
         Ok(recovered) => recovered,
         Err(error) => {
-            resource_status.summary = Some(format!("run recovery failed: {error}"));
-            if let Err(patch_error) = patch_status(&api, &object, resource_status).await {
-                warn!("Could not report the recovery failure on {namespace}/{name}: {patch_error}");
-            }
-            return Err(error);
+            return Err(report_recovery_failure(&api, &object, &mut resource_status, error).await);
         }
     };
     // Set when the tick drained a finished run's result but the plan still has a live run behind
@@ -426,7 +422,14 @@ async fn reconcile(
     if unlaunched_run.is_none()
         && let Some(mirror) = resource_status.active_run.clone()
     {
-        let active_run = RecordedRun::from_mirror(mirror)?;
+        let active_run = match RecordedRun::from_mirror(mirror) {
+            Ok(active_run) => active_run,
+            Err(error) => {
+                return Err(
+                    report_recovery_failure(&api, &object, &mut resource_status, error).await,
+                );
+            }
+        };
         // Reported on the plan before the tick aborts, like recovery above: this is where a finished
         // run's node-root proxy pods and host Leases are given back, so a teardown that will not
         // complete has to be readable on the resource and not only in the operator's log.
@@ -448,8 +451,13 @@ async fn reconcile(
             ActiveRunProgress::Running(requeue) => requeue_after = requeue,
             // The cached status was behind a tick that had already finished this run;
             // `advance_active_run` replaced it with what the apiserver actually holds, so there is
-            // nothing left to advance and the refreshed status decides the rest of this tick.
+            // nothing left to advance and the refreshed status decides the rest of this tick. Any
+            // terminal result staged earlier in this tick must remain unacknowledged so recovery can
+            // replay it after the live status has won the race.
             ActiveRunProgress::AlreadyFinalized => {
+                finished_records.clear();
+                finished_active_run = None;
+                surviving_run = None;
                 requeue_after = std::time::Duration::from_secs(1);
             }
             ActiveRunProgress::Finished {
@@ -1133,7 +1141,7 @@ fn window_taken_by_a_record(
     };
     let mut failures = 0;
     for play in plays.iter().filter(|play| {
-        play_belongs_to_plan(play, plan_name, uid)
+        play_history::play_belongs_to_plan(play, plan_name, uid)
             && play.spec.triggered_slot == Some(slot)
             && play.spec.execution_hash == desired_hash.to_string()
     }) {
@@ -2075,6 +2083,7 @@ async fn ensure_infra_and_launch(
         &run.mirror.play_uid,
     )
     .await?;
+    status::set_running_condition(resource_status);
 
     Ok(None)
 }
@@ -2361,20 +2370,18 @@ async fn advance_active_run(
     let parsed = match (&job, job_is_trusted) {
         (Some(job), true) => {
             let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
-            pods_api
+            let pods = pods_api
                 .list(&ListParams {
                     label_selector: Some(format!("job-name={job_name}")),
                     ..Default::default()
                 })
-                .await?
-                .items
-                .iter()
-                .filter(|pod| {
-                    annotation_value(&pod.metadata, labels::PLAY_UID_ANNOTATION)
-                        == Some(run.mirror.play_uid.as_str())
-                        && pod_belongs_to_job(pod, job)
-                })
-                .find_map(termination_message)
+                .await?;
+            let pods = pods.items.iter().filter(|pod| {
+                annotation_value(&pod.metadata, labels::PLAY_UID_ANNOTATION)
+                    == Some(run.mirror.play_uid.as_str())
+                    && pod_belongs_to_job(pod, job)
+            });
+            latest_termination_message(pods)
                 .as_deref()
                 .and_then(callback_output::parse_callback_output)
         }
@@ -2420,6 +2427,8 @@ async fn advance_active_run(
 /// (a `historyLimit` of 0 prunes it immediately). Reporting that run lost would overwrite a
 /// perfectly good recap with `Unknown` for every host. When the live status disagrees, it is adopted
 /// wholesale — it is strictly newer than the copy this tick started from — and nothing is finalized.
+/// The full-object GET is intentional: the operator has `get` on `playbookplans` but only `patch` on
+/// `playbookplans/status`, so using `get_status` would require an additional RBAC grant.
 async fn finalize_lost_run(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -2429,7 +2438,7 @@ async fn finalize_lost_run(
     let (namespace, name) = namespace_and_name(object)?;
 
     let live_status = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace)
-        .get_status(name)
+        .get(name)
         .await?
         .status;
     let still_active = live_status
@@ -2672,6 +2681,26 @@ async fn report_failed_abandon(
     error
 }
 
+/// Records why run recovery could not proceed on the plan and hands the error straight back.
+///
+/// Best effort, and deliberately so: the reconcile fails on `error` either way, and a failure to
+/// report must not replace the diagnosis it was trying to surface.
+async fn report_recovery_failure(
+    api: &Api<PlaybookPlan>,
+    object: &PlaybookPlan,
+    resource_status: &mut PlaybookPlanStatus,
+    error: ReconcileError,
+) -> ReconcileError {
+    resource_status.summary = Some(format!("run recovery failed: {error}"));
+    if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
+        warn!(
+            "Could not report the recovery failure on {:?}/{:?}: {patch_error}",
+            object.metadata.namespace, object.metadata.name
+        );
+    }
+    error
+}
+
 /// Records why a finished run could not be completed on the plan and hands the error straight back.
 ///
 /// Covers everything between "the Job reached a terminal state" and "the record has been handed back
@@ -2755,8 +2784,8 @@ fn record_failed_run_preparation(
 /// acknowledged after the complete status write, then one retention pass handles them together.
 ///
 /// It has to be reachable from an ordinary reconcile and not only from finalization: a terminal
-/// Play is acknowledged *before* the pass that would delete it, so a deletion that fails leaves an
-/// idle plan with no event that would ever retry it.
+/// Play is acknowledged *before* the pass that would delete it, so a deletion that fails or is
+/// skipped by a concurrent update leaves an idle plan with no event that would ever retry it.
 ///
 /// That is also the whole of what the standalone pass is for, which is why the caller runs it only
 /// while nothing is in flight. Retention gains work only when a run finishes, and a plan with an
@@ -2774,14 +2803,16 @@ async fn prune_history(context: &ReconciliationContext, object: &PlaybookPlan) -
     let Some(namespace) = object.metadata.namespace.as_deref() else {
         return false;
     };
-    if let Err(error) = play_history::prune(&context.client, namespace, object).await {
-        warn!(
-            "Could not prune Play history for {:?}/{:?}: {error}",
-            object.metadata.namespace, object.metadata.name
-        );
-        return true;
+    match play_history::prune(&context.client, namespace, object).await {
+        Ok(retry) => retry,
+        Err(error) => {
+            warn!(
+                "Could not prune Play history for {:?}/{:?}: {error}",
+                object.metadata.namespace, object.metadata.name
+            );
+            true
+        }
     }
-    false
 }
 
 fn prune_retry_after(current: std::time::Duration) -> std::time::Duration {
@@ -3664,11 +3695,10 @@ struct RecordedRun {
 impl RecordedRun {
     /// Reconstructs a run from the plan status' mirror of it — the one path that does not start
     /// from a `Play`, and so the one place a hand-edited status is caught.
-    fn from_mirror(mut mirror: ActiveRun) -> Result<Self, ReconcileError> {
+    fn from_mirror(mirror: ActiveRun) -> Result<Self, ReconcileError> {
         let execution_hash = ExecutionHash::from_hex(&mirror.execution_hash).ok_or(
             ReconcileError::PreconditionFailed("run has an invalid execution hash"),
         )?;
-        mirror.execution_hash = execution_hash.to_string();
         Ok(Self {
             mirror,
             execution_hash,
@@ -4114,7 +4144,7 @@ fn recoverable_plays_for_plan<'a>(plays: &'a [Play], plan: &PlaybookPlan) -> Vec
     let mut recoverable: Vec<&Play> = plays
         .iter()
         .filter(|play| {
-            play_belongs_to_plan(play, plan_name, uid)
+            play_history::play_belongs_to_plan(play, plan_name, uid)
                 && (play.status.as_ref().is_none_or(|status| {
                     matches!(
                         status.phase,
@@ -4127,7 +4157,12 @@ fn recoverable_plays_for_plan<'a>(plays: &'a [Play], plan: &PlaybookPlan) -> Vec
                 }) || play_history::needs_recovery(play))
         })
         .collect();
-    recoverable.sort_by_key(|play| play.metadata.creation_timestamp.as_ref().map(|time| time.0));
+    recoverable.sort_by_key(|play| {
+        (
+            play.metadata.creation_timestamp.as_ref().map(|time| time.0),
+            play.spec.run_number,
+        )
+    });
     recoverable
 }
 
@@ -4249,10 +4284,6 @@ async fn launch_recorded_job(
         run_number: run.mirror.run_number,
     };
     spawn_ansible_job(jobs_api, object, &selected, &run.mirror.play_uid, job).await
-}
-
-fn play_belongs_to_plan(play: &Play, plan_name: &str, plan_uid: &str) -> bool {
-    play.spec.playbook_plan == plan_name && play.spec.playbook_plan_uid == plan_uid
 }
 
 fn job_belongs_to_plan(job: &Job, plan_name: &str, plan_uid: &str) -> bool {
@@ -4437,6 +4468,38 @@ fn termination_message(pod: &Pod) -> Option<String> {
         .and_then(|cs| cs.state.as_ref())
         .and_then(|state| state.terminated.as_ref())
         .and_then(|terminated| terminated.message.clone())
+}
+
+fn termination_finished_at(pod: &Pod) -> Option<k8s_openapi::jiff::Timestamp> {
+    pod.status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find(|cs| cs.name == job_builder::ANSIBLE_CONTAINER_NAME)
+        .and_then(|cs| cs.state.as_ref())
+        .and_then(|state| state.terminated.as_ref())
+        .and_then(|terminated| terminated.finished_at.as_ref())
+        .map(|time| time.0)
+}
+
+fn latest_termination_message<'a>(pods: impl Iterator<Item = &'a Pod>) -> Option<String> {
+    let candidates: Vec<&Pod> = pods
+        .filter(|pod| termination_message(pod).is_some())
+        .collect();
+    let latest_timestamped = candidates
+        .iter()
+        .filter_map(|pod| termination_finished_at(pod).map(|finished_at| (finished_at, *pod)))
+        .reduce(|latest, candidate| {
+            if candidate.0 > latest.0 {
+                candidate
+            } else {
+                latest
+            }
+        })
+        .map(|(_, pod)| pod);
+    let pod = latest_timestamped.or_else(|| candidates.first().copied())?;
+    termination_message(pod)
 }
 
 /// Filters a run's resolved groups down to only the hosts actually targeted this run
@@ -5099,7 +5162,9 @@ async fn select_job(
     let max_recorded_run_number = plays
         .items
         .iter()
-        .filter(|play| play_belongs_to_plan(play, plan_name.as_ref(), plan_uid.as_ref()))
+        .filter(|play| {
+            play_history::play_belongs_to_plan(play, plan_name.as_ref(), plan_uid.as_ref())
+        })
         .map(|play| play.spec.run_number)
         .max()
         .unwrap_or_default();
@@ -5433,9 +5498,9 @@ mod tests {
         let mut play = Play::new("apply-web-abc-1", PlaySpec::default());
         play.spec.playbook_plan = "web".into();
         play.spec.playbook_plan_uid = "uid-1".into();
-        assert!(play_belongs_to_plan(&play, "web", "uid-1"));
-        assert!(!play_belongs_to_plan(&play, "web", "uid-2"));
-        assert!(!play_belongs_to_plan(&play, "other", "uid-1"));
+        assert!(play_history::play_belongs_to_plan(&play, "web", "uid-1"));
+        assert!(!play_history::play_belongs_to_plan(&play, "web", "uid-2"));
+        assert!(!play_history::play_belongs_to_plan(&play, "other", "uid-1"));
     }
 
     #[test]
@@ -5477,6 +5542,50 @@ mod tests {
             &pod_owned_by("apply-web-abc-1", "job-uid", "Job"),
             &uidless
         ));
+    }
+
+    #[test]
+    fn latest_termination_message_prefers_the_latest_finished_pod() {
+        let pod = |message: &str, finished_at: Option<i64>| Pod {
+            status: Some(k8s_openapi::api::core::v1::PodStatus {
+                container_statuses: Some(vec![k8s_openapi::api::core::v1::ContainerStatus {
+                    name: job_builder::ANSIBLE_CONTAINER_NAME.into(),
+                    state: Some(k8s_openapi::api::core::v1::ContainerState {
+                        terminated: Some(k8s_openapi::api::core::v1::ContainerStateTerminated {
+                            message: Some(message.into()),
+                            finished_at: finished_at.map(|seconds| {
+                                k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                                    k8s_openapi::jiff::Timestamp::from_second(seconds).unwrap(),
+                                )
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let pods = [pod("first", Some(100)), pod("second", Some(200))];
+        assert_eq!(
+            latest_termination_message(pods.iter()).as_deref(),
+            Some("second")
+        );
+
+        let pods_with_equal_timestamps = [pod("first", Some(200)), pod("second", Some(200))];
+        assert_eq!(
+            latest_termination_message(pods_with_equal_timestamps.iter()).as_deref(),
+            Some("first")
+        );
+
+        let pods_without_timestamps = [pod("first", None), pod("second", None)];
+        assert_eq!(
+            latest_termination_message(pods_without_timestamps.iter()).as_deref(),
+            Some("first")
+        );
     }
 
     #[test]
@@ -7827,6 +7936,7 @@ spec:
             name: &str,
             owner_uid: &str,
             created_secs: i64,
+            run_number: u32,
             phase: Option<v1beta1::PlayPhase>,
         ) -> Play {
             let mut play = Play::new(
@@ -7837,7 +7947,7 @@ spec:
                     execution_hash: "1a".into(),
                     run_id: "run-1".into(),
                     preparation_fingerprint: "fingerprint".into(),
-                    run_number: 1,
+                    run_number,
                     attempt: 1,
                     inventory: vec![ResolvedHosts {
                         name: "workers".into(),
@@ -7871,29 +7981,55 @@ spec:
             "acknowledged",
             "plan-uid",
             350,
+            1,
             Some(v1beta1::PlayPhase::Succeeded),
         );
         acknowledged.status.as_mut().unwrap().plan_status_recorded = true;
+        let same_second_newer = play(
+            "same-second-newer",
+            "plan-uid",
+            250,
+            2,
+            Some(v1beta1::PlayPhase::Succeeded),
+        );
+        let same_second_older = play(
+            "same-second-older",
+            "plan-uid",
+            250,
+            1,
+            Some(v1beta1::PlayPhase::Succeeded),
+        );
         let plays = vec![
-            play("legacy", "plan-uid", 100, Some(v1beta1::PlayPhase::Running)),
+            play(
+                "legacy",
+                "plan-uid",
+                100,
+                1,
+                Some(v1beta1::PlayPhase::Running),
+            ),
+            same_second_newer,
+            same_second_older,
             play(
                 "other-owner",
                 "other-uid",
                 200,
+                1,
                 Some(v1beta1::PlayPhase::Running),
             ),
             play(
                 "finished",
                 "plan-uid",
                 300,
+                1,
                 Some(v1beta1::PlayPhase::Succeeded),
             ),
             acknowledged,
-            play("prepared", "plan-uid", 400, None),
+            play("prepared", "plan-uid", 400, 1, None),
             play(
                 "running",
                 "plan-uid",
                 500,
+                1,
                 Some(v1beta1::PlayPhase::Running),
             ),
         ];
@@ -7903,16 +8039,25 @@ spec:
             .filter_map(|play| play.metadata.name.as_deref())
             .collect();
 
-        assert_eq!(names, vec!["legacy", "finished", "prepared", "running"]);
+        assert_eq!(
+            names,
+            vec![
+                "legacy",
+                "same-second-older",
+                "same-second-newer",
+                "finished",
+                "prepared",
+                "running"
+            ]
+        );
     }
 
     /// Recovery reads a run's revision back out of two persisted, hand-editable places — the `Play`
     /// spec and the Job's hash label — and both go through `ExecutionHash::from_hex`. Each has to
-    /// canonicalize what it accepts, so the value compares equal to a freshly computed hash however
-    /// it was written down, and each has to refuse a value that is not a hash at all rather than
-    /// silently scoping a run's resources to something else.
+    /// accept only canonical lowercase hexadecimal, and each has to refuse a value that is not a
+    /// canonical hash rather than silently scoping a run's resources to something else.
     #[test]
-    fn a_persisted_execution_hash_is_canonicalized_or_refused() {
+    fn a_persisted_execution_hash_is_canonical_or_refused() {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
         let mut play = Play::new(
@@ -7920,7 +8065,7 @@ spec:
             v1beta1::PlaySpec {
                 playbook_plan: "plan".into(),
                 playbook_plan_uid: "plan-uid".into(),
-                execution_hash: "00001A".into(),
+                execution_hash: "1a".into(),
                 run_id: "run-2".into(),
                 preparation_fingerprint: "fingerprint".into(),
                 run_number: 2,
@@ -7946,8 +8091,12 @@ spec:
 
         let mut hand_edited_mirror = run.mirror.clone();
         hand_edited_mirror.execution_hash = "+1A".into();
-        let mirrored_run = RecordedRun::from_mirror(hand_edited_mirror).unwrap();
-        assert_eq!(mirrored_run.mirror.execution_hash, "1a");
+        assert!(matches!(
+            RecordedRun::from_mirror(hand_edited_mirror),
+            Err(ReconcileError::PreconditionFailed(
+                "run has an invalid execution hash"
+            ))
+        ));
 
         // The record is only a run's identity if it can be tied back to a specific object.
         let mut uidless = play.clone();
@@ -7962,11 +8111,19 @@ spec:
             ))
         ));
 
+        play.spec.execution_hash = "00001a".into();
+        assert!(matches!(
+            recorded_run_from_play(&play),
+            Err(ReconcileError::PreconditionFailed(
+                "active Play has an invalid execution hash"
+            ))
+        ));
+
         let mut job = Job {
             metadata: ObjectMeta {
                 labels: Some(BTreeMap::from([(
                     labels::PLAYBOOKPLAN_HASH.into(),
-                    "00001A".into(),
+                    "1a".into(),
                 )])),
                 ..Default::default()
             },
@@ -7980,6 +8137,18 @@ spec:
             .as_mut()
             .unwrap()
             .insert(labels::PLAYBOOKPLAN_HASH.into(), "not-a-hash".into());
+        assert!(matches!(
+            job_execution_hash(&job),
+            Err(ReconcileError::PreconditionFailed(
+                "active Job has no valid execution hash"
+            ))
+        ));
+
+        job.metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(labels::PLAYBOOKPLAN_HASH.into(), "1A".into());
         assert!(matches!(
             job_execution_hash(&job),
             Err(ReconcileError::PreconditionFailed(

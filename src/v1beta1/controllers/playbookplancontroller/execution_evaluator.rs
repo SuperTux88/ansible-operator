@@ -25,10 +25,10 @@ impl std::ops::Deref for ExecutionHash {
 }
 
 impl ExecutionHash {
-    /// Reconstructs a persisted execution hash. Hashes are serialized as lowercase hexadecimal
-    /// strings by `Display`, so this accepts the status representation used by `ActiveRun`.
+    /// Reconstructs a persisted execution hash from its canonical lowercase hexadecimal form.
     pub fn from_hex(value: &str) -> Option<Self> {
-        u64::from_str_radix(value, 16).ok().map(Self)
+        let parsed = u64::from_str_radix(value, 16).ok()?;
+        (format!("{parsed:x}") == value).then_some(Self(parsed))
     }
 
     /// Folds inventory-author group variables into an existing hash. Kept separate from
@@ -74,6 +74,7 @@ pub fn find_outdated_hosts(
         return hosts;
     };
 
+    let hash = execution_hash.to_string();
     // For each host, check if it already has the current execution hash in the PlaybookPlan's status
     let outdated_hosts = hosts.iter().filter(move |host| {
         let host_status = hosts_status.get(*host);
@@ -86,7 +87,7 @@ pub fn find_outdated_hosts(
         let host_status = host_status.unwrap();
 
         // Otherwise just compare the hashes
-        host_status.last_applied_hash != *execution_hash.to_string()
+        host_status.last_applied_hash != hash
     });
 
     outdated_hosts.cloned().collect()

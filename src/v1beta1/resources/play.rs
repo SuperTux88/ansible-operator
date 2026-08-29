@@ -131,7 +131,7 @@ pub struct PlayStatus {
     #[schemars(with = "UnsignedInt")]
     pub host_count: u32,
 
-    /// How many hosts ended `Failed` or `Unreachable`.
+    /// How many targeted hosts did not end `Succeeded`.
     #[schemars(with = "UnsignedInt")]
     pub failed_host_count: u32,
 

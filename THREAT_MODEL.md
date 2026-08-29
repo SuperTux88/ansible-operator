@@ -531,14 +531,15 @@ From [`clusterrole.yaml`](chart/templates/clusterrole.yaml) (cluster-wide) and
 | pods | get,list,watch | **enrolled ns only** | Read termination message, not cluster-wide. |
 | playbookplans | patch | **enrolled ns only** | Adds and removes the `ansible.cloudbending.dev/run-cleanup` finalizer, which holds a plan deleted mid-run open until its node-root proxy pods and host Leases are released (nothing else can reach them — they live in the operator ns, where an OwnerReference cannot follow). The finalizer is the only field the operator writes here, but RBAC cannot restrict `patch` to `metadata.finalizers`: the grant permits writing the spec and metadata of any plan in an enrolled namespace. Kept out of the `ClusterRole`, which stays read-only for plans, so plan writes are confined to namespaces already trusted to run node-root playbooks. |
 | plays | get,list,create,delete | **enrolled ns only** | Operator-authored recovery/history records. The spec carries plan UID, execution hash, run ID, preparation fingerprint, target inventory, run number, and schedule slot; Jobs and pod templates are correlated to the Play UID. It stores no copy of the plan spec, resolved connection configuration or the Job — those are re-derived from live cluster state. Every field is typed, so the CRD's CEL rule freezes the whole spec (T-ESC-8). Contains no Secret material. |
-| plays/status | get,update,patch | **enrolled ns only** | Advances the operator-owned Prepared → Starting → Launching → Running → terminal state machine and acknowledges that terminal results reached PlaybookPlan status. Resource-version-checked replacements prevent stale writers from reverting terminal state or racing authorization cleanup against committed Job creation. |
+| plays/status | update | **enrolled ns only** | Advances the operator-owned Prepared → Starting → Launching → Running → terminal state machine and acknowledges that terminal results reached PlaybookPlan status. Resource-version-checked replacements prevent stale writers from reverting terminal state or racing authorization cleanup against committed Job creation. |
 | pods | create,delete,deletecollection | operator ns | **Creates node-root proxy pods.** |
-| networkpolicies | get,list,watch,create,delete,deletecollection | operator ns | Run isolation. |
-| leases | full | operator ns | Per-node mutual exclusion. |
+| networkpolicies | delete,create,patch | **enrolled ns** (`delete` everywhere; `create,patch` in plan namespaces when `networkPolicy.enabled`, and always in operator ns) | Run isolation. |
+| networkpolicies | deletecollection | **operator ns only** | Run isolation cleanup for proxy policies. |
+| leases | get,create,update,delete | operator ns | Per-node mutual exclusion. |
 | nodes | get,list,watch | cluster-wide | Selector resolution / NAP allow-set (cluster-scoped resource). |
 | namespaces | get,list,watch | cluster-wide | namespaceSelector matching (cluster-scoped resource). |
 | playbookplans/clusterinventories/staticinventories/nodeaccesspolicies | get,list,watch | cluster-wide | CRDs — read cluster-wide so plans in non-enrolled namespaces are seen and reported. |
-| playbookplans/clusterinventories/nodeaccesspolicies (/status) | get,update | cluster-wide | Status writes (incl. `UnauthorizedNamespace`); StaticInventory has no status-writing controller. |
+| playbookplans/clusterinventories/nodeaccesspolicies (/status) | patch | cluster-wide | Status writes (incl. `UnauthorizedNamespace`); StaticInventory has no status-writing controller. |
 
 The *enrolled set* = the operator's own namespace (always) ∪ the chart's `watchNamespaces`. The
 `secrets`/`jobs`/`pods` grants, and the `playbookplans: patch` grant behind the run-cleanup

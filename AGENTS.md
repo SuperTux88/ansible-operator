@@ -67,16 +67,21 @@ src/v1beta1/
     cluster_inventory.rs             ClusterInventory: hosts resolved from Node labels → managed-ssh (node-root)
     static_inventory.rs              StaticInventory: literal names/IPs + embedded SSH config (BYO key); no controller/status
     node_access_policy.rs            NodeAccessPolicy: admin-authored namespace→node ceiling (cluster-scoped CRD; enforcement reads all policies)
+    play.rs                          Play: immutable per-run recovery/history record; recovery source of truth
     generic.rs                       NodeSelectorTerm/SelectorExpression, LabelSelector, GenericMap
+    custom_rfc3339.rs                RFC3339 serialization for optional resource timestamps
   controllers/
     playbookplancontroller/          the big one — see below
     clusterinventorycontroller/      resolves Node → hosts, watches Nodes, writes ClusterInventoryStatus
+    clusterinventorycontroller/mappers.rs   maps Node changes to ClusterInventory reconciles
     nodeaccesspolicycontroller/      writes NodeAccessPolicyStatus (matched namespaces / allowed nodes) for observability; watches ns + nodes
+    nodeaccesspolicycontroller/mappers.rs   maps Namespace/Node changes to all policy reconciles
     ansible_inventory.rs             ResolvedInventoryGroup (ManagedSsh | Ssh) + ResolvedHosts; AnsibleInventory trait (get_hosts); distinct_hosts/_count (every host-population count, in both controllers)
     nodeselector.rs                  node_matches / selector_matches / selector_matches_fail_closed (INV-1)
     reconcile_error.rs               shared ReconcileError (thiserror)
   controllers/playbookplancontroller/
     reconciler.rs                    the reconcile pipeline (below); patch_status via JSON merge patch
+    mappers.rs                       maps Secret and NodeAccessPolicy changes to affected plans
     node_access.rs                   NodeAccessPolicy enforcement: fail-closed intersection clamp (INV-2/3/5)
     managed_ssh.rs                   proxy pods (hostPID + nsenter = NODE ROOT), per-run sshd config/certs/principals, NetworkPolicy, cleanup (INV-4/7)
     locking.rs                       per-host Leases (operator ns) for run mutual-exclusion
@@ -91,9 +96,13 @@ src/v1beta1/
   ansible/
     playbook_renderer.rs             round-trips spec.template.playbook YAML (validation)
     inventory_renderer.rs            ResolvedInventoryGroup → Ansible YAML inventory (managed-ssh: proxy IP + HostKeyAlias; ssh: BYO key)
+    render_error.rs                  shared YAML rendering error type
+    ansible_operator_preflight.py    managed-ssh preflight gate; waits for every reachable proxy SSH banner
     ansible_operator_recap.py        Ansible callback plugin: writes per-host recap to /dev/termination-log
   labels.rs                          PLAYBOOKPLAN_NAME / _HASH / _HOST / RUN_ID label keys, plus PLAY_UID_ANNOTATION (an annotation, never selectable)
 ```
+
+The managed-SSH preflight script is covered by `tests/python/test_preflight.py` and `just test-python`.
 
 ## Core reconcile flow (playbookplancontroller/reconciler.rs)
 

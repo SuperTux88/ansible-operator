@@ -126,7 +126,7 @@ fn encode_kubelike(mut num: u64) -> String {
     const ALPHABET: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
 
     if num == 0 {
-        return "a".repeat(6); // return "aaaaaa" if input is zero, fixed length
+        return "a".to_owned();
     }
     let base = ALPHABET.len() as u64;
     let mut chars = Vec::new();
@@ -296,7 +296,7 @@ mod tests {
         let mut conditions = vec![ready(
             "True",
             Some("JobRunning"),
-            Some("the run's Job is still active"),
+            Some("the run's Job exists and has not finished"),
             "2026-08-26T10:00:00+02:00",
         )];
 
@@ -305,7 +305,7 @@ mod tests {
             ready(
                 "True",
                 Some("JobRunning"),
-                Some("the run's Job is still active"),
+                Some("the run's Job exists and has not finished"),
                 "2026-08-26T11:00:00+02:00",
             ),
         );
@@ -369,5 +369,12 @@ mod tests {
 
         // A name that is nothing but separators leaves nothing behind rather than a bare hyphen.
         assert_eq!(readable_name_segment("...", 3), "");
+    }
+
+    #[test]
+    fn zero_is_encoded_before_requested_padding_is_applied() {
+        assert_eq!(encode_kubelike(0), "a");
+        assert_eq!(generate_id(0), "aaaaa");
+        assert_eq!(generate_id_with_length(0, 6), "aaaaaa");
     }
 }

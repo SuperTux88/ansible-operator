@@ -242,10 +242,10 @@ then the next acquires them. Plans over completely separate hosts never block ea
 While a plan is waiting on a lock held by another run, its
 [`Blocked` condition](./results-and-troubleshooting.md#conditions) is `True`, its `.status` names the
 host and the run holding it, and the operator logs a warning. The plan is `Applying` because its
-recorded run is active, while the `Running` condition only becomes `True` once a reconcile has
-*observed* a non-terminal Job for the run — which may still be scheduling, pulling its image or
-otherwise starting its pod — so it lags Job creation by one tick, and on a plan's first run it is
-not set at all until then. Being blocked is a temporary wait, not a failure, and the run
+recorded run is active. The `Running` condition is set to `True` in the same reconcile that creates the
+run's Job (a run adopted during recovery picks it up on the next tick), and re-asserted on every tick
+that observes it unfinished. A plan waiting on the lock has no Job yet, so it remains without
+`Running=True` until the lock is free. Being blocked is a temporary wait, not a failure, and the run
 proceeds on its own as soon as the lock is free.
 
 A crashed operator's locks expire on their own after a short period, so a host is never left locked

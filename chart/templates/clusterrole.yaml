@@ -23,7 +23,7 @@ rules:
   # written on plans in non-enrolled namespaces too.
   - apiGroups: ["ansible.cloudbending.dev"]
     resources: ["playbookplans/status", "clusterinventories/status", "nodeaccesspolicies/status"]
-    verbs: ["get", "update", "patch"]
+    verbs: ["patch"]
   # ClusterInventory resolves node label selectors against real Nodes (cluster-scoped resource).
   - apiGroups: [""]
     resources: ["nodes"]
