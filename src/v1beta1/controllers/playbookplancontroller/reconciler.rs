@@ -508,14 +508,8 @@ async fn reconcile(
                 summary,
             )
             .await?;
-            let deferred_terminal_record = finished_records
-                .iter()
-                .any(|finished| finished.record == TerminalRecord::Present);
-            let requeue_after = invalid_scheduling_requeue(
-                &resource_status,
-                recovered_a_run,
-                deferred_terminal_record,
-            );
+            let handover = invalid_scheduling_handover(recovered_a_run, &finished_records);
+            let requeue_after = invalid_scheduling_requeue(&resource_status, handover);
             return finish_reconcile_tick(
                 &context,
                 &object,
@@ -524,7 +518,7 @@ async fn reconcile(
                 // the normal hash-aware terminal path classify it. A lost receipt has nothing to
                 // replay and was classified above from its recorded run identity.
                 &[],
-                recovered_a_run,
+                handover,
                 retry_prune,
                 requeue_after,
             )
@@ -664,17 +658,14 @@ async fn reconcile(
             ),
         )
         .await?;
-        let deferred_terminal_record = finished_records
-            .iter()
-            .any(|finished| finished.record == TerminalRecord::Present);
-        let requeue_after =
-            invalid_scheduling_requeue(&resource_status, recovered_a_run, deferred_terminal_record);
+        let handover = invalid_scheduling_handover(recovered_a_run, &finished_records);
+        let requeue_after = invalid_scheduling_requeue(&resource_status, handover);
         return finish_reconcile_tick(
             &context,
             &object,
             &mut resource_status,
             &[],
-            recovered_a_run,
+            handover,
             retry_prune,
             requeue_after,
         )
@@ -990,7 +981,13 @@ async fn reconcile(
         &object,
         &mut resource_status,
         &finished_records,
-        recovered_a_run,
+        // This exit acknowledges every terminal record it was given, so a run recovered by this tick
+        // is one the next will not find again.
+        if recovered_a_run {
+            RunHandover::Retired
+        } else {
+            RunHandover::NothingHeld
+        },
         retry_prune,
         Some(requeue_after),
     )
@@ -1002,13 +999,16 @@ async fn finish_reconcile_tick(
     object: &PlaybookPlan,
     resource_status: &mut PlaybookPlanStatus,
     finished_records: &[FinishedRecord],
-    recovered_a_run: bool,
+    handover: RunHandover,
     mut retry_prune: bool,
     requeue_after: Option<std::time::Duration>,
 ) -> Result<Action, ReconcileError> {
     let (namespace, name) = namespace_and_name(object)?;
     let api = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace);
-    let release_finalizer = !recovered_a_run && resource_status.active_run.is_none();
+
+    let release_finalizer =
+        handover == RunHandover::NothingHeld && resource_status.active_run.is_none();
+    let defer_finalizer_release = defers_finalizer_release(object, resource_status, handover);
 
     patch_status(&api, object, resource_status.clone()).await?;
 
@@ -1043,6 +1043,10 @@ async fn finish_reconcile_tick(
         ));
     }
 
+    if defer_finalizer_release {
+        requeue_after = Some(finalizer_release_retry_after(requeue_after));
+    }
+
     if release_finalizer && let Err(error) = drop_run_cleanup_finalizer(&api, object).await {
         if !error.is_conflict() {
             return Err(error);
@@ -1051,14 +1055,67 @@ async fn finish_reconcile_tick(
             "Could not give back the run-cleanup finalizer of {namespace}/{name}: the plan changed \
              underneath this tick; retrying shortly"
         );
-        requeue_after = Some(
-            requeue_after
-                .unwrap_or(std::time::Duration::from_secs(5))
-                .min(std::time::Duration::from_secs(5)),
-        );
+        requeue_after = Some(finalizer_release_retry_after(requeue_after));
     }
 
     Ok(requeue_after.map_or_else(Action::await_change, Action::requeue))
+}
+
+/// How long a tick that owes the run-cleanup finalizer back waits before looking again.
+const FINALIZER_RELEASE_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn finalizer_release_retry_after(current: Option<std::time::Duration>) -> std::time::Duration {
+    current
+        .unwrap_or(FINALIZER_RELEASE_RETRY)
+        .min(FINALIZER_RELEASE_RETRY)
+}
+
+/// What a tick did with the run it recovered, as far as the *next* tick is concerned. Both finalizer
+/// decisions read it, so they cannot disagree about whether another tick is worth waking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunHandover {
+    /// The tick found no run at all, so the plan holds nothing and may have its finalizer back.
+    NothingHeld,
+    /// A run was recovered and this tick disposed of it — acknowledged, released or given up. The
+    /// next tick finds nothing and hands the finalizer back, so it is worth coming back for.
+    Retired,
+    /// A run was recovered and deliberately left in place: a terminal record this tick is not
+    /// allowed to acknowledge yet. Every later tick recovers that record again and reaches the same
+    /// decision, so nothing about waking sooner brings the finalizer back — only the correction the
+    /// plan is waiting for does.
+    Retained,
+}
+
+/// Whether this tick owes the plan its run-cleanup finalizer back but may not give it yet.
+///
+/// The release is deferred by one tick on purpose: a recovered terminal record's acknowledgement can
+/// still fail, so only a tick that finds no run at all may let the plan go. What that leaves is the
+/// *interval* until that tick, and it cannot be the caller's — a finished `OneShot` plan asks for the
+/// hour-long idle requeue and a `Recurring` one for the time until its next slot. Inheriting either
+/// would keep a finalizer on a plan that holds nothing for that whole span, and a plan carrying one
+/// cannot be deleted while the operator is down — precisely what [`RUN_CLEANUP_FINALIZER`] is scoped
+/// to a live run to avoid.
+///
+/// Only [`RunHandover::Retired`] qualifies, and that is the whole point of the distinction. Waking
+/// sooner is worth it exactly when the next tick can finish the job. A `Retained` record is one this
+/// tick was not permitted to acknowledge — the invalid-scheduling exits give up before that path —
+/// so every later tick recovers it and defers again: polling would spin at five seconds for as long
+/// as the plan's scheduling stays broken, re-listing records and re-reading inventories and Secrets
+/// each time, and would never release anything. Those exits ask for `await_change` deliberately, and
+/// this must not talk them out of it.
+///
+/// Stated over the same state the release itself reads, and decided beside it, so the two describe
+/// one snapshot. With no run left, `NothingHeld` releases and `Retired` defers — never both, never
+/// neither. A run still in flight belongs to neither: the finalizer is legitimately held, and
+/// answering `true` there would poll every busy plan every five seconds for the whole of its run.
+fn defers_finalizer_release(
+    object: &PlaybookPlan,
+    resource_status: &PlaybookPlanStatus,
+    handover: RunHandover,
+) -> bool {
+    holds_run_cleanup_finalizer(object)
+        && handover == RunHandover::Retired
+        && resource_status.active_run.is_none()
 }
 
 /// Whether the current schedule slot (`start`, the grace window's start) is the recorded slot.
@@ -5083,15 +5140,36 @@ fn record_invalid_scheduling_configuration(
 
 fn invalid_scheduling_requeue(
     status: &PlaybookPlanStatus,
-    recovered_a_run: bool,
-    deferred_terminal_record: bool,
+    handover: RunHandover,
 ) -> Option<std::time::Duration> {
     if status.active_run.is_some() {
         Some(std::time::Duration::from_secs(15))
-    } else if recovered_a_run && !deferred_terminal_record {
+    } else if handover == RunHandover::Retired {
         Some(std::time::Duration::from_secs(1))
     } else {
         None
+    }
+}
+
+/// What the two invalid-scheduling exits leave behind, from what the tick recovered and what it is
+/// giving up before acknowledging.
+///
+/// Both exits describe the same tick — it read the plan's records, may have drained a terminal one,
+/// and is returning before the path that could acknowledge it — so the description is built once and
+/// the requeue and the finalizer both answer from it.
+fn invalid_scheduling_handover(
+    recovered_a_run: bool,
+    finished_records: &[FinishedRecord],
+) -> RunHandover {
+    if !recovered_a_run {
+        RunHandover::NothingHeld
+    } else if finished_records
+        .iter()
+        .any(|finished| finished.record == TerminalRecord::Present)
+    {
+        RunHandover::Retained
+    } else {
+        RunHandover::Retired
     }
 }
 
@@ -6141,6 +6219,166 @@ mod tests {
         assert!(without_run_cleanup_finalizer(&None).is_empty());
     }
 
+    fn plan_holding_the_run_cleanup_finalizer() -> PlaybookPlan {
+        let mut plan = PlaybookPlan::new("web", Default::default());
+        plan.metadata.finalizers = Some(vec![RUN_CLEANUP_FINALIZER.to_string()]);
+        plan
+    }
+
+    fn status_mirroring_a_run() -> PlaybookPlanStatus {
+        PlaybookPlanStatus {
+            active_run: Some(ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-a".into(),
+                job_name: "apply-web-abc-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The tick that finishes a run keeps the finalizer, so the *next* tick is what gives it back —
+    /// and that tick has to come soon. Left to the caller's interval it would be an hour away for a
+    /// finished `OneShot` plan and a whole schedule period away for a `Recurring` one, leaving a
+    /// plan that holds nothing carrying a finalizer that makes it undeletable while the operator is
+    /// down.
+    #[test]
+    fn a_plan_that_owes_its_finalizer_back_is_looked_at_again_promptly() {
+        assert!(defers_finalizer_release(
+            &plan_holding_the_run_cleanup_finalizer(),
+            &PlaybookPlanStatus::default(),
+            RunHandover::Retired,
+        ));
+
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(
+            finalizer_release_retry_after(Some(hour)),
+            FINALIZER_RELEASE_RETRY,
+            "the idle requeue must not decide when the finalizer comes back"
+        );
+        assert_eq!(
+            finalizer_release_retry_after(None),
+            FINALIZER_RELEASE_RETRY,
+            "a tick that would have slept until woken still has to come back for it"
+        );
+        let sooner = std::time::Duration::from_secs(1);
+        assert_eq!(
+            finalizer_release_retry_after(Some(sooner)),
+            sooner,
+            "a caller already coming back sooner keeps its own interval"
+        );
+    }
+
+    /// The other shapes a tick can have. Only a plan that has just stopped holding a run owes the
+    /// finalizer back; asking for the retry interval in any of these would poll a plan that has
+    /// nothing to hand over — and the first of them would do it for the whole of a live run.
+    #[test]
+    fn nothing_else_asks_for_the_finalizer_retry_interval() {
+        let held = plan_holding_the_run_cleanup_finalizer();
+
+        assert!(
+            !defers_finalizer_release(&held, &status_mirroring_a_run(), RunHandover::Retired),
+            "a run is still in flight, so the finalizer is legitimately held"
+        );
+        assert!(
+            !defers_finalizer_release(
+                &held,
+                &PlaybookPlanStatus::default(),
+                RunHandover::NothingHeld
+            ),
+            "nothing was recovered, so this tick gives the finalizer back itself"
+        );
+        assert!(
+            !defers_finalizer_release(
+                &PlaybookPlan::new("web", Default::default()),
+                &PlaybookPlanStatus::default(),
+                RunHandover::Retired,
+            ),
+            "there is no finalizer to give back"
+        );
+    }
+
+    /// A tick that is *not allowed* to acknowledge the record it drained leaves that record for the
+    /// next tick, which recovers it and reaches exactly the same decision. Waking sooner therefore
+    /// releases nothing and only re-lists records and re-reads inventories and Secrets, so the
+    /// invalid-scheduling exits ask for `await_change` and the finalizer must not talk them out of
+    /// it — otherwise a plan whose schedule stays broken polls every five seconds indefinitely.
+    #[test]
+    fn a_record_this_tick_may_not_acknowledge_does_not_buy_a_prompt_requeue() {
+        let idle = PlaybookPlanStatus::default();
+
+        assert!(
+            !defers_finalizer_release(
+                &plan_holding_the_run_cleanup_finalizer(),
+                &idle,
+                RunHandover::Retained,
+            ),
+            "no number of ticks releases a finalizer the plan's scheduling is holding"
+        );
+        assert_eq!(
+            invalid_scheduling_requeue(&idle, RunHandover::Retained),
+            None,
+            "the exit that produces a retained record parks until the plan is corrected"
+        );
+    }
+
+    /// The handover is what keeps the two apart, so it has to be read off the same tick the two exits
+    /// actually describe: only a drained record the tick may not acknowledge is `Retained`.
+    #[test]
+    fn only_an_unacknowledgeable_record_is_retained_across_an_invalid_scheduling_exit() {
+        let run = || RecordedRun {
+            mirror: status_mirroring_a_run().active_run.unwrap(),
+            execution_hash: ExecutionHash::from_hex("1").unwrap(),
+        };
+        let record = |record| FinishedRecord { run: run(), record };
+
+        assert_eq!(
+            invalid_scheduling_handover(false, &[]),
+            RunHandover::NothingHeld
+        );
+        assert_eq!(invalid_scheduling_handover(true, &[]), RunHandover::Retired);
+        assert_eq!(
+            invalid_scheduling_handover(true, &[record(TerminalRecord::Lost)]),
+            RunHandover::Retired,
+            "a lost receipt has nothing to acknowledge, so nothing is left to recover"
+        );
+        assert_eq!(
+            invalid_scheduling_handover(true, &[record(TerminalRecord::Present)]),
+            RunHandover::Retained
+        );
+    }
+
+    /// The pair has to partition the case it is decided in: with no run left, a tick either releases
+    /// the finalizer or owes it, and a version of either condition that let both — or neither —
+    /// answer would strand the finalizer or release it while a terminal record is still
+    /// unacknowledged. `Retained` is deliberately outside that partition: it neither releases (the
+    /// record is unacknowledged) nor defers (no later tick could finish the job).
+    #[test]
+    fn releasing_and_deferring_the_finalizer_are_exclusive_and_exhaustive() {
+        let held = plan_holding_the_run_cleanup_finalizer();
+        let idle = PlaybookPlanStatus::default();
+
+        for handover in [RunHandover::NothingHeld, RunHandover::Retired] {
+            let release = handover == RunHandover::NothingHeld && idle.active_run.is_none();
+            let defer = defers_finalizer_release(&held, &idle, handover);
+            assert_ne!(
+                release, defer,
+                "exactly one of the two must answer for an idle plan ({handover:?})"
+            );
+        }
+
+        let retained = RunHandover::Retained;
+        assert!(retained != RunHandover::NothingHeld);
+        assert!(
+            !defers_finalizer_release(&held, &idle, retained),
+            "a retained record neither releases the finalizer nor is worth waking for"
+        );
+    }
+
     /// The teardown a deleted plan performs is driven by two sources that overlap: the status mirror
     /// and the record it was built from name the same run. Releasing it twice is not harmful, but it
     /// spends a second round of deletes and Lease calls on resources the first pass already removed.
@@ -6806,15 +7044,21 @@ mod tests {
             Some("spec.timeZone is invalid")
         );
         assert_eq!(
-            invalid_scheduling_requeue(&applying, true, false),
+            invalid_scheduling_requeue(&applying, RunHandover::Retired),
             Some(std::time::Duration::from_secs(15))
         );
         assert_eq!(
-            invalid_scheduling_requeue(&idle, true, false),
+            invalid_scheduling_requeue(&idle, RunHandover::Retired),
             Some(std::time::Duration::from_secs(1))
         );
-        assert_eq!(invalid_scheduling_requeue(&idle, false, false), None);
-        assert_eq!(invalid_scheduling_requeue(&idle, true, true), None);
+        assert_eq!(
+            invalid_scheduling_requeue(&idle, RunHandover::NothingHeld),
+            None
+        );
+        assert_eq!(
+            invalid_scheduling_requeue(&idle, RunHandover::Retained),
+            None
+        );
 
         let abandoned = RecordedRun {
             mirror: applying.active_run.clone().unwrap(),
