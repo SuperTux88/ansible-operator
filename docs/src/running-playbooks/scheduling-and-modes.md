@@ -223,8 +223,9 @@ What the budget covers depends on the mode, because what counts as "the same pie
   spent the plan stays `Failed` and starts nothing further — that is the point: its hosts are still
   out of date precisely *because* the runs failed, so nothing else would stop it. Editing the
   playbook or a referenced Secret changes the execution hash and hands it a fresh budget; so does
-  raising `maxAttempts`. A `schedule` does not: it says when a `OneShot` plan may run, not how often
-  it may fail.
+  raising `maxAttempts`. A successful run also closes that execution and resets the budget, so hosts
+  added to the inventory later can run without an unrelated plan edit. A `schedule` does not reset a
+  failed execution: it says when a `OneShot` plan may run, not how often it may fail.
 - **`Recurring`** spends its budget on one schedule tick, and defaults to `1` — no retry, since the
   next tick re-applies the same playbook anyway. With a higher `maxAttempts` a failed run is retried
   within the current tick, and the next tick starts over with a full budget whatever the previous one

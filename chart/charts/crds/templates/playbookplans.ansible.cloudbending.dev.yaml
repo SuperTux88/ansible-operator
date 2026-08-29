@@ -1077,7 +1077,8 @@ spec:
                   How many tries the current execution has spent of its `spec.maxAttempts` budget, the latest
                   run included. Unlike `lastRunNumber` this counts, and it counts within one execution only:
                   it restarts at 1 whenever `currentHash` changes and, for `Recurring` plans, whenever a new
-                  schedule tick starts a run — the two events that begin a new execution.
+                  schedule tick starts a run — the two events that begin a new execution. A successful
+                  `OneShot` execution resets it to 0 so newly eligible hosts can begin a new execution.
 
                   Written from the run's own `Play` record, so a status that lags a run in flight cannot hand
                   the budget back by forgetting a try that was already made.

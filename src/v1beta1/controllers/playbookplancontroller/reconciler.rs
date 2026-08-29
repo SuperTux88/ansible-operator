@@ -620,7 +620,9 @@ async fn reconcile(
         sync_desired_hash_after_finished_run(
             &mut resource_status,
             &execution_hash,
+            &object.spec.mode,
             &finished.run,
+            &finished.outcome,
             surviving_run.as_deref(),
         );
     } else {
@@ -1379,9 +1381,11 @@ fn max_attempts(mode: &ExecutionMode, configured: Option<u32>) -> u32 {
 /// Whether the plan's attempt budget allows starting a run *here*, at the gate that decides whether
 /// a new run may begin at all.
 ///
-/// It is the whole answer for `OneShot`, whose budget spans the revision: once its tries are spent
-/// the plan is finished, and without this it would keep numbering a fresh Job every tick — its hosts
-/// stay outdated precisely *because* the runs failed, so the work gate never closes on its own.
+/// It is the whole answer for `OneShot`, whose budget spans a failed execution: once its tries are
+/// spent the plan is finished, and without this it would keep numbering a fresh Job every tick — its
+/// hosts stay outdated precisely *because* the runs failed, so the work gate never closes on its own.
+/// A successful execution resets the budget when its terminal result is synchronized, so hosts added
+/// to the inventory afterwards can start a new execution.
 ///
 /// For `Recurring` it is deliberately not asked here, and the answer is always yes. Its budget spans
 /// one schedule tick, and the gate that knows about ticks is the window gate below: a plan whose
@@ -1427,9 +1431,9 @@ fn retry_budget_closes_window(
 /// A `Recurring` run reaching a tick the plan has not run for starts a new execution and so a new
 /// budget; every other run continues the one in progress. The budget's own slot, rather than the
 /// separately persisted run-start marker, identifies that execution. `OneShot` has no ticks to
-/// divide its revision into, and gets a fresh budget only from an edit (`update_desired_hash`) —
-/// including when it has a schedule, since a schedule says when a `OneShot` plan may run, not how
-/// often it may fail.
+/// divide its revision into, and gets a fresh budget after a successful execution or from an edit
+/// (`update_desired_hash`) — including when it has a schedule, since a schedule says when a `OneShot`
+/// plan may run, not how often it may fail.
 fn next_attempt(
     mode: &ExecutionMode,
     tries_spent: u32,
@@ -3897,13 +3901,16 @@ fn stage_finished_run(finished: &RecordedRun, resource_status: &mut PlaybookPlan
 ///
 /// The run number is claimed either way, because it answers a different question: it reserves a
 /// name against every later run, and a finished run holds its number whatever else is in flight.
-/// The attempt is not a high-water mark: a new `Recurring` slot restarts it, so the current-revision
-/// surviving run is authoritative when present, and the finished run is authoritative otherwise.
-/// Its slot travels with it so a pruned record cannot leave an unscoped count behind.
+/// The attempt is not a high-water mark: a new `Recurring` slot restarts it, and a successful
+/// `OneShot` execution is complete, so the current-revision surviving run is authoritative when
+/// present, and the finished run is authoritative otherwise. Its slot travels with it so a pruned
+/// record cannot leave an unscoped count behind.
 fn sync_desired_hash_after_finished_run(
     status: &mut PlaybookPlanStatus,
     desired_hash: &ExecutionHash,
+    mode: &ExecutionMode,
     finished: &RecordedRun,
+    finished_outcome: &v1beta1::PlayPhase,
     surviving: Option<&SurvivingRun>,
 ) {
     // Clears the schedule bookkeeping when the desired revision has moved on, so the replacement can
@@ -3925,20 +3932,30 @@ fn sync_desired_hash_after_finished_run(
         record_triggered_slot(status, surviving_slot);
     }
 
-    if let Some((attempt, slot)) = surviving
+    let surviving_attempt = surviving
         .filter(|surviving| surviving.run.execution_hash == *desired_hash)
         .map(|surviving| {
             (
                 surviving.run.mirror.attempt,
                 surviving.run.mirror.triggered_slot,
             )
-        })
-        .or_else(|| {
-            (finished.execution_hash == *desired_hash)
-                .then_some((finished.mirror.attempt, finished.mirror.triggered_slot))
-        })
-    {
+        });
+    if let Some((attempt, slot)) = surviving_attempt {
         record_retry_budget(status, attempt, slot);
+    } else if finished.execution_hash == *desired_hash {
+        if matches!(mode, ExecutionMode::OneShot)
+            && phase_for_finished_run(finished_outcome) == Phase::Succeeded
+        {
+            // A successful OneShot execution is complete. Reset its budget so inventory growth can
+            // trigger a new run for hosts that were not present in the completed execution.
+            record_retry_budget(status, 0, None);
+        } else {
+            record_retry_budget(
+                status,
+                finished.mirror.attempt,
+                finished.mirror.triggered_slot,
+            );
+        }
     }
 }
 
@@ -8714,7 +8731,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
+            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, slot),
+            &v1beta1::PlayPhase::Failed,
             None,
         );
 
@@ -8726,6 +8745,74 @@ spec:
         // Still the desired revision, so the slot it consumed keeps it from re-triggering itself
         // inside its own grace window.
         assert_eq!(status.last_triggered_run, Some(slot));
+    }
+
+    #[test]
+    fn a_successful_oneshot_run_resets_budget_for_new_hosts() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            retry_count: 1,
+            retry_count_slot: Some(slot),
+            eligible_hosts: vec![ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["worker-1".into(), "worker-2".into()],
+            }],
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".into(),
+                v1beta1::HostStatus {
+                    last_applied_hash: hash.to_string(),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &ExecutionMode::OneShot,
+            &finished_run(hash, 3, 1, slot),
+            &v1beta1::PlayPhase::Succeeded,
+            None,
+        );
+
+        assert_eq!(status.retry_count, 0);
+        assert_eq!(status.retry_count_slot, None);
+        let outdated = find_outdated_hosts(&status, &hash);
+        assert_eq!(outdated, vec!["worker-2"]);
+        assert!(may_start_new_run(
+            false,
+            has_work_to_start(&ExecutionMode::OneShot, false, !outdated.is_empty()),
+            attempt_budget_available(&ExecutionMode::OneShot, status.retry_count, 1),
+        ));
+    }
+
+    #[test]
+    fn a_successful_recurring_run_keeps_its_slot_budget() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &ExecutionMode::Recurring,
+            &finished_run(hash, 3, 1, slot),
+            &v1beta1::PlayPhase::Succeeded,
+            None,
+        );
+
+        assert_eq!(status.retry_count, 1);
+        assert_eq!(status.retry_count_slot, Some(slot));
     }
 
     #[test]
@@ -8935,7 +9022,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
+            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
+            &v1beta1::PlayPhase::Failed,
             Some(&surviving_run(hash, Some(live_slot))),
         );
 
@@ -8972,7 +9061,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
+            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
+            &v1beta1::PlayPhase::Failed,
             Some(&surviving_run(hash, Some(live_slot))),
         );
 
@@ -8997,7 +9088,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
+            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
+            &v1beta1::PlayPhase::Failed,
             Some(&surviving_run(hash, None)),
         );
 
@@ -9040,7 +9133,9 @@ spec:
             sync_desired_hash_after_finished_run(
                 &mut status,
                 &hash,
+                &ExecutionMode::OneShot,
                 &finished_run(hash, 3, 2, finished_slot),
+                &v1beta1::PlayPhase::Failed,
                 Some(&surviving_run_in(phase.clone(), hash, Some(live_slot))),
             );
 
@@ -9088,7 +9183,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
+            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
+            &v1beta1::PlayPhase::Failed,
             None,
         );
 
@@ -9115,7 +9212,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
+            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
+            &v1beta1::PlayPhase::Failed,
             Some(&surviving_run(old_hash, Some(slot))),
         );
 
@@ -9142,7 +9241,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
+            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 3, slot),
+            &v1beta1::PlayPhase::Failed,
             Some(&surviving),
         );
 
@@ -9167,7 +9268,9 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
+            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
+            &v1beta1::PlayPhase::Failed,
             None,
         );
 
