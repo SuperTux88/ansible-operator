@@ -74,6 +74,7 @@ pub fn find_outdated_hosts(
         return hosts;
     };
 
+    let hash = execution_hash.to_string();
     // For each host, check if it already has the current execution hash in the PlaybookPlan's status
     let outdated_hosts = hosts.iter().filter(move |host| {
         let host_status = hosts_status.get(*host);
@@ -86,7 +87,7 @@ pub fn find_outdated_hosts(
         let host_status = host_status.unwrap();
 
         // Otherwise just compare the hashes
-        host_status.last_applied_hash != *execution_hash.to_string()
+        host_status.last_applied_hash != hash
     });
 
     outdated_hosts.cloned().collect()
