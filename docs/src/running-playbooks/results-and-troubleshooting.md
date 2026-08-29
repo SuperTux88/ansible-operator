@@ -247,8 +247,8 @@ reconcile.
 
 ### The plan's inputs cannot be read
 
-Two summaries report that the operator could not read what the plan says it should be running, and
-so could not decide anything this tick:
+Three summaries report that the operator could not read or build what the plan says it should be
+running, and so could not decide anything this tick:
 
 - **"cannot resolve the plan's inventories: …"** — a referenced `ClusterInventory` or
   `StaticInventory` could not be read. `Referenced ClusterInventory "…" does not exist` means the
@@ -256,13 +256,17 @@ so could not decide anything this tick:
 - **"cannot read referenced Secrets: …"** — a Secret named by `spec.template.variables` or
   `spec.template.files` could not be read. `Referenced Secret "…" does not exist` means the reference
   is wrong or the Secret was deleted; anything else is an API error to retry.
+- **"spec.template.files entry … is not usable: …"** — a file entry has an invalid mount name or
+  does not describe exactly one recognized Kubernetes volume source without unknown fields. Correct
+  the named entry; a new run does not acquire host Leases or create managed-SSH proxy pods for this
+  invalid spec.
 
-Both reads are treated the same way, including for a run that is already in flight: a missing
-resource is permanent and supersedes a run that has not launched, while anything else is
-transient and holds it.
+A permanent problem — a missing resource, an inventory group that sets an operator-managed variable,
+or a file entry that cannot describe a volume — supersedes a run that has not launched; a transient
+read error holds it instead.
 
-Neither starts a run and neither changes `.status.hostsStatus`, so the plan holds its previous
-per-host results until the read succeeds; the operator retries every tick. `.status.nextRun` is
+None of them starts a run or changes `.status.hostsStatus`, so the plan holds its previous per-host
+results until the problem is resolved; the operator retries every tick. `.status.nextRun` is
 cleared because the plan cannot act on that slot. A real `Succeeded` or `Failed` verdict remains
 visible because the outage does not undo the latest run; a plan without one uses `Pending`. If a run
 was already in flight when this happened it keeps its own phase, and it is *not* dropped for a
@@ -296,6 +300,10 @@ A plan stays `Applying` for as long as a run is in flight, which for a long play
 normal — `.status.summary` then reads **"applying run …"**, naming the run, and the `Blocked` and
 `WaitingForNodes` conditions say whether it is waiting on a host lock or on proxy pods rather than
 executing.
+
+The related **"could not prepare a run: …"** summary, without a run name, means setup failed before
+the operator recorded an active run. There is no `Play`, host Lease, or managed-SSH proxy pod to
+recover in that case; the operator reports the error and retries normally.
 
 If it stays there with nothing progressing, `.status.summary` says which of the following it is
 instead, and `.status.activeRun` names the run it is waiting on:
@@ -360,13 +368,13 @@ instead, and `.status.activeRun` names the run it is waiting on:
   its own proxy resources and Leases. If the plan remains stuck after the foreign Job is gone, inspect
   the new `.status.summary` and operator logs rather than deleting the `Play`; it may be reporting a
   separate cleanup or API-permission problem.
-- **"could not prepare run …: Pod/Secret … already exists but is not this run's managed-ssh proxy
-  for host …"** — the operator found an object at a derived proxy-resource name in the operator
-  namespace, but could not prove that it belongs to this run and host. It refuses to treat the object
-  as this run's proxy because a managed-SSH proxy grants node-root access, keeps the run's host locks,
-  and retries the check.
+- **"could not prepare run …: …"** — setup or launch failed after the run was recorded. The run stays
+  recoverable and the operator retries every tick, so its host Leases and any managed-SSH proxy pods
+  already created remain in place. The rest of the message is the underlying API, admission,
+  workspace, proxy, Job, or run-record error to correct.
 
-  This can mean an object was planted or edited in the operator namespace. It can also mean two Node
+  The specific **"Pod/Secret … already exists but is not this run's managed-ssh proxy for host …"**
+  form can mean an object was planted or edited in the operator namespace. It can also mean two Node
   names produced the same shortened resource-name segment, which requires a deliberately constructed
   collision rather than an ordinary hash accident. Inspect the exact Pod or Secret named in the
   message. Its run ID, execution hash and component labels and its full target-host annotation must

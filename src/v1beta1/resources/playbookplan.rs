@@ -293,12 +293,24 @@ pub struct PlaybookTemplate {
 #[serde(untagged)]
 pub enum FilesSource {
     #[serde(rename_all = "camelCase")]
-    Secret { name: String, secret_ref: SecretRef },
+    Secret {
+        name: String,
+        secret_ref: FilesSecretRef,
+        #[serde(flatten)]
+        extra: BTreeMap<String, serde_json::Value>,
+    },
     Other {
         name: String,
         #[serde(flatten)]
         extra: BTreeMap<String, serde_json::Value>,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FilesSecretRef {
+    pub name: String,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
@@ -635,9 +647,11 @@ mod tests {
                     }]),
                     files: Some(vec![FilesSource::Secret {
                         name: "some-name".into(),
-                        secret_ref: SecretRef {
+                        secret_ref: FilesSecretRef {
                             name: "secret-with-files".into(),
+                            extra: BTreeMap::new(),
                         },
+                        extra: BTreeMap::new(),
                     }]),
                     playbook: r#"
 - tasks:
@@ -703,7 +717,8 @@ spec:
             files.first().unwrap(),
             FilesSource::Secret {
                 name,
-                secret_ref: _
+                secret_ref: _,
+                extra: _
             } if name == "some-configs"
         ));
 

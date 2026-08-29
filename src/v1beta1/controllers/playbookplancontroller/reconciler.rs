@@ -759,7 +759,7 @@ async fn reconcile(
             }
             UnlaunchedAction::ResumeLaunching { may_proceed } => {
                 let resume_with = may_proceed.then_some(run_groups.as_slice());
-                let (_action, requeue) = resume_launching_run(
+                let resume = resume_launching_run(
                     &context,
                     &object,
                     &api,
@@ -767,7 +767,19 @@ async fn reconcile(
                     resume_with,
                     &mut resource_status,
                 )
-                .await?;
+                .await;
+                let (_action, requeue) = match resume {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return Err(report_failed_run_preparation(
+                            &api,
+                            &object,
+                            &mut resource_status,
+                            error,
+                        )
+                        .await);
+                    }
+                };
                 if let Some(requeue) = requeue {
                     requeue_after = requeue;
                 } else if resource_status.active_run.is_some()
@@ -792,15 +804,27 @@ async fn reconcile(
                     triggered_slot: unlaunched.run.mirror.triggered_slot,
                     ..base_run
                 };
-                if let Some(requeue) = try_start_run(
+                let started = try_start_run(
                     &context,
                     &resumed,
                     &object,
                     &mut resource_status,
                     Some(&unlaunched),
                 )
-                .await?
-                {
+                .await;
+                let requeue = match started {
+                    Ok(requeue) => requeue,
+                    Err(error) => {
+                        return Err(report_failed_run_preparation(
+                            &api,
+                            &object,
+                            &mut resource_status,
+                            error,
+                        )
+                        .await);
+                    }
+                };
+                if let Some(requeue) = requeue {
                     requeue_after = requeue;
                 } else {
                     // The Job exists now, so this run has consumed its slot — recorded here and
@@ -949,9 +973,21 @@ async fn reconcile(
                         triggered_slot: this_slot,
                         ..base_run
                     };
-                    if let Some(d) =
-                        try_start_run(&context, &run, &object, &mut resource_status, None).await?
-                    {
+                    let started =
+                        try_start_run(&context, &run, &object, &mut resource_status, None).await;
+                    let requeue = match started {
+                        Ok(requeue) => requeue,
+                        Err(error) => {
+                            return Err(report_failed_run_preparation(
+                                &api,
+                                &object,
+                                &mut resource_status,
+                                error,
+                            )
+                            .await);
+                        }
+                    };
+                    if let Some(d) = requeue {
                         requeue_after = d;
                     } else {
                         // `try_start_run` ran to completion (the Job was created or an active one
@@ -1215,7 +1251,8 @@ fn window_taken_by_a_record(
 }
 
 /// Checks that every `spec.template.files` entry can name a directory of its own under the
-/// workspace, and that no two of them claim the same one.
+/// workspace, that no two claim the same one, and that each body describes one usable Kubernetes
+/// volume source.
 ///
 /// The name is a path component, not decoration: each entry is mounted at
 /// `{workspace}/files/{name}`, which is where the guide tells playbooks to read their files from.
@@ -1231,18 +1268,13 @@ fn window_taken_by_a_record(
 /// something the user did not ask for.
 fn validate_file_entries(plan: &PlaybookPlan) -> Result<(), ReconcileError> {
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let files = plan.spec.template.files.as_deref().unwrap_or_default();
 
-    for name in plan
-        .spec
-        .template
-        .files
-        .iter()
-        .flatten()
-        .map(|source| match source {
-            v1beta1::FilesSource::Secret { name, .. }
-            | v1beta1::FilesSource::Other { name, .. } => name,
-        })
-    {
+    for name in files.iter().map(|source| match source {
+        v1beta1::FilesSource::Secret { name, .. } | v1beta1::FilesSource::Other { name, .. } => {
+            name
+        }
+    }) {
         let invalid = |reason| {
             Err(ReconcileError::InvalidFileEntry {
                 name: name.clone(),
@@ -1266,6 +1298,26 @@ fn validate_file_entries(plan: &PlaybookPlan) -> Result<(), ReconcileError> {
         }
         if !seen.insert(name) {
             return invalid("two entries cannot share a name");
+        }
+    }
+
+    for (source, extracted) in files.iter().zip(job_builder::extract_file_volumes(plan)) {
+        let name = match source {
+            v1beta1::FilesSource::Secret { name, .. }
+            | v1beta1::FilesSource::Other { name, .. } => name,
+        };
+        let invalid = |reason| ReconcileError::InvalidFileEntry {
+            name: name.clone(),
+            reason,
+        };
+        let (_, volume) = extracted
+            .map_err(|_| invalid("its fields cannot be decoded as a Kubernetes volume"))?;
+        let usable = job_builder::file_volume_is_usable(source, &volume)
+            .map_err(|_| invalid("its fields cannot be encoded as a Kubernetes volume"))?;
+        if !usable {
+            return Err(invalid(
+                "it must contain exactly one recognized Kubernetes volume source with no unrecognized fields",
+            ));
         }
     }
 
@@ -2049,7 +2101,7 @@ async fn ensure_infra_and_launch(
     )
     .await?;
 
-    let proxy_readiness = match managed_ssh::ensure_proxy_infra(
+    let proxy_readiness = managed_ssh::ensure_proxy_infra(
         &context.client,
         &context.operator_namespace,
         namespace,
@@ -2064,17 +2116,7 @@ async fn ensure_infra_and_launch(
         // before cleanup runs (the per-run delete in `cleanup_proxy_infra` is the primary path).
         &playbookplan_owner_ref(object)?,
     )
-    .await
-    {
-        Ok(readiness) => readiness,
-        Err(error @ ReconcileError::ForeignProxyResource { .. }) => {
-            let api = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace);
-            return Err(
-                report_failed_run_preparation(&api, object, run, resource_status, error).await,
-            );
-        }
-        Err(error) => return Err(error),
-    };
+    .await?;
 
     let (ready, unreachable) = match proxy_readiness {
         managed_ssh::ProxyReadiness::Pending { waiting } => {
@@ -2812,39 +2854,57 @@ async fn report_failed_finalization(
     error
 }
 
-/// Records a proxy-provenance refusal on the plan and hands the error straight back.
+/// Records a failed attempt to prepare or launch a run on the plan and hands the error straight
+/// back.
 ///
-/// The run remains active and keeps its host locks: the operator cannot safely treat the object as
-/// this run's proxy, and retries after an administrator resolves the collision. Best-effort
-/// reporting must not replace the refusal with a status-write error.
+/// A run that crossed the status barrier remains active and keeps its host locks so the next tick
+/// can recover it. Failures before the barrier have no active identity to preserve, but still need a
+/// user-visible diagnosis. Best-effort reporting must not replace the original failure with a
+/// status-write error.
 async fn report_failed_run_preparation(
     api: &Api<PlaybookPlan>,
     object: &PlaybookPlan,
-    run: &RecordedRun,
     resource_status: &mut PlaybookPlanStatus,
     error: ReconcileError,
 ) -> ReconcileError {
-    record_failed_run_preparation(resource_status, run, &error);
+    if !record_failed_run_preparation(resource_status, &error) {
+        return error;
+    }
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
+        let run = resource_status
+            .active_run
+            .as_ref()
+            .map(|run| run.job_name.as_str())
+            .unwrap_or("<not yet recorded>");
         warn!(
-            "Could not report the failed preparation of run {} on {:?}/{:?}: {patch_error}",
-            run.mirror.job_name, object.metadata.namespace, object.metadata.name
+            "Could not report the failed preparation of run {run} on {:?}/{:?}: {patch_error}",
+            object.metadata.namespace, object.metadata.name
         );
     }
     error
 }
 
-/// The status half of [`report_failed_run_preparation`], split out to pin that reporting a refusal
-/// changes only the diagnosis and leaves the active run available for recovery.
-fn record_failed_run_preparation(
-    status: &mut PlaybookPlanStatus,
-    run: &RecordedRun,
-    error: &ReconcileError,
-) {
-    status.summary = Some(format!(
-        "could not prepare run {}: {error}",
-        run.mirror.job_name
-    ));
+/// The status half of [`report_failed_run_preparation`], split out to pin that reporting changes only
+/// the diagnosis and leaves the active run available for recovery. A step that already reported a
+/// more specific failure keeps its diagnosis.
+fn record_failed_run_preparation(status: &mut PlaybookPlanStatus, error: &ReconcileError) -> bool {
+    if status
+        .active_run
+        .as_ref()
+        .is_some_and(|run| !summary_unclaimed_since_adoption(status, run))
+        || status
+            .summary
+            .as_deref()
+            .is_some_and(|summary| summary.starts_with("could not release the abandoned run "))
+    {
+        return false;
+    }
+
+    status.summary = Some(match status.active_run.as_ref() {
+        Some(run) => format!("could not prepare run {}: {error}", run.job_name),
+        None => format!("could not prepare a run: {error}"),
+    });
+    true
 }
 
 /// The history-retention pass, run either after finished records are acknowledged or — on a tick
@@ -7324,9 +7384,11 @@ spec:
                     .iter()
                     .map(|name| v1beta1::FilesSource::Secret {
                         name: (*name).to_string(),
-                        secret_ref: v1beta1::SecretRef {
+                        secret_ref: v1beta1::FilesSecretRef {
                             name: "some-secret".into(),
+                            extra: BTreeMap::new(),
                         },
+                        extra: BTreeMap::new(),
                     })
                     .collect(),
             );
@@ -7353,6 +7415,49 @@ spec:
         // Two sources cannot share one directory, and choosing between them is not this operator's
         // call to make silently.
         assert!(validate_file_entries(&plan_with(&["tls", "tls"])).is_err());
+    }
+
+    #[test]
+    fn a_file_entry_requires_one_recognized_volume_source_without_ignored_fields() {
+        let plan_with = |yaml: &str| {
+            let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+            plan.spec.template.files = Some(vec![serde_yaml::from_str(yaml).unwrap()]);
+            plan
+        };
+
+        for source in [
+            "name: certs\nsecretRef:\n  name: app-certs",
+            "name: config\nconfigMap:\n  name: app-config",
+            "name: scratch\nemptyDir: {}",
+            "name: assets\nimage:\n  reference: registry.example/assets:v1",
+        ] {
+            assert!(
+                validate_file_entries(&plan_with(source)).is_ok(),
+                "{source:?} must be accepted as a complete volume"
+            );
+        }
+
+        let typo = plan_with("name: assets\nconfigMap:\n  nmae: app-config");
+        assert!(matches!(
+            validate_file_entries(&typo),
+            Err(ReconcileError::InvalidFileEntry { name, reason })
+                if name == "assets" && reason.contains("recognized Kubernetes volume source")
+        ));
+
+        for source in [
+            "name: assets\nconfigMpa:\n  name: app-config",
+            "name: assets",
+            "name: assets\nconfigMap:\n  name: app-config\nemptyDir: {}",
+            "name: assets\nconfigMap: false",
+            "name: assets\nconfigMap:\n  name: app-config\n  nmae: null",
+            "name: certs\nsecretRef:\n  name: app-certs\nemptyDir: {}",
+            "name: certs\nsecretRef:\n  name: app-certs\n  nmae: null",
+        ] {
+            assert!(
+                validate_file_entries(&plan_with(source)).is_err(),
+                "{source:?} must be rejected before a run starts"
+            );
+        }
     }
 
     /// A spec error no tick can clear: holding a run open against it would hold its host Leases for
@@ -8176,6 +8281,24 @@ spec:
 
         status.summary = Some("could not release the abandoned run apply-plan-1-4: boom".into());
         assert!(!summary_unclaimed_since_adoption(&status, &active_run));
+        assert!(!record_failed_run_preparation(
+            &mut status,
+            &ReconcileError::PreconditionFailed("fallback")
+        ));
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("could not release the abandoned run apply-plan-1-4: boom")
+        );
+
+        status.active_run = None;
+        assert!(!record_failed_run_preparation(
+            &mut status,
+            &ReconcileError::PreconditionFailed("fallback")
+        ));
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("could not release the abandoned run apply-plan-1-4: boom")
+        );
 
         // A summary left over from a *previous* tick describes a run that is no longer current, so
         // it is not a claim on this one and must not suppress the fallback.
@@ -8189,7 +8312,7 @@ spec:
     }
 
     #[test]
-    fn a_foreign_proxy_refusal_is_reported_without_giving_up_the_run() {
+    fn a_run_preparation_failure_is_reported_without_giving_up_the_run() {
         let run = RecordedRun {
             execution_hash: ExecutionHash::from_hex("1").unwrap(),
             mirror: ActiveRun {
@@ -8207,6 +8330,7 @@ spec:
             current_hash: "1".into(),
             phase: Phase::Applying,
             active_run: Some(run.mirror.clone()),
+            summary: Some(applying_summary(&run.mirror)),
             retry_count: 2,
             last_run_number: 4,
             ..Default::default()
@@ -8217,7 +8341,7 @@ spec:
             host: "worker-1".into(),
         };
 
-        record_failed_run_preparation(&mut status, &run, &error);
+        assert!(record_failed_run_preparation(&mut status, &error));
 
         assert_eq!(
             status.summary.as_deref(),
@@ -8236,6 +8360,20 @@ spec:
                 .map(|active| active.play_uid.as_str()),
             Some("play-uid")
         );
+    }
+
+    #[test]
+    fn a_start_failure_before_recording_still_gets_a_summary() {
+        let mut status = PlaybookPlanStatus::default();
+        let error = ReconcileError::PreconditionFailed("uid not set");
+
+        assert!(record_failed_run_preparation(&mut status, &error));
+
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("could not prepare a run: Precondition failed: uid not set")
+        );
+        assert!(status.active_run.is_none());
     }
 
     #[test]

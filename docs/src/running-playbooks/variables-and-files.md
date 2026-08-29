@@ -103,10 +103,16 @@ template:
 
 The playbook then reads them from `/run/ansible-operator/files/binary-assets/...`.
 
+Each entry must name exactly one volume source that the operator's Kubernetes API version
+recognizes, and its fields must survive typed decoding intact. The operator performs this check
+before it records a new run or acquires host locks, so an unknown source or a nested typo such as
+`configMap.nmae` is refused on the `PlaybookPlan` instead of leaving an uncreatable Job holding its
+hosts.
+
 > **Note:** image volumes are a newer Kubernetes feature and are not yet supported by every container
 > runtime. If your runtime lacks support, ship the blob a different way (a Secret file, or bake it
-> into the `image`). Because the field is a pass-through, an unsupported or malformed volume surfaces
-> as a reconcile error for that item rather than silently doing nothing.
+> into the `image`). Because the field is a pass-through, an unsupported volume may still fail when
+> Kubernetes starts the Job even after its shape passes the operator's preflight check.
 
 ## Requirements (collections)
 
