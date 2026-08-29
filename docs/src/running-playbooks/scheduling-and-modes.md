@@ -39,23 +39,24 @@ surfaces it in `kubectl get playbookplan`.
 
 ### One tick, one run per revision
 
-Because a run may start anywhere inside that window, the operator has to remember that the window has
-already been used — otherwise a run finishing inside its own window would immediately re-trigger
-itself. `.status.lastTriggeredRun` records the tick a run was last started for. The attempt budget
-also records its tick in `.status.retryCountSlot`, so the operator can distinguish a retry in the
-current tick from the first attempt in the next one even if the run-start marker is stale.
+Because a run may start anywhere inside that window, the trigger gate has to remember that the window
+has already been used — otherwise a run finishing inside its own window would immediately re-trigger
+itself. The gate uses the attempt budget's `.status.retryCountSlot` and the plan's immutable `Play`
+records to identify the current tick. `.status.lastTriggeredRun` records the tick a run was last
+started for as an observable marker only; it is not a gate input.
 
-That memory is per revision, not per window: any change to the [execution hash](#drift-detection)
-clears `lastTriggeredRun`, so an edit made moments after a run started takes effect right away rather
-than waiting for the next tick. Reverting to an earlier revision is a change like any other and runs
-again too.
+That gating state is per revision, not per window: any change to the [execution hash](#drift-detection)
+clears the retry budget and makes prior `Play` records inapplicable, so an edit made moments after a
+run started takes effect right away rather than waiting for the next tick. `lastTriggeredRun` is
+cleared with the revision as an informational status update. Reverting to an earlier revision is a
+change like any other and runs again too.
 
-`lastTriggeredRun` is a summary of something the run records already say. Every run writes down the
-revision and schedule tick before anything is created, so before the operator starts a run for a tick
-it also checks whether one of the plan's own
+Every run writes down the revision and schedule tick before anything is created, so before the
+operator starts a run for a tick it checks whether one of the plan's own
 [`Play` records](./results-and-troubleshooting.md) already took that tick at the current revision.
 The slot-scoped attempt counter remains after old records are pruned. Together they keep a lagging or
-competing status write from granting an extra attempt.
+competing status write from granting an extra attempt; `lastTriggeredRun` remains a summary for
+observers rather than another source of gating decisions.
 
 ## Suspending a plan
 

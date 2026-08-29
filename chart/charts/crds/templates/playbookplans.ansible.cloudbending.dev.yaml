@@ -1053,10 +1053,9 @@ spec:
               lastTriggeredRun:
                 description: |-
                   The start of the schedule slot (`Timing::Now`'s window start) that a run was last started
-                  for. This is the observable run-start marker; the trigger gate also checks the slot-scoped
-                  retry budget and immutable `Play` records so a lagging marker cannot admit a duplicate run.
-                  Cleared whenever `currentHash` changes, so an edit takes effect inside the window it was made
-                  in; `None` for unscheduled plans.
+                  for. This is an observable run-start marker only; the trigger gate uses the slot-scoped retry
+                  budget and immutable `Play` records instead. Cleared whenever `currentHash` changes, so an
+                  edit takes effect inside the window it was made in; `None` for unscheduled plans.
                 nullable: true
                 type: string
               nextRun:
