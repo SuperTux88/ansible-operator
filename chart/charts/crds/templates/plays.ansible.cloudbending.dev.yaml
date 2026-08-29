@@ -167,7 +167,7 @@ spec:
             nullable: true
             properties:
               failedHostCount:
-                description: How many hosts ended `Failed` or `Unreachable`.
+                description: How many targeted hosts did not end `Succeeded`.
                 minimum: 0.0
                 type: integer
               finishedAt:

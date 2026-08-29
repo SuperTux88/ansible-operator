@@ -91,9 +91,9 @@ automatically — you do not need to list them. See [NotReady nodes](#notready-n
 ## How managed SSH reaches a Node
 
 You do not configure any of this; it is background for the security model and for troubleshooting.
-For each targeted Node in a run, the operator:
+For a run targeting Nodes, the operator:
 
-1. Schedules a short-lived **proxy pod** onto that exact Node. The pod runs a real `sshd` and is
+1. Schedules a short-lived **proxy pod** onto each targeted Node. The pod runs a real `sshd` and is
    granted just enough privilege (`hostPID`, a host `/proc` mount, `CAP_SYS_ADMIN` +
    `CAP_SYS_PTRACE`) that each SSH session can `nsenter` into the Node's host namespaces, making the
    session `root` on the Node. The pod does not use `privileged: true`, `hostNetwork`, or `hostIPC`.
