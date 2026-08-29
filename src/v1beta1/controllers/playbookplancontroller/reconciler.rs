@@ -451,8 +451,13 @@ async fn reconcile(
             ActiveRunProgress::Running(requeue) => requeue_after = requeue,
             // The cached status was behind a tick that had already finished this run;
             // `advance_active_run` replaced it with what the apiserver actually holds, so there is
-            // nothing left to advance and the refreshed status decides the rest of this tick.
+            // nothing left to advance and the refreshed status decides the rest of this tick. Any
+            // terminal result staged earlier in this tick must remain unacknowledged so recovery can
+            // replay it after the live status has won the race.
             ActiveRunProgress::AlreadyFinalized => {
+                finished_records.clear();
+                finished_active_run = None;
+                surviving_run = None;
                 requeue_after = std::time::Duration::from_secs(1);
             }
             ActiveRunProgress::Finished {
