@@ -251,8 +251,10 @@ Three summaries report that the operator could not read or build what the plan s
 running, and so could not decide anything this tick:
 
 - **"cannot resolve the plan's inventories: …"** — a referenced `ClusterInventory` or
-  `StaticInventory` could not be read. `Referenced ClusterInventory "…" does not exist` means the
-  reference is wrong or the inventory was deleted; anything else is an API error to retry.
+  `StaticInventory` could not be read, or one of them is not usable. Two forms need an edit rather
+  than a retry: `Referenced ClusterInventory "…" does not exist` (the reference is wrong or the
+  inventory was deleted) and `Inventory group "…" sets variable "…"` (a group sets one of the
+  connection variables the operator owns). Anything else is an API error to retry.
 - **"cannot read referenced Secrets: …"** — a Secret named by `spec.template.variables` or
   `spec.template.files` could not be read. `Referenced Secret "…" does not exist` means the reference
   is wrong or the Secret was deleted; anything else is an API error to retry.
