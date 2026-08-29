@@ -383,6 +383,46 @@ mod tests {
         assert!(rendered.contains("ansible_python_interpreter: /usr/bin/python3.11"));
     }
 
+    /// The other half of the rule `execution_evaluator::renders_group_vars` mirrors: an empty
+    /// `variables` map renders exactly what an absent one does. The hash skips such a group on the
+    /// strength of that, so if this ever started emitting an empty `vars:` block the two would
+    /// disagree — and the group's real, rendered content would stop being what the hash covers.
+    #[test]
+    fn an_empty_variables_map_renders_the_same_as_no_variables_at_all() {
+        let group = |variables| ResolvedInventoryGroup::ManagedSsh {
+            hosts: ResolvedHosts {
+                name: "controlplanes".into(),
+                hosts: vec!["worker-1".into()],
+            },
+            tolerations: None,
+            variables,
+        };
+
+        let mut managed_ssh_hosts = BTreeMap::new();
+        managed_ssh_hosts.insert(
+            "worker-1".to_string(),
+            ManagedSshHostInfo {
+                pod_ip: "10.0.0.5".into(),
+                port: 22,
+                unreachable: false,
+            },
+        );
+        let ssh_paths = BTreeMap::new();
+        let ctx = RenderContext {
+            managed_ssh_hosts: &managed_ssh_hosts,
+            managed_ssh_client_key_path: "/run/ansible-operator/managed-ssh/client_key",
+            managed_ssh_known_hosts_path: "/run/ansible-operator/managed-ssh/known_hosts",
+            ssh_paths_by_static_inventory: &ssh_paths,
+        };
+
+        let empty = render_inventory(&[group(Some(GenericMap(serde_json::json!({}))))], &ctx)
+            .expect("an empty variables map is renderable");
+        let absent = render_inventory(&[group(None)], &ctx).expect("no variables is renderable");
+
+        assert_eq!(empty, absent, "byte-identical, so the hash must not move");
+        assert!(!empty.contains("vars:"));
+    }
+
     #[test]
     fn reserved_vars_cover_every_rendered_host_var() {
         // Render one host of each connection kind (the managed-ssh one unreachable, so it also

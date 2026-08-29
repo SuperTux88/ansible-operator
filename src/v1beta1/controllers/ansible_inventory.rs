@@ -37,15 +37,44 @@ pub fn distinct_host_count(groups: &[ResolvedHosts]) -> usize {
     distinct_hosts(groups).len()
 }
 
+/// Whether a group's `variables` reach the rendered inventory at all: the value has to be a mapping
+/// with at least one entry.
+///
+/// This is `inventory_renderer`'s own condition for emitting a `vars:` block, and it lives here —
+/// beside the type rather than inside one of its consumers — because three of them have to agree
+/// about it. What a run *executes* is the rendered inventory, so a group whose variables render
+/// nothing is a group with no variables: to the execution hash, which must not re-apply the playbook
+/// for an edit no host can observe, and to [`ResolvedInventoryGroup`]'s serialized form, which is
+/// what `reconciler::preparation_fingerprint` reads to decide whether a run that has not launched
+/// yet still matches the plan it was prepared for.
+///
+/// The mapping check covers the same ground for the same reason. A value that is not a mapping
+/// cannot reach the API server (the CRD types `variables` as an object) and the renderer would drop
+/// it if one did, so treating it as content would be the same contradiction in a shape nobody can
+/// produce.
+pub fn renders_group_vars(variables: &serde_json::Value) -> bool {
+    variables.as_object().is_some_and(|vars| !vars.is_empty())
+}
+
+/// The `skip_serializing_if` behind [`ResolvedInventoryGroup`]'s `variables` — see
+/// [`renders_group_vars`] for why an empty map is serialized as though the field were absent.
+fn group_vars_render_nothing(variables: &Option<GenericMap>) -> bool {
+    !variables
+        .as_ref()
+        .is_some_and(|variables| renders_group_vars(&variables.0))
+}
+
 /// A resolved inventory group tagged with which mechanism reaches its hosts — connection
 /// strategy is implicit by inventory kind: `ClusterInventory`-sourced groups always use
 /// managed-ssh, `StaticInventory`-sourced groups always use their own embedded SSH key. Kept as
 /// a distinct per-group type, not flattened, since each resource's own config (tolerations /
 /// SshConfig) has to travel with its hosts downstream.
 ///
-/// `Serialize` is not for persistence — no `Play` or status stores these — but for
-/// `reconciler::preparation_fingerprint`, which hashes the serialized form to detect that the
-/// resolved inventory a run was prepared against has moved on.
+/// `Serialize` is not for persistence — no `Play` or status stores these, and there is deliberately
+/// no `Deserialize` — but for `reconciler::preparation_fingerprint`, which hashes the serialized
+/// form to detect that the resolved inventory a run was prepared against has moved on. Being the
+/// sole consumer is what lets `variables` be canonicalized on the way out
+/// ([`group_vars_render_nothing`]) rather than at that one call site.
 #[derive(Clone, Debug, Serialize)]
 pub enum ResolvedInventoryGroup {
     ManagedSsh {
@@ -53,6 +82,7 @@ pub enum ResolvedInventoryGroup {
         tolerations: Option<Vec<Toleration>>,
         /// Author-supplied group variables from the owning `ClusterInventory`, rendered as
         /// Ansible group `vars:`. `None` when the group set none.
+        #[serde(skip_serializing_if = "group_vars_render_nothing")]
         variables: Option<GenericMap>,
     },
     Ssh {
@@ -64,6 +94,7 @@ pub enum ResolvedInventoryGroup {
         config: SshConfig,
         /// Author-supplied group variables from the owning `StaticInventory`, rendered as
         /// Ansible group `vars:`. `None` when the group set none.
+        #[serde(skip_serializing_if = "group_vars_render_nothing")]
         variables: Option<GenericMap>,
     },
 }

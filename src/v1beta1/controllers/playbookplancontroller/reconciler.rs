@@ -5792,6 +5792,42 @@ mod tests {
         );
     }
 
+    /// The fingerprint is strict on purpose, but it must not be strict about something no host can
+    /// observe. A group whose `variables` render nothing is a group with no variables to the
+    /// renderer and to the execution hash alike, so an author adding `variables: {}` while a run is
+    /// waiting on its locks or its proxy pods must not have that run torn down and rebuilt — which,
+    /// for a scheduled plan, can cost it the rest of its starting window and so the tick itself.
+    #[test]
+    fn a_variables_map_that_renders_nothing_does_not_move_the_fingerprint() {
+        let mut plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("uid".into());
+
+        let with_variables = |variables: Option<serde_json::Value>| {
+            vec![ResolvedInventoryGroup::ManagedSsh {
+                hosts: ResolvedHosts {
+                    name: "nodes".into(),
+                    hosts: vec!["a".into()],
+                },
+                tolerations: None,
+                variables: variables.map(GenericMap),
+            }]
+        };
+
+        let absent = preparation_fingerprint(&plan, &with_variables(None)).unwrap();
+        let empty =
+            preparation_fingerprint(&plan, &with_variables(Some(serde_json::json!({})))).unwrap();
+        assert_eq!(
+            absent, empty,
+            "an empty map renders and hashes as absence, so it must fingerprint as absence too"
+        );
+
+        // The canonicalization must not blunt the check it belongs to: real variables still move it.
+        let real =
+            preparation_fingerprint(&plan, &with_variables(Some(serde_json::json!({ "a": 1 }))))
+                .unwrap();
+        assert_ne!(absent, real, "variables a host will see still count");
+    }
+
     /// The load-bearing property behind dropping the Job snapshot from the `Play`: rebuilding the
     /// blueprint from the plan reproduces the prepared bytes exactly. `create_job_blueprint` must
     /// stay a pure function of the recorded identity plus the plan and groups the fingerprint

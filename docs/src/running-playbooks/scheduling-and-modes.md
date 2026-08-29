@@ -110,8 +110,9 @@ by the inventories the plan references
 The hash is order-insensitive, so reordering inputs does not count as a change, and it excludes the
 internally rendered workspace, whose content (e.g. proxy pod IPs) legitimately changes every run.
 
-The inventories contribute their `variables` only, keyed by group name, so a group that sets none
-contributes nothing at all. Which *hosts* a group resolves to is deliberately not part of the hash: a
+The inventories contribute their `variables` only, keyed by group name, so a group that sets none —
+omitting the field or writing an empty `{}`, which render identically — contributes nothing at all.
+Which *hosts* a group resolves to is deliberately not part of the hash: a
 node joining or leaving changes who the plan targets, not what it applies, and a new node is already
 out of date because it has no recorded hash of its own.
 

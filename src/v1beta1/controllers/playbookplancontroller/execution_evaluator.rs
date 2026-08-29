@@ -5,7 +5,7 @@ use std::{
 
 use k8s_openapi::ByteString;
 
-use crate::v1beta1::{self, distinct_hosts};
+use crate::v1beta1::{self, distinct_hosts, renders_group_vars};
 
 #[derive(PartialEq, Debug, Copy, Clone)]
 pub struct ExecutionHash(u64);
@@ -38,13 +38,14 @@ impl ExecutionHash {
     /// Inventory variables are treated as *content*: changing one re-applies the playbook to
     /// otherwise-current hosts. The fold is order-insensitive (groups resolve in arbitrary order),
     /// and an empty input is a no-op, so an inventory that sets no variables hashes exactly as it
-    /// did before this field existed.
+    /// did before this field existed — see [`renders_group_vars`] for what counts as setting none.
     pub fn fold_inventory_variables<'a>(
         self,
         variables: impl IntoIterator<Item = (&'a str, &'a serde_json::Value)>,
     ) -> ExecutionHash {
         let extra = variables
             .into_iter()
+            .filter(|(_, vars)| renders_group_vars(vars))
             .map(|(group_name, vars)| {
                 let mut hasher = twox_hash::XxHash3_64::new();
                 group_name.hash(&mut hasher);
@@ -273,6 +274,47 @@ mod tests {
             with_vars,
             base.fold_inventory_variables([("workers", &changed), ("edge", &edge)])
         );
+    }
+
+    /// A group whose `variables` render nothing must hash as though it had none. The renderer emits
+    /// a `vars:` block only for a non-empty mapping, so an author who adds `variables: {}` produces
+    /// a byte-identical inventory — and a hash that moved for it would re-apply the playbook to
+    /// every otherwise-current host for an edit no host can observe.
+    #[test]
+    fn a_group_whose_variables_render_nothing_hashes_as_though_it_had_none() {
+        let base = calculate_execution_hash("playbook", std::iter::empty());
+        let empty = serde_json::json!({});
+        let real = serde_json::json!({ "motd": "hello" });
+
+        assert_eq!(
+            base.fold_inventory_variables([("workers", &empty)]),
+            base,
+            "an empty map is what the renderer drops, so it cannot move the hash"
+        );
+        assert_eq!(
+            base.fold_inventory_variables([("workers", &real), ("edge", &empty)]),
+            base.fold_inventory_variables([("workers", &real)]),
+            "an empty map beside a real one contributes nothing either"
+        );
+        // Renaming a group that sets nothing is not a content change, because the group name is only
+        // ever hashed as the key of variables that exist.
+        assert_eq!(
+            base.fold_inventory_variables([("edge", &empty)]),
+            base.fold_inventory_variables([("workers", &empty)])
+        );
+    }
+
+    /// The predicate is the renderer's, so it has to answer for the shapes the renderer refuses —
+    /// not merely for the empty map. Nothing but an object can reach `variables` through the CRD,
+    /// but the hash must not be the one place that disagrees if one ever did.
+    #[test]
+    fn only_a_non_empty_mapping_counts_as_group_variables() {
+        assert!(renders_group_vars(&serde_json::json!({ "a": 1 })));
+
+        assert!(!renders_group_vars(&serde_json::json!({})));
+        assert!(!renders_group_vars(&serde_json::Value::Null));
+        assert!(!renders_group_vars(&serde_json::json!([1, 2])));
+        assert!(!renders_group_vars(&serde_json::json!("a string")));
     }
 
     /// A node reachable through two inventory groups is one host everywhere the plan counts or
