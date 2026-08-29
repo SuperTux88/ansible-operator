@@ -2365,20 +2365,18 @@ async fn advance_active_run(
     let parsed = match (&job, job_is_trusted) {
         (Some(job), true) => {
             let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
-            pods_api
+            let pods = pods_api
                 .list(&ListParams {
                     label_selector: Some(format!("job-name={job_name}")),
                     ..Default::default()
                 })
-                .await?
-                .items
-                .iter()
-                .filter(|pod| {
-                    annotation_value(&pod.metadata, labels::PLAY_UID_ANNOTATION)
-                        == Some(run.mirror.play_uid.as_str())
-                        && pod_belongs_to_job(pod, job)
-                })
-                .find_map(termination_message)
+                .await?;
+            let pods = pods.items.iter().filter(|pod| {
+                annotation_value(&pod.metadata, labels::PLAY_UID_ANNOTATION)
+                    == Some(run.mirror.play_uid.as_str())
+                    && pod_belongs_to_job(pod, job)
+            });
+            latest_termination_message(pods)
                 .as_deref()
                 .and_then(callback_output::parse_callback_output)
         }
@@ -4467,6 +4465,38 @@ fn termination_message(pod: &Pod) -> Option<String> {
         .and_then(|terminated| terminated.message.clone())
 }
 
+fn termination_finished_at(pod: &Pod) -> Option<k8s_openapi::jiff::Timestamp> {
+    pod.status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find(|cs| cs.name == job_builder::ANSIBLE_CONTAINER_NAME)
+        .and_then(|cs| cs.state.as_ref())
+        .and_then(|state| state.terminated.as_ref())
+        .and_then(|terminated| terminated.finished_at.as_ref())
+        .map(|time| time.0)
+}
+
+fn latest_termination_message<'a>(pods: impl Iterator<Item = &'a Pod>) -> Option<String> {
+    let candidates: Vec<&Pod> = pods
+        .filter(|pod| termination_message(pod).is_some())
+        .collect();
+    let latest_timestamped = candidates
+        .iter()
+        .filter_map(|pod| termination_finished_at(pod).map(|finished_at| (finished_at, *pod)))
+        .reduce(|latest, candidate| {
+            if candidate.0 > latest.0 {
+                candidate
+            } else {
+                latest
+            }
+        })
+        .map(|(_, pod)| pod);
+    let pod = latest_timestamped.or_else(|| candidates.first().copied())?;
+    termination_message(pod)
+}
+
 /// Filters a run's resolved groups down to only the hosts actually targeted this run
 /// (`hosts_to_trigger`), preserving group membership so `serial:`/native grouping in the user's
 /// playbook still means something — a single run's Job/inventory only ever targets this subset,
@@ -5507,6 +5537,50 @@ mod tests {
             &pod_owned_by("apply-web-abc-1", "job-uid", "Job"),
             &uidless
         ));
+    }
+
+    #[test]
+    fn latest_termination_message_prefers_the_latest_finished_pod() {
+        let pod = |message: &str, finished_at: Option<i64>| Pod {
+            status: Some(k8s_openapi::api::core::v1::PodStatus {
+                container_statuses: Some(vec![k8s_openapi::api::core::v1::ContainerStatus {
+                    name: job_builder::ANSIBLE_CONTAINER_NAME.into(),
+                    state: Some(k8s_openapi::api::core::v1::ContainerState {
+                        terminated: Some(k8s_openapi::api::core::v1::ContainerStateTerminated {
+                            message: Some(message.into()),
+                            finished_at: finished_at.map(|seconds| {
+                                k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                                    k8s_openapi::jiff::Timestamp::from_second(seconds).unwrap(),
+                                )
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let pods = [pod("first", Some(100)), pod("second", Some(200))];
+        assert_eq!(
+            latest_termination_message(pods.iter()).as_deref(),
+            Some("second")
+        );
+
+        let pods_with_equal_timestamps = [pod("first", Some(200)), pod("second", Some(200))];
+        assert_eq!(
+            latest_termination_message(pods_with_equal_timestamps.iter()).as_deref(),
+            Some("first")
+        );
+
+        let pods_without_timestamps = [pod("first", None), pod("second", None)];
+        assert_eq!(
+            latest_termination_message(pods_without_timestamps.iter()).as_deref(),
+            Some("first")
+        );
     }
 
     #[test]
