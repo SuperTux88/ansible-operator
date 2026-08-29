@@ -61,7 +61,7 @@ rules:
     verbs: ["get", "list", "create", "delete"]
   - apiGroups: ["ansible.cloudbending.dev"]
     resources: ["plays/status"]
-    verbs: ["get", "update", "patch"]
+    verbs: ["update"]
   # `delete` remains available even when optional egress policies are disabled so policies from a
   # previous enabled configuration can still be cleaned up safely.
   - apiGroups: ["networking.k8s.io"]
@@ -73,8 +73,6 @@ rules:
       - patch
       {{- end }}
       {{- if eq $ns $.Release.Namespace }}
-      - list
-      - watch
       - deletecollection
       {{- end }}
   {{- if eq $ns $.Release.Namespace }}
@@ -84,7 +82,7 @@ rules:
   # plan-namespace rule above.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "delete"]
+    verbs: ["get", "create", "update", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["create", "delete", "deletecollection"]

@@ -2423,6 +2423,8 @@ async fn advance_active_run(
 /// (a `historyLimit` of 0 prunes it immediately). Reporting that run lost would overwrite a
 /// perfectly good recap with `Unknown` for every host. When the live status disagrees, it is adopted
 /// wholesale — it is strictly newer than the copy this tick started from — and nothing is finalized.
+/// The full-object GET is intentional: the operator has `get` on `playbookplans` but only `patch` on
+/// `playbookplans/status`, so using `get_status` would require an additional RBAC grant.
 async fn finalize_lost_run(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -2432,7 +2434,7 @@ async fn finalize_lost_run(
     let (namespace, name) = namespace_and_name(object)?;
 
     let live_status = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace)
-        .get_status(name)
+        .get(name)
         .await?
         .status;
     let still_active = live_status
