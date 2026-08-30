@@ -84,7 +84,9 @@ use crate::{
         self, FilesSource, PlaybookPlan, PlaybookVariableSource, ResolvedInventoryGroup, SshConfig,
         controllers::reconcile_error::ReconcileError,
         labels,
-        playbookplancontroller::{execution_evaluator::ExecutionHash, managed_ssh, paths},
+        playbookplancontroller::{
+            execution_evaluator::ExecutionHash, managed_ssh, paths, workspace,
+        },
     },
 };
 
@@ -396,6 +398,8 @@ fn create_job_skeleton(
         "expected .metadata.uid in PlaybookPlan",
     ))?;
 
+    let workspace_secret_name = workspace::workspace_secret_name(&pb_name, &pb_uid);
+
     let mut job = batch::v1::Job::default();
 
     job.metadata.owner_references = Some(vec![OwnerReference {
@@ -419,7 +423,7 @@ fn create_job_skeleton(
     let mut volumes = vec![kcore::v1::Volume {
         name: WORKSPACE_VOLUME_NAME.into(),
         secret: Some(kcore::v1::SecretVolumeSource {
-            secret_name: Some(pb_name.into()),
+            secret_name: Some(workspace_secret_name),
             ..Default::default()
         }),
         ..Default::default()
@@ -1046,6 +1050,69 @@ mod tests {
         assert_eq!(
             super::volume_name("vars", "edge.keys"),
             super::volume_name("vars", "edge.keys")
+        );
+    }
+
+    /// A plan referencing a Secret of its own name is the collision that made a plan replace its own
+    /// successful run forever: the workspace was written to that Secret, so every write moved an
+    /// input of the execution hash. The Job must mount two distinct Secrets here — the user's at
+    /// `files/`, the operator's as the workspace.
+    #[test]
+    fn a_plan_referencing_a_secret_of_its_own_name_still_gets_its_own_workspace() {
+        let yaml = r#"
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: PlaybookPlan
+metadata:
+  name: an-example
+  namespace: default
+spec:
+  image: some-image
+  mode: OneShot
+  inventoryRefs: []
+  template:
+    files:
+      - name: assets
+        secretRef:
+          name: an-example
+    playbook: |
+      - hosts: all
+        "#;
+        let mut pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        pp.metadata.uid = Some("plan-uid".into());
+        let hash = crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash("- hosts: all", std::iter::empty());
+
+        let pod_spec = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp)
+            .unwrap()
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+
+        let workspace_volume = pod_spec
+            .volumes
+            .iter()
+            .flatten()
+            .find(|volume| volume.name == super::WORKSPACE_VOLUME_NAME)
+            .expect("the workspace volume");
+
+        assert_eq!(
+            workspace_volume
+                .secret
+                .as_ref()
+                .and_then(|secret| secret.secret_name.as_deref()),
+            Some(super::workspace::workspace_secret_name("an-example", "plan-uid").as_str())
+        );
+
+        // The user's Secret is still mounted under its own name, at the path the guide documents.
+        assert!(
+            pod_spec
+                .volumes
+                .iter()
+                .flatten()
+                .filter(|volume| volume.name != super::WORKSPACE_VOLUME_NAME)
+                .filter_map(|volume| volume.secret.as_ref())
+                .any(|secret| secret.secret_name.as_deref() == Some("an-example"))
         );
     }
 
