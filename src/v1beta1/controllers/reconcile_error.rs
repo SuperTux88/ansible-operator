@@ -21,6 +21,11 @@ pub enum ReconcileError {
     InvalidFileEntry { name: String, reason: &'static str },
 
     #[error(
+        "Secret {name:?} already exists but is not owned by this PlaybookPlan, so it cannot be used as its workspace"
+    )]
+    ForeignWorkspaceSecret { name: String },
+
+    #[error(
         "spec.template references Secret {name:?}, which is this plan's own workspace — the operator rewrites it on every run, so it cannot also be an input"
     )]
     WorkspaceSecretReferenced { name: String },

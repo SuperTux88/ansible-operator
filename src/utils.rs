@@ -43,19 +43,35 @@ pub fn readable_name_segment(name: &str, budget: usize) -> String {
         .to_string()
 }
 
-pub async fn create_or_update<K>(
+/// Applies `resource`, letting `mutate_fn` fold whatever is already there into what gets written —
+/// and refuse the write outright by returning an error, which is how a caller rejects an object it
+/// must not take over.
+///
+/// **The object `mutate_fn` inspects is the one the write is conditioned on.** The apply carries
+/// that read's `resourceVersion`, so anything that replaces the object in between — including a
+/// delete and a recreate under the same name — fails the write with a 409 instead of overwriting
+/// what the caller never saw. Deciding on one read and writing on the basis of another would leave
+/// exactly that gap, which is why the read lives in here rather than at the call site.
+///
+/// The create path needs no such precondition: a `create` onto a name that has meanwhile appeared
+/// fails with `AlreadyExists` rather than adopting it, and the caller's retry then arrives on the
+/// update path with the object in hand.
+pub async fn create_or_update<K, E>(
     api: &kube::Api<K>,
     field_manager: &str,
     resource_name: &str,
     resource: K,
-    mutate_fn: impl FnOnce(K, &mut K),
-) -> Result<(), kube::Error>
+    mutate_fn: impl FnOnce(K, &mut K) -> Result<(), E>,
+) -> Result<(), E>
 where
-    K: DeserializeOwned + Serialize + Clone + Debug,
+    K: DeserializeOwned + Serialize + Clone + Debug + kube::Resource,
+    E: From<kube::Error>,
 {
     if let Some(existing_resource) = api.get_opt(resource_name).await? {
         let mut updated_resource = resource.clone();
-        mutate_fn(existing_resource, &mut updated_resource);
+        let resource_version = existing_resource.meta().resource_version.clone();
+        mutate_fn(existing_resource, &mut updated_resource)?;
+        updated_resource.meta_mut().resource_version = resource_version;
 
         api.patch(
             resource_name,

@@ -3217,9 +3217,10 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         // a run open against it would hold host Leases for as long as the plan stays wrong.
         ReconcileError::InvalidFileEntry { .. }
         | ReconcileError::WorkspaceSecretReferenced { .. } => true,
-        // Not an input read at all — it comes from a run's own proxy infrastructure — but the enum
-        // is matched exhaustively so that a new failure has to be classified here deliberately.
-        ReconcileError::ForeignProxyResource { .. } => false,
+        // Neither is an input read — both come from a run's own infrastructure — but the enum is
+        // matched exhaustively so that a new failure has to be classified here deliberately.
+        ReconcileError::ForeignProxyResource { .. }
+        | ReconcileError::ForeignWorkspaceSecret { .. } => false,
         ReconcileError::PreconditionFailed(_)
         | ReconcileError::RenderError(_)
         | ReconcileError::CaError(_)
@@ -4773,6 +4774,18 @@ fn managed_ssh_proxy_hosts(groups: &[ResolvedInventoryGroup]) -> Vec<managed_ssh
     hosts
 }
 
+/// Writes the plan's workspace Secret, refusing to touch one the plan does not own.
+///
+/// `workspace::workspace_secret_name` makes an accidental collision with a user's Secret
+/// implausible, but not impossible — the name can be typed. Converging onto one anyway would be a
+/// silent takeover: the apply claims the workspace keys, and the ownerReference it carries hands
+/// the user's object to the garbage collector the moment the plan is deleted. So the write gives up
+/// instead; the run retries, and the message names the Secret that has to be renamed.
+///
+/// The check runs **inside** `create_or_update`'s mutation, on the object that helper read, and it
+/// is that same read the apply is conditioned on. Checking ownership before the call instead would
+/// decide on one read and write on the basis of another, so a Secret swapped in between the two
+/// would be adopted by exactly the write this guard exists to prevent.
 async fn upsert_workspace_secret(
     api: &Api<Secret>,
     object: &PlaybookPlan,
@@ -4788,12 +4801,18 @@ async fn upsert_workspace_secret(
         ))?;
     let secret_name = workspace::workspace_secret_name(plan_name, plan_uid);
 
-    Ok(create_or_update(
+    create_or_update(
         api,
         "ansible-operator",
         &secret_name,
         secret,
         |existing, desired_state| {
+            if !owner_references_plan(&existing.metadata.owner_references, plan_name, plan_uid) {
+                return Err(ReconcileError::ForeignWorkspaceSecret {
+                    name: secret_name.clone(),
+                });
+            }
+
             desired_state.metadata.managed_fields = None;
 
             // `string_data` contains our new or updated keys. If they exist in `data`, remove them from there so that `string_data` can take precedence.
@@ -4808,9 +4827,11 @@ async fn upsert_workspace_secret(
                     )
                 })
             };
+
+            Ok(())
         },
     )
-    .await?)
+    .await
 }
 
 /// Returns a list of all secret names that the given PlaybookPlan references (e.g. secrets used
@@ -7468,6 +7489,43 @@ spec:
             &ReconcileError::WorkspaceSecretReferenced {
                 name: "workspace-an-example-abcdefghij".into(),
             }
+        ));
+    }
+
+    /// The two halves of the workspace-ownership guard have to agree: `upsert_workspace_secret`
+    /// refuses to write any Secret whose ownerReferences do not name the plan, so the workspace the
+    /// operator itself renders must pass that check — otherwise no run could write its own
+    /// workspace — while a Secret a user created at that name must not.
+    #[test]
+    fn only_the_operators_own_workspace_secret_passes_the_ownership_guard() {
+        let yaml = r#"
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: PlaybookPlan
+metadata:
+  name: an-example
+  namespace: default
+  uid: plan-uid
+spec:
+  image: docker.io/serversideup/ansible-core:2.18
+  mode: OneShot
+  inventoryRefs: []
+  template:
+    playbook: |
+      - hosts: all
+        tasks: []
+        "#;
+        let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let rendered = render_secret(&pp, &[], &BTreeMap::new()).unwrap();
+
+        assert!(owner_references_plan(
+            &rendered.metadata.owner_references,
+            "an-example",
+            "plan-uid"
+        ));
+        assert!(!owner_references_plan(
+            &Secret::default().metadata.owner_references,
+            "an-example",
+            "plan-uid"
         ));
     }
 
