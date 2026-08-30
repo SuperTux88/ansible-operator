@@ -87,7 +87,7 @@ src/v1beta1/
     locking.rs                       per-host Leases (operator ns) for run mutual-exclusion
     play_history.rs                  writes/prunes the immutable Play run records; its module doc is the authoritative PlayPhase state machine
     job_builder.rs                   builds the one Job per run (volumes, client-cert mount, callback env, node anti-affinity)
-    workspace.rs                     renders the per-plan workspace Secret (playbook.yml/inventory.yml/recap plugin/vars), owner-ref'd to the plan
+    workspace.rs                     renders the per-plan workspace Secret (playbook.yml/inventory.yml/recap plugin/vars), owner-ref'd to the plan, named `workspace-{plan}-{uid shortid}` so it cannot land on a user's Secret
     execution_evaluator.rs           ExecutionHash over playbook + referenced Secrets (excludes the self-rendered workspace Secret)
     callback_output.rs               parses the recap the callback wrote to the pod termination message
     triggers.rs                      validated 5-field Schedule newtype + total evaluate_schedule / forecast_next_run, timezone-aware

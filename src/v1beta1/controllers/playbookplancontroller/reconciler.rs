@@ -28,7 +28,7 @@ use crate::v1beta1::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
         locking, managed_ssh,
         triggers::{Schedule, Timing, evaluate_schedule, forecast_next_run},
-        workspace::render_secret,
+        workspace::{self, render_secret},
     },
 };
 use crate::{
@@ -531,7 +531,9 @@ async fn reconcile(
     // cluster — it is the plan's own spec — but a spec that cannot produce a valid Job has to be
     // caught *before* a run takes its Leases and starts its proxy pods, or the rejection lands at
     // Job creation, where no retry can clear it and the plan wedges holding those Leases.
-    if let Err(error) = validate_file_entries(&object) {
+    if let Err(error) =
+        validate_file_entries(&object).and_then(|()| validate_workspace_not_referenced(&object))
+    {
         report_desired_input_error(
             &context,
             &object,
@@ -2147,7 +2149,7 @@ async fn ensure_infra_and_launch(
     debug!("Rendering playbook to secret");
     upsert_workspace_secret(
         &secrets_api,
-        name,
+        object,
         render_secret(
             object,
             run_groups,
@@ -3213,10 +3215,12 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         ReconcileError::KubeError(_) => false,
         // A spec the user has to edit, exactly like the three above: no tick clears it, and holding
         // a run open against it would hold host Leases for as long as the plan stays wrong.
-        ReconcileError::InvalidFileEntry { .. } => true,
-        // Not an input read at all — it comes from a run's own proxy infrastructure — but the enum
-        // is matched exhaustively so that a new failure has to be classified here deliberately.
-        ReconcileError::ForeignProxyResource { .. } => false,
+        ReconcileError::InvalidFileEntry { .. }
+        | ReconcileError::WorkspaceSecretReferenced { .. } => true,
+        // Neither is an input read — both come from a run's own infrastructure — but the enum is
+        // matched exhaustively so that a new failure has to be classified here deliberately.
+        ReconcileError::ForeignProxyResource { .. }
+        | ReconcileError::ForeignWorkspaceSecret { .. } => false,
         ReconcileError::PreconditionFailed(_)
         | ReconcileError::RenderError(_)
         | ReconcileError::CaError(_)
@@ -4770,17 +4774,45 @@ fn managed_ssh_proxy_hosts(groups: &[ResolvedInventoryGroup]) -> Vec<managed_ssh
     hosts
 }
 
+/// Writes the plan's workspace Secret, refusing to touch one the plan does not own.
+///
+/// `workspace::workspace_secret_name` makes an accidental collision with a user's Secret
+/// implausible, but not impossible — the name can be typed. Converging onto one anyway would be a
+/// silent takeover: the apply claims the workspace keys, and the ownerReference it carries hands
+/// the user's object to the garbage collector the moment the plan is deleted. So the write gives up
+/// instead; the run retries, and the message names the Secret that has to be renamed.
+///
+/// The check runs **inside** `create_or_update`'s mutation, on the object that helper read, and it
+/// is that same read the apply is conditioned on. Checking ownership before the call instead would
+/// decide on one read and write on the basis of another, so a Secret swapped in between the two
+/// would be adopted by exactly the write this guard exists to prevent.
 async fn upsert_workspace_secret(
     api: &Api<Secret>,
-    secret_name: &str,
+    object: &PlaybookPlan,
     secret: Secret,
 ) -> Result<(), ReconcileError> {
-    Ok(create_or_update(
+    let (_, plan_name) = namespace_and_name(object)?;
+    let plan_uid = object
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or(ReconcileError::PreconditionFailed(
+            "expected .metadata.uid in PlaybookPlan",
+        ))?;
+    let secret_name = workspace::workspace_secret_name(plan_name, plan_uid);
+
+    create_or_update(
         api,
         "ansible-operator",
-        secret_name,
+        &secret_name,
         secret,
         |existing, desired_state| {
+            if !owner_references_plan(&existing.metadata.owner_references, plan_name, plan_uid) {
+                return Err(ReconcileError::ForeignWorkspaceSecret {
+                    name: secret_name.clone(),
+                });
+            }
+
             desired_state.metadata.managed_fields = None;
 
             // `string_data` contains our new or updated keys. If they exist in `data`, remove them from there so that `string_data` can take precedence.
@@ -4795,9 +4827,11 @@ async fn upsert_workspace_secret(
                     )
                 })
             };
+
+            Ok(())
         },
     )
-    .await?)
+    .await
 }
 
 /// Returns a list of all secret names that the given PlaybookPlan references (e.g. secrets used
@@ -4812,6 +4846,42 @@ fn get_related_secrets(playbookplan: &PlaybookPlan) -> Vec<&String> {
     job_builder::extract_secret_names_for_variables(playbookplan)
         .chain(job_builder::extract_secret_names_for_files(playbookplan))
         .collect()
+}
+
+/// Refuses a plan that declares its own workspace Secret as one of its inputs.
+///
+/// The generated name is deterministic, so a plan *can* name it — and the operator would then read
+/// it as a desired input and hash it, while every run rewrites it. On a plan targeting cluster Nodes
+/// those bytes genuinely move run to run (proxy pod IPs are rendered into `inventory.yml`), so the
+/// hash moves with them and the plan replaces its own successful run forever, exactly the loop the
+/// generated name exists to prevent. The rest of that hazard is closed structurally; this last door
+/// has to be shut deliberately, because it is the one a user opens by typing the name.
+///
+/// Refused rather than filtered out of the hash. A reference the operator silently ignored would
+/// mount nothing at the path the playbook reads from — or, under `variables`, a Secret with no
+/// `variables.yaml` key, which fails at the kubelet with the run's Leases already held. There is no
+/// reason to want this either: the workspace is already mounted as the run's working directory.
+fn validate_workspace_not_referenced(plan: &PlaybookPlan) -> Result<(), ReconcileError> {
+    let (_, plan_name) = namespace_and_name(plan)?;
+    let plan_uid = plan
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or(ReconcileError::PreconditionFailed(
+            "expected .metadata.uid in PlaybookPlan",
+        ))?;
+    let workspace_name = workspace::workspace_secret_name(plan_name, plan_uid);
+
+    if get_related_secrets(plan)
+        .into_iter()
+        .any(|name| *name == workspace_name)
+    {
+        return Err(ReconcileError::WorkspaceSecretReferenced {
+            name: workspace_name,
+        });
+    }
+
+    Ok(())
 }
 
 /// Persists `status` via a JSON merge patch, not `Api::replace_status` (a PUT requiring
@@ -7347,6 +7417,116 @@ spec:
             secrets,
             vec!["secret-with-variables", "secret-with-config-files"]
         );
+    }
+
+    /// A plan naming its own workspace as an input would hash a Secret every one of its runs
+    /// rewrites — on a managed-ssh plan the proxy IPs in `inventory.yml` move every run, so the hash
+    /// moves with them and the plan replaces its own successful run forever. The name is
+    /// deterministic, so nothing but this check stops somebody from typing it.
+    ///
+    /// The case that must keep working is the one directly beside it: a Secret named after the
+    /// *plan*, which is the user's to reference and the whole reason the workspace is named
+    /// something else.
+    #[test]
+    fn a_plan_may_not_reference_its_own_workspace_but_may_reference_its_own_name() {
+        let plan_with = |secret: &str| {
+            let yaml = format!(
+                r#"
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: PlaybookPlan
+metadata:
+  name: an-example
+  namespace: default
+  uid: plan-uid
+spec:
+  image: docker.io/serversideup/ansible-core:2.18
+  mode: OneShot
+  inventoryRefs: []
+  template:
+    files:
+      - name: assets
+        secretRef:
+          name: {secret}
+    playbook: |
+      - hosts: all
+        tasks: []
+        "#
+            );
+            serde_yaml::from_str::<PlaybookPlan>(&yaml).unwrap()
+        };
+
+        let workspace_name = workspace::workspace_secret_name("an-example", "plan-uid");
+
+        assert!(matches!(
+            validate_workspace_not_referenced(&plan_with(&workspace_name)),
+            Err(ReconcileError::WorkspaceSecretReferenced { name }) if name == workspace_name
+        ));
+
+        assert!(validate_workspace_not_referenced(&plan_with("an-example")).is_ok());
+        assert!(validate_workspace_not_referenced(&plan_with("some-configs")).is_ok());
+
+        // `variables` is the other way in, and the one whose failure would otherwise land at the
+        // kubelet — the workspace has no `variables.yaml` key — with the run's Leases already held.
+        let mut variables_plan = plan_with("some-configs");
+        variables_plan.spec.template.files = None;
+        variables_plan.spec.template.variables =
+            Some(vec![v1beta1::PlaybookVariableSource::SecretRef {
+                secret_ref: v1beta1::SecretRef {
+                    name: workspace_name.clone(),
+                },
+            }]);
+        assert!(matches!(
+            validate_workspace_not_referenced(&variables_plan),
+            Err(ReconcileError::WorkspaceSecretReferenced { .. })
+        ));
+    }
+
+    /// A permanent spec problem must supersede an unlaunched run rather than hold it: no tick clears
+    /// it, and holding it would renew the run's host Leases against a plan that cannot run.
+    #[test]
+    fn referencing_the_workspace_supersedes_an_unlaunched_run() {
+        assert!(input_error_supersedes_unlaunched(
+            &ReconcileError::WorkspaceSecretReferenced {
+                name: "workspace-an-example-abcdefghij".into(),
+            }
+        ));
+    }
+
+    /// The two halves of the workspace-ownership guard have to agree: `upsert_workspace_secret`
+    /// refuses to write any Secret whose ownerReferences do not name the plan, so the workspace the
+    /// operator itself renders must pass that check — otherwise no run could write its own
+    /// workspace — while a Secret a user created at that name must not.
+    #[test]
+    fn only_the_operators_own_workspace_secret_passes_the_ownership_guard() {
+        let yaml = r#"
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: PlaybookPlan
+metadata:
+  name: an-example
+  namespace: default
+  uid: plan-uid
+spec:
+  image: docker.io/serversideup/ansible-core:2.18
+  mode: OneShot
+  inventoryRefs: []
+  template:
+    playbook: |
+      - hosts: all
+        tasks: []
+        "#;
+        let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let rendered = render_secret(&pp, &[], &BTreeMap::new()).unwrap();
+
+        assert!(owner_references_plan(
+            &rendered.metadata.owner_references,
+            "an-example",
+            "plan-uid"
+        ));
+        assert!(!owner_references_plan(
+            &Secret::default().metadata.owner_references,
+            "an-example",
+            "plan-uid"
+        ));
     }
 
     #[test]

@@ -156,6 +156,26 @@ that span hosts (`serial`, `run_once`, delegation) normally. The operator adds p
 two runs never touch the same host at once, and it steers the Job's own pod away from the Nodes the
 run targets, so a disruptive playbook is less likely to evict its own runner mid-run.
 
+Before the Job starts, the operator renders everything the run needs to read — the playbook, the
+inventory it resolved, any inline variables — into a **workspace Secret** in the plan's namespace,
+named `workspace-<truncated-plan>-<id>` and owned by the plan. The run mounts it as its working
+directory, and it is rewritten in place on every run, so treat it as read-only: every key the
+operator renders — `playbook.yml`, `inventory.yml`, the recap plugin, any static variables — is
+overwritten, so an edit to one of those does not survive. Keys it does not render are left alone
+and nothing prunes them, so a key you add, or one the operator wrote for an earlier revision and no
+longer produces, stays in the run's working directory until you remove it or the Secret is
+recreated. The readable plan portion is shortened as needed and any dots in it become
+hyphens, so a plan named `web.prod` gets `workspace-web-prod-<id>`; the `<id>` is derived from the
+plan's UID. Together they keep the name separate from the Secrets you create — including one named
+after the plan itself, which is yours to use. If something else does end up at that exact name, the
+operator refuses to write it rather than overwrite it, and says so in `.status.summary`. What it
+checks is the owner reference: a Secret carrying one that names this plan by both name and UID is
+taken to be its workspace and rewritten, anything else is refused — so a Secret of yours is only
+treated as the workspace if you gave it that reference, which already means Kubernetes deletes it
+with the plan. See
+[A Secret already occupies the workspace Secret's
+name](./results-and-troubleshooting.md#a-secret-already-occupies-the-workspace-secrets-name).
+
 ## Lifecycle at a glance
 
 A plan moves through phases: `Pending` → `Delayed` while it waits for a scheduled start →
