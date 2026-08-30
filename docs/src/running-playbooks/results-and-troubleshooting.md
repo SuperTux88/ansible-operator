@@ -262,10 +262,15 @@ running, and so could not decide anything this tick:
   does not describe exactly one recognized Kubernetes volume source without unknown fields. Correct
   the named entry; a new run does not acquire host Leases or create managed-SSH proxy pods for this
   invalid spec.
+- **"spec.template references Secret … which is this plan's own workspace"** — a `secretRef` names
+  the [workspace Secret](./playbook-plans.md#one-job-per-run) the operator generates for this plan.
+  It is rewritten on every run, so hashing it as an input would make the plan replace its own
+  finished run indefinitely. Drop the reference: the workspace is already mounted as the run's
+  working directory, so a playbook reads it from there without asking for it.
 
 A permanent problem — a missing resource, an inventory group that sets an operator-managed variable,
-or a file entry that cannot describe a volume — supersedes a run that has not launched; a transient
-read error holds it instead.
+a file entry that cannot describe a volume, or a reference to the plan's own workspace — supersedes
+a run that has not launched; a transient read error holds it instead.
 
 None of them starts a run or changes `.status.hostsStatus`, so the plan holds its previous per-host
 results until the problem is resolved; the operator retries every tick. `.status.nextRun` is
@@ -285,6 +290,39 @@ plan that had not yet run when the outage started is left without a `Ready` cond
 before. The summary is restored from the same host state on that first clean read, including whether
 the latest run failed, so every mode stops advertising the resolved outage without waiting for
 another run.
+
+### A Secret already occupies the workspace Secret's name
+
+The summary reads **"could not prepare run …: Secret "workspace-…" already exists but is not owned
+by this PlaybookPlan, so it cannot be used as its workspace"**.
+
+Every run renders its playbook, its resolved inventory and its inline variables into a generated
+**workspace Secret** named `workspace-<truncated-plan>-<id>`, owned by the plan (see
+[One Job per run](./playbook-plans.md#one-job-per-run)). The `<id>` comes from the plan's UID, so
+the generated name is separate from the Secrets you create — a Secret named after the plan itself
+is yours, and referencing it from `spec.template.variables` or `spec.template.files` is fine. The
+operator only reports this when something else already sits at the generated name, which normally
+means it was created by hand or by another tool.
+
+It refuses to write rather than overwrite it, because writing would replace that object's
+`playbook.yml`/`inventory.yml` keys and adopt it — and an adopted Secret is deleted by Kubernetes
+when the plan is. The run stays recorded and retries every tick, holding its host Leases meanwhile,
+so resolve this promptly. Read the exact name from the summary and look at what is there:
+
+```sh
+PLAN_NAMESPACE=my-team
+SECRET=workspace-my-plan-abcdefghij
+kubectl get secret "$SECRET" -n "$PLAN_NAMESPACE" \
+  -o 'custom-columns=NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].name,OWNER_UID:.metadata.ownerReferences[*].uid'
+kubectl describe secret "$SECRET" -n "$PLAN_NAMESPACE"
+```
+
+If the object is yours, **rename it** — copy it to a name of your choosing, update whatever
+references it, and delete the original. Deleting it outright is safe only once nothing needs it: the
+operator recreates its own workspace on the next tick, so nothing of the plan is lost, but nothing
+restores your data either. If the object is *not* yours and you did not expect it, treat it as
+planted: inspect its contents before deleting it, since it was positioned where a run would have
+mounted it as its working directory.
 
 ### A plan is not starting and its `Blocked` condition is `True`
 
@@ -374,6 +412,10 @@ instead, and `.status.activeRun` names the run it is waiting on:
   recoverable and the operator retries every tick, so its host Leases and any managed-SSH proxy pods
   already created remain in place. The rest of the message is the underlying API, admission,
   workspace, proxy, Job, or run-record error to correct.
+
+  The form **"Secret … already exists but is not owned by this PlaybookPlan"** has its own entry —
+  see [A Secret already occupies the workspace Secret's
+  name](#a-secret-already-occupies-the-workspace-secrets-name).
 
   The specific **"Pod/Secret … already exists but is not this run's managed-ssh proxy for host …"**
   form can mean an object was planted or edited in the operator namespace. It can also mean two Node
