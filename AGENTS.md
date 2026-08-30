@@ -179,9 +179,11 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    suspension contract is held (`suspended_advertises_no_next_run`): a tick has several ways to write
    a status and only one way to reach the end of the pipeline, so "a suspended plan advertises no
    `nextRun`" belongs at the write, not at the end. Terminal `Play` acknowledgement and the
-   version-checked *finalizer* write (`drop_run_cleanup_finalizer`) come **after** it. The finalizer
-   write treats a 409 as "retry next tick" — it raced the status write this tick just made, and
-   losing that race must not discard it.
+   version-checked *finalizer* write (`drop_run_cleanup_finalizer`) come **after** it. That write is
+   conditioned on the plan `patch_status` *returned*, not on the tick's starting read — the status
+   patch moves the `resourceVersion`, so the starting read's copy would fail the precondition against
+   nothing but this tick's own write. A 409 therefore means somebody else wrote the plan, and is
+   treated as "retry next tick" rather than discarding the status just written.
 
 Requeue is dynamic: 3600s default, tightened to "time until next scheduled run" / 15s
 (Job-polling) / 5s (waiting on proxy readiness) as appropriate.

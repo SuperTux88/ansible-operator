@@ -1050,7 +1050,11 @@ async fn finish_reconcile_tick(
         handover == RunHandover::NothingHeld && resource_status.active_run.is_none();
     let defer_finalizer_release = defers_finalizer_release(object, resource_status, handover);
 
-    patch_status(&api, object, resource_status.clone()).await?;
+    // Kept, not discarded like every other status write: the finalizer release below is
+    // version-checked, and this write is what moved the version. `object` is also the tick's
+    // starting read, so its finalizer list predates anything another controller added since —
+    // the live copy answers both questions from the same observation the write is conditioned on.
+    let patched = patch_status(&api, object, resource_status.clone()).await?;
 
     for finished in finished_records {
         if finished.record == TerminalRecord::Present
@@ -1087,13 +1091,15 @@ async fn finish_reconcile_tick(
         requeue_after = Some(finalizer_release_retry_after(requeue_after));
     }
 
-    if release_finalizer && let Err(error) = drop_run_cleanup_finalizer(&api, object).await {
+    if release_finalizer && let Err(error) = drop_run_cleanup_finalizer(&api, &patched).await {
         if !error.is_conflict() {
             return Err(error);
         }
+        // Now that the release is conditioned on the status write's own result, a conflict means
+        // somebody *else* wrote the plan since — not this tick racing itself.
         debug!(
-            "Could not give back the run-cleanup finalizer of {namespace}/{name}: the plan changed \
-             underneath this tick; retrying shortly"
+            "Could not give back the run-cleanup finalizer of {namespace}/{name}: the plan was \
+             written by someone else since this tick's status update; retrying shortly"
         );
         requeue_after = Some(finalizer_release_retry_after(requeue_after));
     }
@@ -1144,10 +1150,15 @@ enum RunHandover {
 /// each time, and would never release anything. Those exits ask for `await_change` deliberately, and
 /// this must not talk them out of it.
 ///
-/// Stated over the same state the release itself reads, and decided beside it, so the two describe
-/// one snapshot. With no run left, `NothingHeld` releases and `Retired` defers — never both, never
-/// neither. A run still in flight belongs to neither: the finalizer is legitimately held, and
-/// answering `true` there would poll every busy plan every five seconds for the whole of its run.
+/// Decided beside the release and over the same `handover`, which is what makes the two exhaustive:
+/// with no run left, `NothingHeld` releases and `Retired` defers — never both, never neither. A run
+/// still in flight belongs to neither: the finalizer is legitimately held, and answering `true`
+/// there would poll every busy plan every five seconds for the whole of its run.
+///
+/// Only the finalizer *presence* is read from a different copy of the plan than the release is: this
+/// runs before the tick's status write and the release re-reads it from that write's result. Both
+/// are then answering "is there anything to hand back", and disagreeing costs at most one early
+/// wake-up on a plan that has already handed it back.
 fn defers_finalizer_release(
     object: &PlaybookPlan,
     resource_status: &PlaybookPlanStatus,
@@ -3182,7 +3193,9 @@ async fn handle_unlaunched_input_error(
             // happen: it needs inputs to converge against, and this run has none.
             JobPresenceAction::Contested | JobPresenceAction::Proceed => {}
         }
-        return patch_status(api, object, resource_status.clone()).await;
+        return patch_status(api, object, resource_status.clone())
+            .await
+            .map(|_| ());
     }
 
     abandon_unlaunched_run(
@@ -4892,11 +4905,18 @@ fn validate_workspace_not_referenced(plan: &PlaybookPlan) -> Result<(), Reconcil
 ///
 /// Every write goes through [`suspended_advertises_no_next_run`] on the way out — see there for why
 /// the suspension contract is held at this boundary rather than at the end of the pipeline.
+///
+/// Returns the plan as the apiserver now holds it. Almost every caller discards that, but a tick
+/// that has to make a *version-checked* write afterwards cannot: this write invalidated the
+/// `resourceVersion` its own `target` carries, so conditioning the next one on that stale value
+/// would fail against nothing but this tick's own status patch. See [`finish_reconcile_tick`], the
+/// one place where the two meet. A no-op patch changes no version, so the returned object is the
+/// right handle either way.
 async fn patch_status(
     api: &Api<PlaybookPlan>,
     target: &PlaybookPlan,
     mut status: PlaybookPlanStatus,
-) -> Result<(), ReconcileError> {
+) -> Result<PlaybookPlan, ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
 
     suspended_advertises_no_next_run(target.spec.suspend, &mut status);
@@ -4905,14 +4925,13 @@ async fn patch_status(
         .name()
         .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
 
-    api.patch_status(
-        &name,
-        &PatchParams::default(),
-        &Patch::Merge(serde_json::json!({ "status": status })),
-    )
-    .await?;
-
-    Ok(())
+    Ok(api
+        .patch_status(
+            &name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "status": status })),
+        )
+        .await?)
 }
 
 async fn hash_playbook_inputs(
