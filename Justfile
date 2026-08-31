@@ -27,12 +27,17 @@ build:
 test:
     cargo test
 
+# Run the tests for the Python scripts the operator embeds (the preflight gate).
+# Standard-library `unittest`, so there is nothing to install.
+test-python:
+    python3 -m unittest discover --start-directory tests/python --verbose
+
 # Lint (must stay clean — see AGENTS.md).
 clippy:
     cargo clippy
 
-# The full pre-change gate: build + test + clippy + guide + API docs.
-check: build test clippy docs apidoc
+# The full pre-change gate: build + tests (Rust and Python) + clippy + guide + API docs.
+check: build test test-python clippy docs apidoc
 
 # Dump all CRDs (PlaybookPlan, Play, ClusterInventory, StaticInventory, NodeAccessPolicy) to stdout.
 crds:

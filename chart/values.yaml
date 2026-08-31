@@ -25,8 +25,9 @@ managedSsh:
 
   # How long the operator waits for a NotReady node's managed-ssh proxy pod to become Ready before it
   # gives up on that node for the run (Ansible then reports the node unreachable, and it is retried on
-  # the next run). The wait is only for pods stuck before Running; a pod that has reached Running is
-  # waited on until Ready as usual. The wait scales with how long the node has been silent: it is
+  # the next run). The wait covers pods stuck before Running and old-credential pods still
+  # terminating after a reset; a pod that has reached Running normally is waited on until Ready as
+  # usual. The wait scales with how long the node has been silent: it is
   # `graceSeconds` for a node whose last heartbeat is within `thresholdDays[0]`, divided by
   # `aggressiveness` again at each further threshold, and 0 (given up immediately) past the last one.
   # Defaults give 600 / 300 / 150 / 0 seconds at 3 / 7 / 30 day boundaries.

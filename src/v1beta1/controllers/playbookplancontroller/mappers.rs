@@ -65,7 +65,7 @@ pub fn secret_to_playbookplans(
                     return files.iter().any(|file| {
                         matches!(
                             file,
-                            v1beta1::FilesSource::Secret { name: _, secret_ref }
+                            v1beta1::FilesSource::Secret { secret_ref, .. }
                             if secret_ref.name == secret_name
                         )
                     });

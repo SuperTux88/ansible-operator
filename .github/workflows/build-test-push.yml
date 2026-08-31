@@ -44,8 +44,8 @@ jobs:
           test "$(helm template ansible-operator chart --namespace ansible-system | grep -c '^kind: CustomResourceDefinition$')" -eq 5
           test "$(helm template ansible-operator chart --namespace ansible-system --set crds.install=false | grep -c '^kind: CustomResourceDefinition$')" -eq 0
 
-  # Sole validation for ordinary commits (PRs, main pushes): compiles the crate once, in
-  # the test profile, and runs the tests.
+  # Rust-backed validation for ordinary commits (PRs and main pushes): runs the tests and
+  # verifies that the checked-in chart CRDs still match the Rust resource definitions.
   test:
     runs-on: ubuntu-latest
 
@@ -60,12 +60,54 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Run Clippy
+        run: |
+          rustup component add clippy
+          cargo clippy -- -D warnings
+
+      - name: Verify generated CRDs are current
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          mkdir -p "$tmp_dir/templates"
+          cat > "$tmp_dir/annotation" <<'ANNOTATION'
+            {{- if .Values.keep }}
+            annotations:
+              helm.sh/resource-policy: keep
+            {{- end }}
+          ANNOTATION
+          cargo run --quiet -- crds > "$tmp_dir/all-crds.yaml"
+          csplit -z -f "$tmp_dir/crd-" "$tmp_dir/all-crds.yaml" '/^---$/' '{*}' > /dev/null
+          for file in "$tmp_dir"/crd-*; do
+            name="$(grep -m1 '^  name:' "$file" | awk '{print $2}')"
+            sed -i '/^---$/d' "$file"
+            sed -i "/^metadata:$/r $tmp_dir/annotation" "$file"
+            cp "$file" "$tmp_dir/templates/${name}.yaml"
+          done
+          diff -rs "$tmp_dir/templates" chart/charts/crds/templates
+
+  # The embedded Python scripts are not compiled by cargo and so are not covered by the job
+  # above. Deliberately a job of its own rather than a step in it: it needs no Rust toolchain and
+  # no cache, it runs in seconds, and keeping it separate means a broken gate script is reported as
+  # itself rather than as "tests failed". Stdlib `unittest` only, so the runner's python3 is the
+  # whole dependency.
+  test-python:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run Python tests
+        run: python3 -m unittest discover --start-directory tests/python --verbose
+
   # Release build. Only runs for real releases (v*.*.* tags) or an explicit manual build —
   # `cargo build --release` never runs on ordinary commits. Compiled in bookworm so the
   # binary's glibc matches the distroless/cc-debian12 runtime it is COPY'd into.
   compile:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    needs: [test, chart]
+    needs: [test, test-python, chart]
     runs-on: ubuntu-latest
 
     container:

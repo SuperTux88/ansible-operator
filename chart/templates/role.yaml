@@ -26,24 +26,42 @@ rules:
   #    `delete` is required in every enrolled namespace, not just the operator's;
   #  - one Job per run is created + watched here;
   #  - the run's Job-owned pod is read here for its termination message;
-  #  - one Play history record per run attempt is created/status-patched/listed/deleted here (it is
-  #    owned by its PlaybookPlan in the same namespace, so it cascades on plan deletion). Not watched
-  #    — the operator only writes Plays, nothing reconciles them.
+  #  - one immutable Play recovery/history record per run is created, status-updated,
+  #    listed, and deleted here (it is owned by its PlaybookPlan in the same namespace, so it
+  #    cascades on plan deletion). The PlaybookPlan controller reads these records during recovery.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  # `delete` is used for cancellation only: a plan deleted mid-run has its Job cancelled explicitly
+  # rather than left to the deleting client's propagation policy, which may orphan the pod. Finished
+  # Jobs are still reaped by their TTL, not by the operator. The operator deletes only a Job whose
+  # identity it has validated, but that is its own restraint: RBAC cannot scope `delete` to Jobs the
+  # operator created, so the grant covers every Job in an enrolled namespace.
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["get", "list", "watch", "create"]
+    verbs: ["get", "list", "watch", "create", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  # `patch` on the plans themselves exists for the run-cleanup finalizer: a run's proxy pods and host
+  # Leases live in the operator's namespace, where an OwnerReference cannot reach them, so a plan
+  # deleted mid-run must be held open until the operator has released them. The finalizer is the only
+  # thing the operator patches here, but that is a property of the code, not of the grant — RBAC
+  # cannot restrict `patch` to `metadata.finalizers`, so this permits writing the spec and metadata
+  # of any plan in an enrolled namespace, and the privilege summary in THREAT_MODEL.md counts it as
+  # such. Deliberately here and NOT in the ClusterRole, which stays read-only: the operator can write
+  # plan objects only in namespaces it is already trusted to run them in. Un-enrolling a namespace
+  # with a run in flight therefore leaves a finalizer the operator can no longer remove — see the
+  # deployment docs.
+  - apiGroups: ["ansible.cloudbending.dev"]
+    resources: ["playbookplans"]
+    verbs: ["patch"]
   - apiGroups: ["ansible.cloudbending.dev"]
     resources: ["plays"]
     verbs: ["get", "list", "create", "delete"]
   - apiGroups: ["ansible.cloudbending.dev"]
     resources: ["plays/status"]
-    verbs: ["get", "update", "patch"]
+    verbs: ["update"]
   # `delete` remains available even when optional egress policies are disabled so policies from a
   # previous enabled configuration can still be cleaned up safely.
   - apiGroups: ["networking.k8s.io"]
@@ -55,8 +73,6 @@ rules:
       - patch
       {{- end }}
       {{- if eq $ns $.Release.Namespace }}
-      - list
-      - watch
       - deletecollection
       {{- end }}
   {{- if eq $ns $.Release.Namespace }}
@@ -66,7 +82,7 @@ rules:
   # plan-namespace rule above.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "delete"]
+    verbs: ["get", "create", "update", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["create", "delete", "deletecollection"]

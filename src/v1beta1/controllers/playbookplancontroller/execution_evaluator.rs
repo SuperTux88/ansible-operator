@@ -5,7 +5,7 @@ use std::{
 
 use k8s_openapi::ByteString;
 
-use crate::v1beta1::{self, controllers::reconcile_error::ReconcileError};
+use crate::v1beta1::{self, distinct_hosts, renders_group_vars};
 
 #[derive(PartialEq, Debug, Copy, Clone)]
 pub struct ExecutionHash(u64);
@@ -25,6 +25,12 @@ impl std::ops::Deref for ExecutionHash {
 }
 
 impl ExecutionHash {
+    /// Reconstructs a persisted execution hash from its canonical lowercase hexadecimal form.
+    pub fn from_hex(value: &str) -> Option<Self> {
+        let parsed = u64::from_str_radix(value, 16).ok()?;
+        (format!("{parsed:x}") == value).then_some(Self(parsed))
+    }
+
     /// Folds inventory-author group variables into an existing hash. Kept separate from
     /// [`calculate_execution_hash`] so the many call sites that hash only playbook + secrets stay
     /// unchanged — the reconciler chains this on with the run's resolved groups.
@@ -32,13 +38,14 @@ impl ExecutionHash {
     /// Inventory variables are treated as *content*: changing one re-applies the playbook to
     /// otherwise-current hosts. The fold is order-insensitive (groups resolve in arbitrary order),
     /// and an empty input is a no-op, so an inventory that sets no variables hashes exactly as it
-    /// did before this field existed.
+    /// did before this field existed — see [`renders_group_vars`] for what counts as setting none.
     pub fn fold_inventory_variables<'a>(
         self,
         variables: impl IntoIterator<Item = (&'a str, &'a serde_json::Value)>,
     ) -> ExecutionHash {
         let extra = variables
             .into_iter()
+            .filter(|(_, vars)| renders_group_vars(vars))
             .map(|(group_name, vars)| {
                 let mut hasher = twox_hash::XxHash3_64::new();
                 group_name.hash(&mut hasher);
@@ -60,18 +67,15 @@ impl ExecutionHash {
 pub fn find_outdated_hosts(
     status: &v1beta1::PlaybookPlanStatus,
     execution_hash: &ExecutionHash,
-) -> Result<Vec<String>, ReconcileError> {
-    let hosts: Vec<_> = status
-        .eligible_hosts
-        .iter()
-        .flat_map(|g| g.hosts.iter().cloned())
-        .collect();
+) -> Vec<String> {
+    let hosts = distinct_hosts(&status.eligible_hosts);
 
     // If we don't have any hosts_status yet, simply return all hosts for execution
     let Some(hosts_status) = &status.hosts_status else {
-        return Ok(hosts);
+        return hosts;
     };
 
+    let hash = execution_hash.to_string();
     // For each host, check if it already has the current execution hash in the PlaybookPlan's status
     let outdated_hosts = hosts.iter().filter(move |host| {
         let host_status = hosts_status.get(*host);
@@ -84,20 +88,14 @@ pub fn find_outdated_hosts(
         let host_status = host_status.unwrap();
 
         // Otherwise just compare the hashes
-        host_status.last_applied_hash != *execution_hash.to_string()
+        host_status.last_applied_hash != hash
     });
 
-    Ok(outdated_hosts.cloned().collect())
+    outdated_hosts.cloned().collect()
 }
 
 pub fn find_all_hosts(status: &v1beta1::PlaybookPlanStatus) -> Vec<String> {
-    let hosts: Vec<_> = status
-        .eligible_hosts
-        .iter()
-        .flat_map(|g| g.hosts.iter().cloned())
-        .collect();
-
-    hosts
+    distinct_hosts(&status.eligible_hosts)
 }
 
 /// Given a playbook and some secrets, calculate a hash that only changes if the inputs change.
@@ -146,7 +144,7 @@ mod tests {
         let to_execute = find_outdated_hosts(&status, &ExecutionHash(1));
 
         // Then
-        assert_eq!(to_execute.unwrap().len(), 0);
+        assert_eq!(to_execute.len(), 0);
     }
 
     #[test]
@@ -171,7 +169,7 @@ mod tests {
             "host-3".to_owned(),
         ];
         let expected: Vec<String> = expected_hostnames.to_vec();
-        let actual: Vec<String> = to_execute.unwrap();
+        let actual: Vec<String> = to_execute;
 
         assert!(expected.eq(&actual));
     }
@@ -216,7 +214,7 @@ mod tests {
         // Then
         let expected_hostnames = ["host-1".to_owned(), "host-3".to_owned()];
         let expected: Vec<String> = expected_hostnames.to_vec();
-        let actual: Vec<String> = to_execute.unwrap();
+        let actual: Vec<String> = to_execute;
 
         assert_eq!(expected, actual);
     }
@@ -275,6 +273,95 @@ mod tests {
         assert_ne!(
             with_vars,
             base.fold_inventory_variables([("workers", &changed), ("edge", &edge)])
+        );
+    }
+
+    /// A group whose `variables` render nothing must hash as though it had none. The renderer emits
+    /// a `vars:` block only for a non-empty mapping, so an author who adds `variables: {}` produces
+    /// a byte-identical inventory — and a hash that moved for it would re-apply the playbook to
+    /// every otherwise-current host for an edit no host can observe.
+    #[test]
+    fn a_group_whose_variables_render_nothing_hashes_as_though_it_had_none() {
+        let base = calculate_execution_hash("playbook", std::iter::empty());
+        let empty = serde_json::json!({});
+        let real = serde_json::json!({ "motd": "hello" });
+
+        assert_eq!(
+            base.fold_inventory_variables([("workers", &empty)]),
+            base,
+            "an empty map is what the renderer drops, so it cannot move the hash"
+        );
+        assert_eq!(
+            base.fold_inventory_variables([("workers", &real), ("edge", &empty)]),
+            base.fold_inventory_variables([("workers", &real)]),
+            "an empty map beside a real one contributes nothing either"
+        );
+        // Renaming a group that sets nothing is not a content change, because the group name is only
+        // ever hashed as the key of variables that exist.
+        assert_eq!(
+            base.fold_inventory_variables([("edge", &empty)]),
+            base.fold_inventory_variables([("workers", &empty)])
+        );
+    }
+
+    /// The predicate is the renderer's, so it has to answer for the shapes the renderer refuses —
+    /// not merely for the empty map. Nothing but an object can reach `variables` through the CRD,
+    /// but the hash must not be the one place that disagrees if one ever did.
+    #[test]
+    fn only_a_non_empty_mapping_counts_as_group_variables() {
+        assert!(renders_group_vars(&serde_json::json!({ "a": 1 })));
+
+        assert!(!renders_group_vars(&serde_json::json!({})));
+        assert!(!renders_group_vars(&serde_json::Value::Null));
+        assert!(!renders_group_vars(&serde_json::json!([1, 2])));
+        assert!(!renders_group_vars(&serde_json::json!("a string")));
+    }
+
+    /// A node reachable through two inventory groups is one host everywhere the plan counts or
+    /// lists hosts. The counts feed the `n/m` summary and the restated `Ready` message, which sit
+    /// beside a `Play`'s own always-distinct `Hosts` column, and the lists feed `filter_groups_to_hosts`.
+    #[test]
+    fn a_host_in_two_groups_counts_and_lists_once() {
+        let overlapping = vec![
+            ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["node-a".into(), "node-b".into()],
+            },
+            ResolvedHosts {
+                name: "storage".into(),
+                hosts: vec!["node-b".into(), "node-c".into()],
+            },
+        ];
+        assert_eq!(
+            distinct_hosts(&overlapping),
+            vec!["node-a".to_string(), "node-b".into(), "node-c".into()],
+            "first-seen order, so group membership still reads naturally"
+        );
+        assert_eq!(crate::v1beta1::distinct_host_count(&overlapping), 3);
+
+        let hash = ExecutionHash(1);
+        let mut status = PlaybookPlanStatus {
+            eligible_hosts: overlapping,
+            ..Default::default()
+        };
+        assert_eq!(find_all_hosts(&status).len(), 3);
+        assert_eq!(
+            find_outdated_hosts(&status, &hash).len(),
+            3,
+            "a plan that never ran owes each host one run, not one per group it appears in"
+        );
+
+        status.hosts_status = Some(BTreeMap::from([(
+            "node-b".to_string(),
+            HostStatus {
+                last_applied_hash: hash.to_string(),
+                ..Default::default()
+            },
+        )]));
+        assert_eq!(
+            find_outdated_hosts(&status, &hash),
+            vec!["node-a".to_string(), "node-c".into()],
+            "the shared host is current once, not once per group"
         );
     }
 

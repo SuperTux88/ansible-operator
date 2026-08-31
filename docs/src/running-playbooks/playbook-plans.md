@@ -5,17 +5,24 @@ A `PlaybookPlan` is the central resource the operator reconciles. It ties a **pl
 reported. This page explains how the fields fit together; the full field list and defaults live in
 the CRD schema (`ansible-operator crds`) and the generated API reference.
 
+A plan's **name** is capped at 63 characters, shorter than Kubernetes would otherwise allow for a
+custom resource. The operator records that name as a label on every object a run creates — its
+`Play`, its Job, that Job's pod, and the run's NetworkPolicy — and Kubernetes label values stop at 63
+characters. A longer name is rejected when you apply it; if your cluster does not enforce CRD
+validation rules, the operator refuses the plan instead and says so in `.status.summary`.
+
 ## Spec fields
 
 | Field | Required | Meaning |
 |---|---|---|
-| `image` | yes | An OCI image that has `ansible-playbook` and every collection your playbook uses. The Job runs this image. |
+| `image` | yes | An OCI image that has `ansible-playbook` on `PATH`, `python3` on `PATH`, and every collection your playbook uses. The Job runs this image. |
 | `securityContext` | no | Container security context applied to the playbook and collection-installer containers. |
 | `serviceAccountName` | no | ServiceAccount the run's pod uses, so tasks can reach the Kubernetes API. Unset means no API token is mounted — see [Managing Kubernetes resources](#managing-kubernetes-resources). |
 | `inventoryRefs` | yes | Which inventories to target — one entry per referenced `ClusterInventory` or `StaticInventory`. |
 | `template.playbook` | yes | The playbook text itself (see below). |
 | `mode` | no (`OneShot`) | `OneShot` or `Recurring` — see [Scheduling and execution modes](./scheduling-and-modes.md). |
-| `schedule` | no | A 5-field cron expression gating when the plan may run. Omit for "as soon as possible". |
+| `maxAttempts` | no (`3` / `1`) | How many times a failed run may be tried again, counting the first run. Defaults to `3` for `OneShot` and `1` for `Recurring` — see [Retries](./scheduling-and-modes.md#retries). |
+| `schedule` | no | A 5-field cron expression (`minute hour day-of-month month day-of-week`) gating when the plan may run. Seconds and year fields are not supported. Omit for "as soon as possible". |
 | `timeZone` | no (UTC) | IANA time zone the `schedule` is evaluated in, e.g. `Europe/Berlin`. |
 | `suspend` | no (`false`) | Pause switch, like a CronJob's `suspend`: while `true` the operator starts no new runs. See [Suspending a plan](./scheduling-and-modes.md#suspending-a-plan). |
 | `template.variables` | no | Variables made available to the playbook — see [Variables and files](./variables-and-files.md). |
@@ -46,6 +53,28 @@ template:
 Baking collections into the image is faster and more reproducible than installing them on every run;
 use `requirements` for collections you cannot or do not want to pre-bake.
 
+### `python3` must be on `PATH`
+
+Two commands are run from your image, and both must resolve on `PATH`: `ansible-playbook`, and
+`python3` for the [preflight connectivity check](./cluster-nodes.md#preflight-connectivity-check)
+that runs before Ansible on plans targeting cluster Nodes. The operator reuses your image for that
+check rather than pulling one of its own, which keeps a run to a single image — and Ansible is itself
+a Python program, so an image that can run `ansible-playbook` practically always ships an
+interpreter.
+
+Practically always is not always, though. If Ansible is installed into a virtual environment that is
+not on the image's `PATH`, or the interpreter is only reachable as `python`, the check cannot start:
+the init container exits immediately, `ansible-playbook` never runs, and the run finishes with no
+recap — every host reported [`Unknown`](./results-and-troubleshooting.md#hosts-show-unknown). Verify
+it the way the Job will:
+
+```sh
+podman run --rm <your-image> python3 --version
+```
+
+If it fails, add a `python3` to the image or symlink the interpreter you have onto `PATH` under that
+name. Plans that target only `StaticInventory` hosts never run the check and are unaffected.
+
 The execution image also determines which container security settings it supports. Configure them
 on the plan so they stay coupled to that image:
 
@@ -60,9 +89,10 @@ spec:
       type: RuntimeDefault
 ```
 
-The context is applied to both the `ansible-playbook` container and the optional
-`download-collections` init container. Changing the security context affects future Jobs but does
-not itself cause hosts that already succeeded to run again.
+The context is applied to every container of the run: the `ansible-playbook` container, the
+optional `download-collections` init container, and the `managed-ssh-preflight` init container that
+plans targeting cluster Nodes get. Changing the security context affects future Jobs but does not
+itself cause hosts that already succeeded to run again.
 
 ## The playbook
 
@@ -120,17 +150,92 @@ lowering it never re-runs the playbook on hosts that are already current.
 
 ## One Job per run
 
-Each run is a single Kubernetes Job (named `apply-<plan>-<id>-<retry>`) that applies the playbook to
+Each run is a single Kubernetes Job (named `apply-<plan>-<id>-<n>`) that applies the playbook to
 all of that run's hosts together, not one Job per host. This lets a playbook use Ansible features
 that span hosts (`serial`, `run_once`, delegation) normally. The operator adds per-host **Leases** so
 two runs never touch the same host at once, and it steers the Job's own pod away from the Nodes the
 run targets, so a disruptive playbook is less likely to evict its own runner mid-run.
 
+Before the Job starts, the operator renders everything the run needs to read — the playbook, the
+inventory it resolved, any inline variables — into a **workspace Secret** in the plan's namespace,
+named `workspace-<truncated-plan>-<id>` and owned by the plan. The run mounts it as its working
+directory, and it is rewritten in place on every run, so treat it as read-only: every key the
+operator renders — `playbook.yml`, `inventory.yml`, the recap plugin, any static variables — is
+overwritten, so an edit to one of those does not survive. Keys it does not render are left alone
+and nothing prunes them, so a key you add, or one the operator wrote for an earlier revision and no
+longer produces, stays in the run's working directory until you remove it or the Secret is
+recreated. The readable plan portion is shortened as needed and any dots in it become
+hyphens, so a plan named `web.prod` gets `workspace-web-prod-<id>`; the `<id>` is derived from the
+plan's UID. Together they keep the name separate from the Secrets you create — including one named
+after the plan itself, which is yours to use. If something else does end up at that exact name, the
+operator refuses to write it rather than overwrite it, and says so in `.status.summary`. What it
+checks is the owner reference: a Secret carrying one that names this plan by both name and UID is
+taken to be its workspace and rewritten, anything else is refused — so a Secret of yours is only
+treated as the workspace if you gave it that reference, which already means Kubernetes deletes it
+with the plan. See
+[A Secret already occupies the workspace Secret's
+name](./results-and-troubleshooting.md#a-secret-already-occupies-the-workspace-secrets-name).
+
 ## Lifecycle at a glance
 
-A plan moves through phases: `Pending` → `Applying` → `Succeeded`/`Failed` (for `OneShot`) or
-`… → Scheduled → …` (for `Recurring`). Drift detection decides *which* hosts actually run: an
+A plan moves through phases: `Pending` → `Delayed` while it waits for a scheduled start →
+`Applying` → `Succeeded`/`Failed`, in both modes, from the recap of the run that just finished. A `Recurring` plan keeps that result between ticks and
+advertises the next one through `.status.nextRun`. Drift detection decides *which* hosts actually run: an
 execution hash over the playbook plus every referenced Secret marks hosts out of date, and a host
 that already succeeded on the current hash is skipped. See
 [Scheduling and execution modes](./scheduling-and-modes.md) for the mechanics and
 [Reading results](./results-and-troubleshooting.md) for how to read the outcome.
+
+`Applying` covers the whole active run, including waiting for host locks and proxy readiness.
+The `Running` condition distinguishes the narrower period when the Job itself is active.
+
+## Deleting a plan
+
+Deleting a plan **cancels** the run it has in flight — the run is not allowed to finish first. The
+plan object then stays in `Terminating` for a moment while the operator tears the run down, because
+it holds a `ansible.cloudbending.dev/run-cleanup` finalizer:
+
+1. the run's Job is cancelled with a foreground deletion, and the operator waits for the Job and then
+   its pod to actually be gone;
+2. the run's managed-ssh proxy pods, their NetworkPolicy and Secret are deleted;
+3. the run's host Leases are released;
+4. the finalizer is removed and the plan disappears.
+
+The wait in step 1 is what makes this safe: the run's host locks keep being renewed until its pod is
+gone, so no other plan can start against a host while a playbook may still be talking to it. A
+foreground deletion is what makes the Job's own disappearance mean that — Kubernetes keeps the Job
+object until it has deleted the pods it owns, so the operator never has to infer from a single
+snapshot that a pod it cannot see will not appear a moment later. A plan that stays `Terminating` for
+a long time is therefore usually a pod that will not stop — look at the Job's pod, and at the
+operator log, which names the run it is waiting on.
+
+The finalizer is only present while a plan actually holds a run, and a plan that has never started
+one never carries it at all. Deleting an idle plan is immediate — with one exception: a plan gives
+the finalizer back on the tick *after* the one that released its run, so a plan whose run has just
+finished, or whose run was interrupted before it created anything, holds it for one more tick. If
+the operator stops inside that moment, even an idle plan waits in `Terminating` until it returns.
+
+Everything a run creates in the plan's own namespace (its Job, `Play` records, workspace Secret,
+client-certificate Secret and egress NetworkPolicy) is owned by the plan and would be removed by
+Kubernetes anyway. The finalizer exists for what lives in the **operator's** namespace — proxy pods
+and host Leases — which no owner reference can reach across namespaces, and which nothing but this
+operator can release.
+
+> **Do not strip the finalizer to force a deletion.** Removing `ansible.cloudbending.dev/run-cleanup`
+> by hand makes the plan disappear immediately and strands exactly the resources it protects: a
+> node-root proxy pod that keeps running, and a host Lease held by a run that no longer exists.
+>
+> If you have to do it, **write the run's identity down first**. The plan's `Play` records and its
+> Job are owned by the plan and are deleted with it, so the moment it disappears there is nothing
+> left in its namespace that names the run — while the proxy pods and Leases in the operator's
+> namespace are found by exactly those values:
+>
+> ```sh
+> kubectl get playbookplan my-plan -n my-team -o jsonpath='{.status.activeRun}'
+> ```
+>
+> Keep the `runId`, `executionHash` and `jobName` it prints, along with the plan's name and
+> namespace, and clean the run up afterwards with the [manual
+> procedure](./results-and-troubleshooting.md#the-plan-is-stuck-in-applying). If the plan is already
+> gone and nothing was captured, see [orphaned run resources with no
+> plan](./results-and-troubleshooting.md#orphaned-run-resources-with-no-plan).

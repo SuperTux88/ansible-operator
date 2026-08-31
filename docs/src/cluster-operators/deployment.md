@@ -50,11 +50,12 @@ Cluster-node access needs a **real OpenSSH `sshd`** image for the proxy pods; th
 is distroless and cannot serve this role. It is configured via the chart's `managedSsh.proxyImage`.
 
 The default is the first-party, minimal, statically-linked `sshd` image published alongside the
-operator (`ghcr.io/webd97/ansible-operator-sshd`). With `tag` left empty it tracks the chart
-appVersion, so it moves in lockstep with the operator on upgrade.
+operator (`ghcr.io/webd97/ansible-operator-sshd`), pinned to a release-specific `@sha256:` digest.
+The empty `tag` is intentional: the release workflow repins the digest when publishing a new proxy
+image.
 
-**This is a node-root pod, so treat the image as node-root supply chain.** In production, pin it to a
-digest from a registry you trust — set `tag: ""` and put the digest in `repository`:
+**This is a node-root pod, so treat the image as node-root supply chain.** If you override the default,
+pin the image to a digest from a registry you trust — set `tag: ""` and put the digest in `repository`:
 
 ```yaml
 # values.yaml
@@ -71,8 +72,9 @@ the operator (via a `checksum/config` annotation) rather than hot-reloading.
 
 When a `ClusterInventory` targets a `NotReady` Node, the operator still schedules its proxy pod and
 waits for the pod to become Ready. If it does not become Ready in time, the run proceeds without that
-Node — Ansible reports it unreachable, and it is retried on the next run. The wait applies only to a
-pod that has not yet started; a pod that has reached `Running` is waited on until Ready as usual.
+Node — Ansible reports it unreachable, and it is retried on the next run. The same bound applies to
+an old-credential pod still terminating after a reset; it is never reused. A pod that has reached
+`Running` normally is waited on until Ready as usual.
 
 The wait scales with how long the Node has been silent (its last `Ready` heartbeat): a Node that only
 just went `NotReady` is given the full wait, one silent for longer is given up on sooner. Tune it via
@@ -117,11 +119,96 @@ Two consequences to plan for:
   **dedicated to Ansible ops**, not general-purpose application namespaces, so this power covers as
   few unrelated Secrets as possible. See
   [Security model → the blast radius you accept](./security.md#blast-radius).
+- **Un-enrol a namespace only while its plans are idle.** A plan with a run in flight carries the
+  `ansible.cloudbending.dev/run-cleanup` finalizer, and the `patch` permission that lets the operator
+  remove it again is granted per enrolled namespace. Removing the namespace from `watchNamespaces`
+  while a run is active therefore leaves any plan deleted afterwards stuck in `Terminating`: the
+  operator can no longer release the run *or* drop its own finalizer. Recovering means re-enrolling
+  the namespace (the operator then finishes the teardown on its own), or removing the finalizer by
+  hand and cleaning the run up with the
+  [manual procedure](../running-playbooks/results-and-troubleshooting.md#the-plan-is-stuck-in-applying).
+  Check for active runs before un-enrolling:
+
+  ```sh
+  kubectl get playbookplan -n <namespace> \
+    -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,RUN:.status.activeRun.jobName
+  ```
 
 Under the hood this is driven by a small TOML config (`watch_namespaces`, `proxy_image`) that the
 chart renders into a mounted ConfigMap. For local development you can point the binary at a config
 file directly with `run --config <path>` and set `POD_NAMESPACE` (the operator's own namespace, always
 enrolled).
+
+### Protect operator-created Jobs
+
+The chart's `Role` grants the operator ServiceAccount permission to create and delete Jobs in each
+enrolled namespace, and to patch `PlaybookPlan` objects there. Kubernetes RBAC is additive: this does
+**not** stop another `Role`, `ClusterRole`, or binding from granting the same permissions to a user
+or another ServiceAccount. Keep enrolled namespaces dedicated to Ansible operations and do not grant
+untrusted principals `create` on `batch/jobs` there.
+
+Two of those grants are wider than what the operator does with them, because RBAC cannot express the
+narrower rule:
+
+- **`delete` on `batch/jobs`** cancels the run of a plan that is deleted mid-run, or whose `Play` record
+  is removed, rather than leaving its pod to the deleting client's propagation policy. The operator
+  deletes only a Job whose identity it has validated, and passes that Job's UID as a delete
+  precondition, but the grant itself covers every Job in the namespace.
+- **`patch` on `playbookplans`** carries the `ansible.cloudbending.dev/run-cleanup` finalizer, which
+  is what keeps a deleted plan alive until its node-root proxy pods and host Leases are released.
+  RBAC cannot restrict a patch to `metadata.finalizers`, so the grant permits writing the spec and
+  metadata of any plan in the namespace. It is deliberately not in the `ClusterRole` — the operator
+  reads plans cluster-wide but can only write them where it is already trusted to run them.
+
+Both are accounted for in the operator privilege summary in the repository's `THREAT_MODEL.md`.
+Neither widens what a compromised operator can reach: it already creates node-root proxy pods for
+runs in those namespaces.
+
+This matters for more than ordinary workload separation. The operator records a run before creating
+its Job and later checks the Job's owner reference and run labels to identify it. A principal that can
+create Jobs in an enrolled namespace can occupy an expected Job name, or copy the operator's identity
+metadata onto a different pod template. The reconciler refuses an ordinary foreign Job and waits for
+it, but object metadata alone cannot prove which principal created a Job that carries all the expected
+fields.
+
+Check the effective permission for the operator and for every other principal that may act in an
+enrolled namespace. Replace the ServiceAccount names with the ones used by your installation:
+
+```sh
+ENROLLED_NAMESPACE=team-a
+OPERATOR_NAMESPACE=ansible-system
+OPERATOR_SERVICE_ACCOUNT=ansible-operator
+
+OPERATOR="system:serviceaccount:$OPERATOR_NAMESPACE:$OPERATOR_SERVICE_ACCOUNT"
+TENANT="system:serviceaccount:$ENROLLED_NAMESPACE:default"
+
+# expected: yes for all three
+kubectl auth can-i create jobs -n "$ENROLLED_NAMESPACE" --as="$OPERATOR"
+kubectl auth can-i delete jobs -n "$ENROLLED_NAMESPACE" --as="$OPERATOR"
+kubectl auth can-i patch playbookplans.ansible.cloudbending.dev \
+  -n "$ENROLLED_NAMESPACE" --as="$OPERATOR"
+
+# expected for an untrusted tenant ServiceAccount: no for all three
+kubectl auth can-i create jobs -n "$ENROLLED_NAMESPACE" --as="$TENANT"
+kubectl auth can-i delete jobs -n "$ENROLLED_NAMESPACE" --as="$TENANT"
+kubectl auth can-i patch playbookplans.ansible.cloudbending.dev \
+  -n "$ENROLLED_NAMESPACE" --as="$TENANT"
+```
+
+A `yes` in the second block means some other binding hands a tenant principal the same authority the
+operator relies on: Job creation lets it occupy a run's expected Job name, Job deletion lets it
+cancel runs, and plan patching lets it strip the run-cleanup finalizer and strand a deleted plan's
+proxy pods and host Leases.
+
+Review namespaced `RoleBinding`s and cluster-wide `ClusterRoleBinding`s as well; a cluster-wide grant
+can bypass the namespace's intended local policy. If an enrolled namespace must also host unrelated
+Job workloads, use an admission policy to reserve the operator's Job identity instead: allow only the
+operator ServiceAccount to create Jobs with the operator's reserved component/plan/run labels and
+with names matching the operator's `apply-...` convention. Do not solve this by allowing every Job in
+the namespace to bypass admission.
+
+See [Security model → the Job trust boundary](./security.md#the-job-trust-boundary) for why this
+restriction is required even though the operator validates Job identity during recovery.
 
 ## ServiceAccount tokens
 
@@ -193,6 +280,21 @@ Set `crds.install: false` only when another release owns the same cluster-scoped
 manifests are generated from the operator binary itself (`ansible-operator crds`) and stored under
 the subchart's `templates/` directory.
 The regeneration procedure lives in `chart/README.md`.
+
+The chart declares `kubeVersion: ">=1.25.0-0"` because two CRDs use **CRD validation rules**
+(`x-kubernetes-validations`):
+
+- The `Play` CRD freezes a run record's spec for its lifetime, one of the controls that keeps a
+  committed run from being steered by anyone with write access to `plays` (see
+  [Security](./security.md) and `T-ESC-8`).
+- The `PlaybookPlan` CRD caps a plan's name at 63 characters, because that name is written as a
+  label value onto every object a run creates.
+
+Kubernetes only evaluates such rules from 1.25 onwards, and an older or non-conformant API server
+would **ignore them silently** rather than reject them — so if you bypass the version constraint,
+confirm they are actually in force rather than assuming it. The operator re-checks the plan-name cap
+itself and refuses an over-long plan with a clear message on the resource, so only the `Play` rule
+depends on the API server alone.
 
 Being ordinary release resources also means Helm would delete them on `helm uninstall`, and
 deleting a CRD deletes every custom resource of that kind cluster-wide. `crds.keep` defaults to

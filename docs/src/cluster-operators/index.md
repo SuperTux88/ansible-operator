@@ -22,7 +22,7 @@ node access.
 ## Source of truth
 
 This chapter is an operator-facing summary. The full analysis — threats, mitigations, and the
-numbered invariants (INV-1…INV-7) — lives in the repository's `THREAT_MODEL.md`. If this guide and
+numbered invariants — lives in the repository's `THREAT_MODEL.md`. If this guide and
 `THREAT_MODEL.md` disagree, `THREAT_MODEL.md` is authoritative; report the discrepancy as a
 documentation bug.
 

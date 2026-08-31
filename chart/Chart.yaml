@@ -2,6 +2,10 @@ apiVersion: v2
 name: ansible-operator
 description: An opinionated runner for Ansible on Kubernetes
 type: application
+# The Play CRD relies on CRD validation rules (`x-kubernetes-validations`) to freeze a run
+# record's spec; those are only evaluated from 1.25 on, and would be silently ignored, not
+# rejected, on anything older.
+kubeVersion: ">=1.25.0-0"
 version: 0.1.0 # VERSION
 appVersion: "0.1.0"
 dependencies:

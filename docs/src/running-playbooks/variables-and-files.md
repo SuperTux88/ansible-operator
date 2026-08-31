@@ -63,6 +63,13 @@ at:
 
 so the playbook can read it there, or via the relative path `files/my-assets/...`.
 
+The `name` is that one directory, so it has to be a single path component: not empty, not `.` or
+`..`, and with no `/`, `:` or control characters in it. Anything else is refused with a message on
+the plan and no run is started — a name that is a *path* would mount your Secret somewhere else in
+the run's pod entirely. Two entries may not share a name either: they would claim one directory, and
+the operator will not pick between them for you. Letters, digits, dots, dashes and underscores are
+all fine, in any case: `TLS_certs` and `assets.v2` are valid names.
+
 ### From a Secret
 
 Mounts a Secret's keys as files under the entry's directory — the way to ship certificates, config
@@ -96,10 +103,16 @@ template:
 
 The playbook then reads them from `/run/ansible-operator/files/binary-assets/...`.
 
+Each entry must name exactly one volume source that the operator's Kubernetes API version
+recognizes, and its fields must survive typed decoding intact. The operator performs this check
+before it records a new run or acquires host locks, so an unknown source or a nested typo such as
+`configMap.nmae` is refused on the `PlaybookPlan` instead of leaving an uncreatable Job holding its
+hosts.
+
 > **Note:** image volumes are a newer Kubernetes feature and are not yet supported by every container
 > runtime. If your runtime lacks support, ship the blob a different way (a Secret file, or bake it
-> into the `image`). Because the field is a pass-through, an unsupported or malformed volume surfaces
-> as a reconcile error for that item rather than silently doing nothing.
+> into the `image`). Because the field is a pass-through, an unsupported volume may still fail when
+> Kubernetes starts the Job even after its shape passes the operator's preflight check.
 
 ## Requirements (collections)
 

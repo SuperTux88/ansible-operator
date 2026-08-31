@@ -10,7 +10,11 @@ Two independent things decide *when* a plan runs and *what* runs:
 
 `spec.schedule` is a standard **5-field cron** expression (`minute hour day-of-month month
 day-of-week`). `spec.timeZone` is the IANA time zone it is evaluated in; if omitted, **UTC** is used.
-The granularity is minutes, not seconds.
+The granularity is minutes, not seconds. Schedules with a seconds or year field are not accepted.
+Invalid cron expressions, unknown time zones, and expressions with no future occurrence are rejected;
+the plan does not run until the field is corrected. Its status identifies the invalid field; see
+[The plan's schedule or time zone is
+invalid](./results-and-troubleshooting.md#the-plans-schedule-or-time-zone-is-invalid).
 
 The operator evaluates the schedule on its own reconcile cycle rather than exactly on the tick, so a
 run starts within a short window *after* each scheduled time. `spec.startingDeadlineSeconds` sets how
@@ -33,16 +37,43 @@ pinned to a maintenance window.
 The plan's `.status.nextRun` shows the next computed fire time, and the `Next run` printer column
 surfaces it in `kubectl get playbookplan`.
 
+### One tick, one run per revision
+
+Because a run may start anywhere inside that window, the trigger gate has to remember that the window
+has already been used — otherwise a run finishing inside its own window would immediately re-trigger
+itself. The gate uses the attempt budget's `.status.retryCountSlot` and the plan's immutable `Play`
+records to identify the current tick. `.status.lastTriggeredRun` records the tick a run was last
+started for as an observable marker only; it is not a gate input.
+
+That gating state is per revision, not per window: any change to the [execution hash](#drift-detection)
+clears the retry budget and makes prior `Play` records inapplicable, so an edit made moments after a
+run started takes effect right away rather than waiting for the next tick. `lastTriggeredRun` is
+cleared with the revision as an informational status update. Reverting to an earlier revision is a
+change like any other and runs again too.
+
+Every run writes down the revision and schedule tick before anything is created, so before the
+operator starts a run for a tick it checks whether one of the plan's own
+[`Play` records](./results-and-troubleshooting.md) already took that tick at the current revision.
+The slot-scoped attempt counter remains after old records are pruned. Together they keep a lagging or
+competing status write from granting an extra attempt; `lastTriggeredRun` remains a summary for
+observers rather than another source of gating decisions.
+
 ## Suspending a plan
 
 Set `spec.suspend: true` to stop the operator starting new runs, the same idea as a CronJob's
 `.spec.suspend`. It is a pause switch, not a delete:
 
-- A run **already in progress** is left to finish — suspending never kills a running Job.
+- A run whose **Job already exists** is left to finish — suspending never kills a running Job.
+- A run that has **not created its Job yet** — one still waiting for its host locks, or still
+  bringing up its proxy pods — is dropped instead: nothing irrevocable exists for it, so pausing the
+  plan stops it rather than letting it launch whenever it becomes able to. It is cleaned up and
+  deleted the same way a run superseded by an edit is, and a fresh run starts once you
+  resume. See [Editing a plan while a run is in
+  flight](#editing-a-plan-while-a-run-is-in-flight).
 - No **new** run is started while suspended, in any mode: a `Recurring` plan skips its schedule
   ticks, and a `OneShot` plan holds off even when hosts are out of date.
 - The `Suspended` printer column reads `true` and `.status.nextRun` is cleared — there is no next run
-  while paused. The plan's phase keeps showing its underlying state (e.g. `Scheduled` or
+  while paused. The plan's phase keeps showing its underlying state (e.g. `Delayed` or
   `Succeeded`); the column, not the phase, is what tells you it is paused.
 
 Clear the flag (`spec.suspend: false`, or remove it) to resume; a `Recurring` plan picks up again at
@@ -57,41 +88,161 @@ reflects the latest inputs.
 ### `OneShot` (default)
 
 Converge to a goal state and then stop. Only **out-of-date** hosts run; once every host has succeeded
-on the current playbook and inputs, the plan settles into `Succeeded` (or `Failed` if some host could
-not be brought current) and stops — it does **not** keep re-running on the schedule. It wakes again
-only when the inputs change (see drift detection below). Good for "make it so": apply a configuration
+on the current playbook and inputs, the plan settles into `Succeeded` and stops — it does **not** keep
+re-running on the schedule. A run that fails is tried again a bounded number of times (see
+[Retries](#retries)); once that budget is spent the plan settles into `Failed` and stops the same way.
+Either way it wakes again only when the inputs change (see drift detection below). Good for "make it so": apply a configuration
 or a one-time migration and confirm every host got it.
 
 ### `Recurring`
 
 Re-apply on **every** schedule tick. *All* hosts run each time, regardless of whether they ran
-successfully last time, and the plan reschedules itself back to `Scheduled` for the next tick. Good
-for periodic enforcement or inherently repeating work: nightly package upgrades, drift correction,
-health tasks. A `Recurring` plan needs a `schedule`.
+successfully last time. Between ticks the phase keeps the latest run's `Succeeded` or `Failed`
+result, while `.status.nextRun` names the next tick. Good for periodic enforcement or inherently
+repeating work: nightly package upgrades, drift correction, health tasks. A `Recurring` plan needs a
+`schedule`.
 
 ## Drift detection
 
 To decide which hosts are out of date, the operator computes an **execution hash** over the playbook
-text **plus the contents of every referenced Secret** (variables and files). The hash is
-order-insensitive, so reordering inputs does not count as a change, and it excludes the internally
-rendered workspace, whose content (e.g. proxy pod IPs) legitimately changes every run.
+text, **the contents of every referenced Secret** (variables and files), and the group variables set
+by the inventories the plan references
+([cluster nodes](./cluster-nodes.md#group-variables), [external hosts](./external-hosts.md#group-variables)).
+The hash is order-insensitive, so reordering inputs does not count as a change, and it excludes the
+internally rendered workspace, whose content (e.g. proxy pod IPs) legitimately changes every run.
+
+The inventories contribute their `variables` only, keyed by group name, so a group that sets none —
+omitting the field or writing an empty `{}`, which render identically — contributes nothing at all.
+Which *hosts* a group resolves to is deliberately not part of the hash: a
+node joining or leaving changes who the plan targets, not what it applies, and a new node is already
+out of date because it has no recorded hash of its own.
 
 - Each host records the hash it **last succeeded on** (`.status.hostsStatus.<host>.lastAppliedHash`).
 - A host whose last-applied hash equals the current hash is **current** and is skipped (in
   `OneShot`).
-- When you edit the playbook, or change a referenced variables/files Secret, the hash changes: the
-  plan resets to `Pending`, clears its retry bookkeeping, and every host becomes out of date again.
+- When you edit the playbook or change a referenced variables/files Secret, the hash changes **at
+  once**: the operator watches the plan and the Secrets it names, so the desired hash, run numbering
+  and [consumed schedule slot](#one-tick-one-run-per-revision) update on the spot.
+- Changing an inventory's group variables changes the hash too, but **not at once**. The operator
+  does not watch `ClusterInventory` or `StaticInventory` resources, so the plan picks such a change
+  up at its next reconcile — which is seconds away for a plan with a run in flight, the next
+  scheduled tick for a `Recurring` plan (when it would re-apply anyway), and up to an hour for an
+  idle `OneShot` plan that has settled. The same delay applies to the hosts a group resolves to, for
+  the same reason. If you need the change applied now, touch the plan itself: any edit to it, an
+  annotation included, wakes it immediately.
+- An in-flight run keeps its own hash, target inventory, run number, and schedule slot in an
+  immutable `Play`, so none of these edits disturb it — see [Editing a plan while a run is in
+  flight](#editing-a-plan-while-a-run-is-in-flight).
 
 This is what makes `OneShot` idempotent and cheap: editing an unrelated field does not re-run
 everything, but a real change to the playbook or its inputs does. The current hash is visible as
 `.status.currentHash` and in the `Current hash` printer column.
 
-## Retries and adoption
+## Editing a plan while a run is in flight
 
-Within a single hash, if a run's Job needs to be retried the operator numbers successive Jobs
-(`apply-<plan>-<id>-<n>`) rather than colliding on one name — the playbook and inputs are unchanged,
-so the hash alone cannot distinguish attempts. You generally do not interact with this; it is why you
-may see more than one Job object for the same run.
+You can edit a plan at any time; you never have to wait for a run to finish. What happens to the run
+already in progress depends on whether its Job has been created yet. That is never assumed: the
+operator asks the API server directly, and asks again immediately before giving up on a run, so
+a Job that only became visible in between is still found and adopted rather than having its
+infrastructure torn down underneath it.
+
+**A run whose Job exists keeps going.** It finishes the playbook it started, against the hosts it
+started with, and its results are recorded against the revision it actually ran. The operator does not
+kill it, swap its playbook underneath it, or attribute its recap to your new revision. Your edit takes
+effect on the next run.
+
+**A run whose Job does not exist yet is abandoned.** A run that is still waiting for host locks,
+still bringing up its proxy pods, or committed but not yet launched is dropped in favour of the new
+revision: its locks are released and any proxy infrastructure it had started building is cleaned up.
+It is deleted rather than reported as a failed or unknown execution, and it is never retried — there
+is no point applying a revision you have already replaced. A fresh run then starts for the plan as
+it now reads.
+
+This second case is triggered by more than the execution hash. An unlaunched run is abandoned
+whenever *any* part of the plan spec changes — the image, tolerations, verbosity, inventory
+references — or when the set of nodes the plan resolves to changes, for instance because a node was
+relabelled or a `NodeAccessPolicy` was narrowed. The hash decides which hosts are out of date; this
+check decides whether a run still matches the plan it was prepared for, and it is deliberately
+the stricter of the two. Setting `spec.suspend: true` has the same effect, for the same reason:
+nothing irrevocable exists for an unlaunched run, so a paused plan drops it instead of launching
+it later.
+
+One trigger is narrower than the rest. A run that is still waiting for its **host locks** is
+also dropped if it misses its schedule window, because it has yet to consume the slot it was started
+for. That gate lifts as soon as the locks are held: bringing up proxy pods routinely takes longer
+than `startingDeadlineSeconds`, so keeping it would leave a scheduled plan unable to launch at all.
+
+An absent-Job run is also abandoned when something it references no longer exists — one of its
+inventories, or a Secret named by `spec.template.variables`/`files` — or when an inventory group
+contains an operator-reserved connection variable: there is no executable desired state left to
+resume it against. A run that had already committed to launching is re-checked first, and if its
+Job does exist by then it is adopted and allowed to finish like any other started run — a broken
+reference belongs to the *next* revision, not to a run that is already under way. A transient failure
+reading otherwise valid inventory, policy or Secret data abandons nothing at all; it only pauses
+recovery, with the run's host locks kept alive, rather than launching from incomplete input.
+
+The distinction matters because holding a run is not free: its host locks keep being renewed for
+as long as it is held, so a run waiting on something that is never coming back would block every
+other plan targeting those hosts indefinitely. A missing reference is therefore resolved rather than
+waited on.
+
+The practical consequence: repeatedly editing a plan while its runs are still starting up can keep
+starting fresh runs. That is intentional — each abandoned run is cleaned up and costs nothing
+but the setup time — but if you are making a series of edits, `spec.suspend` is the tidier way to
+batch them.
+
+## Run numbers
+
+Two runs of an unchanged plan produce the same execution hash, so the hash alone cannot tell their
+Jobs apart. Each run therefore gets a number, and the Job is named `apply-<plan>-<id>-<n>`. Run
+numbers are reserved across the plan as a whole, not per execution hash: each is one past every Job
+and retained `Play` record that still claims a number. The hash suffix can be shared by different
+revisions, so numbering continues across an edit rather than restarting at 1.
+
+The number exists to keep names unique, and that is all it promises. It is not a dense count of the
+plan's runs — a run abandoned before its Job was created can leave its number unused — and
+`.status.lastRunNumber` is the highest number handed out so far, not a count of how often the
+current revision has been tried. You generally do not interact with either.
+
+A Job's name is capped at 63 characters by Kubernetes, so the plan-name portion is shortened to fit.
+The rest of the name — `apply-`, the id and the run number — takes 19 characters at a
+single-digit run, leaving 44: a plan named 45 characters or more is shortened, and one more
+character goes each time the run number gains a digit. The `Play` shares the shortened name, so
+the two always match.
+
+## Retries
+
+A run that fails is tried again, up to `spec.maxAttempts` tries counting the first one — so
+`maxAttempts: 1` means no retry at all. Each try is a run in its own right: its own Job, its own
+`Play` record, its own run number. `.status.retryCount` says how many of the budget the plan has
+spent so far, `.status.retryCountSlot` identifies the schedule tick that count belongs to, and the
+`Play`'s `Try` column (`kubectl get plays -o wide`) says which try each run was.
+
+What the budget covers depends on the mode, because what counts as "the same piece of work" does:
+
+- **`OneShot`** spends its budget on the current playbook and inputs, and defaults to `3`. Once it is
+  spent the plan stays `Failed` and starts nothing further — that is the point: its hosts are still
+  out of date precisely *because* the runs failed, so nothing else would stop it. Editing the
+  playbook or a referenced Secret changes the execution hash and hands it a fresh budget; so does
+  raising `maxAttempts`. A successful run also closes that execution and resets the budget, so hosts
+  added to the inventory later can run without an unrelated plan edit. A `schedule` does not reset a
+  failed execution: it says when a `OneShot` plan may run, not how often it may fail.
+- **`Recurring`** spends its budget on one schedule tick, and defaults to `1` — no retry, since the
+  next tick re-applies the same playbook anyway. With a higher `maxAttempts` a failed run is retried
+  within the current tick, and the next tick starts over with a full budget whatever the previous one
+  did. Retries are still bound by `startingDeadlineSeconds` (see above), measured from the original
+  schedule tick rather than from the time an attempt fails. Every retry must start before that
+  original deadline, so time spent running earlier attempts counts against the window. With the
+  default 30 seconds, a first attempt that runs for longer than 30 seconds cannot be retried. When
+  setting `maxAttempts` above `1`, set `startingDeadlineSeconds` long enough to cover the expected
+  duration of earlier attempts and reconciliation between them; otherwise the plan waits for the
+  next tick with its unused tries.
+
+A run that never got as far as its Job — one given up because the plan was edited, suspended, missed
+its window, or lost a host lock — is not a failed try, but it does consume a run number. If the same
+scheduled execution can still start, as after a host-lock takeover clears within its grace window,
+the unspent attempt remains available. Giving up a retry restores the preceding `Failed` verdict;
+giving up an execution's first attempt leaves the plan `Pending` because it has no verdict yet.
 
 ## Host locks
 
@@ -108,9 +259,12 @@ then the next acquires them. Plans over completely separate hosts never block ea
 
 While a plan is waiting on a lock held by another run, its
 [`Blocked` condition](./results-and-troubleshooting.md#conditions) is `True`, its `.status` names the
-host and the run holding it, and the operator logs a warning. The plan's phase stays `Scheduled` (or
-`Pending`) meanwhile: being blocked is a temporary wait, not a failure, and the run proceeds on its
-own as soon as the lock is free.
+host and the run holding it, and the operator logs a warning. The plan is `Applying` because its
+recorded run is active. The `Running` condition is set to `True` in the same reconcile that creates the
+run's Job (a run adopted during recovery picks it up on the next tick), and re-asserted on every tick
+that observes it unfinished. A plan waiting on the lock has no Job yet, so it remains without
+`Running=True` until the lock is free. Being blocked is a temporary wait, not a failure, and the run
+proceeds on its own as soon as the lock is free.
 
 A crashed operator's locks expire on their own after a short period, so a host is never left locked
 indefinitely.
