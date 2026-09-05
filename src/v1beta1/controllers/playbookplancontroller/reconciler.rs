@@ -771,12 +771,18 @@ async fn reconcile(
     let unready_nodes = node_readiness::unready_nodes(&context.nodes, &run_groups);
     let hold_for_unready_nodes =
         node_readiness::holds_for_unready_nodes(&object.spec.mode, &run_groups, &unready_nodes);
-    if !hold_for_unready_nodes {
+    if !hold_for_unready_nodes && status::held_for_unready_nodes(&resource_status) {
         // Retires a hold this plan is no longer under, whatever ended it — the nodes came back, the
-        // inventory moved on, the plan was suspended. Written here rather than only where a hold is
-        // released, because every one of those paths leaves the tick somewhere different, and a
-        // `WaitingForNodes` left standing over a plan that is running would be read as the reason it
-        // is not. A run started later in this tick overwrites it with its own proxy-pod wait.
+        // inventory moved on. Written here rather than only where a hold is released, because every
+        // one of those paths leaves the tick somewhere different, and a `WaitingForNodes` left
+        // standing over a plan that is running would be read as the reason it is not.
+        //
+        // Only ever *this* hold, which is what the second half asks: the condition is shared with
+        // the proxy-pod wait that a run later in this tick may re-assert, and clearing that one here
+        // would restamp its `lastTransitionTime` on every tick of the wait — see
+        // `status::held_for_unready_nodes`. Nothing else needs the unconditional clear; the paths
+        // that end a proxy wait (`ensure_infra_and_launch`, `clear_run_conditions`) each clear it
+        // themselves.
         status::set_waiting_for_nodes_condition(&mut resource_status, None);
     }
 

@@ -197,6 +197,24 @@ pub fn set_waiting_for_nodes_condition(
     upsert_condition(&mut status.conditions, condition);
 }
 
+/// Whether the plan is currently reporting the [`WaitingForNodes::NodesNotReady`] hold, as opposed
+/// to the proxy-pod wait that shares the condition or no wait at all.
+///
+/// Exists so a caller can retire *its* wait without touching the other one. Clearing the condition
+/// unconditionally looks harmless — the tick that starts a run re-asserts `ProxyPodsNotReady` a
+/// moment later — but `upsert_condition` restamps `lastTransitionTime` whenever the status flips,
+/// so the round trip through `False` turns a status that says nothing new into a write, a
+/// `resourceVersion` bump and another reconcile, every five seconds for as long as a run waits on
+/// its proxy pods. It also leaves the timestamp meaning "the last tick" rather than "when the wait
+/// began".
+pub fn held_for_unready_nodes(status: &PlaybookPlanStatus) -> bool {
+    status.conditions.iter().any(|condition| {
+        condition.type_ == "WaitingForNodes"
+            && condition.status == "True"
+            && condition.reason.as_deref() == Some("NodesNotReady")
+    })
+}
+
 pub fn clear_run_conditions(status: &mut PlaybookPlanStatus) {
     set_blocked_condition(status, None);
     set_waiting_for_nodes_condition(status, None);
@@ -594,6 +612,62 @@ mod tests {
             .find(|c| c.type_ == "WaitingForNodes")
             .unwrap();
         assert_eq!(cleared.status, "False");
+    }
+
+    /// The predicate and the writer have to agree on the same two strings, and nothing but a test
+    /// makes them: a typo in either would silently turn the hold into "no hold", which reads as a
+    /// working plan and re-enables the clear the guard exists to prevent.
+    #[test]
+    fn only_the_nodes_not_ready_hold_answers_the_hold_predicate() {
+        let mut status = PlaybookPlanStatus::default();
+        let hosts = ["worker-1".to_string()];
+
+        assert!(!held_for_unready_nodes(&status), "no condition, no hold");
+
+        set_waiting_for_nodes_condition(&mut status, Some(WaitingForNodes::ProxyPods(&hosts)));
+        assert!(
+            !held_for_unready_nodes(&status),
+            "a run waiting on its proxy pods is not a plan held from starting one"
+        );
+
+        set_waiting_for_nodes_condition(&mut status, Some(WaitingForNodes::NodesNotReady(&hosts)));
+        assert!(held_for_unready_nodes(&status));
+
+        set_waiting_for_nodes_condition(&mut status, None);
+        assert!(!held_for_unready_nodes(&status));
+    }
+
+    /// Why the caller has to ask before clearing. Re-stating the same wait is free — the condition
+    /// is byte-identical, so the plan's status write is a no-op — but a round trip through `False`
+    /// is not: it restamps `lastTransitionTime`, and a status that differs only in a timestamp is
+    /// still a write, a `resourceVersion` bump and another reconcile, once per tick for the whole
+    /// length of the wait.
+    #[test]
+    fn a_round_trip_through_cleared_restamps_a_wait_that_did_not_change() {
+        let mut status = PlaybookPlanStatus::default();
+        let hosts = ["worker-1".to_string()];
+
+        set_waiting_for_nodes_condition(&mut status, Some(WaitingForNodes::ProxyPods(&hosts)));
+        // Backdated so "kept" and "restamped" are distinguishable however coarse the clock is.
+        let started = "2025-08-12T20:00:00Z"
+            .parse::<chrono::DateTime<chrono::FixedOffset>>()
+            .unwrap();
+        status.conditions[0].last_transition_time = Some(started);
+
+        set_waiting_for_nodes_condition(&mut status, Some(WaitingForNodes::ProxyPods(&hosts)));
+        assert_eq!(
+            status.conditions[0].last_transition_time,
+            Some(started),
+            "the same wait, re-stated, is the same wait"
+        );
+
+        set_waiting_for_nodes_condition(&mut status, None);
+        set_waiting_for_nodes_condition(&mut status, Some(WaitingForNodes::ProxyPods(&hosts)));
+        assert_ne!(
+            status.conditions[0].last_transition_time,
+            Some(started),
+            "clearing and re-asserting loses when the wait began"
+        );
     }
 
     /// A run whose recap could not be read is still reported through its terminal `Play`, not
