@@ -161,6 +161,27 @@ The same bounded wait applies when a proxy from an interrupted credential reset 
 It is never reused, even if Kubernetes still reports it `Ready`; after the deadline the Node is marked
 unreachable for that run rather than holding the run and its host locks indefinitely.
 
+### Holding instead of starting
+
+All of the above is about a run that has already started. A `OneShot` plan that has *not* started one
+asks a cheaper question first: if **every** Node the run would target is `NotReady`, there is nothing
+for the run to do, so the plan holds instead of starting it. It carries a `WaitingForNodes` condition
+with reason `NodesNotReady`, and `.status.summary` names the Nodes it is waiting for.
+
+Holding rather than running matters because a run that reaches nobody still spends one of the plan's
+[attempts](./scheduling-and-modes.md#retries) — a `OneShot` plan that burnt its budget that way would
+stop for good, on an outcome that was knowable before the Job existed. A held plan spends nothing and
+is released the moment one of those Nodes reports `Ready` again, which the operator notices at once.
+
+The hold is all-or-nothing on purpose. A run that can still reach *some* of its hosts goes ahead and
+reaches them, taking the `NotReady` ones along so they are reported unreachable in the result rather
+than quietly dropped from it. `Recurring` plans never hold: their contract is to re-apply at every
+tick against whatever is reachable then.
+
+A plan can stay held indefinitely, and for a Node that is never coming back that is the intended
+resting state — the condition says exactly what it is waiting for. Removing the Node from the cluster
+or from the inventory's selector is what ends it.
+
 ## Requirements and limitations
 
 - The operator must be installed and your namespace **enrolled** (see

@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{Node, Secret};
 use kube::runtime::reflector::{ObjectRef, Store};
 use tracing::debug;
 
-use crate::v1beta1::{self, ClusterInventory, InventoryRef, NodeAccessPolicy, StaticInventory};
+use crate::v1beta1::{
+    self, ClusterInventory, InventoryRef, NodeAccessPolicy, StaticInventory,
+    playbookplancontroller::node_readiness,
+};
 
 /// Returns a closure that maps a `NodeAccessPolicy` change to *every* PlaybookPlan, so their
 /// managed-ssh node clamping is re-evaluated promptly when an admin edits a policy. A policy's
@@ -91,6 +94,66 @@ fn inventory_to_playbookplans<I: kube::Resource>(
             })
             .collect::<Vec<_>>()
     }
+}
+
+/// Returns a closure that maps a Node becoming `Ready` to the PlaybookPlans still waiting to apply
+/// to it.
+///
+/// The narrow predicate is the point. Every kubelet reposts its Node status periodically, so a
+/// mapper that answered "all plans" would reconcile every plan every few minutes for the life of
+/// the cluster, scaling with the node count. Asking instead whether *this* plan still owes *this*
+/// node a run makes a converged cluster cost nothing: no plan matches, and the heartbeats fall on
+/// the floor. A plan that does have a stranded host is woken by that host's own heartbeats until it
+/// converges, which is both the retry signal wanted and a bounded one.
+///
+/// Only a `Ready` node is mapped, because becoming ready is the transition worth acting on. The
+/// plan's cached status is enough to decide: a trigger only picks what to look at, and the reconcile
+/// it schedules re-derives everything from live state.
+pub fn node_to_playbookplans(
+    playbookplan_reader: Arc<Store<v1beta1::PlaybookPlan>>,
+) -> impl Fn(Node) -> Vec<ObjectRef<v1beta1::PlaybookPlan>> {
+    move |node| {
+        let Some(node_name) = node.metadata.name.as_deref() else {
+            return Vec::new();
+        };
+        if !node_readiness::is_ready(&node) {
+            return Vec::new();
+        }
+
+        playbookplan_reader
+            .state()
+            .iter()
+            .filter(|plan| plan_awaits_node(plan, node_name))
+            .map(|plan| ObjectRef::from(&**plan))
+            .inspect(|obj_ref| {
+                debug!("Reconcile of {obj_ref} triggered by node {node_name} becoming Ready");
+            })
+            .collect::<Vec<_>>()
+    }
+}
+
+/// Whether `plan` targets `node` and has not yet applied its current revision to it.
+///
+/// Both halves are read from the plan's own status, which is what makes this answerable without a
+/// cluster read: `eligibleHosts` is the host set the last reconcile resolved, and a host is owed a
+/// run while the hash it last *succeeded* on is not the one the plan currently wants. A host with no
+/// recorded status at all has never succeeded, so it is owed one too.
+fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &str) -> bool {
+    let Some(status) = plan.status.as_ref() else {
+        return false;
+    };
+
+    let targeted = status
+        .eligible_hosts
+        .iter()
+        .any(|group| group.hosts.iter().any(|host| host == node));
+
+    targeted
+        && status
+            .hosts_status
+            .as_ref()
+            .and_then(|hosts| hosts.get(node))
+            .is_none_or(|host| host.last_applied_hash != status.current_hash)
 }
 
 /// Whether `plan` targets the inventory `namespace`/`name` of the kind `referenced` selects.
@@ -300,6 +363,83 @@ mod tests {
             "edge",
             static_inventory_name
         ));
+    }
+
+    fn plan_with_status(status: v1beta1::PlaybookPlanStatus) -> PlaybookPlan {
+        let mut plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+        plan.status = Some(status);
+        plan
+    }
+
+    fn eligible(hosts: &[&str]) -> Vec<crate::v1beta1::ResolvedHosts> {
+        vec![crate::v1beta1::ResolvedHosts {
+            name: "workers".into(),
+            hosts: hosts.iter().map(|host| host.to_string()).collect(),
+        }]
+    }
+
+    #[test]
+    fn a_plan_awaits_a_targeted_host_it_has_never_applied_to() {
+        let plan = plan_with_status(v1beta1::PlaybookPlanStatus {
+            eligible_hosts: eligible(&["node-a", "node-b"]),
+            current_hash: "abc".into(),
+            hosts_status: None,
+            ..Default::default()
+        });
+
+        assert!(plan_awaits_node(&plan, "node-a"));
+        assert!(plan_awaits_node(&plan, "node-b"));
+    }
+
+    #[test]
+    fn a_plan_does_not_await_a_host_it_does_not_target() {
+        let plan = plan_with_status(v1beta1::PlaybookPlanStatus {
+            eligible_hosts: eligible(&["node-a"]),
+            current_hash: "abc".into(),
+            ..Default::default()
+        });
+
+        assert!(!plan_awaits_node(&plan, "node-b"));
+    }
+
+    /// The whole point of the predicate: a converged plan must not be woken by the periodic Node
+    /// status reposts of the hosts it already applied to.
+    #[test]
+    fn a_plan_does_not_await_a_host_already_on_the_current_revision() {
+        let plan = plan_with_status(v1beta1::PlaybookPlanStatus {
+            eligible_hosts: eligible(&["node-a", "node-b"]),
+            current_hash: "abc".into(),
+            hosts_status: Some(std::collections::BTreeMap::from([
+                (
+                    "node-a".to_string(),
+                    crate::v1beta1::HostStatus {
+                        last_applied_hash: "abc".into(),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "node-b".to_string(),
+                    crate::v1beta1::HostStatus {
+                        last_applied_hash: "older".into(),
+                        ..Default::default()
+                    },
+                ),
+            ])),
+            ..Default::default()
+        });
+
+        assert!(!plan_awaits_node(&plan, "node-a"));
+        assert!(
+            plan_awaits_node(&plan, "node-b"),
+            "a host left behind by the current revision is still owed a run"
+        );
+    }
+
+    #[test]
+    fn a_plan_without_a_status_awaits_nothing() {
+        let plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+
+        assert!(!plan_awaits_node(&plan, "node-a"));
     }
 
     #[test]

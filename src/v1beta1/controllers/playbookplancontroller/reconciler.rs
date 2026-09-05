@@ -3,7 +3,7 @@ use futures_util::{Stream, StreamExt as _};
 use k8s_openapi::api::{
     batch::v1::Job,
     coordination::v1::Lease,
-    core::v1::{Pod, Secret},
+    core::v1::{Node, Pod, Secret},
     networking::v1::NetworkPolicyEgressRule,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -40,7 +40,7 @@ use crate::{
         playbookplancontroller::{
             callback_output,
             execution_evaluator::{self, find_outdated_hosts},
-            job_builder, mappers, node_access, play_history, status,
+            job_builder, mappers, node_access, node_readiness, play_history, status,
         },
     },
 };
@@ -81,6 +81,12 @@ struct ReconciliationContext {
     /// Populated + kept fresh by the reflector spawned in `new`; policy edits also re-trigger
     /// affected plans via `mappers::node_access_policy_to_playbookplans`.
     node_access_policies: Arc<Store<NodeAccessPolicy>>,
+    /// Reflector-backed cache of cluster Nodes, backing the Node watch that wakes a plan when a
+    /// host it is waiting on becomes `Ready`. Read only for *readiness*
+    /// (`node_readiness::unready_nodes`), never for authorization: `node_access::enforce` keeps its
+    /// own live read, because the allow-set is a security gate and must not be served from a cache
+    /// (INV-5).
+    nodes: Arc<Store<Node>>,
     /// Image for the managed-ssh proxy pods (the node-root primitive — THREAT_MODEL T-ESC-5). Set by
     /// the admin via the chart's `managedSsh.proxyImage` (rendered to `proxy_image`); there is **no
     /// built-in default** — the operator refuses to start without it (see `config::require_proxy_image`
@@ -143,6 +149,9 @@ pub fn new(
     // map to a plan there, which the enrollment guard refuses anyway.
     let cluster_inventories_api: Api<ClusterInventory> = Api::all(client.clone());
     let static_inventories_api: Api<StaticInventory> = Api::all(client.clone());
+    // Nodes are cluster-scoped, and the operator already reads them for inventory resolution and
+    // policy enforcement.
+    let nodes_api: Api<Node> = Api::all(client.clone());
 
     let enrolled_namespaces = Arc::new(enrolled_namespaces);
 
@@ -191,12 +200,38 @@ pub fn new(
         reader
     };
 
+    // One reflector serves both jobs the Node watch has: deciding which plans an event concerns
+    // (`mappers::node_to_playbookplans`, which reads the watched object itself) and answering
+    // "is this host reachable at all?" while a tick decides whether to start a run.
+    let node_reflector_reader = {
+        let writer = Writer::<Node>::default();
+        let reader = Arc::new(writer.as_reader());
+
+        let reflector = kube::runtime::reflector(
+            writer,
+            watcher(nodes_api.clone(), watcher::Config::default()),
+        );
+
+        tokio::spawn(async move {
+            reflector
+                .for_each(|event| async {
+                    if let Err(e) = event {
+                        error!("Node reflector error: {e:?}");
+                    }
+                })
+                .await;
+        });
+
+        reader
+    };
+
     let context = Arc::new(ReconciliationContext {
         client: client.clone(),
         operator_namespace,
         enrolled_namespaces: Arc::clone(&enrolled_namespaces),
         ca,
         node_access_policies: Arc::clone(&node_access_policy_reflector_reader),
+        nodes: Arc::clone(&node_reflector_reader),
         proxy_image,
         proxy_grace,
         workload_egress_policies,
@@ -224,6 +259,14 @@ pub fn new(
             static_inventories_api,
             watcher::Config::default(),
             mappers::static_inventory_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
+        )
+        // The Node watch is what releases a plan held by `hold_for_unready_nodes`. Its mapper is
+        // narrow on purpose — see `mappers::node_to_playbookplans` for why a converged cluster must
+        // not pay for every kubelet's periodic status repost.
+        .watches(
+            nodes_api,
+            watcher::Config::default(),
+            mappers::node_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
         );
 
     // Owned-Job and referenced-Secret watches are set up per enrolled namespace instead of once
@@ -717,6 +760,23 @@ async fn reconcile(
     // Job/proxy/render path and the Play history record share one grouped view.
     let run_groups = filter_groups_to_hosts(&target_groups, &hosts_to_trigger);
 
+    // Which of this run's cluster nodes are down, and whether that leaves it nothing to do. Both are
+    // computed here, before the start gate, because the *nodes* are what a held plan reports waiting
+    // on and what its Node watch will wake it for. A `Recurring` plan is deliberately not held: its
+    // contract is to re-apply at each tick against whatever exists then, so a tick that can only
+    // reach some of its hosts still reaches them and reports the rest unreachable.
+    let unready_nodes = node_readiness::unready_nodes(&context.nodes, &run_groups);
+    let hold_for_unready_nodes = matches!(object.spec.mode, ExecutionMode::OneShot)
+        && node_readiness::holds_for_unready_nodes(&run_groups, &unready_nodes);
+    if !hold_for_unready_nodes {
+        // Retires a hold this plan is no longer under, whatever ended it — the nodes came back, the
+        // inventory moved on, the plan was suspended. Written here rather than only where a hold is
+        // released, because every one of those paths leaves the tick somewhere different, and a
+        // `WaitingForNodes` left standing over a plan that is running would be read as the reason it
+        // is not. A run started later in this tick overwrites it with its own proxy-pod wait.
+        status::set_waiting_for_nodes_condition(&mut resource_status, None);
+    }
+
     // Plain `?`, unlike the desired-input reads above: this hashes two already-deserialized values,
     // so it has no cluster state to fail against and nothing to hold a recovered run open for.
     // Computed once and used for both jobs it has: recording a fresh run's fingerprint, and
@@ -947,6 +1007,13 @@ async fn reconcile(
                 requeue_after = duration_until(&until, now());
                 resource_status.phase = phase_while_waiting_for_schedule(&resource_status.phase);
                 resource_status.next_run = Some(until.fixed_offset());
+            }
+            // Every host this run would reach is on a node that is down, so there is nothing for it
+            // to do but wait — see `node_readiness::holds_for_unready_nodes`. Held before the slot
+            // bookkeeping below, so the window is left unconsumed and the run this plan owes can
+            // still start once the nodes report `Ready` and the watch wakes it.
+            Timing::Now(_) if hold_for_unready_nodes => {
+                hold_plan_for_unready_nodes(&mut resource_status, &unready_nodes);
             }
             Timing::Now(start) => {
                 let this_slot = start.map(|s| s.fixed_offset());
@@ -2161,7 +2228,10 @@ async fn ensure_infra_and_launch(
     let (ready, unreachable) = match proxy_readiness {
         managed_ssh::ProxyReadiness::Pending { waiting } => {
             debug!("Waiting for managed-ssh proxy pods to become Ready on {waiting:?}");
-            status::set_waiting_for_nodes_condition(resource_status, Some(&waiting));
+            status::set_waiting_for_nodes_condition(
+                resource_status,
+                Some(status::WaitingForNodes::ProxyPods(&waiting)),
+            );
             return Ok(Some(std::time::Duration::from_secs(5)));
         }
         managed_ssh::ProxyReadiness::Ready { ready, unreachable } => {
@@ -3812,6 +3882,34 @@ fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usi
     status.next_run = None;
     // Restoring the verdict of a plan that succeeded, so there is no failure to report.
     status.summary = Some(plan_summary(0, total_count, false));
+}
+
+/// Reports a `OneShot` plan holding back a run because every node it would reach is not `Ready`.
+///
+/// Deliberately writes no `requeue`: nothing here is worth polling for. The plan is released by the
+/// controller's Node watch, which fires the moment one of these nodes reports `Ready` again
+/// (`mappers::node_to_playbookplans`), and the tick's ordinary idle requeue remains as the backstop.
+///
+/// The verdict survives ([`phase_under_readiness_overlay`]) because a node going down does not undo
+/// what the plan last did — the summary is what says why nothing is happening now. A plan can sit
+/// here indefinitely, and that is the intended end state for a node that is never coming back: the
+/// condition names it, and removing it from the inventory or from the cluster is an operator's call,
+/// not the operator's.
+///
+/// `next_run` is left alone for the same reason. This arm is only reached with a `Timing::Now`, so a
+/// *scheduled* plan is being held inside the starting-deadline window of a slot it still owes a run
+/// for, and that forecast is exactly what a reader needs while the hold lasts. An unscheduled plan
+/// has no forecast to keep.
+fn hold_plan_for_unready_nodes(status: &mut PlaybookPlanStatus, unready: &[String]) {
+    status.phase = phase_under_readiness_overlay(&status.phase);
+    status.summary = Some(format!(
+        "waiting for node(s) {} to become Ready",
+        unready.join(", ")
+    ));
+    status::set_waiting_for_nodes_condition(
+        status,
+        Some(status::WaitingForNodes::NodesNotReady(unready)),
+    );
 }
 
 /// The phase an idle plan keeps while a readiness overlay explains why it is not running. A real
@@ -8442,6 +8540,60 @@ spec:
         assert_eq!(status.phase, Phase::Succeeded);
         assert_eq!(status.next_run, None);
         assert_eq!(status.summary.as_deref(), Some("1/1 up-to-date"));
+    }
+
+    /// A plan held for down nodes has to say so without erasing what it last did: the verdict is
+    /// still the truth about the previous run, and the summary and condition are what explain why
+    /// there is not a new one. The forecast stays too — the hold is only ever entered for a plan
+    /// whose slot is already due, so a scheduled one is holding a run it still owes, and blanking
+    /// `nextRun` would say the opposite.
+    #[test]
+    fn a_plan_held_for_unready_nodes_reports_them_and_keeps_its_verdict() {
+        let next_run = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Failed,
+            summary: Some("0/1 up-to-date (1 outdated, last run failed)".into()),
+            next_run: Some(next_run),
+            ..Default::default()
+        };
+
+        hold_plan_for_unready_nodes(&mut status, &["worker-1".to_string()]);
+
+        assert_eq!(
+            status.phase,
+            Phase::Failed,
+            "a node going down does not undo the previous run's verdict"
+        );
+        assert_eq!(status.next_run, Some(next_run));
+        let summary = status.summary.as_deref().unwrap();
+        assert!(summary.contains("worker-1"), "{summary}");
+        let waiting = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "WaitingForNodes")
+            .expect("the hold must be visible as a condition");
+        assert_eq!(waiting.status, "True");
+        assert_eq!(
+            waiting.reason.as_deref(),
+            Some("NodesNotReady"),
+            "distinguishable from a run waiting on its proxy pods"
+        );
+    }
+
+    /// A plan with no verdict yet has no lifecycle state worth keeping while it waits, so the hold
+    /// leaves it `Pending` rather than inventing one.
+    #[test]
+    fn a_plan_held_before_its_first_run_stays_pending() {
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Delayed,
+            ..Default::default()
+        };
+
+        hold_plan_for_unready_nodes(&mut status, &["worker-1".to_string()]);
+
+        assert_eq!(status.phase, Phase::Pending);
     }
 
     /// A recovered run is put back onto the plan whole, but its retry number only counts towards

@@ -136,26 +136,52 @@ pub fn set_blocked_condition(status: &mut PlaybookPlanStatus, blocked: Option<&B
     upsert_condition(&mut status.conditions, condition);
 }
 
-/// Sets the plan-level `WaitingForNodes` condition, reporting whether this run is currently waiting
-/// for managed-ssh proxy pods to become Ready on one or more target nodes (a node may be `NotReady`
-/// or its proxy pod still starting). `Some(hosts)` sets it `True` naming the pending hosts; `None` —
-/// the proxies are all Ready, or timed out and the run is proceeding — sets it `False`. Like
-/// `Blocked`, this is an orthogonal transient overlay on the plan's lifecycle, not a phase of its own,
-/// so a condition models it better than a phase would.
+/// What a plan is waiting on the cluster's nodes for, when it is waiting on them at all.
+///
+/// The two are genuinely different waits and a reader has to be able to tell them apart: one
+/// happens *inside* a run that has already committed to its hosts, the other happens *instead* of
+/// starting one. They share a condition because to anyone watching the plan they are the same
+/// question — "why is nothing happening, and what would change that?" — and a plan can only ever be
+/// in one of them at a time.
+pub enum WaitingForNodes<'a> {
+    /// A run is under way and its managed-ssh proxy pods have not all come up yet (a node may be
+    /// `NotReady`, or its pod still starting). Resolves on its own, one way or the other: the pods
+    /// become Ready, or the grace window closes and the run proceeds without those hosts.
+    ProxyPods(&'a [String]),
+    /// No run was started, because every host one would target is on a node that is not `Ready`.
+    /// Resolves when a node does — the controller's Node watch is what notices.
+    NodesNotReady(&'a [String]),
+}
+
+/// Sets the plan-level `WaitingForNodes` condition. `None` — the proxies are all Ready or timed out
+/// and the run is proceeding, or there are no down nodes holding a run back — sets it `False`.
+///
+/// Like `Blocked`, this is an orthogonal transient overlay on the plan's lifecycle, not a phase of
+/// its own, so a condition models it better than a phase would.
 pub fn set_waiting_for_nodes_condition(
     status: &mut PlaybookPlanStatus,
-    waiting: Option<&[String]>,
+    waiting: Option<WaitingForNodes>,
 ) {
     let now = chrono::Local::now().fixed_offset();
 
     let condition = match waiting {
-        Some(hosts) => PlaybookPlanCondition {
+        Some(WaitingForNodes::ProxyPods(hosts)) => PlaybookPlanCondition {
             type_: "WaitingForNodes".into(),
             status: "True".into(),
             reason: Some("ProxyPodsNotReady".into()),
             message: Some(format!(
                 "waiting for managed-ssh proxy pods on host(s): {}",
                 hosts.join(", ")
+            )),
+            last_transition_time: Some(now),
+        },
+        Some(WaitingForNodes::NodesNotReady(nodes)) => PlaybookPlanCondition {
+            type_: "WaitingForNodes".into(),
+            status: "True".into(),
+            reason: Some("NodesNotReady".into()),
+            message: Some(format!(
+                "not starting a run: every node it would target is not Ready ({})",
+                nodes.join(", ")
             )),
             last_transition_time: Some(now),
         },
@@ -527,10 +553,8 @@ mod tests {
     fn waiting_for_nodes_condition_names_hosts_then_clears_in_place() {
         let mut status = PlaybookPlanStatus::default();
 
-        set_waiting_for_nodes_condition(
-            &mut status,
-            Some(&["worker-1".to_string(), "worker-2".to_string()]),
-        );
+        let hosts = ["worker-1".to_string(), "worker-2".to_string()];
+        set_waiting_for_nodes_condition(&mut status, Some(WaitingForNodes::ProxyPods(&hosts)));
         let waiting = status
             .conditions
             .iter()
@@ -541,6 +565,18 @@ mod tests {
         let message = waiting.message.as_deref().unwrap();
         assert!(message.contains("worker-1"), "{message}");
         assert!(message.contains("worker-2"), "{message}");
+
+        // The other wait shares the condition but must be tellable apart by its reason: one happens
+        // inside a run, the other instead of starting one.
+        set_waiting_for_nodes_condition(&mut status, Some(WaitingForNodes::NodesNotReady(&hosts)));
+        let waiting = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "WaitingForNodes")
+            .unwrap();
+        assert_eq!(waiting.status, "True");
+        assert_eq!(waiting.reason.as_deref(), Some("NodesNotReady"));
+        assert!(waiting.message.as_deref().unwrap().contains("worker-1"));
 
         set_waiting_for_nodes_condition(&mut status, None);
         assert_eq!(

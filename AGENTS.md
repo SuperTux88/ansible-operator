@@ -83,6 +83,7 @@ src/v1beta1/
     reconciler.rs                    the reconcile pipeline (below); patch_status via JSON merge patch
     mappers.rs                       maps Secret, NodeAccessPolicy, ClusterInventory and StaticInventory changes to affected plans
     node_access.rs                   NodeAccessPolicy enforcement: fail-closed intersection clamp (INV-2/3/5)
+    node_readiness.rs                Node Ready-condition predicates + the OneShot "hold instead of starting" gate; readiness only, never authorization
     managed_ssh.rs                   proxy pods (hostPID + nsenter = NODE ROOT), per-run sshd config/certs/principals, NetworkPolicy, cleanup (INV-4/7)
     locking.rs                       per-host Leases (operator ns) for run mutual-exclusion
     play_history.rs                  writes/prunes the immutable Play run records; its module doc is the authoritative PlayPhase state machine
@@ -337,8 +338,16 @@ made one happen, and an inventory that gained a host reached its plans only on t
 (`mappers::node_to_inventories`); `nodeaccesspolicycontroller` recomputes policy status on any
 namespace/node change.
 
-The plan controller does **not** watch Nodes directly (yet): a Node that goes Ready after a run
-failed to reach it is picked up only on the plan's next requeue.
+The plan controller also watches **Nodes**, through one reflector serving two jobs: the mapper
+(`mappers::node_to_playbookplans`) and the readiness lookups the reconcile does
+(`node_readiness::unready_nodes`). The mapper is deliberately narrow — a Node that is `Ready` *and*
+in the plan's `eligibleHosts` *and* not yet on the plan's `currentHash` — because every kubelet
+reposts its Node status periodically, so an "all plans" mapping would reconcile every plan every few
+minutes forever, scaling with node count. A converged cluster matches no plans and the heartbeats
+fall on the floor.
+
+That reflector is for **readiness only**. `node_access::enforce` keeps its own *live* Node read:
+the allow-set is a security gate and INV-5 says it is never served from a cache.
 
 ## Enrolled namespaces (R1)
 

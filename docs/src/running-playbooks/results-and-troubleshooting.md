@@ -81,9 +81,15 @@ printer columns:
   message names the host and the run holding it. This one is not a column — read it with `kubectl
   describe` or `-o yaml`. It clears on its own once every lock the run needs is free. See
   [Host locks](./scheduling-and-modes.md#host-locks).
-- **`WaitingForNodes`** — managed-SSH proxy pods are not `Ready` yet. The message names the pending
-  Nodes. It clears when the proxies become Ready or their wait expires. See
-  [NotReady nodes](./cluster-nodes.md#notready-nodes).
+- **`WaitingForNodes`** — the plan is waiting on the state of its target Nodes. The `reason` says
+  which of the two waits it is, and the message names the Nodes:
+  - `ProxyPodsNotReady` — a run is under way and its managed-SSH proxy pods are not `Ready` yet. It
+    clears when the proxies become Ready or their wait expires. See
+    [NotReady nodes](./cluster-nodes.md#notready-nodes).
+  - `NodesNotReady` — no run was started, because every Node one would target is `NotReady`. Only
+    `OneShot` plans hold this way. It clears when one of those Nodes becomes `Ready`, which the
+    operator notices at once.
+    See [Holding instead of starting](./cluster-nodes.md#holding-instead-of-starting).
 
 `.status.summary` is a one-line human summary (also a column), and `.status.currentHash` is the
 current [execution hash](./scheduling-and-modes.md#drift-detection).

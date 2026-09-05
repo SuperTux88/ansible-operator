@@ -151,6 +151,7 @@ timer. The watched inputs are:
 | A Secret it names in `variables` or `files` | at once |
 | A `ClusterInventory` or `StaticInventory` it names — including the Nodes a `ClusterInventory` resolves to | at once |
 | A `NodeAccessPolicy` (which may change [which Nodes the namespace may target](../cluster-operators/node-access-policies.md)) | at once |
+| A Node it still owes a run becoming `Ready` | at once |
 | The run's Job finishing | at once |
 | Nothing at all | on a timer: the time until the next scheduled tick, or an hour for an unscheduled plan |
 
