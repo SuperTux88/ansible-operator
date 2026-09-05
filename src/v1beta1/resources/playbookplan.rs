@@ -477,7 +477,17 @@ pub enum HostOutcome {
     #[default]
     Unknown,
     Succeeded,
+    /// Ansible connected to the host and a task failed on it.
     Failed,
+    /// Ansible could not open a connection to the host at all, so no task ran on it — a managed-ssh
+    /// Node whose proxy pod never became Ready is rendered at an unroutable address precisely to
+    /// produce this, and a `StaticInventory` host that is down or refusing the key lands here too.
+    ///
+    /// Distinct from `Failed` because the two are fixed in different places, and from `NotReached`
+    /// because Ansible *did* get to this host — the connection is what did not happen. A host whose
+    /// connection dropped part-way through, leaving both failed and unreachable tasks behind, reads
+    /// `Failed`: something did run and did fail, which is the more actionable half.
+    Unreachable,
     /// The host was in scope for this run but Ansible never reached it (e.g. an earlier host in its
     /// `serial` batch stopped the play).
     NotReached,

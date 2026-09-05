@@ -106,7 +106,8 @@ prevents an old Job and a new revision from targeting the same host concurrently
 | Outcome | Meaning |
 |---|---|
 | `Succeeded` | Ansible applied the playbook to this host successfully. `lastAppliedHash` is bumped to the current hash. |
-| `Failed` | Ansible reached the host but a task failed. |
+| `Failed` | Ansible connected to the host and a task failed on it. A host whose connection dropped part-way through also reads `Failed`: something ran and failed before it went. |
+| `Unreachable` | Ansible could not connect to the host at all, so no task ran on it — a `NotReady` Node whose proxy never came up, a `StaticInventory` host that is down, or one refusing the key. Fixed on the host or the Node, not in the playbook. See [NotReady nodes](./cluster-nodes.md#notready-nodes). |
 | `NotReached` | The host was in scope but Ansible never got to it — e.g. an earlier host in its `serial` batch stopped the play. Not an error *on this host*. |
 | `Unknown` | The operator could not read a recap for this host — its **own instrumentation** failed, not Ansible. Distinct from `NotReached`. Worth investigating (see below). |
 
@@ -686,8 +687,28 @@ Compare them run ID by run ID, against both of the last two listings. A Lease's 
 ### Hosts show `NotReached`
 
 Expected when a play stops early — for example a `serial` batch that failed before reaching later
-hosts, or a `run_once` task that aborted. Fix the host that actually failed (its outcome is `Failed`);
-the `NotReached` hosts should proceed on the next run.
+hosts, or a `run_once` task that aborted. Fix the host that actually stopped it (its outcome is
+`Failed` or `Unreachable`); the `NotReached` hosts should proceed on the next run.
+
+### Hosts show `Unreachable`
+
+Ansible never opened a connection, so nothing in the playbook is implicated. Where to look depends on
+how the host is reached:
+
+- a **cluster Node**: its managed-SSH proxy pod never became `Ready` within the wait window, so the
+  run was pointed at an unroutable address on purpose. Start with the Node itself
+  (`kubectl get node <name>`) and then the proxy pod — [NotReady
+  nodes](./cluster-nodes.md#notready-nodes) covers both, including the taints a proxy pod needs to
+  tolerate to schedule onto a Node that is already down.
+- a **`StaticInventory` host**: it is down, not accepting connections, or rejecting the key in
+  `spec.ssh.secretRef`.
+
+A `OneShot` plan does not spend an [attempt](./scheduling-and-modes.md#retries) on a run whose only
+non-successes were hosts on Nodes that were already `NotReady` when it launched, and it holds rather
+than starting another run while they stay down — so a plan in this state is waiting for the Node, not
+stuck. That relief is specific to cluster Nodes the operator saw go down: an unreachable
+`StaticInventory` host, or a Node that was `Ready` when the run started, is a failure like any other
+and does spend its attempts.
 
 ### Hosts show `Unknown`
 

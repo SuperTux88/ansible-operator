@@ -1010,8 +1010,9 @@ spec:
                     lastOutcome:
                       enum:
                       - Succeeded
-                      - Failed
                       - Unknown
+                      - Failed
+                      - Unreachable
                       - NotReached
                       type: string
                     lastTransitionTime:

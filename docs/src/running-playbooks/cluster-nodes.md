@@ -153,8 +153,9 @@ still schedules the proxy pod onto it and waits for the pod to become Ready. Whi
 `PlaybookPlan` carries a `WaitingForNodes` condition naming the pending Node(s).
 
 If the proxy pod does not become Ready within the wait window, the run proceeds without that Node:
-Ansible reports it **unreachable** for the run, and the Node is retried on the next run, so it heals on
-its own once it recovers. The wait window is set by the cluster operator and shrinks the longer a Node
+Ansible reports it **unreachable** for the run — `.status.hostsStatus` records it as
+[`Unreachable`](./results-and-troubleshooting.md#per-host-outcomes), not `Failed`, since no task ever
+ran on it — and the Node is retried on the next run, so it heals on its own once it recovers. The wait window is set by the cluster operator and shrinks the longer a Node
 has been unreachable (see [Deployment](../cluster-operators/deployment.md)).
 
 The same bounded wait applies when a proxy from an interrupted credential reset is still terminating.

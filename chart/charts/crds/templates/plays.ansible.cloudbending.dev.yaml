@@ -192,8 +192,9 @@ spec:
                     outcome:
                       enum:
                       - Succeeded
-                      - Failed
                       - Unknown
+                      - Failed
+                      - Unreachable
                       - NotReached
                       type: string
                     recap:

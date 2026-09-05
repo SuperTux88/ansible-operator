@@ -756,7 +756,8 @@ fn sum_recap(parsed: Option<&CallbackOutput>) -> PlayRecap {
 
 /// Per-host recap + outcome for every targeted host. These outcomes are what
 /// `status::apply_terminal_play_status` later folds into the plan, so this is where the mapping is
-/// decided: absent from the recap means `NotReached`, no recap at all means `Unknown`.
+/// decided: absent from the recap means `NotReached`, no recap at all means `Unknown`, and a host
+/// the recap does carry is classified from its own counters by [`outcome_from_stats`].
 fn host_results(
     parsed: Option<&CallbackOutput>,
     hosts: &[String],
@@ -776,17 +777,34 @@ fn host_results(
                     },
                     Some(stats) => PlayHostResult {
                         recap: recap_from_stats(stats),
-                        outcome: if stats.is_failure() {
-                            HostOutcome::Failed
-                        } else {
-                            HostOutcome::Succeeded
-                        },
+                        outcome: outcome_from_stats(stats),
                     },
                 },
             };
             (host.clone(), result)
         })
         .collect()
+}
+
+/// The outcome a host's own recap counters describe.
+///
+/// Success is asked as `is_failure`, not re-derived from the counters, so that this and the run's
+/// verdict — which counts the hosts that came out `Succeeded` — can never disagree about what a
+/// success is. Only the failing half is split further: a host with no failed tasks that Ansible
+/// could not connect to at all is `Unreachable`, which is what a managed-ssh Node whose proxy pod
+/// never came up produces, since it is rendered at an unroutable address for exactly that purpose.
+/// Reporting that as `Failed` would send an operator looking for a broken task.
+///
+/// A host carrying both counters is `Failed`: tasks did run and did fail before the connection went,
+/// and the playbook failure is the more actionable of the two.
+fn outcome_from_stats(stats: &HostStats) -> HostOutcome {
+    if !stats.is_failure() {
+        HostOutcome::Succeeded
+    } else if stats.failed == 0 {
+        HostOutcome::Unreachable
+    } else {
+        HostOutcome::Failed
+    }
 }
 
 fn recap_from_stats(s: &HostStats) -> PlayRecap {
@@ -1118,6 +1136,79 @@ mod tests {
         assert_eq!(sum_recap(None), PlayRecap::default());
     }
 
+    /// Where a host's verdict is decided. The interesting line is between `Failed` and
+    /// `Unreachable`: they are fixed in different places — a broken task versus a host nothing
+    /// could connect to — and a managed-ssh Node whose proxy never came up is deliberately rendered
+    /// at an unroutable address to land in the second.
+    #[test]
+    fn a_host_that_was_never_connected_to_is_unreachable_rather_than_failed() {
+        let stats = |failed: u32, unreachable: u32| HostStats {
+            ok: 1,
+            failed,
+            unreachable,
+            ..Default::default()
+        };
+
+        assert_eq!(outcome_from_stats(&stats(0, 0)), HostOutcome::Succeeded);
+        assert_eq!(outcome_from_stats(&stats(0, 1)), HostOutcome::Unreachable);
+        assert_eq!(outcome_from_stats(&stats(1, 0)), HostOutcome::Failed);
+        // The connection dropped mid-run: something did run and did fail, which is the half worth
+        // reporting.
+        assert_eq!(outcome_from_stats(&stats(1, 1)), HostOutcome::Failed);
+
+        // The classification is per host, and a host the recap never mentions is not classified
+        // from counters at all.
+        let hosts = vec![
+            "reached".to_string(),
+            "unreachable".to_string(),
+            "absent".to_string(),
+        ];
+        let results = host_results(
+            Some(&output(&[
+                ("reached", stats(1, 0)),
+                ("unreachable", stats(0, 1)),
+            ])),
+            &hosts,
+        );
+
+        assert_eq!(results["reached"].outcome, HostOutcome::Failed);
+        assert_eq!(results["unreachable"].outcome, HostOutcome::Unreachable);
+        assert_eq!(results["absent"].outcome, HostOutcome::NotReached);
+        // The per-host counters travel with the verdict, so `unreachable: 1` is still readable on
+        // the host itself and not only in the run's total.
+        assert_eq!(results["unreachable"].recap.unreachable, 1);
+    }
+
+    /// An `Unreachable` host is not a success, so it must count against the run exactly as a failed
+    /// one does — the verdict asks `is_failure`, and splitting the outcome finer must not have
+    /// quietly moved that line.
+    #[test]
+    fn an_unreachable_host_still_makes_the_run_fail() {
+        let hosts = vec!["a".to_string(), "b".to_string()];
+        let recap = output(&[
+            (
+                "a",
+                HostStats {
+                    ok: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "b",
+                HostStats {
+                    unreachable: 1,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let status = terminal_status("job", &hosts, Some(&recap), Vec::new());
+
+        assert_eq!(status.phase, PlayPhase::Failed);
+        assert_eq!(status.failed_host_count, 1);
+        assert_eq!(status.hosts["b"].outcome, HostOutcome::Unreachable);
+    }
+
     #[test]
     fn terminal_status_phase_reflects_host_outcomes() {
         let hosts = vec!["a".to_string(), "b".to_string()];
@@ -1321,7 +1412,7 @@ mod tests {
         );
 
         assert_eq!(terminal.phase, PlayPhase::Failed);
-        assert_eq!(terminal.hosts["node-b"].outcome, HostOutcome::Failed);
+        assert_eq!(terminal.hosts["node-b"].outcome, HostOutcome::Unreachable);
         assert_eq!(terminal.nodes_not_ready, vec!["node-b".to_string()]);
     }
 
