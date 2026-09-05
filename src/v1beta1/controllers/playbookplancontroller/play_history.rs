@@ -179,15 +179,24 @@ pub async fn commit_starting(
         play_uid,
         PlayPhase::Prepared,
         PlayPhase::Starting,
+        None,
     )
     .await
 }
 
+/// Commits the run to creating its Job, recording the Nodes it is launching over that are not
+/// `Ready` — see [`PlayStatus::nodes_not_ready`].
+///
+/// This is the transition that means "the infrastructure has settled", which is the moment the set
+/// is both known and still true, so it is written here rather than observed later. A replay of a
+/// commit that already landed stays the no-op every step of this protocol is, so the set the first
+/// commit recorded is the one that stands — which is the intended reading of "at launch".
 pub async fn commit_launching(
     client: &kube::Client,
     namespace: &str,
     play_name: &str,
     play_uid: &str,
+    nodes_not_ready: &[String],
 ) -> Result<Play, ReconcileError> {
     transition_phase(
         client,
@@ -196,6 +205,7 @@ pub async fn commit_launching(
         play_uid,
         PlayPhase::Starting,
         PlayPhase::Launching,
+        Some(nodes_not_ready),
     )
     .await
 }
@@ -226,6 +236,7 @@ pub async fn abort_unlaunched(
         play_uid,
         from,
         PlayPhase::Aborted,
+        None,
     )
     .await
 }
@@ -257,6 +268,7 @@ async fn transition_phase(
     play_uid: &str,
     expected: PlayPhase,
     next: PlayPhase,
+    nodes_not_ready: Option<&[String]>,
 ) -> Result<Play, ReconcileError> {
     let api = Api::<Play>::namespaced(client.clone(), namespace);
 
@@ -268,7 +280,8 @@ async fn transition_phase(
             .as_ref()
             .ok_or(ReconcileError::PreconditionFailed("Play has no status"))?;
 
-        let Some(status) = decide_transition(status, &expected, next.clone())? else {
+        let Some(status) = decide_transition(status, &expected, next.clone(), nodes_not_ready)?
+        else {
             return Ok(object);
         };
         match replace_status(&api, object, status).await {
@@ -290,10 +303,15 @@ async fn transition_phase(
 /// that already happened has to be a no-op rather than an error — while a record that advanced to
 /// some *third* phase must still fail loudly, because that means another writer is driving the same
 /// run.
+///
+/// The whole status is carried forward and only the phase — plus, for the launch commit, the
+/// not-ready Nodes — is replaced, so every field a later transition inherits survives to the
+/// terminal write.
 fn decide_transition(
     status: &PlayStatus,
     expected: &PlayPhase,
     next: PlayPhase,
+    nodes_not_ready: Option<&[String]>,
 ) -> Result<Option<PlayStatus>, ReconcileError> {
     if status.phase == next {
         return Ok(None);
@@ -305,6 +323,9 @@ fn decide_transition(
     }
     let mut next_status = status.clone();
     next_status.phase = next;
+    if let Some(nodes_not_ready) = nodes_not_ready {
+        next_status.nodes_not_ready = nodes_not_ready.to_vec();
+    }
     Ok(Some(next_status))
 }
 
@@ -478,7 +499,8 @@ pub async fn delete_aborted(
 /// more, so every host it targeted falls to `Unknown`, exactly as for a run whose Job was reaped
 /// before the operator saw its recap.
 pub fn lost_run_status(job_name: &str, hosts: &[String]) -> PlayStatus {
-    terminal_status(job_name, hosts, None)
+    // No record, so nothing is known about the Nodes it launched over either.
+    terminal_status(job_name, hosts, None, Vec::new())
 }
 
 /// Stamps the terminal outcome onto the run's existing immutable recovery record.
@@ -495,7 +517,14 @@ pub async fn record_finished(
         .name
         .clone()
         .ok_or(ReconcileError::PreconditionFailed("Play name not set"))?;
-    let status = terminal_status(&job_name, hosts, parsed);
+    // The terminal status is built fresh rather than derived from the record, so anything the run
+    // wrote down about itself has to be carried across explicitly.
+    let nodes_not_ready = object
+        .status
+        .as_ref()
+        .map(|status| status.nodes_not_ready.clone())
+        .unwrap_or_default();
+    let status = terminal_status(&job_name, hosts, parsed, nodes_not_ready);
     match object.status.as_ref().map(|status| &status.phase) {
         Some(PlayPhase::Launching | PlayPhase::Running) => {
             replace_status(api, object, status).await
@@ -672,10 +701,15 @@ fn build_play(play: &PlayRef<'_>) -> Result<Play, ReconcileError> {
 /// Counted over the *distinct* hosts, not over `hosts` itself: a node listed by two inventory groups
 /// is flattened into that slice twice, and comparing a deduplicated success count against the raw
 /// length would report a clean run as `Failed` — leaving its hosts outdated and re-running forever.
+///
+/// `nodes_not_ready` is the exception to "derived from the recap": it is what the run wrote down at
+/// its launch commit and is passed back in, because a status built from scratch would otherwise drop
+/// the one thing the recap cannot say.
 fn terminal_status(
     job_name: &str,
     hosts: &[String],
     parsed: Option<&CallbackOutput>,
+    nodes_not_ready: Vec<String>,
 ) -> PlayStatus {
     let host_results = host_results(parsed, hosts);
     let host_count = host_results.len();
@@ -699,6 +733,7 @@ fn terminal_status(
         failed_host_count: (host_count - succeeded) as u32,
         recap: sum_recap(parsed),
         hosts: host_results,
+        nodes_not_ready,
     }
 }
 
@@ -1104,7 +1139,7 @@ mod tests {
                 },
             ),
         ]);
-        let s = terminal_status("job", &hosts, Some(&clean));
+        let s = terminal_status("job", &hosts, Some(&clean), Vec::new());
         assert_eq!(s.phase, PlayPhase::Succeeded);
         assert_eq!(s.failed_host_count, 0);
 
@@ -1125,7 +1160,7 @@ mod tests {
                 },
             ),
         ]);
-        let s = terminal_status("job", &hosts, Some(&bad));
+        let s = terminal_status("job", &hosts, Some(&bad), Vec::new());
         assert_eq!(s.phase, PlayPhase::Failed);
         assert_eq!(s.failed_host_count, 1);
         assert_eq!(s.hosts["b"].outcome, HostOutcome::Failed);
@@ -1138,12 +1173,12 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let s = terminal_status("job", &hosts, Some(&partial));
+        let s = terminal_status("job", &hosts, Some(&partial), Vec::new());
         assert_eq!(s.phase, PlayPhase::Failed);
         assert_eq!(s.hosts["b"].outcome, HostOutcome::NotReached);
 
         // No recap at all -> Unknown for the run and every host.
-        let s = terminal_status("job", &hosts, None);
+        let s = terminal_status("job", &hosts, None, Vec::new());
         assert_eq!(s.phase, PlayPhase::Unknown);
         assert_eq!(s.hosts["a"].outcome, HostOutcome::Unknown);
         assert_eq!(s.failed_host_count, 2);
@@ -1172,7 +1207,7 @@ mod tests {
             ),
         ]);
 
-        let status = terminal_status("job", &hosts, Some(&clean));
+        let status = terminal_status("job", &hosts, Some(&clean), Vec::new());
 
         assert_eq!(status.phase, PlayPhase::Succeeded);
         assert_eq!(status.host_count, 2);
@@ -1194,6 +1229,7 @@ mod tests {
             &at(PlayPhase::Prepared),
             &PlayPhase::Prepared,
             PlayPhase::Starting,
+            None,
         )
         .unwrap()
         .expect("a pending transition must produce a status to write");
@@ -1204,7 +1240,8 @@ mod tests {
             decide_transition(
                 &at(PlayPhase::Starting),
                 &PlayPhase::Prepared,
-                PlayPhase::Starting
+                PlayPhase::Starting,
+                None
             )
             .unwrap()
             .is_none()
@@ -1215,7 +1252,8 @@ mod tests {
             decide_transition(
                 &at(PlayPhase::Running),
                 &PlayPhase::Prepared,
-                PlayPhase::Starting
+                PlayPhase::Starting,
+                None
             )
             .is_err()
         );
@@ -1225,10 +1263,66 @@ mod tests {
             decide_transition(
                 &at(PlayPhase::Succeeded),
                 &PlayPhase::Starting,
-                PlayPhase::Aborted
+                PlayPhase::Aborted,
+                None
             )
             .is_err()
         );
+    }
+
+    /// The launch commit is the only writer of the not-ready Nodes, and the terminal write builds a
+    /// *fresh* status rather than editing the record's — so the set has to be carried across both
+    /// deliberately. Without that the plan can never tell a host nobody could reach from one whose
+    /// playbook failed, and the attempt budget loses the only evidence it has.
+    #[test]
+    fn nodes_recorded_at_launch_survive_every_later_transition() {
+        let starting = PlayStatus {
+            phase: PlayPhase::Starting,
+            ..Default::default()
+        };
+
+        let launching = decide_transition(
+            &starting,
+            &PlayPhase::Starting,
+            PlayPhase::Launching,
+            Some(&["node-b".to_string()]),
+        )
+        .unwrap()
+        .expect("the launch commit writes a status");
+        assert_eq!(launching.nodes_not_ready, vec!["node-b".to_string()]);
+
+        // Every other transition passes `None` and must leave the recorded set alone.
+        let aborted =
+            decide_transition(&launching, &PlayPhase::Launching, PlayPhase::Aborted, None)
+                .unwrap()
+                .expect("a pending transition produces a status");
+        assert_eq!(aborted.nodes_not_ready, vec!["node-b".to_string()]);
+
+        let terminal = terminal_status(
+            "apply-web-abc-1",
+            &["node-a".to_string(), "node-b".to_string()],
+            Some(&output(&[
+                (
+                    "node-a",
+                    HostStats {
+                        ok: 1,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "node-b",
+                    HostStats {
+                        unreachable: 1,
+                        ..Default::default()
+                    },
+                ),
+            ])),
+            launching.nodes_not_ready.clone(),
+        );
+
+        assert_eq!(terminal.phase, PlayPhase::Failed);
+        assert_eq!(terminal.hosts["node-b"].outcome, HostOutcome::Failed);
+        assert_eq!(terminal.nodes_not_ready, vec!["node-b".to_string()]);
     }
 
     /// `abort_unlaunched` is the only way into `Aborted`, and it is only ever legitimate while the

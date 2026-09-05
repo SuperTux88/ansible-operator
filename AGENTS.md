@@ -226,6 +226,15 @@ Two gates, deliberately: `attempt_budget_available` at `may_start_new_run` is th
 answered by the schedule-window gate, which is the only one that can tell a retry of the current
 tick from the first run of the next.
 
+A `OneShot` run gets its budget back when it made all the progress that was available to it, which
+is a `Succeeded` verdict *or* a failure confined to Nodes the run recorded as not `Ready` at its
+launch commit (`classify_run_failure`, `PlayStatus::nodes_not_ready`). The set has to be captured at
+launch and persisted: the recap cannot distinguish an operator-unreachable host from a reachable one
+with a broken sshd, and the Node may have recovered by the time the result is drained. That relief
+and the `node_readiness` start gate are a matched pair — the relief is what stops a stranded Node
+burning the budget, the gate is what stops the plan re-running against it every grace window. Neither
+belongs without the other.
+
 ### Run records and recovery (`Play`)
 
 Every run is written down **before** anything is created for it, as a `Play` in the plan's

@@ -22,7 +22,7 @@ use kube::{
     api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
 };
 
-use super::paths;
+use super::{node_readiness, paths};
 use crate::utils;
 use crate::v1beta1::{
     ca::CertificateAuthority,
@@ -122,12 +122,27 @@ pub struct ProxyPodInfo {
     pub port: i32,
 }
 
+/// A host whose proxy pod never became Ready within its grace window, and why that is as far as the
+/// operator can tell.
+///
+/// `node_not_ready` separates the two cases the run's outcome cannot: a Node that is itself down —
+/// nobody could have reached it, and it is the Node's return that will change that — from one
+/// Kubernetes reports as `Ready` whose pod never came up anyway (an untolerated taint, a failing
+/// image pull, a rejecting admission webhook), which is a configuration problem no Node event
+/// resolves. A host with no Node object at all is *not* recorded as not-ready: nothing will report
+/// it `Ready` later either, and treating it as a Node that might come back would leave a plan
+/// retrying it forever.
+pub struct UnreachableHost {
+    pub host: String,
+    pub node_not_ready: bool,
+}
+
 pub enum ProxyReadiness {
     /// Every proxy pod has settled: `ready` carries the reachable hosts (with a live pod IP);
     /// `unreachable` names hosts whose pod never became Ready within its grace window.
     Ready {
         ready: Vec<ProxyPodInfo>,
-        unreachable: Vec<String>,
+        unreachable: Vec<UnreachableHost>,
     },
     /// At least one proxy pod is still `Running`-not-yet-Ready or within its startup/termination
     /// grace window; `waiting` names them so the caller can report them on the plan.
@@ -978,13 +993,19 @@ pub async fn ensure_proxy_infra(
             // deadline the host is rendered unreachable so a dead kubelet cannot wedge this run and
             // its Leases forever.
             state @ (PodReadyState::PreRunning | PodReadyState::Terminating) => {
-                let heartbeat_age = match nodes_api.get_opt(host).await? {
-                    Some(node) => node_ready_heartbeat_age_secs(&node, now),
-                    None => None,
-                };
+                // One read, two answers: how stale the node's heartbeat is (which shortens the
+                // grace) and whether it is reporting `Ready` at all (which is what the plan's
+                // attempt budget later turns on).
+                let node = nodes_api.get_opt(host).await?;
+                let heartbeat_age = node
+                    .as_ref()
+                    .and_then(|node| node_ready_heartbeat_age_secs(node, now));
                 let grace = effective_grace_secs(heartbeat_age, grace_policy);
                 match proxy_wait_age_secs(&pod, &state, now) {
-                    Some(age) if age >= grace => unreachable.push(host.clone()),
+                    Some(age) if age >= grace => unreachable.push(UnreachableHost {
+                        host: host.clone(),
+                        node_not_ready: node.is_some_and(|node| !node_readiness::is_ready(&node)),
+                    }),
                     _ => waiting.push(host.clone()),
                 }
             }

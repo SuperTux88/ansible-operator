@@ -244,6 +244,22 @@ spec:
                   Kubernetes' TTL controller; this Play outlives them.
                 nullable: true
                 type: string
+              nodesNotReady:
+                default: []
+                description: |-
+                  The Nodes this run targeted that were themselves not `Ready` when it launched, so their
+                  managed-ssh proxy never came up and they were rendered at the unroutable sentinel — Ansible
+                  reports them `unreachable`.
+
+                  Written once, at the launch commit, because the answer is only knowable then: the outcome
+                  cannot be read back from the recap (an operator-unreachable host is indistinguishable from a
+                  reachable one with a broken sshd), and the Node's own state cannot be re-read afterwards
+                  because by then it may have recovered. It is what lets a `OneShot` plan tell "nobody could
+                  reach these Nodes" apart from "the playbook failed on them" when deciding whether the run
+                  spent one of its attempts.
+                items:
+                  type: string
+                type: array
               phase:
                 enum:
                 - Prepared

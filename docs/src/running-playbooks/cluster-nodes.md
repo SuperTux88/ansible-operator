@@ -168,10 +168,10 @@ asks a cheaper question first: if **every** Node the run would target is `NotRea
 for the run to do, so the plan holds instead of starting it. It carries a `WaitingForNodes` condition
 with reason `NodesNotReady`, and `.status.summary` names the Nodes it is waiting for.
 
-Holding rather than running matters because a run that reaches nobody still spends one of the plan's
-[attempts](./scheduling-and-modes.md#retries) — a `OneShot` plan that burnt its budget that way would
-stop for good, on an outcome that was knowable before the Job existed. A held plan spends nothing and
-is released the moment one of those Nodes reports `Ready` again, which the operator notices at once.
+Holding rather than running matters because the run would achieve nothing and take the full wait
+window to find that out — a proxy pod per Node, every host lock held for the duration, and a `Failed`
+verdict that says nothing about the playbook. A held plan does none of that, and is released the
+moment one of those Nodes reports `Ready` again, which the operator notices at once.
 
 The hold is all-or-nothing on purpose. A run that can still reach *some* of its hosts goes ahead and
 reaches them, taking the `NotReady` ones along so they are reported unreachable in the result rather
@@ -181,6 +181,29 @@ tick against whatever is reachable then.
 A plan can stay held indefinitely, and for a Node that is never coming back that is the intended
 resting state — the condition says exactly what it is waiting for. Removing the Node from the cluster
 or from the inventory's selector is what ends it.
+
+### Unreachable Nodes and the attempt budget
+
+A run that can still reach some of its hosts does start, and it ends `Failed` if it could not reach
+the rest. That verdict stands — the result names every host that was not reached — but it does not
+cost the plan one of its [attempts](./scheduling-and-modes.md#retries): if every host that did not
+succeed sat on a Node that was already `NotReady` when the run launched, the run applied everything
+there was to apply, and a `OneShot` plan's budget is reset exactly as a fully successful run resets
+it. What the plan is waiting for is the Node, not another try, and the next try would be identical.
+
+Only Nodes the operator recorded **at launch** count. Two failures that can look the same from the
+outside do spend an attempt, because no Node coming back resolves either:
+
+- a Node that was `Ready` when the run started and went down *while it ran* — a playbook that reboots
+  its target, say. The operator did reach it, and the run genuinely tried. What keeps the *following*
+  attempt from being spent is the hold above, for as long as the Node stays down.
+- a Node Kubernetes reports `Ready` whose proxy pod never came up anyway — an untolerated taint, a
+  failing image pull, a rejecting admission webhook. That is a configuration problem, and it is the
+  one the attempt budget exists to stop retrying.
+
+A run whose recap could not be read at all (`Unknown`, see
+[Results](./results-and-troubleshooting.md)) always spends its attempt: nothing proves any of its
+hosts was reached.
 
 ## Requirements and limitations
 

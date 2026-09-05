@@ -448,6 +448,7 @@ async fn reconcile(
                     record: TerminalRecord::Present,
                 });
                 finished_active_run = Some(FinishedRun {
+                    failure: classify_run_failure(&status),
                     outcome: status.phase,
                     run: finished,
                 });
@@ -529,6 +530,7 @@ async fn reconcile(
             ActiveRunProgress::Finished {
                 run: finished,
                 outcome,
+                failure,
                 record,
             } => {
                 resource_status.summary =
@@ -541,6 +543,7 @@ async fn reconcile(
                 finished_active_run = Some(FinishedRun {
                     run: finished,
                     outcome,
+                    failure,
                 });
                 // This *was* the run a drained result was still waiting behind, and it has now
                 // finished too, so the plan may be classified on its own terms after all.
@@ -690,7 +693,7 @@ async fn reconcile(
             &execution_hash,
             &object.spec.mode,
             &finished.run,
-            &finished.outcome,
+            &finished.failure,
             surviving_run.as_deref(),
         );
     } else {
@@ -2240,9 +2243,19 @@ async fn ensure_infra_and_launch(
         }
     };
 
+    // Recorded on the run before its Job exists, because it is only answerable here: a Node that is
+    // down now may be back by the time the recap is read, and the recap itself cannot tell a host
+    // nobody could reach from one that was reached and failed.
+    let nodes_not_ready: Vec<String> = unreachable
+        .iter()
+        .filter(|host| host.node_not_ready)
+        .map(|host| host.host.clone())
+        .collect();
+
     if !unreachable.is_empty() {
+        let hosts: Vec<&str> = unreachable.iter().map(|host| host.host.as_str()).collect();
         warn!(
-            "PlaybookPlan {namespace}/{name}: proceeding without node(s) {unreachable:?} — their managed-ssh proxy pods never became Ready within the grace window; Ansible will report them unreachable, and they'll be retried on the next run",
+            "PlaybookPlan {namespace}/{name}: proceeding without node(s) {hosts:?} — their managed-ssh proxy pods never became Ready within the grace window; Ansible will report them unreachable, and they'll be retried on the next run",
         );
     }
 
@@ -2281,6 +2294,7 @@ async fn ensure_infra_and_launch(
         namespace,
         &run.mirror.job_name,
         &run.mirror.play_uid,
+        &nodes_not_ready,
     )
     .await?;
     let jobs_api = Api::<Job>::namespaced(context.client.clone(), namespace);
@@ -2302,7 +2316,7 @@ async fn ensure_infra_and_launch(
 /// see `inventory_renderer`) so Ansible records them unreachable instead of hanging.
 fn managed_ssh_host_map(
     ready: Vec<managed_ssh::ProxyPodInfo>,
-    unreachable: Vec<String>,
+    unreachable: Vec<managed_ssh::UnreachableHost>,
 ) -> BTreeMap<String, ansible::ManagedSshHostInfo> {
     let mut hosts: BTreeMap<String, ansible::ManagedSshHostInfo> = ready
         .into_iter()
@@ -2318,9 +2332,11 @@ fn managed_ssh_host_map(
         })
         .collect();
 
+    // Why a host is unreachable makes no difference to Ansible — every one of them is rendered at
+    // the sentinel and reported unreachable.
     for host in unreachable {
         hosts.insert(
-            host,
+            host.host,
             ansible::ManagedSshHostInfo {
                 pod_ip: managed_ssh::UNREACHABLE_SENTINEL_IP.to_string(),
                 port: managed_ssh::PROXY_SSH_PORT,
@@ -2345,6 +2361,9 @@ enum ActiveRunProgress {
         /// from. A run finalized without its record reads `Unknown` here, and that is a failure
         /// like any other: nothing proves its hosts were reached.
         outcome: v1beta1::PlayPhase,
+        /// What that verdict says about the plan's attempt budget — classified here, where the
+        /// run's terminal status is still in hand. See [`classify_run_failure`].
+        failure: RunFailure,
         record: TerminalRecord,
     },
     /// The cached plan status named a run that the apiserver's copy no longer has — an earlier tick
@@ -2617,11 +2636,13 @@ async fn advance_active_run(
                 "finished Play has no status",
             ))?;
     let outcome = finished_status.phase.clone();
+    let failure = classify_run_failure(finished_status);
     status::apply_terminal_play_status(&run.execution_hash, finished_status, resource_status);
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
         outcome,
+        failure,
         record: TerminalRecord::Present,
     })
 }
@@ -2688,11 +2709,13 @@ async fn finalize_lost_run(
 
     let lost_status = play_history::lost_run_status(&run.mirror.job_name, &run.mirror.hosts);
     let outcome = lost_status.phase.clone();
+    let failure = classify_run_failure(&lost_status);
     status::apply_terminal_play_status(&run.execution_hash, &lost_status, resource_status);
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
         outcome,
+        failure,
         record: TerminalRecord::Lost,
     })
 }
@@ -4002,6 +4025,65 @@ impl RecordedRun {
 struct FinishedRun {
     run: RecordedRun,
     outcome: v1beta1::PlayPhase,
+    failure: RunFailure,
+}
+
+/// What a finished run's result says about the plan's attempt budget — the one question the verdict
+/// alone cannot answer.
+#[derive(Clone, Debug, PartialEq)]
+enum RunFailure {
+    /// Every host the run targeted succeeded.
+    None,
+    /// The run failed, and every host that did not succeed sat on a Node the operator had already
+    /// recorded as not `Ready` when the run launched. The reachable part of the inventory is fully
+    /// applied, so nothing about this execution is worth retrying until one of those Nodes returns.
+    OnlyUnreachableNodes,
+    /// Something the operator did reach did not succeed — or the recap could not be read at all,
+    /// which proves nothing either way.
+    Real,
+}
+
+/// Classifies a terminal `PlayStatus` for the attempt budget.
+///
+/// "Every non-succeeded host was a recorded not-ready Node" and "every host the operator could
+/// reach succeeded" are the same statement, and this is where it is decided — once, while the
+/// run's own status is in hand, because neither half survives the tick: the recap cannot tell an
+/// operator-unreachable host from a reachable one with a broken sshd, and re-reading the Node
+/// answers the wrong question, since it may have recovered since.
+///
+/// Two failures deliberately stay `Real`, both because no Node event will ever resolve them:
+/// a Node that was `Ready` at launch and went down *during* the run — the operator reached it, and
+/// the start gate is what keeps the follow-up attempt from being wasted — and a `Ready` Node whose
+/// proxy pod never came up anyway (an untolerated taint, a failing image pull).
+fn classify_run_failure(status: &v1beta1::PlayStatus) -> RunFailure {
+    match status.phase {
+        v1beta1::PlayPhase::Succeeded => RunFailure::None,
+        v1beta1::PlayPhase::Failed => {
+            let unsucceeded: Vec<&String> = status
+                .hosts
+                .iter()
+                .filter(|(_, result)| result.outcome != v1beta1::HostOutcome::Succeeded)
+                .map(|(host, _)| host)
+                .collect();
+            if !unsucceeded.is_empty()
+                && unsucceeded
+                    .iter()
+                    .all(|host| status.nodes_not_ready.contains(host))
+            {
+                RunFailure::OnlyUnreachableNodes
+            } else {
+                RunFailure::Real
+            }
+        }
+        // `Unknown` is a run whose recap was never read: nothing proves any of its hosts was
+        // reached, so it can never buy the budget back.
+        v1beta1::PlayPhase::Unknown
+        | v1beta1::PlayPhase::Prepared
+        | v1beta1::PlayPhase::Starting
+        | v1beta1::PlayPhase::Launching
+        | v1beta1::PlayPhase::Running
+        | v1beta1::PlayPhase::Aborted => RunFailure::Real,
+    }
 }
 
 struct FinishedRecord {
@@ -4041,16 +4123,16 @@ fn stage_finished_run(finished: &RecordedRun, resource_status: &mut PlaybookPlan
 ///
 /// The run number is claimed either way, because it answers a different question: it reserves a
 /// name against every later run, and a finished run holds its number whatever else is in flight.
-/// The attempt is not a high-water mark: a new `Recurring` slot restarts it, and a successful
-/// `OneShot` execution is complete, so the current-revision surviving run is authoritative when
-/// present, and the finished run is authoritative otherwise. Its slot travels with it so a pruned
-/// record cannot leave an unscoped count behind.
+/// The attempt is not a high-water mark: a new `Recurring` slot restarts it, and a `OneShot`
+/// execution that made all the progress there was to make is complete, so the current-revision
+/// surviving run is authoritative when present, and the finished run is authoritative otherwise.
+/// Its slot travels with it so a pruned record cannot leave an unscoped count behind.
 fn sync_desired_hash_after_finished_run(
     status: &mut PlaybookPlanStatus,
     desired_hash: &ExecutionHash,
     mode: &ExecutionMode,
     finished: &RecordedRun,
-    finished_outcome: &v1beta1::PlayPhase,
+    finished_failure: &RunFailure,
     surviving: Option<&SurvivingRun>,
 ) {
     // Clears the schedule bookkeeping when the desired revision has moved on, so the replacement can
@@ -4084,10 +4166,19 @@ fn sync_desired_hash_after_finished_run(
         record_retry_budget(status, attempt, slot);
     } else if finished.execution_hash == *desired_hash {
         if matches!(mode, ExecutionMode::OneShot)
-            && phase_for_finished_run(finished_outcome) == Phase::Succeeded
+            && matches!(
+                finished_failure,
+                // A successful OneShot execution is complete. Reset its budget so inventory growth
+                // can trigger a new run for hosts that were not present in the completed execution.
+                RunFailure::None
+                    // Nothing the operator could reach failed either, so this execution made all
+                    // the progress there was to make and the run did not spend an attempt on it.
+                    // The plan does not immediately retry on that budget: with every remaining
+                    // outdated host on a Node that is down, the start gate holds it until the Node
+                    // watch says one is back. Without that gate this would loop.
+                    | RunFailure::OnlyUnreachableNodes
+            )
         {
-            // A successful OneShot execution is complete. Reset its budget so inventory growth can
-            // trigger a new run for hosts that were not present in the completed execution.
             record_retry_budget(status, 0, None);
         } else {
             record_retry_budget(
@@ -7429,6 +7520,7 @@ mod tests {
                     execution_hash: hash,
                 },
                 outcome: v1beta1::PlayPhase::Failed,
+                failure: RunFailure::Real,
             }),
             "spec.timeZone is invalid".into(),
         );
@@ -7453,6 +7545,7 @@ mod tests {
                     execution_hash: hash,
                 },
                 outcome: v1beta1::PlayPhase::Unknown,
+                failure: RunFailure::Real,
             }),
             "spec.timeZone is invalid".into(),
         );
@@ -9091,6 +9184,98 @@ spec:
         }
     }
 
+    /// A finished run's terminal status, in the shape `record_finished` writes it: a verdict, the
+    /// per-host outcomes, and the Nodes the run recorded as not `Ready` when it launched.
+    fn terminal_play_status(
+        phase: v1beta1::PlayPhase,
+        hosts: &[(&str, v1beta1::HostOutcome)],
+        nodes_not_ready: &[&str],
+    ) -> v1beta1::PlayStatus {
+        v1beta1::PlayStatus {
+            phase,
+            hosts: hosts
+                .iter()
+                .map(|(host, outcome)| {
+                    (
+                        host.to_string(),
+                        v1beta1::PlayHostResult {
+                            recap: v1beta1::PlayRecap::default(),
+                            outcome: outcome.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            nodes_not_ready: nodes_not_ready.iter().map(|n| n.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The rule the attempt budget turns on: a failure is only forgiven when every host that did
+    /// not succeed sat on a Node the run had already written down as not `Ready`. Anything the
+    /// operator did reach is a real failure, because no Node coming back will change it.
+    #[test]
+    fn a_failure_is_only_confined_to_unreachable_nodes_when_the_run_recorded_them() {
+        use v1beta1::{HostOutcome, PlayPhase};
+
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Succeeded,
+                &[("node-a", HostOutcome::Succeeded)],
+                &[],
+            )),
+            RunFailure::None
+        );
+
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[
+                    ("node-a", HostOutcome::Succeeded),
+                    ("node-b", HostOutcome::Failed),
+                ],
+                &["node-b"],
+            )),
+            RunFailure::OnlyUnreachableNodes,
+            "every host the operator could reach succeeded"
+        );
+
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[
+                    ("node-a", HostOutcome::Failed),
+                    ("node-b", HostOutcome::Failed),
+                ],
+                &["node-b"],
+            )),
+            RunFailure::Real,
+            "the playbook failed on a host that was reached"
+        );
+
+        // A Node that was `Ready` at launch: either it went down mid-run — the reboot case, where
+        // the operator did reach it — or its proxy pod never came up on a Node Kubernetes calls
+        // healthy. Neither is recorded, and neither is resolved by a Node event.
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[("node-a", HostOutcome::Failed)],
+                &[],
+            )),
+            RunFailure::Real
+        );
+
+        // No recap was read at all, so nothing proves any host was reached — including the ones
+        // the run recorded.
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Unknown,
+                &[("node-b", HostOutcome::Unknown)],
+                &["node-b"],
+            )),
+            RunFailure::Real
+        );
+    }
+
     #[test]
     fn finishing_the_same_revision_restores_its_slot_and_run_number() {
         let slot = "2025-08-12T20:00:00Z"
@@ -9109,7 +9294,7 @@ spec:
             &hash,
             &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             None,
         );
 
@@ -9152,7 +9337,7 @@ spec:
             &hash,
             &ExecutionMode::OneShot,
             &finished_run(hash, 3, 1, slot),
-            &v1beta1::PlayPhase::Succeeded,
+            &RunFailure::None,
             None,
         );
 
@@ -9164,6 +9349,73 @@ spec:
             false,
             has_work_to_start(&ExecutionMode::OneShot, false, !outdated.is_empty()),
             attempt_budget_available(&ExecutionMode::OneShot, status.retry_count, 1),
+        ));
+    }
+
+    /// A `OneShot` run whose only non-successes were Nodes nobody could reach applied everything
+    /// there was to apply, so it hands the budget back exactly as a successful one does. What keeps
+    /// that from looping is the start gate: the hosts still outdated are all on Nodes that are
+    /// down, so the plan holds until the Node watch says one is back.
+    #[test]
+    fn a_oneshot_run_that_only_missed_unreachable_nodes_does_not_spend_an_attempt() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            retry_count: 2,
+            retry_count_slot: Some(slot),
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &ExecutionMode::OneShot,
+            &finished_run(hash, 3, 3, slot),
+            &RunFailure::OnlyUnreachableNodes,
+            None,
+        );
+
+        assert_eq!(status.retry_count, 0);
+        assert_eq!(status.retry_count_slot, None);
+        assert!(attempt_budget_available(
+            &ExecutionMode::OneShot,
+            status.retry_count,
+            3
+        ));
+    }
+
+    /// The other half of the rule: a run that failed on something it reached still spends its try,
+    /// even when a `NotReady` Node was among its targets. Three of those and the plan stops, which
+    /// is the whole point of the budget.
+    #[test]
+    fn a_oneshot_run_that_failed_on_a_reachable_host_still_spends_its_attempt() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &ExecutionMode::OneShot,
+            &finished_run(hash, 3, 3, slot),
+            &RunFailure::Real,
+            None,
+        );
+
+        assert_eq!(status.retry_count, 3);
+        assert_eq!(status.retry_count_slot, Some(slot));
+        assert!(!attempt_budget_available(
+            &ExecutionMode::OneShot,
+            status.retry_count,
+            3
         ));
     }
 
@@ -9183,7 +9435,7 @@ spec:
             &hash,
             &ExecutionMode::Recurring,
             &finished_run(hash, 3, 1, slot),
-            &v1beta1::PlayPhase::Succeeded,
+            &RunFailure::None,
             None,
         );
 
@@ -9400,7 +9652,7 @@ spec:
             &hash,
             &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             Some(&surviving_run(hash, Some(live_slot))),
         );
 
@@ -9439,7 +9691,7 @@ spec:
             &hash,
             &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             Some(&surviving_run(hash, Some(live_slot))),
         );
 
@@ -9466,7 +9718,7 @@ spec:
             &hash,
             &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             Some(&surviving_run(hash, None)),
         );
 
@@ -9511,7 +9763,7 @@ spec:
                 &hash,
                 &ExecutionMode::OneShot,
                 &finished_run(hash, 3, 2, finished_slot),
-                &v1beta1::PlayPhase::Failed,
+                &RunFailure::Real,
                 Some(&surviving_run_in(phase.clone(), hash, Some(live_slot))),
             );
 
@@ -9561,7 +9813,7 @@ spec:
             &new_hash,
             &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             None,
         );
 
@@ -9590,7 +9842,7 @@ spec:
             &new_hash,
             &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             Some(&surviving_run(old_hash, Some(slot))),
         );
 
@@ -9619,7 +9871,7 @@ spec:
             &new_hash,
             &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 3, slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             Some(&surviving),
         );
 
@@ -9646,7 +9898,7 @@ spec:
             &new_hash,
             &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             None,
         );
 

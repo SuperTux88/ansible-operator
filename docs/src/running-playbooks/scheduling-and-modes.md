@@ -246,7 +246,10 @@ What the budget covers depends on the mode, because what counts as "the same pie
   out of date precisely *because* the runs failed, so nothing else would stop it. Editing the
   playbook or a referenced Secret changes the execution hash and hands it a fresh budget; so does
   raising `maxAttempts`. A successful run also closes that execution and resets the budget, so hosts
-  added to the inventory later can run without an unrelated plan edit. A `schedule` does not reset a
+  added to the inventory later can run without an unrelated plan edit — and so does a run whose only
+  non-successes were hosts on Nodes that were already `NotReady` when it launched, since every host
+  it could reach did succeed (see [Unreachable Nodes and the attempt
+  budget](./cluster-nodes.md#unreachable-nodes-and-the-attempt-budget)). A `schedule` does not reset a
   failed execution: it says when a `OneShot` plan may run, not how often it may fail.
 - **`Recurring`** spends its budget on one schedule tick, and defaults to `1` — no retry, since the
   next tick re-applies the same playbook anyway. With a higher `maxAttempts` a failed run is retried

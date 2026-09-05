@@ -141,6 +141,19 @@ pub struct PlayStatus {
 
     /// Per-host recap and outcome, for drilling into which host did what.
     pub hosts: BTreeMap<String, PlayHostResult>,
+
+    /// The Nodes this run targeted that were themselves not `Ready` when it launched, so their
+    /// managed-ssh proxy never came up and they were rendered at the unroutable sentinel — Ansible
+    /// reports them `unreachable`.
+    ///
+    /// Written once, at the launch commit, because the answer is only knowable then: the outcome
+    /// cannot be read back from the recap (an operator-unreachable host is indistinguishable from a
+    /// reachable one with a broken sshd), and the Node's own state cannot be re-read afterwards
+    /// because by then it may have recovered. It is what lets a `OneShot` plan tell "nobody could
+    /// reach these Nodes" apart from "the playbook failed on them" when deciding whether the run
+    /// spent one of its attempts.
+    #[serde(default)]
+    pub nodes_not_ready: Vec<String>,
 }
 
 /// The seven Ansible recap counters (`PLAY RECAP` line). Field order is irrelevant here — unlike
