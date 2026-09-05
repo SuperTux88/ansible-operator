@@ -5,7 +5,7 @@ use kube::runtime::reflector::{ObjectRef, Store};
 use tracing::debug;
 
 use crate::v1beta1::{
-    self, ClusterInventory, InventoryRef, NodeAccessPolicy, StaticInventory,
+    self, ClusterInventory, HostOutcome, InventoryRef, NodeAccessPolicy, StaticInventory,
     playbookplancontroller::node_readiness,
 };
 
@@ -101,9 +101,9 @@ fn inventory_to_playbookplans<I: kube::Resource>(
 ///
 /// The narrow predicate is the point. Every kubelet reposts its Node status periodically, so a
 /// mapper that answered "all plans" would reconcile every plan every few minutes for the life of
-/// the cluster, scaling with the node count. Asking instead whether *this* plan still owes *this*
-/// node a run makes a converged cluster cost nothing: no plan matches, and the heartbeats fall on
-/// the floor. A plan that does have a stranded host is woken by that host's own heartbeats until it
+/// the cluster, scaling with the node count. Asking instead whether *this* plan is still waiting on
+/// *this* node makes a settled cluster cost nothing: no plan matches, and the heartbeats fall on the
+/// floor. A plan that does have a stranded host is woken by that host's own heartbeats until it
 /// converges, which is both the retry signal wanted and a bounded one.
 ///
 /// Only a `Ready` node is mapped, because becoming ready is the transition worth acting on. The
@@ -132,12 +132,28 @@ pub fn node_to_playbookplans(
     }
 }
 
-/// Whether `plan` targets `node` and has not yet applied its current revision to it.
+/// Whether `plan` targets `node` and is waiting on something the node turning `Ready` could supply.
 ///
-/// Both halves are read from the plan's own status, which is what makes this answerable without a
+/// Every part is read from the plan's own status, which is what makes this answerable without a
 /// cluster read: `eligibleHosts` is the host set the last reconcile resolved, and a host is owed a
 /// run while the hash it last *succeeded* on is not the one the plan currently wants. A host with no
 /// recorded status at all has never succeeded, so it is owed one too.
+///
+/// The outcome check is what keeps that from meaning "forever". `lastAppliedHash` is only stamped on
+/// `Succeeded` (`status::apply_terminal_play_status`), so a host that was reached and failed for real
+/// never advances it and would otherwise match this predicate for the life of the plan — waking a
+/// plan whose budget is long spent once per Ready node per heartbeat, at a cost of re-resolving both
+/// inventory kinds, re-reading every referenced Secret and listing every Node for policy enforcement,
+/// none of which can change the outcome. `Failed` means Ansible connected and a task failed; a Node
+/// reporting `Ready` does not fix that. `NotReached` means an earlier host in the `serial` batch
+/// stopped the play, so it is that host's recovery that matters and that host's own heartbeats that
+/// carry it.
+///
+/// Everything else stays in: a host with no entry, one left `Unreachable` by a Node that was down,
+/// one whose recap was unreadable (`Unknown` — nothing proves it was reached), and one that
+/// `Succeeded` on an older revision. The last matters more than it looks: a plan held by the
+/// readiness gate never ran, so it still carries the *previous* run's `Succeeded` outcomes, and this
+/// watch is the only thing that releases it.
 fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &str) -> bool {
     let Some(status) = plan.status.as_ref() else {
         return false;
@@ -153,7 +169,13 @@ fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &str) -> bool {
             .hosts_status
             .as_ref()
             .and_then(|hosts| hosts.get(node))
-            .is_none_or(|host| host.last_applied_hash != status.current_hash)
+            .is_none_or(|host| {
+                host.last_applied_hash != status.current_hash
+                    && !matches!(
+                        host.last_outcome,
+                        HostOutcome::Failed | HostOutcome::NotReached
+                    )
+            })
 }
 
 /// Whether `plan` targets the inventory `namespace`/`name` of the kind `referenced` selects.
@@ -435,11 +457,122 @@ mod tests {
         );
     }
 
+    fn host(last_applied_hash: &str, last_outcome: HostOutcome) -> crate::v1beta1::HostStatus {
+        crate::v1beta1::HostStatus {
+            last_applied_hash: last_applied_hash.into(),
+            last_outcome,
+            ..Default::default()
+        }
+    }
+
+    fn plan_awaiting(node: &str, host_status: crate::v1beta1::HostStatus) -> PlaybookPlan {
+        plan_with_status(v1beta1::PlaybookPlanStatus {
+            eligible_hosts: eligible(&[node]),
+            current_hash: "abc".into(),
+            hosts_status: Some(std::collections::BTreeMap::from([(
+                node.to_string(),
+                host_status,
+            )])),
+            ..Default::default()
+        })
+    }
+
+    /// A host Ansible connected to and failed on is not fixed by its Node reporting `Ready`, and its
+    /// `lastAppliedHash` never advances — so without this it would match the hash check on every
+    /// kubelet heartbeat for the life of a plan that provably cannot act on the wake-up.
+    #[test]
+    fn a_plan_does_not_await_a_host_that_was_reached_and_failed() {
+        let plan = plan_awaiting("node-a", host("", HostOutcome::Failed));
+
+        assert!(!plan_awaits_node(&plan, "node-a"));
+    }
+
+    /// A `NotReached` host is blocked on whichever host stopped its `serial` batch, not on its own
+    /// Node; if that host is one a Node recovery unblocks, its own heartbeats carry the plan.
+    #[test]
+    fn a_plan_does_not_await_a_host_an_earlier_batch_stopped_the_play_for() {
+        let plan = plan_awaiting("node-a", host("", HostOutcome::NotReached));
+
+        assert!(!plan_awaits_node(&plan, "node-a"));
+    }
+
+    /// The case the watch exists for: a Node that was down is rendered at the sentinel address and
+    /// comes back `Unreachable`, and its return is exactly what should start the next run.
+    #[test]
+    fn a_plan_awaits_a_host_left_unreachable_by_a_node_that_was_down() {
+        let plan = plan_awaiting("node-a", host("", HostOutcome::Unreachable));
+
+        assert!(plan_awaits_node(&plan, "node-a"));
+    }
+
+    /// An unreadable recap proves nothing about whether the host was reached, so it stays eligible
+    /// for a Node-triggered retry rather than being written off like a real failure.
+    #[test]
+    fn a_plan_awaits_a_host_whose_recap_could_not_be_read() {
+        let plan = plan_awaiting("node-a", host("", HostOutcome::Unknown));
+
+        assert!(plan_awaits_node(&plan, "node-a"));
+    }
+
+    /// A plan held by the readiness gate never ran, so its hosts still carry the *previous* run's
+    /// `Succeeded` outcomes against the previous hash. This watch is the only thing that releases
+    /// such a plan, so narrowing the predicate must not exclude it.
+    #[test]
+    fn a_plan_awaits_a_host_that_succeeded_on_an_older_revision() {
+        let plan = plan_awaiting("node-a", host("older", HostOutcome::Succeeded));
+
+        assert!(plan_awaits_node(&plan, "node-a"));
+    }
+
     #[test]
     fn a_plan_without_a_status_awaits_nothing() {
         let plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
 
         assert!(!plan_awaits_node(&plan, "node-a"));
+    }
+
+    fn node_named(name: &str, ready: bool) -> Node {
+        let mut node = Node {
+            metadata: kube::core::ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        node.status.get_or_insert_default().conditions =
+            Some(vec![k8s_openapi::api::core::v1::NodeCondition {
+                type_: "Ready".into(),
+                status: if ready { "True" } else { "False" }.into(),
+                ..Default::default()
+            }]);
+        node
+    }
+
+    fn store_holding(plan: PlaybookPlan) -> Arc<Store<PlaybookPlan>> {
+        let mut writer = kube::runtime::reflector::store::Writer::<PlaybookPlan>::default();
+        let reader = Arc::new(writer.as_reader());
+        writer.apply_watcher_event(&kube::runtime::watcher::Event::Apply(plan));
+        reader
+    }
+
+    /// The two halves of the mapper are tested apart — `node_readiness::is_ready` and
+    /// `plan_awaits_node` — but their *order* is the part that costs something, and only the
+    /// composed closure has it. Every kubelet heartbeat of every Node enters here, so the readiness
+    /// check has to reject a not-`Ready` Node before the store is scanned: reversing the two would
+    /// still return the right answer and would still pass both halves' own tests, while walking
+    /// every plan in the cluster on every heartbeat to do it.
+    #[test]
+    fn a_node_that_is_not_ready_maps_to_no_plans_without_consulting_the_store() {
+        let plan = plan_awaiting("node-a", host("", HostOutcome::Unreachable));
+        let mapper = node_to_playbookplans(store_holding(plan));
+
+        assert!(
+            mapper(node_named("node-a", false)).is_empty(),
+            "a Node that is not Ready supplies nothing, whatever the plans want"
+        );
+        // The same plan and the same Node, so the emptiness above is the readiness check and not a
+        // store that never held anything.
+        assert_eq!(mapper(node_named("node-a", true)).len(), 1);
     }
 
     #[test]
