@@ -129,19 +129,27 @@ async fn run(args: RunArgs) {
             .expect("failed to generate the operator's ephemeral SSH certificate authority"),
     );
 
-    let playbookplan_controller = v1beta1::playbookplancontroller::reconciler::new(
-        client.clone(),
-        operator_namespace,
-        enrolled_namespaces,
-        ca,
-        proxy_image,
-        proxy_grace,
-        v1beta1::playbookplancontroller::reconciler::WorkloadEgressPolicies {
-            playbook: operator_config.playbook_network_policy_egress,
-            managed_ssh: operator_config.managed_ssh_network_policy_egress,
-        },
-    )
-    .for_each(|outcome| async move { report_outcome("PlaybookPlan", outcome) });
+    // Built inside its own future rather than awaited here: this controller waits for its Node
+    // cache's initial sync before it will reconcile anything (see `reconciler::new`), and an
+    // apiserver slow to answer that LIST must not also keep the other two from starting.
+    let playbookplan_client = client.clone();
+    let playbookplan_controller = async move {
+        v1beta1::playbookplancontroller::reconciler::new(
+            playbookplan_client,
+            operator_namespace,
+            enrolled_namespaces,
+            ca,
+            proxy_image,
+            proxy_grace,
+            v1beta1::playbookplancontroller::reconciler::WorkloadEgressPolicies {
+                playbook: operator_config.playbook_network_policy_egress,
+                managed_ssh: operator_config.managed_ssh_network_policy_egress,
+            },
+        )
+        .await
+        .for_each(|outcome| async move { report_outcome("PlaybookPlan", outcome) })
+        .await;
+    };
 
     let inventory_controller = v1beta1::clusterinventorycontroller::new(client.clone())
         .for_each(|outcome| async move { report_outcome("ClusterInventory", outcome) });

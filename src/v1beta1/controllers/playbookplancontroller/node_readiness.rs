@@ -26,11 +26,12 @@ pub fn is_ready(node: &Node) -> bool {
 /// The managed-ssh nodes among `groups` that are currently known to be **not** `Ready`, sorted and
 /// deduplicated.
 ///
-/// A node the cache has no entry for is treated as ready — deliberately. The alternative fails
-/// closed on missing data, which here would mean an operator whose Node reflector has not finished
-/// its initial sync holds back every run it should be starting. A node that is genuinely gone is
-/// also not in the resolved inventory for long, and a run that targets one anyway behaves exactly
-/// as it did before this module existed: no proxy pod, grace window, reported unreachable.
+/// A node the cache has no entry for is treated as ready — deliberately. The cache is synced before
+/// the controller reconciles anything (`reconciler::new`), so a miss is not missing data: it says
+/// the Node does not exist, and nothing will ever report it `Ready`. Holding for one would be
+/// holding forever. A node that is genuinely gone is also not in the resolved inventory for long,
+/// and a run that targets one anyway behaves exactly as it did before this module existed: no proxy
+/// pod, grace window, reported unreachable.
 ///
 /// `StaticInventory` hosts are not Nodes and never appear here.
 pub fn unready_nodes(nodes: &Store<Node>, groups: &[ResolvedInventoryGroup]) -> Vec<String> {

@@ -355,6 +355,13 @@ reposts its Node status periodically, so an "all plans" mapping would reconcile 
 minutes forever, scaling with node count. A converged cluster matches no plans and the heartbeats
 fall on the floor.
 
+`reconciler::new` is `async` for one reason: it waits for that reflector's initial LIST before
+handing back a controller. An unsynced Node cache reports every node `Ready`, which is precisely the
+answer that starts the runs the readiness gate exists to hold back — so after a restart every held
+plan would launch one, take its hosts' Leases for the full proxy grace window and report everything
+unreachable. `main` drives this controller as a future of its own so that wait does not delay the
+other two.
+
 That reflector is for **readiness only**. `node_access::enforce` keeps its own *live* Node read:
 the allow-set is a security gate and INV-5 says it is never served from a cache.
 

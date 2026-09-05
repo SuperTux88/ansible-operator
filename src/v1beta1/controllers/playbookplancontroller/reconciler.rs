@@ -124,7 +124,13 @@ struct SchedulingConfiguration {
     schedule: Option<Schedule>,
 }
 
-pub fn new(
+/// Builds the PlaybookPlan controller's event stream.
+///
+/// Async because it does not hand back a controller until its Node cache has completed its initial
+/// LIST — see the wait below for why the first reconcile must not run without it. Nothing else here
+/// blocks, and the caller drives this as a future of its own so the wait does not hold up the other
+/// controllers.
+pub async fn new(
     client: kube::Client,
     operator_namespace: String,
     enrolled_namespaces: std::collections::BTreeSet<String>,
@@ -224,6 +230,20 @@ pub fn new(
 
         reader
     };
+
+    // The start gate reads this cache to decide whether a `OneShot` run is worth starting, and a
+    // cache that has not synced yet answers "every node is Ready" for every node — which is exactly
+    // the answer that starts the runs a held plan exists to hold back. Each such run takes its
+    // hosts' Leases, creates a node-root proxy pod per host, waits out the full grace window
+    // (default 600s) blocking every other plan on those hosts, and then reports them all
+    // unreachable. That is what an operator restart would cost every held plan, so the initial LIST
+    // is waited for instead. It is the only thing this constructor waits for.
+    if let Err(error) = node_reflector_reader.wait_until_ready().await {
+        error!(
+            "Node reflector stopped before its initial sync: {error:?} — readiness checks will \
+             treat every node as Ready until it recovers"
+        );
+    }
 
     let context = Arc::new(ReconciliationContext {
         client: client.clone(),
