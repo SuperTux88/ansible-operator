@@ -138,6 +138,11 @@ pub fn new(
     let playbookplans_api: Api<v1beta1::PlaybookPlan> = Api::all(client.clone());
     // NodeAccessPolicy is cluster-scoped (admin-authored via cluster RBAC); cache/watch all of them.
     let node_access_policies_api: Api<NodeAccessPolicy> = Api::all(client.clone());
+    // Both inventory kinds are namespaced but watched cluster-wide for the same reason plans are:
+    // CRD reads stay cluster-wide (R1), and an inventory in a non-enrolled namespace can only ever
+    // map to a plan there, which the enrollment guard refuses anyway.
+    let cluster_inventories_api: Api<ClusterInventory> = Api::all(client.clone());
+    let static_inventories_api: Api<StaticInventory> = Api::all(client.clone());
 
     let enrolled_namespaces = Arc::new(enrolled_namespaces);
 
@@ -197,11 +202,29 @@ pub fn new(
         workload_egress_policies,
     });
 
-    let mut controller = Controller::new(playbookplans_api, watcher::Config::default()).watches(
-        node_access_policies_api,
-        watcher::Config::default(),
-        mappers::node_access_policy_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
-    );
+    // The inventory watches close the gap between what a tick *reads* and what starts one:
+    // `resolve_inventory` reads both kinds live on every tick, so their contents were always fresh
+    // whenever a reconcile happened — but nothing made one happen. A `ClusterInventory` that gained
+    // a Node therefore reached its plans only on their next requeue (an hour for an idle `OneShot`
+    // plan, the next slot for a scheduled one), and a `StaticInventory` edit had no path at all.
+    let mut controller = Controller::new(playbookplans_api, watcher::Config::default())
+        .watches(
+            node_access_policies_api,
+            watcher::Config::default(),
+            mappers::node_access_policy_to_playbookplans(Arc::clone(
+                &playbookplan_reflector_reader,
+            )),
+        )
+        .watches(
+            cluster_inventories_api,
+            watcher::Config::default(),
+            mappers::cluster_inventory_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
+        )
+        .watches(
+            static_inventories_api,
+            watcher::Config::default(),
+            mappers::static_inventory_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
+        );
 
     // Owned-Job and referenced-Secret watches are set up per enrolled namespace instead of once
     // cluster-wide: the operator holds `jobs`/`secrets` RBAC only in these namespaces (R1), so a

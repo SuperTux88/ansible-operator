@@ -123,13 +123,15 @@ out of date because it has no recorded hash of its own.
 - When you edit the playbook or change a referenced variables/files Secret, the hash changes **at
   once**: the operator watches the plan and the Secrets it names, so the desired hash, run numbering
   and [consumed schedule slot](#one-tick-one-run-per-revision) update on the spot.
-- Changing an inventory's group variables changes the hash too, but **not at once**. The operator
-  does not watch `ClusterInventory` or `StaticInventory` resources, so the plan picks such a change
-  up at its next reconcile — which is seconds away for a plan with a run in flight, the next
-  scheduled tick for a `Recurring` plan (when it would re-apply anyway), and up to an hour for an
-  idle `OneShot` plan that has settled. The same delay applies to the hosts a group resolves to, for
-  the same reason. If you need the change applied now, touch the plan itself: any edit to it, an
-  annotation included, wakes it immediately.
+- Changing an inventory's group variables changes the hash at once too, and for the same reason —
+  the operator watches the `ClusterInventory` and `StaticInventory` resources a plan names. The same
+  goes for the hosts a group resolves to: a Node joining, leaving or being relabelled updates the
+  `ClusterInventory`'s `.status.resolvedHosts` within seconds, and that update reaches every plan
+  built on it immediately.
+- Being woken is not the same as running. What updates on the spot is the plan's *view* — its
+  desired hash, `.status.eligibleHosts` and summary. Whether a run then starts is still the
+  schedule's decision: an unscheduled `OneShot` plan starts one right away, while a scheduled plan
+  of either mode waits for its next tick.
 - An in-flight run keeps its own hash, target inventory, run number, and schedule slot in an
   immutable `Play`, so none of these edits disturb it — see [Editing a plan while a run is in
   flight](#editing-a-plan-while-a-run-is-in-flight).
@@ -137,6 +139,24 @@ out of date because it has no recorded hash of its own.
 This is what makes `OneShot` idempotent and cheap: editing an unrelated field does not re-run
 everything, but a real change to the playbook or its inputs does. The current hash is visible as
 `.status.currentHash` and in the `Current hash` printer column.
+
+### What wakes a plan
+
+A plan is re-evaluated whenever one of the things it is built from changes, and otherwise on a
+timer. The watched inputs are:
+
+| Change | Reaches the plan |
+|---|---|
+| The `PlaybookPlan` itself | at once |
+| A Secret it names in `variables` or `files` | at once |
+| A `ClusterInventory` or `StaticInventory` it names — including the Nodes a `ClusterInventory` resolves to | at once |
+| A `NodeAccessPolicy` (which may change [which Nodes the namespace may target](../cluster-operators/node-access-policies.md)) | at once |
+| The run's Job finishing | at once |
+| Nothing at all | on a timer: the time until the next scheduled tick, or an hour for an unscheduled plan |
+
+A `StaticInventory`'s SSH key Secret is deliberately **not** in that list: rotating a key changes how
+the operator connects, not what it applies, so it does not wake a plan or re-apply the playbook to
+hosts that are already current.
 
 ## Editing a plan while a run is in flight
 

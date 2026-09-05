@@ -718,10 +718,12 @@ references — trigger a re-run of already current hosts. Editing an unrelated `
 schedule that has not fired yet) will not. Confirm `.status.currentHash` actually changed after your
 edit.
 
-An inventory's group variables do count, but not at once: the operator does not watch
-`ClusterInventory` or `StaticInventory`, so such an edit waits for the plan's next reconcile, which
-is up to an hour for a settled `OneShot` plan. Touching the plan itself — any edit, an annotation
-included — wakes it immediately.
+An inventory's group variables count too, and take effect at once: the operator watches the
+`ClusterInventory` and `StaticInventory` resources a plan references, alongside the plan itself and
+the Secrets it names. If an inventory edit appears to do nothing, check that the plan's
+`.spec.inventoryRefs` really names *that* inventory, and that the two live in the same namespace —
+inventory references are resolved in the plan's own namespace, so a same-named inventory elsewhere
+is a different object.
 
 ### It never seems to run
 

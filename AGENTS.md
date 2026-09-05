@@ -81,7 +81,7 @@ src/v1beta1/
     reconcile_error.rs               shared ReconcileError (thiserror)
   controllers/playbookplancontroller/
     reconciler.rs                    the reconcile pipeline (below); patch_status via JSON merge patch
-    mappers.rs                       maps Secret and NodeAccessPolicy changes to affected plans
+    mappers.rs                       maps Secret, NodeAccessPolicy, ClusterInventory and StaticInventory changes to affected plans
     node_access.rs                   NodeAccessPolicy enforcement: fail-closed intersection clamp (INV-2/3/5)
     managed_ssh.rs                   proxy pods (hostPID + nsenter = NODE ROOT), per-run sshd config/certs/principals, NetworkPolicy, cleanup (INV-4/7)
     locking.rs                       per-host Leases (operator ns) for run mutual-exclusion
@@ -328,9 +328,17 @@ Per-node **Leases** give run mutual exclusion.
 `.watches(secrets_api, …, mappers::secret_to_playbookplans(…))` re-triggers a plan when a
 referenced Secret changes — but Secret/Job watches are set up **per enrolled namespace**, not
 cluster-wide (the operator's `secrets`/`jobs` RBAC is scoped there; a cluster-wide `Api::all`
-watch would 403). `clusterinventorycontroller` has the Node → ClusterInventory equivalent
+watch would 403). The `ClusterInventory`/`StaticInventory` watches
+(`mappers::cluster_inventory_to_playbookplans` / `..._static_...`) are cluster-wide like the plan
+watch itself, since CRD reads are (R1). They exist because `resolve_inventory` reads both kinds
+**live on every tick**, so their contents were always fresh whenever a reconcile happened — nothing
+made one happen, and an inventory that gained a host reached its plans only on their next requeue.
+`clusterinventorycontroller` has the Node → ClusterInventory equivalent
 (`mappers::node_to_inventories`); `nodeaccesspolicycontroller` recomputes policy status on any
 namespace/node change.
+
+The plan controller does **not** watch Nodes directly (yet): a Node that goes Ready after a run
+failed to reach it is picked up only on the plan's next requeue.
 
 ## Enrolled namespaces (R1)
 
