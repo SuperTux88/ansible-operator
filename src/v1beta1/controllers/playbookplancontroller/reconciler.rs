@@ -769,8 +769,8 @@ async fn reconcile(
     // contract is to re-apply at each tick against whatever exists then, so a tick that can only
     // reach some of its hosts still reaches them and reports the rest unreachable.
     let unready_nodes = node_readiness::unready_nodes(&context.nodes, &run_groups);
-    let hold_for_unready_nodes = matches!(object.spec.mode, ExecutionMode::OneShot)
-        && node_readiness::holds_for_unready_nodes(&run_groups, &unready_nodes);
+    let hold_for_unready_nodes =
+        node_readiness::holds_for_unready_nodes(&object.spec.mode, &run_groups, &unready_nodes);
     if !hold_for_unready_nodes {
         // Retires a hold this plan is no longer under, whatever ended it — the nodes came back, the
         // inventory moved on, the plan was suspended. Written here rather than only where a hold is
@@ -5888,6 +5888,50 @@ mod tests {
             panic!("expected a ManagedSsh group");
         };
         assert_eq!(t, &tolerations);
+    }
+
+    /// Readiness gates a run; it never *filters* one. A run that can reach some of its hosts starts
+    /// and carries the `NotReady` ones along, so they are reported unreachable in the play result
+    /// rather than quietly dropped from it — which is also what keeps them outdated afterwards, and
+    /// so what makes them retried at all.
+    ///
+    /// Composed from the same three steps the reconcile runs in the same order (`reconcile`, at the
+    /// `hosts_to_trigger`/`run_groups`/`unready_nodes` block), because the property lives in that
+    /// composition: what a run targets is decided by drift alone, and readiness is only ever asked
+    /// afterwards, as a yes/no on the whole run. A future "just skip the down ones" would have to
+    /// reach into one of these steps, and this says why it must not.
+    #[test]
+    fn the_readiness_gate_never_drops_a_not_ready_host_from_a_run_that_starts() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let target_groups = vec![managed_ssh_group("workers", &["node-a", "node-b"], None)];
+        let status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            eligible_hosts: flatten_hosts(&target_groups),
+            ..Default::default()
+        };
+
+        let hosts_to_trigger = find_outdated_hosts(&status, &hash);
+        let run_groups = filter_groups_to_hosts(&target_groups, &hosts_to_trigger);
+        let unready = vec!["node-b".to_string()];
+
+        assert!(
+            !node_readiness::holds_for_unready_nodes(
+                &ExecutionMode::OneShot,
+                &run_groups,
+                &unready
+            ),
+            "node-a is reachable, so the run has work to do and must start"
+        );
+
+        let targeted: Vec<&String> = run_groups
+            .iter()
+            .flat_map(|group| group.hosts().hosts.iter())
+            .collect();
+        assert_eq!(
+            targeted,
+            vec!["node-a", "node-b"],
+            "the NotReady node stays in the run so Ansible reports it unreachable"
+        );
     }
 
     #[test]

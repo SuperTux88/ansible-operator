@@ -8,7 +8,7 @@
 use k8s_openapi::api::core::v1::Node;
 use kube::runtime::reflector::{ObjectRef, Store};
 
-use crate::v1beta1::ResolvedInventoryGroup;
+use crate::v1beta1::{ExecutionMode, ResolvedInventoryGroup};
 
 /// Whether a Node reports `Ready=True`.
 ///
@@ -54,11 +54,11 @@ pub fn unready_nodes(nodes: &Store<Node>, groups: &[ResolvedInventoryGroup]) -> 
     unready
 }
 
-/// Whether every host this run would target is a managed-ssh node that is not `Ready` — the
-/// condition under which starting the run buys nothing.
+/// Whether a run must be held rather than started, because every host it would target is a
+/// managed-ssh node that is not `Ready` — the condition under which starting it buys nothing.
 ///
 /// Such a run is not harmless. Each of those nodes gets a proxy pod that cannot come up, the run
-/// waits out the full grace window, and Ansible then reports every host unreachable — burning one
+/// waits out the full grace window, and Ansible then reports every host unreachable — spending one
 /// of a `OneShot` plan's attempts on an outcome that was knowable before the Job existed. Holding
 /// instead costs nothing, because the controller's Node watch wakes the plan the moment one of them
 /// reports `Ready` again.
@@ -66,8 +66,17 @@ pub fn unready_nodes(nodes: &Store<Node>, groups: &[ResolvedInventoryGroup]) -> 
 /// It is deliberately "every", not "any". A run that can still reach *some* of its hosts must go
 /// ahead and reach them, carrying the unreachable ones along so they are reported as such in the
 /// play result rather than silently dropped from it.
-pub fn holds_for_unready_nodes(groups: &[ResolvedInventoryGroup], unready: &[String]) -> bool {
-    if unready.is_empty() {
+///
+/// `Recurring` never holds, whatever the nodes are doing: its contract is to re-apply at each tick
+/// against whatever exists then, and its budget already resets per tick, so a tick that reaches
+/// nobody costs it nothing to skip. The mode is taken here rather than checked at the call site so
+/// that both halves of the rule are decided — and tested — in one place.
+pub fn holds_for_unready_nodes(
+    mode: &ExecutionMode,
+    groups: &[ResolvedInventoryGroup],
+    unready: &[String],
+) -> bool {
+    if !matches!(mode, ExecutionMode::OneShot) || unready.is_empty() {
         return false;
     }
 
@@ -146,14 +155,38 @@ mod tests {
         let groups = vec![managed("workers", &["node-a", "node-b"])];
 
         assert!(holds_for_unready_nodes(
+            &ExecutionMode::OneShot,
             &groups,
             &["node-a".to_string(), "node-b".to_string()]
         ));
         assert!(
-            !holds_for_unready_nodes(&groups, &["node-a".to_string()]),
+            !holds_for_unready_nodes(&ExecutionMode::OneShot, &groups, &["node-a".to_string()]),
             "node-b can still be reached, so the run has work to do"
         );
-        assert!(!holds_for_unready_nodes(&groups, &[]));
+        assert!(!holds_for_unready_nodes(
+            &ExecutionMode::OneShot,
+            &groups,
+            &[]
+        ));
+    }
+
+    /// A `Recurring` plan re-applies at each tick against whatever exists then, and its budget
+    /// resets per tick, so it has nothing to protect by waiting and a skipped tick is simply a tick
+    /// that did not happen. It runs even when every one of its nodes is down.
+    #[test]
+    fn a_recurring_run_starts_even_when_every_node_is_down() {
+        let groups = vec![managed("workers", &["node-a", "node-b"])];
+        let unready = ["node-a".to_string(), "node-b".to_string()];
+
+        assert!(!holds_for_unready_nodes(
+            &ExecutionMode::Recurring,
+            &groups,
+            &unready
+        ));
+        assert!(
+            holds_for_unready_nodes(&ExecutionMode::OneShot, &groups, &unready),
+            "the same inputs hold a OneShot plan — the mode is the only difference"
+        );
     }
 
     /// A `StaticInventory` host is reached over its own SSH key, with no Node and no proxy pod
@@ -166,6 +199,10 @@ mod tests {
             ssh("edge", &["host.example.com"]),
         ];
 
-        assert!(!holds_for_unready_nodes(&groups, &["node-a".to_string()]));
+        assert!(!holds_for_unready_nodes(
+            &ExecutionMode::OneShot,
+            &groups,
+            &["node-a".to_string()]
+        ));
     }
 }
