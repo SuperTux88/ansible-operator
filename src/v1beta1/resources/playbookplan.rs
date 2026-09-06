@@ -431,6 +431,17 @@ pub struct PlaybookPlanStatus {
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub retry_count_slot: Option<DateTime<FixedOffset>>,
+    /// Fingerprint of the SSH key material this plan's `StaticInventory` hosts are reached with,
+    /// as it was when the plan last looked. Absent for a plan that reaches no such hosts.
+    ///
+    /// Deliberately *not* part of `currentHash`. That hash decides which hosts are outdated, so
+    /// folding a key into it would re-apply the playbook to every host that is already current —
+    /// rotating a key changes how the operator connects, not what it applies. Kept beside the hash
+    /// instead, this notices the rotation without claiming a new revision: a plan whose last run
+    /// did not succeed gets its `retryCount` back, because the old key may well be why it failed,
+    /// and `lastAppliedHash` still keeps the run off the hosts that are already converged.
+    #[serde(default)]
+    pub observed_ssh_key_revision: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]

@@ -81,7 +81,7 @@ src/v1beta1/
     reconcile_error.rs               shared ReconcileError (thiserror)
   controllers/playbookplancontroller/
     reconciler.rs                    the reconcile pipeline (below); patch_status via JSON merge patch
-    mappers.rs                       maps Secret, NodeAccessPolicy, ClusterInventory and StaticInventory changes to affected plans
+    mappers.rs                       maps Secret, NodeAccessPolicy, ClusterInventory and StaticInventory changes to affected plans; the Secret watch asks two rules (named in `variables`/`files`, or holding a StaticInventory's SSH key)
     node_access.rs                   NodeAccessPolicy enforcement: fail-closed intersection clamp (INV-2/3/5)
     node_readiness.rs                Node Ready-condition predicates + the OneShot "hold instead of starting" gate; readiness only, never authorization
     managed_ssh.rs                   proxy pods (hostPID + nsenter = NODE ROOT), per-run sshd config/certs/principals, NetworkPolicy, cleanup (INV-4/7)
@@ -247,6 +247,18 @@ the run excluded, each flagged with whether its Node was itself down — a host 
 `Ready` Node's proxy pod never came up is a configuration problem and is not refunded. It has to be
 captured at launch and persisted: the recap says nothing at all about a host the run excluded, and
 the Node may have recovered by the time the result is drained.
+
+An SSH key rotation is the one input that is *noticed* without being hashed. `StaticInventory`
+key material is deliberately outside the execution hash — that hash decides which hosts are outdated,
+so folding a key into it would re-apply the playbook to hosts that are already current. Instead
+`status.observedSshKeyRevision` fingerprints it (`execution_evaluator::hash_secret_data`), and a
+change restores a `OneShot` plan's attempt budget when its last run did not succeed
+(`sync_ssh_key_revision`). The budget reset is the point: a plan whose hosts rejected the old key has
+spent every try by then — a `StaticInventory` host has no proxy grace window in front of it — so
+waking it alone would achieve nothing. `mappers::ssh_secret_to_playbookplans` supplies the wake-up,
+and both sides share `status::may_need_another_run` so the mapper can never wake a plan the reset
+would then decline. The first observation is recorded without acting, which is what keeps an upgrade
+from handing every failed plan a free retry at once.
 
 The "applied to at least one host" half is a bound, not a nicety: the gate reads the Node at tick
 time while `node_not_ready` is read a grace window later, so a Node that alternates across that

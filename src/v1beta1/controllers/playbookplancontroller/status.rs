@@ -3,7 +3,7 @@ use k8s_openapi::api::batch;
 use crate::{
     utils::upsert_condition,
     v1beta1::{
-        HostOutcome, PlayPhase, PlayStatus, PlaybookPlanCondition, PlaybookPlanStatus,
+        HostOutcome, Phase, PlayPhase, PlayStatus, PlaybookPlanCondition, PlaybookPlanStatus,
         distinct_host_count,
     },
 };
@@ -213,6 +213,16 @@ pub fn held_for_unready_nodes(status: &PlaybookPlanStatus) -> bool {
             && condition.status == "True"
             && condition.reason.as_deref() == Some("NodesNotReady")
     })
+}
+
+/// Whether the plan's last outcome leaves something a further run could still apply.
+///
+/// One comparison, but shared on purpose: the mapper that wakes a plan on an SSH key rotation and
+/// the budget reset that lets the woken plan act must agree exactly. If the mapper were the wider of
+/// the two it would wake plans that then decline to do anything; if it were the narrower, a plan
+/// would sit on a fix it had already been given.
+pub fn may_need_another_run(status: &PlaybookPlanStatus) -> bool {
+    status.phase != Phase::Succeeded
 }
 
 pub fn clear_run_conditions(status: &mut PlaybookPlanStatus) {
