@@ -1,25 +1,25 @@
 use std::{sync::Arc, time::Duration};
 
-use futures::{Stream, StreamExt as _};
+use futures::Stream;
 use k8s_openapi::api::core::v1::{Namespace, Node};
 use kube::{
     Api, ResourceExt,
-    api::{ListParams, Patch, PatchParams},
+    api::{ListParams, PartialObjectMeta, Patch, PatchParams},
     runtime::{
         Controller,
         controller::{self, Action},
-        reflector::{Lookup, ObjectRef, store::Writer},
+        reflector::{Lookup, ObjectRef},
         watcher,
     },
 };
-use tracing::error;
 
 use crate::v1beta1::{
     self, NodeAccessPolicy, NodeAccessPolicyStatus,
-    controllers::{nodeselector::selector_matches_fail_closed, reconcile_error::ReconcileError},
+    controllers::{
+        nodeselector::selector_matches_fail_closed, reconcile_error::ReconcileError,
+        selector_trigger,
+    },
 };
-
-use super::mappers;
 
 struct ReconciliationContext {
     client: kube::Client,
@@ -38,44 +38,20 @@ pub fn new(
     });
 
     let policies_api: Api<NodeAccessPolicy> = Api::all(client.clone());
-    let namespaces_api: Api<Namespace> = Api::all(client.clone());
-    let nodes_api: Api<Node> = Api::all(client.clone());
+    // Metadata-only: both selectors read labels and nothing else, and so do the triggers.
+    let namespace_metadata_api: Api<PartialObjectMeta<Namespace>> = Api::all(client.clone());
+    let node_metadata_api: Api<PartialObjectMeta<Node>> = Api::all(client.clone());
 
-    let policy_reflector_reader = {
-        let policy_reflector_writer = Writer::<NodeAccessPolicy>::default();
-        let policy_reflector_reader = Arc::new(policy_reflector_writer.as_reader());
-
-        let policy_reflector = kube::runtime::reflector(
-            policy_reflector_writer,
-            watcher(policies_api.clone(), watcher::Config::default()),
-        );
-
-        tokio::spawn(async move {
-            policy_reflector
-                .for_each(|event| async {
-                    if let Err(e) = event {
-                        error!("Reflector error: {e:?}");
-                    }
-                })
-                .await;
-        });
-
-        policy_reflector_reader
-    };
-
-    // Recompute every policy's status when any namespace or node changes — a policy's
-    // matchedNamespaces/allowedNodeCount depend on the whole set, not one object.
+    // Recompute every policy's status when the namespace or node *set* moves — a policy's
+    // matchedNamespaces/allowedNodeCount depend on the whole set, not one object, which is why this
+    // is `reconcile_all_on` rather than a mapper with something to target. The filter is what is
+    // new: the previous trigger fired on every event of either kind, so every kubelet status repost
+    // recomputed every policy, each recomputation costing two cluster-wide `list_metadata` calls and
+    // a status patch. `selector_trigger::label_changes` fires only when a label those selectors read
+    // actually moves, or an object appears or disappears.
     Controller::new(policies_api, watcher::Config::default())
-        .watches(
-            namespaces_api,
-            watcher::Config::default(),
-            mappers::to_all_policies(Arc::clone(&policy_reflector_reader)),
-        )
-        .watches(
-            nodes_api,
-            watcher::Config::default(),
-            mappers::to_all_policies(Arc::clone(&policy_reflector_reader)),
-        )
+        .reconcile_all_on(selector_trigger::label_changes(namespace_metadata_api))
+        .reconcile_all_on(selector_trigger::label_changes(node_metadata_api))
         .run(
             reconcile,
             |_, _, _| Action::requeue(Duration::from_secs(15)),
