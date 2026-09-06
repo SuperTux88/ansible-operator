@@ -36,6 +36,26 @@ pub fn render_playbook(spec: &v1beta1::PlaybookPlanSpec) -> Result<String, super
 /// through a playbook — and a host whose connection did break is already out of the run by the time
 /// this play starts. `gather_facts: false` keeps it from being the one thing in the run that dials
 /// every host again.
+///
+/// **The marker task carries no tags, and adding `tags: [always]` is not the free fix it looks
+/// like.** `render_ansible_command` passes neither `--tags` nor `--skip-tags`, so nothing filters
+/// tasks today and this is inert either way — measured, the callback's output is byte-identical with
+/// and without the tag. If tag support is ever added, though, both spellings are wrong, in opposite
+/// directions:
+///
+/// - untagged, `--tags <anything>` drops the marker, so every host of every plan reports
+///   `Incomplete` and nothing is ever stamped converged again;
+/// - with `tags: [always]`, the marker survives `--tags config` and the hosts read `Succeeded` — so
+///   `status::apply_terminal_play_status` stamps `lastAppliedHash` for the *whole* playbook on a host
+///   that only ran the `config` tasks. That is precisely the defect the marker was introduced to
+///   stop: a partially applied host recorded as converged, permanently, and silently.
+///
+/// So the tag is not the decision to make first. Fold the tag selection into the execution hash, so
+/// that a `--tags config` run has a hash of its own and stamping it claims only what it applied;
+/// once that holds, `tags: [always]` here becomes correct and necessary. Until then the untagged
+/// marker is the safer of two wrong answers, because it fails loudly and never claims convergence
+/// it does not have. (Note `--skip-tags always` would defeat the tag anyway, so it was never
+/// absolute protection.)
 fn completion_marker_play() -> Value {
     let mut task = Mapping::new();
     task.insert(

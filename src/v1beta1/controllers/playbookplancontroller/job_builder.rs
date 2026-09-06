@@ -951,6 +951,11 @@ fn volume_name(prefix: &str, source: &str) -> String {
 /// Builds the `ansible-playbook` invocation. Connection details no longer appear here at all —
 /// each host's connection mechanism is expressed as inventory vars in the rendered
 /// `inventory.yml` instead, so there's no more per-strategy `-c`/`-l`/`--private-key` branching.
+///
+/// **Adding `--tags`/`--skip-tags` here is not a self-contained change.** Task filtering interacts
+/// with the completion marker the operator appends to every playbook, and getting it wrong either
+/// reports every host of every plan as `Incomplete` forever or stamps partially applied hosts as
+/// converged. Read `ansible::playbook_renderer::completion_marker_play` before starting.
 fn render_ansible_command(
     plan: &v1beta1::PlaybookPlan,
     extra_vars_filepaths: Vec<&String>,
