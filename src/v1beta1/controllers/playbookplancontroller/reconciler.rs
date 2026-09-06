@@ -514,6 +514,13 @@ async fn reconcile(
                 status,
                 surviving,
             } => {
+                let no_playbook_activity = playbook_produced_no_recap_activity(&status);
+                if no_playbook_activity {
+                    warn!(
+                        "PlaybookPlan {namespace}/{name}: run {} finished successfully but the playbook produced no recap activity; verify its host patterns or confirm it is intentionally empty",
+                        finished.mirror.job_name
+                    );
+                }
                 status::apply_terminal_play_status(
                     &finished.execution_hash,
                     &status,
@@ -537,6 +544,7 @@ async fn reconcile(
                 finished_active_run = Some(FinishedRun {
                     failure: classify_run_failure(&status),
                     verdict: phase_for_finished_run(&status),
+                    no_playbook_activity,
                     run: finished,
                 });
                 surviving_run = surviving;
@@ -618,6 +626,7 @@ async fn reconcile(
                 run: finished,
                 verdict,
                 failure,
+                no_playbook_activity,
                 record,
             } => {
                 resource_status.summary =
@@ -631,6 +640,7 @@ async fn reconcile(
                     run: finished,
                     verdict,
                     failure,
+                    no_playbook_activity,
                 });
                 // This *was* the run a drained result was still waiting behind, and it has now
                 // finished too, so the plan may be classified on its own terms after all.
@@ -1225,6 +1235,13 @@ async fn reconcile(
     ) {
         requeue_after = requeue_after.min(until_next_run);
     }
+
+    apply_no_playbook_activity_diagnostic(
+        &mut resource_status,
+        finished_active_run
+            .as_ref()
+            .is_some_and(|finished| finished.no_playbook_activity),
+    );
 
     finish_reconcile_tick(
         &context,
@@ -2541,6 +2558,10 @@ enum ActiveRunProgress {
         /// What that verdict says about the plan's attempt budget — classified here, where the
         /// run's terminal status is still in hand. See [`classify_run_failure`].
         failure: RunFailure,
+        /// The run completed every target but the user's playbook contributed no recap counters.
+        /// This is diagnostic rather than a different verdict because an intentionally taskless
+        /// playbook has the same observable result as a host-pattern typo.
+        no_playbook_activity: bool,
         record: TerminalRecord,
     },
     /// The cached plan status named a run that the apiserver's copy no longer has — an earlier tick
@@ -2814,12 +2835,20 @@ async fn advance_active_run(
             ))?;
     let verdict = phase_for_finished_run(finished_status);
     let failure = classify_run_failure(finished_status);
+    let no_playbook_activity = playbook_produced_no_recap_activity(finished_status);
+    if no_playbook_activity {
+        warn!(
+            "PlaybookPlan {namespace}/{name}: run {} finished successfully but the playbook produced no recap activity; verify its host patterns or confirm it is intentionally empty",
+            run.mirror.job_name
+        );
+    }
     status::apply_terminal_play_status(&run.execution_hash, finished_status, resource_status);
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
         verdict,
         failure,
+        no_playbook_activity,
         record: TerminalRecord::Present,
     })
 }
@@ -2893,6 +2922,7 @@ async fn finalize_lost_run(
         run: run.clone(),
         verdict,
         failure,
+        no_playbook_activity: false,
         record: TerminalRecord::Lost,
     })
 }
@@ -4227,6 +4257,7 @@ struct FinishedRun {
     /// phase.
     verdict: Phase,
     failure: RunFailure,
+    no_playbook_activity: bool,
 }
 
 /// What a finished run's result says about the plan's attempt budget — the one question the verdict
@@ -5159,6 +5190,32 @@ fn plan_summary(outdated_count: usize, total_count: usize, verdict: &Phase) -> S
     }
 
     summary
+}
+
+fn apply_no_playbook_activity_diagnostic(
+    status: &mut PlaybookPlanStatus,
+    no_playbook_activity: bool,
+) {
+    if !no_playbook_activity {
+        return;
+    }
+
+    let summary = status
+        .summary
+        .get_or_insert_with(|| "previous run finished".to_string());
+    summary.push_str(
+        " (playbook produced no recap activity; verify its host patterns or confirm it is intentionally empty)",
+    );
+}
+
+/// Whether the run reached the completion marker on every target but the user's playbook produced
+/// no recap counters at all. This commonly means a `hosts:` pattern matched nothing, but an
+/// intentionally taskless playbook has the same observable result, so callers must report it as a
+/// diagnostic rather than reinterpret the successful host verdicts.
+fn playbook_produced_no_recap_activity(status: &v1beta1::PlayStatus) -> bool {
+    status.phase == v1beta1::PlayPhase::Succeeded
+        && status.host_count != 0
+        && status.recap == v1beta1::PlayRecap::default()
 }
 
 /// The plan phase a finished run resolves to, in either mode.
@@ -7966,6 +8023,7 @@ mod tests {
                 },
                 verdict: Phase::Failed,
                 failure: RunFailure::Real,
+                no_playbook_activity: false,
             }),
             "spec.timeZone is invalid".into(),
         );
@@ -7991,6 +8049,7 @@ mod tests {
                 },
                 verdict: Phase::Failed,
                 failure: RunFailure::Real,
+                no_playbook_activity: false,
             }),
             "spec.timeZone is invalid".into(),
         );
@@ -8413,6 +8472,34 @@ spec:
             &mut never_run,
         );
         assert_eq!(never_run.phase, Phase::Delayed);
+    }
+
+    #[test]
+    fn a_no_activity_diagnostic_survives_the_empty_recurring_inventory_summary() {
+        let now = "2025-08-12T20:00:10Z".parse::<DateTime<Utc>>().unwrap();
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Succeeded,
+            summary: Some("3/3 up-to-date".into()),
+            ..Default::default()
+        };
+
+        update_idle_recurring_status(
+            &ExecutionMode::Recurring,
+            Some(&Schedule::parse("0 20 * * *").unwrap()),
+            false,
+            false,
+            now,
+            &mut status,
+        );
+        apply_no_playbook_activity_diagnostic(&mut status, true);
+
+        assert_eq!(status.phase, Phase::Succeeded);
+        assert_eq!(
+            status.summary.as_deref(),
+            Some(
+                "plan currently resolves to no hosts (playbook produced no recap activity; verify its host patterns or confirm it is intentionally empty)"
+            )
+        );
     }
 
     #[test]
@@ -10133,6 +10220,30 @@ spec:
         );
     }
 
+    #[test]
+    fn a_successful_run_with_no_user_recap_activity_is_detected() {
+        use v1beta1::{HostOutcome, PlayPhase};
+
+        let mut marker_only = finished_with(&[
+            ("node-a", HostOutcome::Succeeded),
+            ("node-b", HostOutcome::Succeeded),
+        ]);
+        marker_only.host_count = 2;
+        assert!(playbook_produced_no_recap_activity(&marker_only));
+
+        let mut active = marker_only.clone();
+        active.recap.ok = 1;
+        assert!(!playbook_produced_no_recap_activity(&active));
+
+        let failed =
+            terminal_play_status(PlayPhase::Failed, &[("node-a", HostOutcome::Failed)], &[]);
+        assert!(!playbook_produced_no_recap_activity(&failed));
+        assert!(!playbook_produced_no_recap_activity(&v1beta1::PlayStatus {
+            phase: PlayPhase::Succeeded,
+            ..Default::default()
+        }));
+    }
+
     /// Where the two exclusions part ways, deliberately. `HostsUnreachable` says the plan is waiting
     /// for a machine and there is nothing to fix; an untolerated taint, a failing image pull or a
     /// rejecting webhook is somebody to fix, and the Node it sits on is `Ready` and will stay
@@ -10975,6 +11086,37 @@ spec:
         assert_eq!(outcome.phase, Phase::Succeeded);
         assert_eq!(outcome.next_run, None);
         assert_eq!(outcome.summary, "3/3 up-to-date");
+        assert_eq!(outcome.requeue, None);
+    }
+
+    #[test]
+    fn a_no_activity_diagnostic_preserves_the_successful_terminal_outcome() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let outcome = decide_terminal(
+            &ExecutionMode::OneShot,
+            None,
+            &Phase::Succeeded,
+            false,
+            0,
+            2,
+            now,
+        );
+        let mut status = PlaybookPlanStatus {
+            phase: outcome.phase,
+            next_run: outcome.next_run,
+            summary: Some(outcome.summary),
+            ..Default::default()
+        };
+        apply_no_playbook_activity_diagnostic(&mut status, true);
+
+        assert_eq!(status.phase, Phase::Succeeded);
+        assert_eq!(status.next_run, None);
+        assert_eq!(
+            status.summary.as_deref(),
+            Some(
+                "2/2 up-to-date (playbook produced no recap activity; verify its host patterns or confirm it is intentionally empty)"
+            )
+        );
         assert_eq!(outcome.requeue, None);
     }
 
