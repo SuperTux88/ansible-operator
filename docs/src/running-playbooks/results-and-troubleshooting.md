@@ -142,8 +142,16 @@ kubectl get plays -n my-team
 # apply-web-config-a1b2c3-2   web-config      3  12        3       0            0  Succeeded   8m
 ```
 
-The columns mirror the Ansible **recap**, summed across every host the run targeted. `kubectl get
-plays -o wide` adds the less-common counters (`rescued`, `skipped`, `ignored`), the run number and
+The counter columns are the Ansible **recap** your own playbook would have printed, had you run it
+unmodified against the same fleet in the same condition. They are deliberately not a transcript of
+the pod's `PLAY RECAP`, which differs from it in two operator-introduced ways: the appended
+completion-marker task adds an `ok` to every host (subtracted back out here), and a host the run
+[excluded](#hosts-show-unreachable) is missing from it entirely (counted here as `unreachable`, since
+that is what your own run would have reported for a host nothing could dial). By the same standard a
+`hosts: localhost` play's counters are included, so the totals can exceed what the per-host rows
+account for — `Hosts` counts the machines targeted, the counters count what the playbook did.
+
+`kubectl get plays -o wide` adds the less-common counters (`rescued`, `skipped`, `ignored`), the run number and
 the `Try` column — which try of its execution that run was, in the sense
 [Retries](./scheduling-and-modes.md#retries) gives it. Each `Play`'s `.status` also carries the per-host recap and outcome plus `finishedAt`:
 
@@ -773,8 +781,13 @@ If *every* host of one run shows `Unknown` at once, check these causes first:
 Expected. Every run is launched with `--limit`, whose pattern list names `all` and `localhost` before
 excluding the hosts nothing could reach — so a `hosts: localhost` play runs exactly as it would
 without the operator, but localhost is not one of the plan's hosts. It gets no entry in
-`.status.hostsStatus`, no `lastAppliedHash`, and its counters are not part of `.status.recap`, which
-describes the hosts the plan targets. Its output is in the run's Job log.
+`.status.hostsStatus` and no `lastAppliedHash`, and nothing about it is ever recorded as converged or
+outdated. Its output is in the run's Job log.
+
+Its counters *are* in `.status.recap`, because that total reproduces your playbook rather than the
+plan's host list (see [Run history](#run-history)). So the recap can exceed what the per-host rows
+add up to, and the `Ok` column can exceed what `Hosts` would suggest. That is not an inconsistency:
+`Hosts` counts the machines the run targeted, the recap counts what the playbook did.
 
 Note that `localhost` here is Ansible's *implicit* localhost, which `all` never matches: a
 `hosts: all` play does not pick it up, and neither does the operator's completion-marker play, which
