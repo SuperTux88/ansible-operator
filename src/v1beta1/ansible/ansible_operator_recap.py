@@ -30,9 +30,13 @@ requirements:
 # state.terminated.message once it exits.
 TERMINATION_LOG_PATH = "/dev/termination-log"
 
-# The kubelet's MaxContainerTerminationMessageLength. It truncates to this and keeps the *leading*
-# bytes, so an oversized recap does not arrive partial — it arrives as invalid JSON, and the operator
-# can only report every host `Unknown` and spend the run's whole attempt budget re-producing it.
+# The kubelet's MaxContainerTerminationMessageLength. Two layers trim the message to it, from
+# opposite ends: the kubelet reads the file with `tail.ReadAtMost`, keeping the *last* 4096 bytes,
+# and the status manager then keeps the *first* MaxPodTerminationMessageLogLength/containers of what
+# survived (12 KiB split evenly, see job_builder.rs). Either way an oversized recap does not arrive
+# partial — it arrives as invalid JSON, and the operator can only report every host `Unknown` and
+# spend the run's whole attempt budget re-producing it. So the prefixes below are readable only
+# because nothing here ever writes past the cap, never because of where they sit.
 # Plain JSON runs out at roughly 60 hosts with cloud-provider node names, which is why the fallback
 # below exists rather than a warning about it.
 TERMINATION_MESSAGE_MAX_BYTES = 4096

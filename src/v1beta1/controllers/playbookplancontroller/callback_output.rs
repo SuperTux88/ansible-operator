@@ -99,6 +99,12 @@ const MAX_INFLATED_RECAP_BYTES: u64 = 1024 * 1024;
 /// JSON and every host reads `Unknown` on every retry until the attempt budget is gone. Compression
 /// is decided by the writer, per run, so a small fleet's message stays readable JSON; both forms are
 /// accepted here forever, since which one arrives depends on the fleet rather than on a version.
+///
+/// A prefix at the front is no truncation guard, in either direction: the message is trimmed at two
+/// layers and from opposite ends — the kubelet keeps the file's *last* 4096 bytes, and the status
+/// manager then keeps the *first* `12 KiB / containers` of what survived (see `job_builder`). A
+/// message that overflowed either arrives unparseable whichever end it lost, so the prefixes are
+/// legible only because the callback decides what fits before it writes.
 pub fn parse_callback_output(message: &str) -> Option<CallbackOutput> {
     let message = message.trim();
 
@@ -173,6 +179,22 @@ mod tests {
         // A tail-truncated object is no longer valid JSON.
         assert!(parse_callback_output(r#"{"host-1":[2,0,0,1,0,0"#).is_none());
         assert!(parse_callback_output("not json").is_none());
+    }
+
+    /// Nothing but a test keeps the two spellings together, exactly as
+    /// `playbook_renderer::the_marker_task_name_matches_the_callback_that_reads_it` does for the
+    /// marker task. A drift here is invisible until a fleet is large enough to take the compressed
+    /// path — so it would first be seen on the clusters least able to afford it, as every host of
+    /// every run reading `Unknown`, and never on a cluster small enough for anyone to have tried
+    /// the format by hand.
+    #[test]
+    fn the_compressed_prefix_matches_the_callback_that_writes_it() {
+        let callback = include_str!("../../ansible/ansible_operator_recap.py");
+
+        assert!(
+            callback.contains(&format!("COMPRESSED_PREFIX = \"{COMPRESSED_PREFIX}\"")),
+            "the callback must mark a compressed recap with the prefix this parser strips"
+        );
     }
 
     fn compressed(json: &str) -> String {
@@ -260,6 +282,26 @@ mod tests {
         assert!(parse_callback_output("!:900").is_none());
         assert_eq!(recap_overflowed_host_count("!:900"), Some(900));
         assert_eq!(recap_overflowed_host_count(" !:900\n"), Some(900));
+    }
+
+    /// The other half of the writer's contract, pinned for the same reason the compressed prefix
+    /// is: the marker is the only thing that turns the remaining ceiling into a diagnostic, and the
+    /// byte count is what the callback decides against. A drift in either leaves the operator
+    /// reporting a plain unreadable recap — silence — on precisely the fleets that need the reason.
+    #[test]
+    fn the_overflow_marker_and_the_cap_match_the_callback_that_applies_them() {
+        let callback = include_str!("../../ansible/ansible_operator_recap.py");
+
+        assert!(
+            callback.contains(&format!("OVERSIZE_PREFIX = \"{OVERSIZE_PREFIX}\"")),
+            "the callback must mark an overflowed recap with the prefix this reader looks for"
+        );
+        assert!(
+            callback.contains(&format!(
+                "TERMINATION_MESSAGE_MAX_BYTES = {TERMINATION_MESSAGE_MAX_BYTES}"
+            )),
+            "the diagnostic names a limit only the callback enforces, so it must be the same one"
+        );
     }
 
     #[test]

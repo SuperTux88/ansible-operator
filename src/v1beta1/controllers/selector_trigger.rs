@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 
 use futures::{Stream, StreamExt as _};
-use kube::runtime::watcher;
+use kube::runtime::{WatchStreamExt as _, watcher};
 use kube::{Api, Resource, ResourceExt as _};
 use serde::de::DeserializeOwned;
 use tracing::{debug, error};
@@ -44,6 +44,13 @@ where
     let kind = M::kind(&M::DynamicType::default()).to_string();
 
     watcher(api, watcher::Config::default())
+        // The delay `Controller::watches` used to supply. A bare `watcher` re-lists on the very
+        // next poll after an error, and the retry that made that acceptable belongs to the
+        // controller: `Controller::run` wraps its trigger streams in `StreamBackoff`, which only
+        // ever sees the errors that reach it as stream items. This one answers them here, so
+        // without this a persistent failure — a revoked `nodes` grant, an apiserver refusing the
+        // watch — would re-list as fast as the requests come back, and log a line each time.
+        .default_backoff()
         .scan(TrackedLabels::default(), move |tracked, event| {
             let tick = match event {
                 Ok(event) => tracked.absorb(&kind, event),
