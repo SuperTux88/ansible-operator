@@ -1607,7 +1607,7 @@ fn may_start_new_run(suspend: bool, has_work_to_start: bool, budget_available: b
 /// that silently stopped. A `Recurring` plan is going to re-apply the same playbook at the next
 /// tick anyway, so retrying inside the current one buys nothing by default and only makes a
 /// systematically failing playbook hammer its hosts.
-fn max_attempts(mode: &ExecutionMode, configured: Option<u32>) -> u32 {
+pub(super) fn max_attempts(mode: &ExecutionMode, configured: Option<u32>) -> u32 {
     configured
         .unwrap_or(match mode {
             ExecutionMode::OneShot => DEFAULT_ONESHOT_ATTEMPTS,
@@ -1631,7 +1631,19 @@ fn max_attempts(mode: &ExecutionMode, configured: Option<u32>) -> u32 {
 /// one schedule tick, and the gate that knows about ticks is the window gate below: a plan whose
 /// current tick is exhausted must still be free to start the next one, which is a run this gate
 /// cannot tell apart from a retry.
-fn attempt_budget_available(mode: &ExecutionMode, tries_spent: u32, max_attempts: u32) -> bool {
+///
+/// Shared with `mappers::plan_awaits_node`, for the same reason `status::may_need_another_run` is
+/// shared between the SSH-key mapper and its budget reset: a Node watch that woke plans this gate
+/// then turned away would be paying a full reconcile to learn what the cached object already said,
+/// and a second copy of the rule in the mapper is how the two would come to disagree. The
+/// `Recurring` arm is what makes it answerable there at all — the slot-scoped half of that mode's
+/// budget lives in the window gate, so nothing outside this function needs `retryCountSlot` to ask
+/// this question.
+pub(super) fn attempt_budget_available(
+    mode: &ExecutionMode,
+    tries_spent: u32,
+    max_attempts: u32,
+) -> bool {
     match mode {
         ExecutionMode::OneShot => tries_spent < max_attempts,
         ExecutionMode::Recurring => true,
