@@ -46,6 +46,12 @@ TERMINATION_MESSAGE_MAX_BYTES = 4096
 # `callback_output::parse_callback_output`.
 COMPRESSED_PREFIX = "z:"
 
+# Marks a recap that would not fit even compressed, followed by the host count. Compression moves the
+# ceiling into the hundreds of hosts but does not remove it, and the operator cannot tell a recap
+# that overflowed from one a crash never wrote — both are simply unparseable. Writing a marker that
+# *does* fit is what turns the remaining ceiling from silence into a diagnostic naming it.
+OVERSIZE_PREFIX = "!:"
+
 # The task the operator appends to every playbook, in a play of its own, to learn which hosts the
 # playbook did not stop short of. Ansible's counters cannot say: a host that never ran the rest of
 # an aborted play reports failed=0/unreachable=0, exactly like one that ran everything, and no
@@ -105,10 +111,19 @@ def encode_recap(recap):
     keeps the compressed path off the hot path for the common case. Above the cap, the recap is
     highly redundant — repeated node-name prefixes and long runs of zero counters — so deflate buys
     roughly 3-5x, which moves the ceiling from ~60 hosts into the hundreds.
+
+    Past even that, a marker naming the host count is written instead. It costs the same per-host
+    detail an unwritable message costs, but it is the difference between the operator reporting
+    "the recap could not be read" and reporting why — and the operator cannot work it out for
+    itself, since an overflowed message and a crashed one are equally unparseable.
     """
     payload = json.dumps(recap, separators=(",", ":"))
     if len(payload.encode("utf-8")) <= TERMINATION_MESSAGE_MAX_BYTES:
         return payload
 
     compressed = zlib.compress(payload.encode("utf-8"), 9)
-    return COMPRESSED_PREFIX + base64.b64encode(compressed).decode("ascii")
+    compressed = COMPRESSED_PREFIX + base64.b64encode(compressed).decode("ascii")
+    if len(compressed.encode("utf-8")) <= TERMINATION_MESSAGE_MAX_BYTES:
+        return compressed
+
+    return f"{OVERSIZE_PREFIX}{len(recap)}"
