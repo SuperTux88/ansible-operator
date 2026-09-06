@@ -249,6 +249,15 @@ the run excluded, each flagged with whether its Node was itself down — a host 
 captured at launch and persisted: the recap says nothing at all about a host the run excluded, and
 the Node may have recovered by the time the result is drained.
 
+That record and the run's `--limit` file are written from **one** variable in one tick, and must
+stay that way. A resumed run whose Job was never created re-reads its proxy pods, so the launch
+commit re-states the set rather than treating the replay as a pure no-op — the phase half stays
+idempotent, the data half does not. Left un-restated, the file and the record would describe
+different runs: a host excluded in one but not the other either loses its `unreachable` from the
+recap, or runs the playbook and is reported unreachable anyway, never stamped, and re-run forever.
+It is still "at launch", because a run whose Job exists is adopted rather than resumed, so the last
+write is always the one immediately before the Job that ran.
+
 An SSH key rotation is the one input that is *noticed* without being hashed. `StaticInventory`
 key material is deliberately outside the execution hash — that hash decides which hosts are outdated,
 so folding a key into it would re-apply the playbook to hosts that are already current. Instead

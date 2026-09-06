@@ -151,9 +151,14 @@ pub struct PlayStatus {
     /// `NotReached` when the Node was `Ready` and only its proxy pod failed. The two are recovered
     /// from in different places, and only the first is something a Node returning to `Ready` fixes.
     ///
-    /// Written once, at the launch commit, because neither half is knowable later: the recap says
-    /// nothing about a host it never processed, and the Node's own state cannot be re-read
-    /// afterwards because by then it may have recovered.
+    /// Written at the launch commit, because neither half is knowable later: the recap says nothing
+    /// about a host it never processed, and the Node's own state cannot be re-read afterwards
+    /// because by then it may have recovered.
+    ///
+    /// A run whose Job creation did not complete is resumed, re-reads its proxy pods and re-states
+    /// this from what it finds, so that the record and the `--limit` file the same tick renders
+    /// always describe one run. That still makes it "at launch": a run whose Job exists is adopted
+    /// rather than resumed, so the last write is always the one immediately before the Job that ran.
     #[serde(default)]
     pub unreachable_hosts: Vec<UnreachableHost>,
 }
