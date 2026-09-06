@@ -742,22 +742,44 @@ fn terminal_status(
         finished_at: Some(chrono::Local::now().fixed_offset()),
         host_count: host_count as u32,
         failed_host_count: (host_count - succeeded) as u32,
-        recap: sum_recap(&host_results),
+        recap: sum_recap(parsed, &unreachable_hosts),
         hosts: host_results,
         unreachable_hosts,
     }
 }
 
-/// The run's recap: the seven counters summed across its hosts.
+/// The run's recap: the seven counters the user's **own** playbook would have printed, running
+/// unmodified against the same fleet in the same condition.
 ///
-/// Summed over the per-host results rather than straight off the recap so the run's counters and
-/// the per-host ones can never disagree — the same reason [`outcome_from_stats`] is the single
-/// source of what a success is. That is also what puts an excluded host's `unreachable` into the
-/// total: no recap mentions it, so summing the recap alone would report the run as having reached
-/// every host it targeted.
-fn sum_recap(hosts: &BTreeMap<String, PlayHostResult>) -> PlayRecap {
+/// That is the standard, and it is deliberately neither of the two things closer to hand. It is not
+/// the pod's `PLAY RECAP`, which counts the *operator's* playbook — the appended completion marker
+/// inflates every host's `ok`, and the hosts the run excluded are missing entirely. Nor is it a sum
+/// over [`host_results`], which is keyed by the run's own host list and so silently drops every host
+/// Ansible processed that is not an inventory host of the plan: the implicit localhost of a
+/// `hosts: localhost` play, an `add_host` target.
+///
+/// So it is summed from two sources, one per kind of host:
+///
+/// - the parsed recap, which is already the author's own counters — the callback subtracts the
+///   marker's `ok` per host, gated on the same per-host flag that records it, so a host that never
+///   ran the marker has nothing subtracted;
+/// - one `unreachable` per excluded host, which no recap can supply: the run passed
+///   `--limit '!<host>'`, so Ansible never processed it and never counted it. Without this the total
+///   would claim the run reached every host it targeted.
+///
+/// The two cannot overlap, which is what makes adding them safe: `--limit` keeps an excluded host
+/// out of every play, so it is never in `processed` — not even if the playbook `add_host`s a host of
+/// that name, since the limit still applies to it. A run that excluded *everything* has no recap at
+/// all and falls out as `0 + N`, which is again what the user's own playbook would print with every
+/// host down.
+///
+/// The consequence is that the total can exceed what the rows in `.status.hosts` account for, and
+/// that is correct rather than an inconsistency: `hostCount` counts the hosts the run targeted while
+/// the recap counts what the playbook did, and a `localhost` play has made those differ for as long
+/// as playbooks have had one.
+fn sum_recap(parsed: Option<&CallbackOutput>, unreachable_hosts: &[UnreachableHost]) -> PlayRecap {
     let mut total = PlayRecap::default();
-    for s in hosts.values().map(|result| &result.recap) {
+    for s in parsed.iter().flat_map(|output| output.processed.values()) {
         total.ok += s.ok;
         total.changed += s.changed;
         total.unreachable += s.unreachable;
@@ -766,6 +788,7 @@ fn sum_recap(hosts: &BTreeMap<String, PlayHostResult>) -> PlayRecap {
         total.rescued += s.rescued;
         total.ignored += s.ignored;
     }
+    total.unreachable += unreachable_hosts.len() as u32;
     total
 }
 
@@ -832,6 +855,15 @@ fn host_results(
 /// Trusting the counters there is what recorded a partially applied host as converged, permanently.
 /// Completion is only consulted on that branch — a host that did fail is `Failed` whether or not
 /// the run got as far as asking, and its failure is the actionable thing either way.
+///
+/// **A host that is in the recap but not in the plan's inventory would classify `Incomplete` here,
+/// and two things have to keep holding for that never to happen.** The implicit localhost of a
+/// `hosts: localhost` play is in the recap with `completed = false`, because the marker play targets
+/// `all` and `all` never matches an implicit localhost. It reaches no verdict only because
+/// [`host_results`] iterates the *run's* host list, so no outcome is computed for it at all. Widen
+/// either side — a marker play that also took `localhost`, or a `host_results` keyed off the recap —
+/// and a plain `localhost` play starts reporting a host as `Incomplete`, which is the operator's way
+/// of saying nothing converged.
 fn outcome_from_stats(stats: &HostStats) -> HostOutcome {
     if !stats.is_failure() {
         if stats.completed {
@@ -1153,11 +1185,11 @@ mod tests {
         play
     }
 
-    /// The run's counters are the per-host ones added up — including the excluded hosts', which no
-    /// recap mentions. A run total that disagreed with the rows under it would be unreadable.
+    /// The run's counters are what Ansible reported, plus one `unreachable` per host the run
+    /// excluded — which no recap mentions, so summing the recap alone would claim the run reached
+    /// every host it targeted.
     #[test]
-    fn sum_recap_totals_across_hosts_and_is_zero_without_a_recap() {
-        let hosts = vec!["a".to_string(), "b".to_string(), "excluded".to_string()];
+    fn sum_recap_totals_the_recap_plus_the_exclusions() {
         let out = output(&[
             (
                 "a",
@@ -1177,20 +1209,87 @@ mod tests {
             ),
         ]);
 
-        let recap = sum_recap(&host_results(
-            Some(&out),
-            &hosts,
-            &[unreachable_host("excluded", true)],
-        ));
+        let recap = sum_recap(Some(&out), &[unreachable_host("excluded", true)]);
         assert_eq!(recap.ok, 5);
         assert_eq!(recap.changed, 1);
         assert_eq!(recap.failed, 1);
         assert_eq!(recap.unreachable, 1);
 
+        assert_eq!(sum_recap(None, &[]), PlayRecap::default());
+
+        // A run that excluded every host it targeted has no recap at all, and its total is exactly
+        // what the user's own playbook would have printed with every host down.
         assert_eq!(
-            sum_recap(&host_results(None, &hosts, &[])),
-            PlayRecap::default()
+            sum_recap(
+                None,
+                &[unreachable_host("a", true), unreachable_host("b", false)]
+            ),
+            PlayRecap {
+                unreachable: 2,
+                ..PlayRecap::default()
+            }
         );
+    }
+
+    /// The run's counters reproduce the user's **own** playbook, not the operator's rewrite of it
+    /// and not the rows in `.status.hosts`. Measured against a real `ansible-core`: a 1-task
+    /// `hosts: localhost` play then a 3-task `hosts: workers` play over `node-a`/`node-b`/`node-c`
+    /// with `node-c` down prints `ok=7, unreachable=1` when the author runs it themselves.
+    ///
+    /// The operator's run of the same playbook produces the wire message below — `node-c` excluded
+    /// so absent, the appended marker already subtracted per host, and `localhost` present because
+    /// `hosts: localhost` plays run (`workspace::render_limit` permits the implicit localhost). Two
+    /// wrong answers are close to hand and this pins against both: the pod's own `PLAY RECAP` says
+    /// `ok=9`, counting the marker task the operator appended, and summing the per-host rows says
+    /// `ok=6`, dropping `localhost` because it is not an inventory host of the plan.
+    #[test]
+    fn the_run_total_reproduces_the_users_own_playbook() {
+        let wire = output(&[
+            (
+                "localhost",
+                HostStats {
+                    ok: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "node-a",
+                HostStats {
+                    ok: 3,
+                    completed: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "node-b",
+                HostStats {
+                    ok: 3,
+                    completed: true,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let recap = sum_recap(Some(&wire), &[unreachable_host("node-c", true)]);
+
+        assert_eq!(recap.ok, 7);
+        assert_eq!(recap.unreachable, 1);
+
+        // And the rows are unaffected: the plan's three hosts, localhost among none of them.
+        let rows = host_results(
+            Some(&wire),
+            &[
+                "node-a".to_string(),
+                "node-b".to_string(),
+                "node-c".to_string(),
+            ],
+            &[unreachable_host("node-c", true)],
+        );
+
+        assert_eq!(rows.len(), 3);
+        assert!(!rows.contains_key("localhost"));
+        assert_eq!(rows["node-a"].outcome, HostOutcome::Succeeded);
+        assert_eq!(rows["node-c"].outcome, HostOutcome::Unreachable);
     }
 
     /// Where a host's verdict is decided. The interesting line is between `Failed` and
