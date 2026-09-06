@@ -73,9 +73,8 @@ src/v1beta1/
   controllers/
     playbookplancontroller/          the big one — see below
     clusterinventorycontroller/      resolves Node → hosts, watches Nodes, writes ClusterInventoryStatus
-    clusterinventorycontroller/mappers.rs   maps Node changes to ClusterInventory reconciles
     nodeaccesspolicycontroller/      writes NodeAccessPolicyStatus (matched namespaces / allowed nodes) for observability; watches ns + nodes
-    nodeaccesspolicycontroller/mappers.rs   maps Namespace/Node changes to all policy reconciles
+    selector_trigger.rs              label_changes: the set-valued controllers' watch trigger — ticks only on a label change, an appearance or a disappearance; must stay in lockstep with what nodeselector.rs reads
     ansible_inventory.rs             ResolvedInventoryGroup (ManagedSsh | Ssh) + ResolvedHosts; AnsibleInventory trait (get_hosts); distinct_hosts/_count (every host-population count, in both controllers)
     nodeselector.rs                  node_matches / selector_matches / selector_matches_fail_closed (INV-1)
     reconcile_error.rs               shared ReconcileError (thiserror)
@@ -388,9 +387,16 @@ watch would 403). The `ClusterInventory`/`StaticInventory` watches
 watch itself, since CRD reads are (R1). They exist because `resolve_inventory` reads both kinds
 **live on every tick**, so their contents were always fresh whenever a reconcile happened — nothing
 made one happen, and an inventory that gained a host reached its plans only on their next requeue.
-`clusterinventorycontroller` has the Node → ClusterInventory equivalent
-(`mappers::node_to_inventories`); `nodeaccesspolicycontroller` recomputes policy status on any
-namespace/node change.
+`clusterinventorycontroller` and `nodeaccesspolicycontroller` are the *set-valued* controllers: their
+whole status is a function of every Node (and, for policies, every Namespace), so there is no
+per-object targeting to do and both recompute everything on every trigger. What is narrow is the
+**trigger**, `selector_trigger::label_changes` + `Controller::reconcile_all_on`, which ticks only
+when a label moves or an object appears or disappears. A mapper cannot do this job: `watches`
+flattens `watcher::Event` through `touched_objects()` before the mapper runs, and a deleted Node
+still carries the labels it matched with, so a content-only predicate would miss every deletion and
+strand a departed machine in `resolvedHosts` until the hourly requeue. The filter hashes **labels**
+because labels are exactly what `nodeselector` reads — a selector term over taints, annotations or
+spec fields would be invisible to it, so the two must move together.
 
 The plan controller also watches **Nodes**, through one reflector serving two jobs: the mapper
 (`mappers::node_to_playbookplans`) and the readiness lookups the reconcile does
