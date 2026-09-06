@@ -806,8 +806,8 @@ fn sum_recap(parsed: Option<&CallbackOutput>, unreachable_hosts: &[UnreachableHo
 ///
 /// A host the run excluded is the one outcome not read off the recap. It is absent from it — the
 /// run passed `--limit '!<host>'` precisely so nothing would be attempted against it — so what it
-/// gets is what the operator established before the run began, rather than something inferred from
-/// an address chosen to fail.
+/// gets is what the operator had already established about it at the launch commit, carried forward
+/// on the run's own record.
 ///
 /// **Which** exclusion it was decides the outcome, because the two are recovered from in different
 /// places and only one of them can be recovered from at all by a Node coming back:
@@ -1323,10 +1323,14 @@ mod tests {
         assert_eq!(rows["node-c"].outcome, HostOutcome::Unreachable);
     }
 
-    /// Where a host's verdict is decided. The interesting line is between `Failed` and
-    /// `Unreachable`: they are fixed in different places — a broken task versus a host nothing
-    /// could connect to — and a managed-ssh Node whose proxy never came up is deliberately rendered
-    /// at an unroutable address to land in the second.
+    /// Where a host's verdict is read off the counters Ansible reported for it. The interesting line
+    /// is between `Failed` and `Unreachable`: they are fixed in different places — a broken task
+    /// versus a host that answered nothing — so reporting a dead machine as `Failed` would send an
+    /// operator looking for a task that never ran.
+    ///
+    /// Only a host the run actually attempted gets here. One the run *excluded* is classified in
+    /// `host_results` from the record the run wrote at its launch commit, so no verdict is ever
+    /// inferred from counters produced by dialling an address picked to fail.
     #[test]
     fn a_host_that_was_never_connected_to_is_unreachable_rather_than_failed() {
         // Ran to the end, so the only thing left to classify is the counters.
