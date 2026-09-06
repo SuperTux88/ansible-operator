@@ -2622,8 +2622,9 @@ fn mirrors_run(status: &PlaybookPlanStatus, run: &RecordedRun) -> bool {
 /// A run spends its attempt while it is prepared so recovery cannot offer the same budget twice
 /// while it waits for locks or proxy pods. If it is abandoned before its Job exists, that attempt
 /// was never made and is returned here. The revision, attempt and mirror guards make replay a no-op
-/// and prevent an old aborted record from returning a newer run's budget. Returning a retry restores
-/// the preceding `Failed` verdict, which is what keeps the remaining budget available; a first try
+/// and prevent an old aborted record from returning a newer run's budget. Returning a later retry
+/// preserves a preceding failure verdict; if the in-flight lifecycle had already replaced it, the
+/// fallback is `Failed`. Either failure verdict keeps the remaining budget available. A first try
 /// has no preceding verdict and returns to `Pending`.
 fn apply_abandoned_run_status(status: &mut PlaybookPlanStatus, run: &RecordedRun) {
     if !mirrors_run(status, run) {
@@ -2652,7 +2653,11 @@ fn apply_abandoned_run_status(status: &mut PlaybookPlanStatus, run: &RecordedRun
     }
     if refund_due || already_refunded {
         status.phase = if remaining_attempts > 0 {
-            Phase::Failed
+            if is_failure_verdict(&status.phase) {
+                status.phase.clone()
+            } else {
+                Phase::Failed
+            }
         } else {
             Phase::Pending
         };
@@ -7094,6 +7099,37 @@ mod tests {
         assert_eq!(first_status.retry_count, 0);
         assert_eq!(first_status.retry_count_slot, None);
         assert_eq!(first_status.phase, Phase::Pending);
+    }
+
+    #[test]
+    fn abandoning_a_later_attempt_preserves_the_hosts_unreachable_verdict() {
+        let run = RecordedRun {
+            execution_hash: ExecutionHash::from_hex("1").unwrap(),
+            mirror: ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-abandoned".into(),
+                job_name: "apply-web-abandoned".into(),
+                play_uid: "abandoned".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 8,
+                attempt: 2,
+                triggered_slot: None,
+            },
+        };
+        let mut status = PlaybookPlanStatus {
+            current_hash: "1".into(),
+            // The run record reached `Aborted`, but its active-run mirror never landed. The plan
+            // therefore still carries the preceding verdict and already-refunded attempt count.
+            retry_count: 1,
+            phase: Phase::HostsUnreachable,
+            ..Default::default()
+        };
+
+        apply_abandoned_run_status(&mut status, &run);
+
+        assert_eq!(status.retry_count, 1);
+        assert_eq!(status.phase, Phase::HostsUnreachable);
+        assert!(status.active_run.is_none());
     }
 
     /// The finalizer edits must be surgical: the list they rewrite also holds Kubernetes' own
