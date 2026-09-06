@@ -821,15 +821,24 @@ fn host_results(
 /// Success is asked as `is_failure`, not re-derived from the counters, so that this and the run's
 /// verdict — which counts the hosts that came out `Succeeded` — can never disagree about what a
 /// success is. Only the failing half is split further: a host with no failed tasks that Ansible
-/// could not connect to at all is `Unreachable`, which is what a managed-ssh Node whose proxy pod
-/// never came up produces, since it is rendered at an unroutable address for exactly that purpose.
-/// Reporting that as `Failed` would send an operator looking for a broken task.
+/// could not connect to at all is `Unreachable`. Reporting that as `Failed` would send an operator
+/// looking for a broken task.
 ///
 /// A host carrying both counters is `Failed`: tasks did run and did fail before the connection went,
 /// and the playbook failure is the more actionable of the two.
+///
+/// Clean counters are the case the counters get wrong on their own, and where completion decides:
+/// a host the playbook stopped short of reports exactly what a host that ran every task reports.
+/// Trusting the counters there is what recorded a partially applied host as converged, permanently.
+/// Completion is only consulted on that branch — a host that did fail is `Failed` whether or not
+/// the run got as far as asking, and its failure is the actionable thing either way.
 fn outcome_from_stats(stats: &HostStats) -> HostOutcome {
     if !stats.is_failure() {
-        HostOutcome::Succeeded
+        if stats.completed {
+            HostOutcome::Succeeded
+        } else {
+            HostOutcome::Incomplete
+        }
     } else if stats.failed == 0 {
         HostOutcome::Unreachable
     } else {
@@ -1190,10 +1199,12 @@ mod tests {
     /// at an unroutable address to land in the second.
     #[test]
     fn a_host_that_was_never_connected_to_is_unreachable_rather_than_failed() {
+        // Ran to the end, so the only thing left to classify is the counters.
         let stats = |failed: u32, unreachable: u32| HostStats {
             ok: 1,
             failed,
             unreachable,
+            completed: true,
             ..Default::default()
         };
 
@@ -1228,6 +1239,114 @@ mod tests {
         assert_eq!(results["unreachable"].recap.unreachable, 1);
     }
 
+    /// The defect the completion marker exists for. A playbook that stops at the first failure —
+    /// `any_errors_fatal`, a failed `serial` batch, `max_fail_percentage` — leaves the surviving
+    /// hosts having run *part* of it, and their counters are byte-for-byte what a host that ran all
+    /// of it reports: `failed=0, unreachable=0`. Reading them as `Succeeded` stamped a partially
+    /// applied host as converged and dropped it from every future run.
+    #[test]
+    fn a_host_the_playbook_stopped_short_of_is_not_a_success() {
+        let cut_short = HostStats {
+            ok: 1,
+            skipped: 1,
+            completed: false,
+            ..Default::default()
+        };
+        let ran_it_all = HostStats {
+            ok: 3,
+            completed: true,
+            ..Default::default()
+        };
+
+        // Identical on every counter that exists — only completion separates them.
+        assert!(!cut_short.is_failure());
+        assert!(!ran_it_all.is_failure());
+        assert_eq!(outcome_from_stats(&cut_short), HostOutcome::Incomplete);
+        assert_eq!(outcome_from_stats(&ran_it_all), HostOutcome::Succeeded);
+
+        // A host that did fail is `Failed` whether or not the run got as far as asking: its own
+        // failure is the actionable thing, and it is what stopped the others.
+        let failed = HostStats {
+            ok: 1,
+            failed: 1,
+            completed: false,
+            ..Default::default()
+        };
+        assert_eq!(outcome_from_stats(&failed), HostOutcome::Failed);
+    }
+
+    /// The whole aborted run, end to end: one host fails, the play stops, and the two healthy hosts
+    /// must not come out of it recorded as having received the playbook.
+    #[test]
+    fn an_aborted_play_leaves_its_survivors_incomplete_and_the_run_failed() {
+        let hosts = vec![
+            "good-a".to_string(),
+            "good-b".to_string(),
+            "bad-c".to_string(),
+        ];
+        let cut_short = HostStats {
+            ok: 1,
+            skipped: 1,
+            ..Default::default()
+        };
+        let recap = output(&[
+            ("good-a", cut_short.clone()),
+            ("good-b", cut_short),
+            (
+                "bad-c",
+                HostStats {
+                    ok: 1,
+                    failed: 1,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let status = terminal_status("job", &hosts, Some(&recap), Vec::new());
+
+        assert_eq!(status.phase, PlayPhase::Failed);
+        assert_eq!(status.hosts["good-a"].outcome, HostOutcome::Incomplete);
+        assert_eq!(status.hosts["good-b"].outcome, HostOutcome::Incomplete);
+        assert_eq!(status.hosts["bad-c"].outcome, HostOutcome::Failed);
+        // None of the three is a success, so none of them is recorded as converged.
+        assert_eq!(status.failed_host_count, 3);
+    }
+
+    /// A host in the run's inventory that no play in the playbook targets. It reaches the marker —
+    /// which targets `all` — with no counters at all, and that is the honest answer: applying this
+    /// playbook to it is vacuous, so it is up to date. Before the marker it was absent from the
+    /// recap entirely, which read as `NotReached`, failed the run, and left the plan retrying a
+    /// host no run would ever touch until its attempt budget ran out.
+    #[test]
+    fn a_host_no_play_targets_is_converged_rather_than_never_reached() {
+        let hosts = vec!["web-1".to_string(), "db-1".to_string()];
+        let recap = output(&[
+            (
+                "web-1",
+                HostStats {
+                    ok: 2,
+                    completed: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "db-1",
+                HostStats {
+                    completed: true,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let status = terminal_status("job", &hosts, Some(&recap), Vec::new());
+
+        assert_eq!(status.phase, PlayPhase::Succeeded);
+        assert_eq!(status.hosts["db-1"].outcome, HostOutcome::Succeeded);
+        // Its counters stay empty: nothing ran on it, and the marker is subtracted back out by the
+        // callback, so the run's totals describe the playbook rather than the operator.
+        assert_eq!(status.hosts["db-1"].recap, PlayRecap::default());
+    }
+
     /// An `Unreachable` host is not a success, so it must count against the run exactly as a failed
     /// one does — the verdict asks `is_failure`, and splitting the outcome finer must not have
     /// quietly moved that line.
@@ -1239,6 +1358,7 @@ mod tests {
                 "a",
                 HostStats {
                     ok: 1,
+                    completed: true,
                     ..Default::default()
                 },
             ),
@@ -1268,6 +1388,7 @@ mod tests {
                 "a",
                 HostStats {
                     ok: 1,
+                    completed: true,
                     ..Default::default()
                 },
             ),
@@ -1275,6 +1396,7 @@ mod tests {
                 "b",
                 HostStats {
                     ok: 1,
+                    completed: true,
                     ..Default::default()
                 },
             ),
@@ -1289,6 +1411,7 @@ mod tests {
                 "a",
                 HostStats {
                     ok: 1,
+                    completed: true,
                     ..Default::default()
                 },
             ),
@@ -1310,6 +1433,7 @@ mod tests {
             "a",
             HostStats {
                 ok: 1,
+                completed: true,
                 ..Default::default()
             },
         )]);
@@ -1335,6 +1459,7 @@ mod tests {
                 "a",
                 HostStats {
                     ok: 1,
+                    completed: true,
                     ..Default::default()
                 },
             ),
@@ -1342,6 +1467,7 @@ mod tests {
                 "b",
                 HostStats {
                     ok: 1,
+                    completed: true,
                     ..Default::default()
                 },
             ),
@@ -1452,6 +1578,7 @@ mod tests {
                 "node-a",
                 HostStats {
                     ok: 1,
+                    completed: true,
                     ..Default::default()
                 },
             )])),
@@ -1521,6 +1648,7 @@ mod tests {
                 "ran",
                 HostStats {
                     ok: 1,
+                    completed: true,
                     ..Default::default()
                 },
             )])),

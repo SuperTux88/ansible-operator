@@ -196,6 +196,7 @@ spec:
                       - Failed
                       - Unreachable
                       - NotReached
+                      - Incomplete
                       type: string
                     recap:
                       description: |-

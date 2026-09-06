@@ -226,6 +226,19 @@ Two gates, deliberately: `attempt_budget_available` at `may_start_new_run` is th
 answered by the schedule-window gate, which is the only one that can tell a retry of the current
 tick from the first run of the next.
 
+The operator appends a `__ansible_operator_completion_marker` play to every rendered playbook
+(`ansible::playbook_renderer`), and the recap callback reports per host whether it produced a result
+for that play's single task. This is the only way to tell "ran the whole playbook" from "was fine up
+to the point the play stopped": under an `any_errors_fatal`/`serial`/`max_fail_percentage` abort a
+surviving host reports `failed=0, unreachable=0`, identical to one that ran every task, and no
+callback hook announces the abort. An abort ends the whole playbook run so nobody reaches the marker,
+while a host that failed or went unreachable is dropped from later plays and so does not reach it
+either — which makes the answer per host. `HostOutcome::Incomplete` is that case, and it is
+deliberately not `Succeeded`, so `apply_terminal_play_status` does not stamp `lastAppliedHash` on a
+host that received part of a playbook. The task name is duplicated in `playbook_renderer.rs` and
+`ansible_operator_recap.py`; a test pins them together, because a drift there reads as "nothing
+converged" on every plan at once.
+
 A `OneShot` run gets its budget back when it made all the progress that was available to it, which
 is a `Succeeded` verdict *or* a failure confined to Nodes the run recorded as not `Ready` at its
 launch commit (`classify_run_failure`, `PlayStatus::unreachable_hosts`). That record holds every host

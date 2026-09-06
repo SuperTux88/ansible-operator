@@ -147,7 +147,9 @@ pub fn node_to_playbookplans(
 /// none of which can change the outcome. `Failed` means Ansible connected and a task failed; a Node
 /// reporting `Ready` does not fix that. `NotReached` means an earlier host in the `serial` batch
 /// stopped the play, so it is that host's recovery that matters and that host's own heartbeats that
-/// carry it.
+/// carry it. `Incomplete` is the same shape of answer: this host ran and did not fail, and what cut
+/// it short was some *other* host's failure — so its own Node returning changes nothing, and if a
+/// Node recovery is what unblocks the run, it is the failing host's heartbeats that say so.
 ///
 /// Everything else stays in: a host with no entry, one left `Unreachable` by a Node that was down,
 /// one whose recap was unreadable (`Unknown` — nothing proves it was reached), and one that
@@ -173,7 +175,7 @@ fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &str) -> bool {
                 host.last_applied_hash != status.current_hash
                     && !matches!(
                         host.last_outcome,
-                        HostOutcome::Failed | HostOutcome::NotReached
+                        HostOutcome::Failed | HostOutcome::NotReached | HostOutcome::Incomplete
                     )
             })
 }
@@ -492,6 +494,17 @@ mod tests {
     #[test]
     fn a_plan_does_not_await_a_host_an_earlier_batch_stopped_the_play_for() {
         let plan = plan_awaiting("node-a", host("", HostOutcome::NotReached));
+
+        assert!(!plan_awaits_node(&plan, "node-a"));
+    }
+
+    /// An `Incomplete` host ran and did not fail — the playbook stopped for it because a *different*
+    /// host failed. Its own Node is healthy and was healthy, so its heartbeats have nothing to say
+    /// about the run, and waking the plan on them would be a per-node reconcile every ~5 minutes for
+    /// as long as the playbook stays broken.
+    #[test]
+    fn a_plan_does_not_await_a_host_another_hosts_failure_cut_short() {
+        let plan = plan_awaiting("node-a", host("", HostOutcome::Incomplete));
 
         assert!(!plan_awaits_node(&plan, "node-a"));
     }

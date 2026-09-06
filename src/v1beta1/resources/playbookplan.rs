@@ -491,6 +491,15 @@ pub enum HostOutcome {
     /// The host was in scope for this run but Ansible never reached it (e.g. an earlier host in its
     /// `serial` batch stopped the play).
     NotReached,
+    /// Ansible ran tasks on the host, none of them failed, and the playbook still stopped before
+    /// reaching the end for it — an `any_errors_fatal` abort, a failed `serial` batch, a
+    /// `max_fail_percentage` rollout halt. Some other host is what failed.
+    ///
+    /// This host received *part* of the playbook. Its counters look exactly like a host that
+    /// received all of it — that is the whole reason the outcome exists — so it is deliberately not
+    /// `Succeeded`, and the run does not record the playbook as applied to it. Fix whatever failed
+    /// elsewhere in the run; this host is re-applied on the next one.
+    Incomplete,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]

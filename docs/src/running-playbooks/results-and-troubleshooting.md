@@ -105,10 +105,11 @@ prevents an old Job and a new revision from targeting the same host concurrently
 
 | Outcome | Meaning |
 |---|---|
-| `Succeeded` | Ansible applied the playbook to this host successfully. `lastAppliedHash` is bumped to the current hash. |
+| `Succeeded` | Ansible applied the playbook to this host successfully, **and the playbook ran to the end for it**. `lastAppliedHash` is bumped to the current hash. |
 | `Failed` | Ansible connected to the host and a task failed on it. A host whose connection dropped part-way through also reads `Failed`: something ran and failed before it went. |
 | `Unreachable` | Ansible could not connect to the host at all, so no task ran on it — a `NotReady` Node whose proxy never came up, a `StaticInventory` host that is down, or one refusing the key. Fixed on the host or the Node, not in the playbook. See [NotReady nodes](./cluster-nodes.md#notready-nodes). |
 | `NotReached` | The host was in scope but Ansible never got to it — e.g. an earlier host in its `serial` batch stopped the play. Not an error *on this host*. |
+| `Incomplete` | Tasks ran on this host and none of them failed, but the playbook stopped before finishing for it, because a **different** host failed — `any_errors_fatal`, a failed `serial` batch, `max_fail_percentage`. It received *part* of the playbook, so it is not recorded as converged and is re-applied on the next run. See [Hosts show `Incomplete`](#hosts-show-incomplete). |
 | `Unknown` | The operator could not read a recap for this host — its **own instrumentation** failed, not Ansible. Distinct from `NotReached`. Worth investigating (see below). |
 
 Each host also records `lastAppliedHash` (the hash it last *succeeded* on — this is what drift
@@ -708,6 +709,28 @@ than starting another run while they stay down — so a plan in this state is wa
 stuck. That relief is specific to cluster Nodes the operator saw go down: an unreachable
 `StaticInventory` host, or a Node that was `Ready` when the run started, is a failure like any other
 and does spend its attempts.
+
+### Hosts show `Incomplete`
+
+Nothing is wrong with this host. Some **other** host in the same run failed, and the playbook is
+configured to stop the whole play when one does — `any_errors_fatal: true`, a `serial` batch that
+failed outright, or a `max_fail_percentage` threshold. Ansible stopped at that point, so this host
+ran the tasks up to it and never ran the rest.
+
+Fix whatever failed elsewhere in the run; every `Incomplete` host is re-applied on the next one.
+`kubectl get play <name> -o jsonpath='{.status.hosts}'` shows which host failed.
+
+Its recap counters look exactly like a fully applied host's — `failed=0, unreachable=0` — which is
+why the operator does not read them on their own. It appends a `__ansible_operator_completion_marker`
+play to every playbook, whose one task runs for each host that reached the end. An abort stops the
+whole playbook run, so nobody reaches the marker; a host that failed or went unreachable is dropped
+from later plays, so it does not either. That play is why run logs show one more `PLAY` than the
+playbook has, and its task is subtracted back out of every count the operator reports, so
+`.status.recap` describes the playbook rather than the operator.
+
+Before this existed, such a host was recorded `Succeeded` and stamped converged — permanently, since
+`OneShot` then skips a converged host on every later run. If a plan looks converged on a host that
+demonstrably never received the whole playbook, that is what happened.
 
 ### Hosts show `Unknown`
 

@@ -3,12 +3,12 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 /// Per-host outcome counters, deserialized from the compact fixed-order array the callback plugin
-/// writes: `[ok, changed, unreachable, failed, skipped, rescued, ignored]`. Only `failed`/
-/// `unreachable` are consulted today (via `is_failure`); the rest mirror ansible's stats and are
-/// groundwork for future per-task progression info.
+/// writes: `[ok, changed, unreachable, failed, skipped, rescued, ignored, completed]`. Only
+/// `failed`/`unreachable` (via `is_failure`) and `completed` are consulted today; the rest mirror
+/// ansible's stats and are groundwork for future per-task progression info.
 #[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone, Default)]
-#[serde(from = "[u32; 7]")]
+#[serde(from = "[u32; 8]")]
 pub struct HostStats {
     pub ok: u32,
     pub changed: u32,
@@ -17,13 +17,29 @@ pub struct HostStats {
     pub skipped: u32,
     pub rescued: u32,
     pub ignored: u32,
+    /// The host produced a result for the completion marker the operator appends to every playbook,
+    /// so the playbook did not stop short of it. Not a counter: it is the one thing ansible's
+    /// counters cannot express, since a host cut short by an abort reports exactly what a host that
+    /// ran everything reports.
+    pub completed: bool,
 }
 
-impl From<[u32; 7]> for HostStats {
+impl From<[u32; 8]> for HostStats {
     /// Fixed wire order — must stay in lockstep with `ansible_operator_recap.py`. Changing it is
     /// a *shape*-compatible edit that would silently misread an in-flight message, so don't
     /// reorder: only ever add/remove positions (which changes the length and fails to parse).
-    fn from([ok, changed, unreachable, failed, skipped, rescued, ignored]: [u32; 7]) -> Self {
+    fn from(
+        [
+            ok,
+            changed,
+            unreachable,
+            failed,
+            skipped,
+            rescued,
+            ignored,
+            completed,
+        ]: [u32; 8],
+    ) -> Self {
         Self {
             ok,
             changed,
@@ -32,6 +48,7 @@ impl From<[u32; 7]> for HostStats {
             skipped,
             rescued,
             ignored,
+            completed: completed != 0,
         }
     }
 }
@@ -64,19 +81,21 @@ mod tests {
 
     #[test]
     fn parses_bare_host_array_map_positionally() {
-        let msg = r#"{"host-1":[2,1,0,0,0,0,0],"host-2":[2,0,0,1,0,0,0]}"#;
+        let msg = r#"{"host-1":[2,1,0,0,0,0,0,1],"host-2":[2,0,0,1,0,0,0,0]}"#;
 
         let parsed = parse_callback_output(msg).unwrap();
         assert_eq!(parsed.processed.len(), 2);
 
-        // [ok, changed, unreachable, failed, skipped, rescued, ignored]
+        // [ok, changed, unreachable, failed, skipped, rescued, ignored, completed]
         let h1 = &parsed.processed["host-1"];
         assert_eq!((h1.ok, h1.changed), (2, 1));
         assert!(!h1.is_failure());
+        assert!(h1.completed);
 
         let h2 = &parsed.processed["host-2"];
         assert_eq!(h2.failed, 1);
         assert!(h2.is_failure());
+        assert!(!h2.completed);
     }
 
     #[test]
@@ -94,8 +113,28 @@ mod tests {
 
     #[test]
     fn wrong_length_array_returns_none() {
-        // A shape change (here 6 elements, not 7) fails to parse -> Unknown, never a silent misread.
+        // A shape change fails to parse -> Unknown, never a silent misread. The 7-element form is
+        // what a workspace rendered before the completion marker existed emits, and it must fail
+        // this way rather than be read as a 7-counter host with the last field defaulted.
         assert!(parse_callback_output(r#"{"host-1":[2,0,0,1,0,0]}"#).is_none());
+        assert!(parse_callback_output(r#"{"host-1":[2,0,0,1,0,0,0]}"#).is_none());
+    }
+
+    /// Completion is orthogonal to failure, and both directions occur: a host cut short by an
+    /// abort has clean counters and no completion, while a host that ignored an unreachable task
+    /// ran to the end with a counter set.
+    #[test]
+    fn completion_is_read_independently_of_the_counters() {
+        let msg = r#"{"cut-short":[1,1,0,0,1,0,0,0],"ignored-unreachable":[2,0,1,0,0,0,0,1]}"#;
+        let parsed = parse_callback_output(msg).unwrap();
+
+        let cut_short = &parsed.processed["cut-short"];
+        assert!(!cut_short.is_failure());
+        assert!(!cut_short.completed);
+
+        let ignored = &parsed.processed["ignored-unreachable"];
+        assert!(ignored.is_failure());
+        assert!(ignored.completed);
     }
 
     #[test]
