@@ -151,6 +151,13 @@ that is what your own run would have reported for a host nothing could dial). By
 `hosts: localhost` play's counters are included, so the totals can exceed what the per-host rows
 account for — `Hosts` counts the machines targeted, the counters count what the playbook did.
 
+If a run succeeds but every recap counter is zero, its plan summary warns that the playbook produced
+no recap activity. This commonly means a `hosts:` pattern matched no inventory group — for example,
+`webserver` instead of `webservers`. Check the `Play`'s `Ok` column and the Job output for Ansible's
+`Could not match supplied host pattern` warning. An intentionally taskless playbook has the same
+observable result, so the operator keeps the successful verdict and asks you to confirm which case
+you intended rather than treating every empty playbook as a failure.
+
 `kubectl get plays -o wide` adds the less-common counters (`rescued`, `skipped`, `ignored`), the run number and
 the `Try` column — which try of its execution that run was, in the sense
 [Retries](./scheduling-and-modes.md#retries) gives it. Each `Play`'s `.status` also carries the per-host recap and outcome plus `finishedAt`:
