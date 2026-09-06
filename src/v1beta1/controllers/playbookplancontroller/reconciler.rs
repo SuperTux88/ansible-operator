@@ -790,12 +790,13 @@ async fn reconcile(
     // reach some of its hosts still reaches them and reports the rest unreachable.
     let unready_nodes = node_readiness::unready_nodes(&context.nodes, &run_groups);
     let hold_for_unready_nodes =
-        node_readiness::holds_for_unready_nodes(&object.spec.mode, &run_groups, &unready_nodes);
+        held_back_by_unready_nodes(&timing, &object.spec.mode, &run_groups, &unready_nodes);
     if !hold_for_unready_nodes && status::held_for_unready_nodes(&resource_status) {
         // Retires a hold this plan is no longer under, whatever ended it — the nodes came back, the
-        // inventory moved on. Written here rather than only where a hold is released, because every
-        // one of those paths leaves the tick somewhere different, and a `WaitingForNodes` left
-        // standing over a plan that is running would be read as the reason it is not.
+        // inventory moved on, its schedule window closed. Written here rather than only where a hold
+        // is released, because every one of those paths leaves the tick somewhere different, and a
+        // `WaitingForNodes` left standing over a plan that is running would be read as the reason it
+        // is not.
         //
         // Only ever *this* hold, which is what the second half asks: the condition is shared with
         // the proxy-pod wait that a run later in this tick may re-assert, and clearing that one here
@@ -1648,25 +1649,41 @@ fn update_idle_recurring_status<Tz: TimeZone>(
     (next - now).to_std().ok()
 }
 
-/// The other half of the suspension contract: while suspended, the plan advertises no next run. The
-/// start gate blocks the run itself, so a `nextRun` pointing at a slot that will not fire says the
+/// The other half of the suspension contract: while suspended, the plan advertises no run it is
+/// about to start. The start gate blocks the run itself, so anything still announcing one says the
 /// plan is about to do something it will not do — to an operator reading it, and to any client
 /// scheduling around it.
+///
+/// Two things announce one, and both are retracted here:
+///
+/// - `nextRun`, pointing at a slot that will not fire;
+/// - the `WaitingForNodes`/`NodesNotReady` hold, which says a run is queued behind a Node coming
+///   back. Suspension is why no run is starting now, not the Node, and the hold's summary names the
+///   Node as the reason — so the summary is replaced along with the condition. Only ever *this*
+///   hold: the condition is shared with the proxy-pod wait, which belongs to a run that is already
+///   under way and that suspension deliberately lets finish.
 ///
 /// Held where the status is *written* rather than at the end of the pipeline, because a tick has
 /// more than one way to write one and only one way to reach the end. A tick that finalizes a run, or
 /// that reports an unreadable inventory and gives up, writes the status too — and those writes were
-/// carrying whatever `nextRun` the plan already advertised straight back onto it, so a plan
-/// suspended while waiting on its schedule could keep advertising its old slot until some later tick happened to
+/// carrying whatever the plan already advertised straight back onto it, so a plan suspended while
+/// waiting on its schedule could keep advertising its old slot until some later tick happened to
 /// run the whole pipeline through. Every write now settles it, so the first one after the suspend
 /// takes effect regardless of how the tick ends.
 ///
-/// A run in progress is untouched (it has no `nextRun` anyway) and is left to finish; the phase
-/// keeps reflecting the plan's real state, with the `Suspended` printer column (from `.spec.suspend`)
-/// signalling the pause. The schedule path recomputes `nextRun` once the plan resumes.
-fn suspended_advertises_no_next_run(suspend: bool, status: &mut PlaybookPlanStatus) {
-    if suspend {
-        status.next_run = None;
+/// Nothing re-asserts either one while the plan stays suspended: both are written on paths behind
+/// the start gate, which `spec.suspend` closes. A run in progress is untouched and is left to
+/// finish; the phase keeps reflecting the plan's real state, with the `Suspended` printer column
+/// (from `.spec.suspend`) signalling the pause. The schedule path recomputes `nextRun`, and the
+/// readiness gate re-asserts the hold, once the plan resumes.
+fn suspended_advertises_no_pending_run(suspend: bool, status: &mut PlaybookPlanStatus) {
+    if !suspend {
+        return;
+    }
+    status.next_run = None;
+    if status::held_for_unready_nodes(status) {
+        status::set_waiting_for_nodes_condition(status, None);
+        status.summary = Some("suspended; no new run will start".to_string());
     }
 }
 
@@ -3190,6 +3207,18 @@ fn record_input_failure(status: &mut PlaybookPlanStatus, summary: String) {
     if status.active_run.is_none() {
         status.phase = phase_under_readiness_overlay(&status.phase);
         status.next_run = None;
+        // The third way a hold ends, and the one the retire in `reconcile` cannot reach: that retire
+        // is computed from the resolved groups, so a tick that never resolves them returns before
+        // it. A held plan whose inventory is then deleted would otherwise keep `WaitingForNodes`
+        // naming a Node beside the `Ready=False` this just wrote — pointing a reader at a machine
+        // when the plan is no longer waiting on one, and would not start a run if it came back.
+        //
+        // Only ever this hold, for the same reason as there: the condition is shared with the
+        // proxy-pod wait, which belongs to a run in flight — and the guard above has already
+        // established there is none.
+        if status::held_for_unready_nodes(status) {
+            status::set_waiting_for_nodes_condition(status, None);
+        }
     }
 }
 
@@ -3992,6 +4021,27 @@ fn hold_plan_for_unready_nodes(status: &mut PlaybookPlanStatus, unready: &[Strin
         status,
         Some(status::WaitingForNodes::NodesNotReady(unready)),
     );
+}
+
+/// Whether the plan is being held back by the readiness gate *right now*, which is a narrower
+/// question than [`node_readiness::holds_for_unready_nodes`] answers on its own.
+///
+/// That predicate says "a run started now would be pointless", and its inputs are only the mode, the
+/// groups and the down Nodes. A plan whose schedule window is closed is not held by it, however far
+/// down its Nodes are — it is waiting on the clock, and the schedule arm reports that for itself.
+///
+/// Composed here rather than at either call site because both the arm that *asserts* the hold and
+/// the retire that clears it have to agree on the answer. They ask from different places, and a
+/// retire that is even slightly wider than the assert leaves `WaitingForNodes` standing over a plan
+/// that is not waiting for a Node — which reads as the reason it is not running.
+fn held_back_by_unready_nodes<Tz: chrono::TimeZone>(
+    timing: &Timing<Tz>,
+    mode: &ExecutionMode,
+    groups: &[ResolvedInventoryGroup],
+    unready: &[String],
+) -> bool {
+    matches!(timing, Timing::Now(_))
+        && node_readiness::holds_for_unready_nodes(mode, groups, unready)
 }
 
 /// The phase an idle plan keeps while a readiness overlay explains why it is not running. A real
@@ -5190,8 +5240,8 @@ fn validate_workspace_not_referenced(plan: &PlaybookPlan) -> Result<(), Reconcil
 /// write to the same object routinely lands first and would reject a version-checked PUT with a
 /// 409. A merge patch carries no such precondition.
 ///
-/// Every write goes through [`suspended_advertises_no_next_run`] on the way out — see there for why
-/// the suspension contract is held at this boundary rather than at the end of the pipeline.
+/// Every write goes through [`suspended_advertises_no_pending_run`] on the way out — see there for
+/// why the suspension contract is held at this boundary rather than at the end of the pipeline.
 ///
 /// Returns the plan as the apiserver now holds it. Almost every caller discards that, but a tick
 /// that has to make a *version-checked* write afterwards cannot: this write invalidated the
@@ -5206,7 +5256,7 @@ async fn patch_status(
 ) -> Result<PlaybookPlan, ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
 
-    suspended_advertises_no_next_run(target.spec.suspend, &mut status);
+    suspended_advertises_no_pending_run(target.spec.suspend, &mut status);
 
     let name = target
         .name()
@@ -8211,15 +8261,111 @@ spec:
         };
 
         let mut suspended = forecast();
-        suspended_advertises_no_next_run(true, &mut suspended);
+        suspended_advertises_no_pending_run(true, &mut suspended);
         assert_eq!(suspended.next_run, None);
         // Only the forecast: the phase keeps saying what the plan's underlying state is, and the
         // `Suspended` printer column is what says it is paused.
         assert_eq!(suspended.phase, Phase::Delayed);
 
         let mut running = forecast();
-        suspended_advertises_no_next_run(false, &mut running);
+        suspended_advertises_no_pending_run(false, &mut running);
         assert_eq!(running.next_run, forecast().next_run);
+    }
+
+    /// The gate answers "would a run started now be pointless", so a plan whose schedule window is
+    /// shut is not held by it — it is waiting on the clock, and the `Delayed` arm says so with a
+    /// phase and a `nextRun`. Without the timing half, a scheduled `OneShot` held during its window
+    /// would keep `NodesNotReady` standing after the window closed, naming a Node as the reason
+    /// while the status beside it named the clock.
+    #[test]
+    fn a_plan_outside_its_schedule_window_is_not_held_by_its_nodes() {
+        let groups = vec![ResolvedInventoryGroup::ManagedSsh {
+            hosts: v1beta1::ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["worker-1".to_string()],
+            },
+            tolerations: None,
+            variables: None,
+        }];
+        let unready = ["worker-1".to_string()];
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+
+        assert!(held_back_by_unready_nodes(
+            &Timing::Now(Some(slot)),
+            &ExecutionMode::OneShot,
+            &groups,
+            &unready
+        ));
+        assert!(
+            !held_back_by_unready_nodes(
+                &Timing::Delayed(slot),
+                &ExecutionMode::OneShot,
+                &groups,
+                &unready
+            ),
+            "a shut window is why nothing is running, not the Node"
+        );
+        // The gate's own half still decides the rest: `Recurring` never holds.
+        assert!(!held_back_by_unready_nodes(
+            &Timing::Now(Some(slot)),
+            &ExecutionMode::Recurring,
+            &groups,
+            &unready
+        ));
+    }
+
+    /// A plan suspended while the readiness gate holds it. The hold is a queued run, so suspension
+    /// retracts it exactly as it retracts a forecast: the gate's own predicate reads only the mode,
+    /// the groups and the down Nodes, so it stays true and would leave `NodesNotReady` standing —
+    /// with a summary naming a Node — over a plan that is not waiting for any Node.
+    #[test]
+    fn a_suspended_plan_retires_the_hold_that_was_waiting_for_its_nodes() {
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Pending,
+            ..Default::default()
+        };
+        hold_plan_for_unready_nodes(&mut status, &["worker-1".to_string()]);
+        assert!(status::held_for_unready_nodes(&status));
+
+        suspended_advertises_no_pending_run(true, &mut status);
+
+        assert!(!status::held_for_unready_nodes(&status));
+        let summary = status.summary.as_deref().unwrap();
+        assert!(
+            !summary.contains("worker-1"),
+            "the Node is not why nothing is running any more: {summary}"
+        );
+        assert!(summary.contains("suspended"), "{summary}");
+    }
+
+    /// The proxy-pod wait shares the condition but belongs to a run that is already under way, and
+    /// suspension lets such a run finish. Retiring it here would blank the only status saying why
+    /// that run is sitting still.
+    #[test]
+    fn suspending_a_plan_leaves_a_running_plans_proxy_wait_alone() {
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Applying,
+            summary: Some("applying run 3".to_string()),
+            ..Default::default()
+        };
+        let hosts = ["worker-1".to_string()];
+        status::set_waiting_for_nodes_condition(
+            &mut status,
+            Some(status::WaitingForNodes::ProxyPods(&hosts)),
+        );
+
+        suspended_advertises_no_pending_run(true, &mut status);
+
+        let waiting = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "WaitingForNodes")
+            .expect("the proxy wait must survive");
+        assert_eq!(waiting.status, "True");
+        assert_eq!(waiting.reason.as_deref(), Some("ProxyPodsNotReady"));
+        assert_eq!(status.summary.as_deref(), Some("applying run 3"));
     }
 
     /// The suspend half of the unlaunched-run decision: a suspended plan must never keep an
@@ -8600,6 +8746,61 @@ spec:
             "cannot resolve the plan's inventories: nope".into(),
         );
         assert_eq!(applying.phase, Phase::Applying);
+    }
+
+    /// The retire in `reconcile` is computed from the resolved groups, so a tick that cannot resolve
+    /// them returns before reaching it. Without this the plan would report `Ready=False` because its
+    /// inventory is unreadable *and* `WaitingForNodes` naming a Node it is no longer waiting on —
+    /// and would not start a run if that Node came back.
+    #[test]
+    fn an_unreadable_input_retires_a_readiness_hold_but_not_a_proxy_pod_wait() {
+        let nodes = ["worker-1".to_string()];
+
+        let mut held = PlaybookPlanStatus::default();
+        status::set_waiting_for_nodes_condition(
+            &mut held,
+            Some(status::WaitingForNodes::NodesNotReady(&nodes)),
+        );
+        record_input_failure(
+            &mut held,
+            "cannot resolve the plan's inventories: nope".into(),
+        );
+        assert!(
+            !status::held_for_unready_nodes(&held),
+            "the hold ended when the inventory that named its hosts stopped resolving"
+        );
+
+        // The same condition, asserted by a run in flight rather than by the gate. That run is still
+        // executing — the read failure does not stop its Job — so its wait is still true and must
+        // survive. The `active_run` guard is what separates them.
+        let mut waiting_on_proxies = PlaybookPlanStatus {
+            active_run: Some(ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-1".into(),
+                job_name: "apply-plan-1-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: None,
+            }),
+            ..Default::default()
+        };
+        status::set_waiting_for_nodes_condition(
+            &mut waiting_on_proxies,
+            Some(status::WaitingForNodes::ProxyPods(&nodes)),
+        );
+        record_input_failure(
+            &mut waiting_on_proxies,
+            "cannot resolve the plan's inventories: nope".into(),
+        );
+        let waiting = waiting_on_proxies
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "WaitingForNodes")
+            .unwrap();
+        assert_eq!(waiting.status, "True");
+        assert_eq!(waiting.reason.as_deref(), Some("ProxyPodsNotReady"));
     }
 
     /// Once desired inputs are readable, an idle Recurring plan must replace the outage summary

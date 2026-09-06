@@ -88,7 +88,10 @@ printer columns:
     [NotReady nodes](./cluster-nodes.md#notready-nodes).
   - `NodesNotReady` — no run was started, because every Node one would target is `NotReady`. Only
     `OneShot` plans hold this way. It clears when one of those Nodes becomes `Ready`, which the
-    operator notices at once.
+    operator notices at once — and also whenever the plan stops being held for any other reason:
+    suspending it, a schedule window closing, or an inventory change that leaves it no such hosts.
+    A held plan that is then suspended reports `suspended; no new run will start` instead, since
+    suspension is what is stopping the run at that point, not the Node.
     See [Holding instead of starting](./cluster-nodes.md#holding-instead-of-starting).
 
 `.status.summary` is a one-line human summary (also a column), and `.status.currentHash` is the
