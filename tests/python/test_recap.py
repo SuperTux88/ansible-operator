@@ -231,6 +231,29 @@ class EncodingTest(unittest.TestCase):
             [12, 3, 0, 0, 7, 0, 0, 0],
         )
 
+    def test_a_fleet_past_even_the_compressed_ceiling_writes_a_marker_that_fits(self):
+        """Compression moves the ceiling into the hundreds of hosts; it does not remove it. Past it
+        the operator would otherwise see the same unparseable message a crashed container leaves,
+        and report the plan `Unknown` with no way to learn why."""
+        hosts = self.fleet(20000)
+
+        message = write([], hosts)
+
+        self.assertTrue(message.startswith(recap.OVERSIZE_PREFIX))
+        self.assertLessEqual(len(message.encode("utf-8")), self.CAP)
+        self.assertEqual(
+            int(message[len(recap.OVERSIZE_PREFIX) :]),
+            20000,
+            "the host count is the whole payload; without it the marker says nothing a crash does not",
+        )
+
+    def test_a_fleet_that_still_compresses_is_never_reduced_to_a_marker(self):
+        """The marker discards every per-host result, so it must be the last resort and not merely
+        the response to exceeding the plain-JSON cap."""
+        message = write([], self.fleet(200))
+
+        self.assertFalse(message.startswith(recap.OVERSIZE_PREFIX))
+
     def test_the_boundary_is_measured_in_bytes_not_characters(self):
         """A non-ASCII inventory hostname costs more bytes than characters, and it is bytes the
         kubelet counts."""

@@ -72,6 +72,15 @@ pub struct CallbackOutput {
 /// `ansible_operator_recap.py`.
 const COMPRESSED_PREFIX: &str = "z:";
 
+/// Marks a recap that would not fit even compressed, followed by the host count. Must stay in
+/// lockstep with `OVERSIZE_PREFIX` in `ansible_operator_recap.py`.
+const OVERSIZE_PREFIX: &str = "!:";
+
+/// The kubelet's `MaxContainerTerminationMessageLength`, which is what all of the above is working
+/// around. Read only to name the number in the diagnostic — the callback is what enforces it, since
+/// it is the side that decides what to write.
+pub const TERMINATION_MESSAGE_MAX_BYTES: usize = 4096;
+
 /// Ceiling on what a compressed recap may inflate to.
 ///
 /// The termination message is written by a pod running the *user's* image, so it is untrusted input
@@ -97,6 +106,17 @@ pub fn parse_callback_output(message: &str) -> Option<CallbackOutput> {
         Some(encoded) => serde_json::from_slice(&inflate(encoded)?).ok(),
         None => serde_json::from_str(message).ok(),
     }
+}
+
+/// How many hosts a run had, when its recap overflowed the termination message even compressed.
+///
+/// Deliberately not folded into [`parse_callback_output`]: an overflowed recap carries no per-host
+/// data, so every outcome it produces is exactly what an unreadable message produces, and the
+/// verdicts must not diverge. What it does carry is the *reason*, which the operator has no other
+/// way to learn — a crashed run and an overflowed one are equally unparseable — so this is asked
+/// separately, by the one caller that turns it into a diagnostic.
+pub fn recap_overflowed_host_count(message: &str) -> Option<u32> {
+    message.trim().strip_prefix(OVERSIZE_PREFIX)?.parse().ok()
 }
 
 fn inflate(base64_encoded: &str) -> Option<Vec<u8>> {
@@ -230,6 +250,34 @@ mod tests {
         assert!(bomb.len() < 4096, "a bomb fits the cap; that is the point");
 
         assert!(parse_callback_output(&bomb).is_none());
+    }
+
+    /// The marker exists to name the reason, not to change the answer: it carries no per-host data,
+    /// so it must parse as unreadable exactly like a crash does, and the host count must be
+    /// available separately.
+    #[test]
+    fn an_overflow_marker_is_unreadable_as_a_recap_but_names_its_host_count() {
+        assert!(parse_callback_output("!:900").is_none());
+        assert_eq!(recap_overflowed_host_count("!:900"), Some(900));
+        assert_eq!(recap_overflowed_host_count(" !:900\n"), Some(900));
+    }
+
+    #[test]
+    fn nothing_else_is_mistaken_for_an_overflow_marker() {
+        for message in [
+            "",
+            "!:",
+            "!:not-a-number",
+            "!:-1",
+            r#"{"host-1":[2,1,0,0,0,0,0,1]}"#,
+            "z:aGVsbG8=",
+        ] {
+            assert_eq!(
+                recap_overflowed_host_count(message),
+                None,
+                "{message:?} is not an overflow marker"
+            );
+        }
     }
 
     #[test]
