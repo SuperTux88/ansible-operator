@@ -124,6 +124,34 @@ pub fn calculate_execution_hash<'a, T: IntoIterator<Item = &'a BTreeMap<String, 
     ExecutionHash(hash)
 }
 
+/// A content fingerprint over a set of Secrets, for an input the plan must be able to *notice*
+/// without it becoming part of the execution hash.
+///
+/// Deliberately not an [`ExecutionHash`]. That type is what decides which hosts are outdated, so
+/// anything folded into it re-applies the playbook everywhere — and the SSH key material a
+/// `StaticInventory` reaches its hosts with is exactly the input that must not do that: rotating a
+/// key changes how the operator connects, not what it applies.
+///
+/// Order-insensitive, like [`calculate_execution_hash`], because the Secrets are read concurrently
+/// and arrive in no particular order.
+pub fn hash_secret_data<'a, T: IntoIterator<Item = &'a BTreeMap<String, ByteString>>>(
+    secrets: T,
+) -> String {
+    let hash = secrets
+        .into_iter()
+        .map(|secret| {
+            let mut hasher = twox_hash::XxHash3_64::new();
+            for (key, value) in secret {
+                key.hash(&mut hasher);
+                value.0.hash(&mut hasher);
+            }
+            hasher.finish()
+        })
+        .fold(0u64, u64::wrapping_add);
+
+    format!("{hash:x}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -375,5 +403,46 @@ mod tests {
 
         // Then
         assert_eq!("ff", as_string)
+    }
+    fn secret(entries: &[(&str, &[u8])]) -> BTreeMap<String, ByteString> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), ByteString(v.to_vec())))
+            .collect()
+    }
+
+    /// The SSH key fingerprint has one job: change when the key does, and not otherwise. It must be
+    /// order-insensitive because the Secrets behind it are read concurrently — a fingerprint that
+    /// moved with the read order would look like a rotation on every tick and hand a failed plan its
+    /// attempt budget back forever.
+    #[test]
+    fn hash_secret_data_tracks_content_and_not_read_order() {
+        let a = secret(&[("id_rsa", b"key-a")]);
+        let b = secret(&[("id_rsa", b"key-b")]);
+
+        assert_eq!(
+            hash_secret_data([&a, &b]),
+            hash_secret_data([&b, &a]),
+            "the Secrets are read concurrently and arrive in no particular order"
+        );
+        assert_ne!(hash_secret_data([&a]), hash_secret_data([&b]));
+        assert_eq!(hash_secret_data([&a]), hash_secret_data([&a.clone()]));
+        // A key added to the set is a change, even if every existing key is untouched.
+        assert_ne!(hash_secret_data([&a]), hash_secret_data([&a, &b]));
+    }
+
+    /// It is deliberately not an `ExecutionHash`, and nothing should make it one: folding SSH key
+    /// material into that hash would mark every host outdated and re-apply the playbook to hosts
+    /// that are already current.
+    #[test]
+    fn the_key_fingerprint_is_independent_of_the_execution_hash() {
+        let key = secret(&[("id_rsa", b"key-a")]);
+        let rotated = secret(&[("id_rsa", b"key-b")]);
+
+        assert_eq!(
+            calculate_execution_hash("playbook", std::iter::empty()),
+            calculate_execution_hash("playbook", std::iter::empty()),
+        );
+        assert_ne!(hash_secret_data([&key]), hash_secret_data([&rotated]));
     }
 }

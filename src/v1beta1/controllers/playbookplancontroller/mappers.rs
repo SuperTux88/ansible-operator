@@ -6,7 +6,7 @@ use tracing::debug;
 
 use crate::v1beta1::{
     self, ClusterInventory, HostOutcome, InventoryRef, NodeAccessPolicy, StaticInventory,
-    playbookplancontroller::node_readiness,
+    playbookplancontroller::{node_readiness, status},
 };
 
 /// Returns a closure that maps a `NodeAccessPolicy` change to *every* PlaybookPlan, so their
@@ -200,6 +200,94 @@ fn plan_references_inventory(
             .any(|inventory_name| inventory_name == name)
 }
 
+/// The Secret watch's mapper. A Secret reaches a plan two ways, and both are asked here so that one
+/// watch per enrolled namespace serves both — a second watch on the same collection would double
+/// the operator's Secret traffic to answer a question this closure already has in hand.
+///
+/// The two rules stay separate functions because they are different rules with different
+/// predicates: naming a Secret in `variables`/`files` makes it *content*, and a change re-applies
+/// the playbook; holding a `StaticInventory`'s SSH key does not, and a change is only worth waking a
+/// plan that has something left to apply. Duplicates need no handling — the controller's scheduler
+/// is keyed by `ObjectRef`.
+pub fn secret_to_affected_playbookplans(
+    playbookplan_reader: Arc<Store<v1beta1::PlaybookPlan>>,
+    static_inventory_reader: Arc<Store<StaticInventory>>,
+) -> impl Fn(Secret) -> Vec<ObjectRef<v1beta1::PlaybookPlan>> {
+    let by_reference = secret_to_playbookplans(Arc::clone(&playbookplan_reader));
+    let by_ssh_key = ssh_secret_to_playbookplans(playbookplan_reader, static_inventory_reader);
+
+    move |secret| {
+        let mut affected = by_reference(secret.clone());
+        affected.extend(by_ssh_key(secret));
+        affected
+    }
+}
+
+/// Returns a closure that maps a Secret holding SSH key material to the PlaybookPlans an SSH key
+/// rotation could unstick.
+///
+/// The reference is two hops — a plan names a `StaticInventory`, and the inventory names the Secret
+/// — so unlike [`secret_to_playbookplans`] this cannot be answered from the plan store alone, and
+/// takes the inventory store too.
+///
+/// **A plan whose last run succeeded is deliberately left asleep.** Rotating a key changes how the
+/// operator connects, not what it applies, so there is nothing for a converged plan to do with the
+/// news. The interesting case is the opposite one: a plan whose hosts rejected the old key sits
+/// `Failed` with its attempt budget spent, and this is the only thing that will offer it the fix.
+/// The predicate is [`status::may_need_another_run`], shared with the budget reset on the other
+/// side, so this can never wake a plan that would then decline to act.
+///
+/// # Panics
+///
+/// Panics if the secret returned from the apiserver does not have a name.
+pub fn ssh_secret_to_playbookplans(
+    playbookplan_reader: Arc<Store<v1beta1::PlaybookPlan>>,
+    static_inventory_reader: Arc<Store<StaticInventory>>,
+) -> impl Fn(Secret) -> Vec<ObjectRef<v1beta1::PlaybookPlan>> {
+    move |secret| {
+        let secret_name = secret
+            .metadata
+            .name
+            .as_deref()
+            .expect("Secret must have a name");
+
+        let inventories: Vec<String> = static_inventory_reader
+            .state()
+            .iter()
+            .filter(|inventory| inventory.metadata.namespace == secret.metadata.namespace)
+            .filter(|inventory| inventory.spec.ssh.secret_ref.name == secret_name)
+            .filter_map(|inventory| inventory.metadata.name.clone())
+            .collect();
+        if inventories.is_empty() {
+            return Vec::new();
+        }
+
+        playbookplan_reader
+            .state()
+            .iter()
+            .filter(|plan| plan.metadata.namespace == secret.metadata.namespace)
+            .filter(|plan| {
+                plan.status
+                    .as_ref()
+                    .is_some_and(status::may_need_another_run)
+            })
+            .filter(|plan| {
+                plan.spec
+                    .inventory_refs
+                    .iter()
+                    .filter_map(|inventory_ref| inventory_ref.static_inventory.as_deref())
+                    .any(|named| inventories.iter().any(|inventory| inventory == named))
+            })
+            .map(|plan| ObjectRef::from(&**plan))
+            .inspect(|obj_ref| {
+                debug!(
+                    "Reconcile of {obj_ref} triggered by a change to SSH key Secret {secret_name}"
+                );
+            })
+            .collect::<Vec<_>>()
+    }
+}
+
 /// Returns a closure that maps a Secret to all PlaybookPlans that reference it.
 ///
 /// # Panics
@@ -258,7 +346,7 @@ pub fn secret_to_playbookplans(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v1beta1::{PlaybookPlan, PlaybookPlanSpec};
+    use crate::v1beta1::{Phase, PlaybookPlan, PlaybookPlanSpec};
 
     fn cluster_inventory_name(inventory_ref: &InventoryRef) -> Option<&str> {
         inventory_ref.cluster_inventory.as_deref()
@@ -586,6 +674,153 @@ mod tests {
         // The same plan and the same Node, so the emptiness above is the readiness check and not a
         // store that never held anything.
         assert_eq!(mapper(node_named("node-a", true)).len(), 1);
+    }
+
+    fn static_inventory(name: &str, namespace: &str, secret: &str) -> StaticInventory {
+        let mut inventory = StaticInventory::new(
+            name,
+            v1beta1::StaticInventorySpec {
+                hosts: Vec::new(),
+                ssh: v1beta1::SshConfig {
+                    user: "root".into(),
+                    secret_ref: v1beta1::SecretRef {
+                        name: secret.into(),
+                    },
+                },
+            },
+        );
+        inventory.metadata.namespace = Some(namespace.to_string());
+        inventory
+    }
+
+    fn plan_using(name: &str, namespace: &str, inventory: &str, phase: Phase) -> PlaybookPlan {
+        let mut plan = PlaybookPlan::new(
+            name,
+            PlaybookPlanSpec {
+                inventory_refs: vec![static_(inventory)],
+                ..Default::default()
+            },
+        );
+        plan.metadata.namespace = Some(namespace.to_string());
+        plan.status = Some(v1beta1::PlaybookPlanStatus {
+            phase,
+            ..Default::default()
+        });
+        plan
+    }
+
+    fn secret_named(name: &str, namespace: &str) -> Secret {
+        Secret {
+            metadata: kube::core::ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(namespace.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn store_of<K>(objects: Vec<K>) -> Arc<Store<K>>
+    where
+        K: kube::Resource + Clone + 'static,
+        K::DynamicType: Eq + std::hash::Hash + Clone + Default,
+    {
+        let mut writer = kube::runtime::reflector::store::Writer::<K>::default();
+        let reader = Arc::new(writer.as_reader());
+        for object in objects {
+            writer.apply_watcher_event(&kube::runtime::watcher::Event::Apply(object));
+        }
+        reader
+    }
+
+    /// The case the mapper exists for: the hosts rejected the old key, the plan is `Failed` with its
+    /// attempts spent, and rotating the Secret is the fix. Nothing else would ever wake it — the key
+    /// is not in the execution hash, so the plan's revision has not moved.
+    #[test]
+    fn rotating_an_ssh_key_wakes_the_plan_it_may_have_broken() {
+        let mapper = ssh_secret_to_playbookplans(
+            store_of(vec![plan_using("web", "tenant", "ccu", Phase::Failed)]),
+            store_of(vec![static_inventory("ccu", "tenant", "ssh-key")]),
+        );
+
+        assert_eq!(mapper(secret_named("ssh-key", "tenant")).len(), 1);
+    }
+
+    /// A converged plan is left asleep. Rotating a key changes how the operator connects, not what
+    /// it applies, so waking it could only re-apply a playbook to hosts that are already current —
+    /// and the budget reset on the other side would decline anyway, by the same predicate.
+    #[test]
+    fn rotating_an_ssh_key_does_not_wake_a_plan_that_succeeded() {
+        let mapper = ssh_secret_to_playbookplans(
+            store_of(vec![plan_using("web", "tenant", "ccu", Phase::Succeeded)]),
+            store_of(vec![static_inventory("ccu", "tenant", "ssh-key")]),
+        );
+
+        assert!(mapper(secret_named("ssh-key", "tenant")).is_empty());
+    }
+
+    /// Both hops are namespaced, and both must be checked: `inventoryRefs` are bare names resolved
+    /// in the plan's own namespace, so two tenants may each own a `ccu` inventory and a `ssh-key`
+    /// Secret, and neither may be woken by the other's rotation.
+    #[test]
+    fn an_ssh_key_rotation_stays_inside_its_namespace() {
+        let mapper = ssh_secret_to_playbookplans(
+            store_of(vec![
+                plan_using("web", "tenant", "ccu", Phase::Failed),
+                plan_using("web", "other", "ccu", Phase::Failed),
+            ]),
+            store_of(vec![
+                static_inventory("ccu", "tenant", "ssh-key"),
+                static_inventory("ccu", "other", "ssh-key"),
+            ]),
+        );
+
+        let woken = mapper(secret_named("ssh-key", "tenant"));
+        assert_eq!(woken.len(), 1);
+        assert_eq!(woken[0].namespace.as_deref(), Some("tenant"));
+    }
+
+    /// A Secret that no `StaticInventory` names is not key material, whatever else it is — the plan
+    /// store is not even consulted for it.
+    #[test]
+    fn a_secret_no_inventory_names_wakes_nothing_by_this_route() {
+        let mapper = ssh_secret_to_playbookplans(
+            store_of(vec![plan_using("web", "tenant", "ccu", Phase::Failed)]),
+            store_of(vec![static_inventory("ccu", "tenant", "ssh-key")]),
+        );
+
+        assert!(mapper(secret_named("unrelated", "tenant")).is_empty());
+    }
+
+    /// One watch, two rules. The composed mapper is what the controller actually installs, so the
+    /// union has to be pinned here rather than inferred from the halves: a Secret that is both a
+    /// plan's `variables` source and an inventory's key reaches the plan by either route, and a
+    /// plan that only holds the second must not be dropped because the first did not match.
+    #[test]
+    fn the_secret_watch_asks_both_rules() {
+        let mut by_variables = plan_in("tenant", Vec::new());
+        by_variables.metadata.name = Some("vars".into());
+        by_variables.spec.template.variables =
+            Some(vec![v1beta1::PlaybookVariableSource::SecretRef {
+                secret_ref: v1beta1::SecretRef {
+                    name: "ssh-key".into(),
+                },
+            }]);
+
+        let mapper = secret_to_affected_playbookplans(
+            store_of(vec![
+                by_variables,
+                plan_using("web", "tenant", "ccu", Phase::Failed),
+            ]),
+            store_of(vec![static_inventory("ccu", "tenant", "ssh-key")]),
+        );
+
+        let mut woken: Vec<String> = mapper(secret_named("ssh-key", "tenant"))
+            .into_iter()
+            .map(|object_ref| object_ref.name)
+            .collect();
+        woken.sort();
+        assert_eq!(woken, vec!["vars".to_string(), "web".to_string()]);
     }
 
     #[test]

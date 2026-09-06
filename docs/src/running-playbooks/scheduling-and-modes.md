@@ -152,6 +152,7 @@ timer. The watched inputs are:
 | A `ClusterInventory` or `StaticInventory` it names — including the Nodes a `ClusterInventory` resolves to | at once |
 | A `NodeAccessPolicy` (which may change [which Nodes the namespace may target](../cluster-operators/node-access-policies.md)) | at once |
 | A Node it is still waiting on becoming `Ready` | at once |
+| A `StaticInventory`'s SSH key Secret | at once, but **only for a plan whose last run did not succeed** |
 | The run's Job finishing | at once |
 | Nothing at all | on a timer: the time until the next scheduled tick, or an hour for an unscheduled plan |
 
@@ -161,16 +162,25 @@ whose recap it could not read, or one that succeeded on an older revision. It do
 plan for a host Ansible connected to and failed on: that host is fixed by fixing the playbook, and
 its Node was never the thing standing in the way.
 
-A `StaticInventory`'s SSH key Secret is **not** in that list. Rotating a key changes how the operator
-connects, not what it applies, so it deliberately does not re-apply the playbook to hosts that are
-already current — the key is not part of the execution hash, and it is the hash that decides which
-hosts are outdated.
+The SSH key row is deliberately one-sided. Rotating a key changes how the operator connects, not what
+it applies, so it must never re-apply the playbook to hosts that are already current — which is why
+the key is not part of the execution hash, and the hash is what decides which hosts are outdated. A
+plan that succeeded therefore ignores the rotation entirely.
 
-It also does not wake the plan at all, which matters if you are rotating a key **to fix a plan whose
-last run failed on it**: the new key will not be picked up until something else re-evaluates the
-plan, and if the run already spent the plan's [attempts](#retries), nothing will start a new one.
-After rotating a key to fix a failing plan, touch the plan itself — raise `spec.maxAttempts`, or
-re-apply it — so a run starts against the new key.
+A plan whose last run **failed** is the opposite case: the old key may well be why it failed, so
+rotating it is a fix. Because that plan has usually spent its [attempts](#retries) by then — a
+`StaticInventory` host has no proxy wait in front of it, so the tries burn in seconds — waking it
+alone would achieve nothing, and the rotation restores the plan's attempt budget as well. The run
+that follows still only targets the hosts that are not up to date, since `lastAppliedHash` is
+untouched.
+
+Two details worth knowing:
+
+- **The first key a plan ever sees is not a rotation.** A plan created before this behaviour existed,
+  or one reaching a `StaticInventory` for the first time, records the key it finds without acting on
+  it. Only a *change* from a key the plan already recorded counts.
+- **A rotation during a run waits for it.** The run in flight finishes against the key it started
+  with, and the rotation is acted on once its result is in.
 
 ## Editing a plan while a run is in flight
 

@@ -206,6 +206,31 @@ pub async fn new(
         reader
     };
 
+    // Needed only by `mappers::ssh_secret_to_playbookplans`, which has to walk Secret ->
+    // StaticInventory -> plan and so cannot answer from the plan store alone. Cheap where the Node
+    // reflector is not: StaticInventories are few, small, and edited by hand.
+    let static_inventory_reflector_reader = {
+        let writer = Writer::<StaticInventory>::default();
+        let reader = Arc::new(writer.as_reader());
+
+        let reflector = kube::runtime::reflector(
+            writer,
+            watcher(static_inventories_api.clone(), watcher::Config::default()),
+        );
+
+        tokio::spawn(async move {
+            reflector
+                .for_each(|event| async {
+                    if let Err(e) = event {
+                        error!("StaticInventory reflector error: {e:?}");
+                    }
+                })
+                .await;
+        });
+
+        reader
+    };
+
     // One reflector serves both jobs the Node watch has: deciding which plans an event concerns
     // (`mappers::node_to_playbookplans`, which reads the watched object itself) and answering
     // "is this host reachable at all?" while a tick decides whether to start a run.
@@ -302,7 +327,10 @@ pub async fn new(
             .watches(
                 secrets_api,
                 watcher::Config::default(),
-                mappers::secret_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
+                mappers::secret_to_affected_playbookplans(
+                    Arc::clone(&playbookplan_reflector_reader),
+                    Arc::clone(&static_inventory_reflector_reader),
+                ),
             );
     }
 
@@ -721,6 +749,22 @@ async fn reconcile(
     }
     if resource_status.active_run.is_some() {
         resource_status.phase = Phase::Applying;
+    }
+
+    // Read alongside the execution hash but deliberately kept out of it — see
+    // `PlaybookPlanStatus::observed_ssh_key_revision`. Placed before the start gate so a rotation
+    // that hands the budget back takes effect on this tick rather than the next one, which is what
+    // makes rotating a key an actual fix for a plan its hosts locked out.
+    let observed_ssh_key_revision = observe_ssh_key_revision(&target_groups, &secrets_api).await;
+    if sync_ssh_key_revision(
+        &mut resource_status,
+        &object.spec.mode,
+        observed_ssh_key_revision.as_deref(),
+    ) {
+        info!(
+            "PlaybookPlan {namespace}/{name}: the SSH key its StaticInventory hosts are reached \
+             with has changed and its last run did not succeed — restoring its attempt budget"
+        );
     }
 
     // Step 1: compute outdated hosts and evaluate the schedule.
@@ -4315,6 +4359,109 @@ fn sync_desired_hash_after_finished_run(
     }
 }
 
+/// The Secrets holding the SSH key material this run's `StaticInventory` groups are reached with,
+/// deduplicated: several groups may come from one inventory, and several inventories may share a key.
+fn ssh_key_secret_names(groups: &[ResolvedInventoryGroup]) -> Vec<String> {
+    let mut names: Vec<String> = groups
+        .iter()
+        .filter_map(|group| match group {
+            ResolvedInventoryGroup::Ssh { config, .. } => Some(config.secret_ref.name.clone()),
+            ResolvedInventoryGroup::ManagedSsh { .. } => None,
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Reads and fingerprints this plan's SSH key material.
+///
+/// `None` means "nothing to decide from this tick", which covers both a plan that reaches no
+/// `StaticInventory` hosts and one whose Secrets could not be read. The two are folded together on
+/// purpose: neither is evidence that a key changed, and a failed read must never be mistaken for a
+/// rotation — that would hand the attempt budget back on every apiserver hiccup.
+///
+/// A read failure is not propagated. This is a side observation, not one of the desired inputs: a
+/// tick that cannot answer it can still do everything else, and the next tick asks again.
+async fn observe_ssh_key_revision(
+    groups: &[ResolvedInventoryGroup],
+    secrets_api: &Api<Secret>,
+) -> Option<String> {
+    let names = ssh_key_secret_names(groups);
+    if names.is_empty() {
+        return None;
+    }
+
+    let reads = futures::future::join_all(
+        names
+            .iter()
+            .map(|name| async move { (name.clone(), secrets_api.get(name).await) }),
+    )
+    .await;
+
+    match collect_secret_data(reads) {
+        Ok(data) => Some(execution_evaluator::hash_secret_data(data.iter())),
+        Err(error) => {
+            debug!(
+                "Could not read the SSH key material for this plan, so a rotation cannot be \
+                 detected this tick: {error:?}"
+            );
+            None
+        }
+    }
+}
+
+/// Folds an observed SSH key revision into the status, returning whether it gave the attempt budget
+/// back.
+///
+/// The budget reset is the whole point. Simply waking the plan would achieve nothing: a plan that
+/// failed because its hosts rejected the old key has, by then, spent every attempt it had — there is
+/// no proxy grace window in front of a `StaticInventory` host, so the tries burn in seconds — and
+/// `attempt_budget_available` refuses to start another run. Rotating the key is a fix the plan can
+/// only act on if it is also given a try to act with.
+///
+/// Three cases deliberately do not reset it:
+///
+/// - **the first observation.** A plan upgraded into this field has not rotated anything, and a plan
+///   that never had one has no budget to give back. Recording it without acting is what keeps the
+///   upgrade from handing every failed plan in the cluster a free retry at once.
+/// - **a `Succeeded` plan.** Its hosts are converged and the key it connected with worked; a
+///   rotation is not a reason to touch them again. This is the same rule the mapper applies, from
+///   [`status::may_need_another_run`], so a plan can never be woken for a rotation it would then
+///   decline to act on.
+/// - **a run in flight.** Its outcome is not known yet, and resetting mid-run would talk over the
+///   attempt it is currently spending. Nothing is recorded either, so the rotation is still there to
+///   be noticed once the run drains.
+fn sync_ssh_key_revision(
+    status: &mut PlaybookPlanStatus,
+    mode: &ExecutionMode,
+    observed: Option<&str>,
+) -> bool {
+    let Some(observed) = observed else {
+        return false;
+    };
+    if status.active_run.is_some() || status.observed_ssh_key_revision.as_deref() == Some(observed)
+    {
+        return false;
+    }
+
+    let first_observation = status.observed_ssh_key_revision.is_none();
+    status.observed_ssh_key_revision = Some(observed.to_string());
+
+    // `Recurring` is left out because its budget already restarts at every schedule tick, so there
+    // is nothing here to give back — and `record_retry_budget` would clear the slot the current
+    // tick's budget belongs to.
+    if first_observation
+        || !matches!(mode, ExecutionMode::OneShot)
+        || !status::may_need_another_run(status)
+    {
+        return false;
+    }
+
+    record_retry_budget(status, 0, None);
+    true
+}
+
 fn record_retry_budget(
     status: &mut PlaybookPlanStatus,
     attempts: u32,
@@ -5959,6 +6106,15 @@ mod tests {
         hosts: &[&str],
         static_inventory_name: &str,
     ) -> ResolvedInventoryGroup {
+        ssh_group_with_key(name, hosts, static_inventory_name, "ssh-key")
+    }
+
+    fn ssh_group_with_key(
+        name: &str,
+        hosts: &[&str],
+        static_inventory_name: &str,
+        secret_name: &str,
+    ) -> ResolvedInventoryGroup {
         ResolvedInventoryGroup::Ssh {
             hosts: ResolvedHosts {
                 name: name.into(),
@@ -5968,7 +6124,7 @@ mod tests {
             config: SshConfig {
                 user: "root".into(),
                 secret_ref: SecretRef {
-                    name: "ssh-key".into(),
+                    name: secret_name.into(),
                 },
             },
             variables: None,
@@ -9697,6 +9853,172 @@ spec:
                 &[("node-b", true)],
             )),
             RunFailure::Real
+        );
+    }
+
+    fn rotated(revision: &str, phase: Phase) -> PlaybookPlanStatus {
+        PlaybookPlanStatus {
+            phase,
+            retry_count: 3,
+            observed_ssh_key_revision: Some(revision.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The rule the whole feature is: rotating the key a plan's `StaticInventory` hosts rejected
+    /// hands that plan its attempt budget back, so the rotation is a fix it can actually act on.
+    /// Without the reset the plan is woken and immediately declines — its tries are long spent,
+    /// because a static host has no proxy grace window in front of it and three attempts burn in
+    /// seconds.
+    #[test]
+    fn rotating_the_ssh_key_gives_a_failed_plan_its_attempts_back() {
+        let mut status = rotated("old", Phase::Failed);
+
+        assert!(sync_ssh_key_revision(
+            &mut status,
+            &ExecutionMode::OneShot,
+            Some("new")
+        ));
+        assert_eq!(status.retry_count, 0);
+        assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("new"));
+    }
+
+    /// A converged plan is left alone. Rotating a key changes how the operator connects, not what it
+    /// applies, so there is nothing for it to do — and re-applying a playbook to healthy hosts
+    /// because their credentials were rotated is the behaviour this whole design exists to avoid.
+    #[test]
+    fn rotating_the_ssh_key_does_not_disturb_a_plan_that_succeeded() {
+        let mut status = rotated("old", Phase::Succeeded);
+
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            &ExecutionMode::OneShot,
+            Some("new")
+        ));
+        assert_eq!(status.retry_count, 3);
+        // Still recorded: the plan has seen this key, so a *later* failure must not be credited
+        // with a rotation that already happened.
+        assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("new"));
+    }
+
+    /// The upgrade case. Every plan that predates this field observes its key for the first time on
+    /// the first tick after the operator is upgraded, and that is not a rotation — without this,
+    /// upgrading would hand a free retry to every failed plan in the cluster at once.
+    #[test]
+    fn the_first_observation_of_a_key_is_recorded_but_changes_nothing() {
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Failed,
+            retry_count: 3,
+            ..Default::default()
+        };
+
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            &ExecutionMode::OneShot,
+            Some("first")
+        ));
+        assert_eq!(status.retry_count, 3);
+        assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("first"));
+    }
+
+    /// `None` covers both "this plan reaches no `StaticInventory` hosts" and "the Secrets could not
+    /// be read", and neither is evidence of anything. The second is why they are folded together: a
+    /// failed read that reset the budget would hand it back on every apiserver hiccup.
+    #[test]
+    fn an_unanswerable_key_observation_decides_nothing() {
+        let mut status = rotated("old", Phase::Failed);
+
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            &ExecutionMode::OneShot,
+            None
+        ));
+        assert_eq!(status.retry_count, 3);
+        assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("old"));
+    }
+
+    /// A rotation noticed mid-run is deferred rather than dropped: nothing is recorded, so the tick
+    /// that finds the plan idle still sees the change. Resetting here would talk over the attempt
+    /// the running run is currently spending.
+    #[test]
+    fn a_rotation_during_a_run_is_left_for_the_tick_after_it() {
+        let mut status = rotated("old", Phase::Applying);
+        status.active_run = Some(v1beta1::ActiveRun {
+            execution_hash: "abc".into(),
+            run_id: "run-1".into(),
+            job_name: "apply-plan-1".into(),
+            play_uid: "play-uid".into(),
+            hosts: vec!["ccu.fritz.box".into()],
+            run_number: 1,
+            attempt: 1,
+            triggered_slot: None,
+        });
+
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            &ExecutionMode::OneShot,
+            Some("new")
+        ));
+        assert_eq!(
+            status.observed_ssh_key_revision.as_deref(),
+            Some("old"),
+            "the rotation must still be there to notice once the run drains"
+        );
+    }
+
+    /// `Recurring` already restarts its budget at every schedule tick, so there is nothing to give
+    /// back — and `record_retry_budget` would clear the slot the current tick's budget belongs to.
+    #[test]
+    fn a_recurring_plan_records_the_rotation_without_touching_its_budget() {
+        let mut status = rotated("old", Phase::Failed);
+        status.retry_count_slot = Some(
+            "2025-08-12T20:00:00Z"
+                .parse::<DateTime<FixedOffset>>()
+                .unwrap(),
+        );
+
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            &ExecutionMode::Recurring,
+            Some("new")
+        ));
+        assert_eq!(status.retry_count, 3);
+        assert!(status.retry_count_slot.is_some());
+        assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("new"));
+    }
+
+    /// An unchanged key is not a rotation, however often the plan looks at it — otherwise every tick
+    /// of a failed plan would refund its budget and `maxAttempts` would stop bounding anything.
+    #[test]
+    fn an_unchanged_key_is_not_a_rotation() {
+        let mut status = rotated("same", Phase::Failed);
+
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            &ExecutionMode::OneShot,
+            Some("same")
+        ));
+        assert_eq!(status.retry_count, 3);
+    }
+
+    /// Only `StaticInventory` groups carry key material; a managed-ssh Node is reached with a
+    /// per-run certificate the operator mints itself, which no user rotates.
+    #[test]
+    fn only_static_inventory_groups_contribute_ssh_key_secrets() {
+        let groups = vec![
+            managed_ssh_group("workers", &["node-a"], None),
+            ssh_group_with_key("external", &["ccu.fritz.box"], "ccu", "ssh-key"),
+            ssh_group_with_key("more", &["pdu.fritz.box"], "pdu", "ssh-key"),
+            ssh_group_with_key("other", &["nas.fritz.box"], "nas", "other-key"),
+        ];
+
+        // Deduplicated: two inventories sharing a key must not hash it twice.
+        assert_eq!(
+            ssh_key_secret_names(&groups),
+            vec!["other-key".to_string(), "ssh-key".to_string()]
+        );
+        assert!(
+            ssh_key_secret_names(&[managed_ssh_group("workers", &["node-a"], None)]).is_empty()
         );
     }
 
