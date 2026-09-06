@@ -4094,8 +4094,9 @@ enum RunFailure {
     /// Every host the run targeted succeeded.
     None,
     /// The run failed, and every host that did not succeed sat on a Node the operator had already
-    /// recorded as not `Ready` when the run launched. The reachable part of the inventory is fully
-    /// applied, so nothing about this execution is worth retrying until one of those Nodes returns.
+    /// recorded as not `Ready` when the run launched, **and** the run applied the playbook to at
+    /// least one host. The reachable part of the inventory is fully applied, so nothing about this
+    /// execution is worth retrying until one of those Nodes returns.
     OnlyUnreachableNodes,
     /// Something the operator did reach did not succeed — or the recap could not be read at all,
     /// which proves nothing either way.
@@ -4116,6 +4117,14 @@ enum RunFailure {
 /// proxy pod never came up anyway (an untolerated taint, a failing image pull). The second is why
 /// the test is `node_not_ready` on the run's record and not mere membership in it: both are
 /// excluded from the run identically, and only the record tells them apart.
+///
+/// The third is a run that succeeded on *nothing*, and it is what bounds the whole mechanism. A
+/// refund is credit for progress, so a run with no progress to its name buys nothing back however
+/// good its excuse — otherwise a Node that alternates faster than a plan converges refunds every
+/// attempt it costs, and the plan runs forever: the start gate reads the Node at tick time and
+/// `node_not_ready` is read a grace window later, so a Node that is `Ready` for the first and down
+/// by the second passes the gate and then earns the refund, once per grace window, unbounded. The
+/// budget is the only thing that can bound that, and it can only do so if something spends it.
 fn classify_run_failure(status: &v1beta1::PlayStatus) -> RunFailure {
     match status.phase {
         v1beta1::PlayPhase::Succeeded => RunFailure::None,
@@ -4126,7 +4135,9 @@ fn classify_run_failure(status: &v1beta1::PlayStatus) -> RunFailure {
                 .filter(|(_, result)| result.outcome != v1beta1::HostOutcome::Succeeded)
                 .map(|(host, _)| host)
                 .collect();
-            if !unsucceeded.is_empty()
+            let applied_to_someone = unsucceeded.len() < status.hosts.len();
+            if applied_to_someone
+                && !unsucceeded.is_empty()
                 && unsucceeded.iter().all(|host| {
                     status
                         .unreachable_hosts
@@ -9482,6 +9493,80 @@ spec:
             classify_run_failure(&terminal_play_status(
                 PlayPhase::Unknown,
                 &[("node-b", HostOutcome::Unknown)],
+                &[("node-b", true)],
+            )),
+            RunFailure::Real
+        );
+    }
+
+    /// The bound on the refund, and the reason it is a bound rather than a nicety.
+    ///
+    /// A refund is credit for progress. A run that applied the playbook to nobody has none to be
+    /// credited with, so it spends its attempt however good its excuse — and that is what stops a
+    /// flapping Node running a plan forever: the start gate reads the Node at tick time while
+    /// `node_not_ready` is read a grace window later, so a Node that is `Ready` for the first and
+    /// down by the second passes the gate *and* earns the refund. Without this the plan starts a
+    /// fresh run every grace window for as long as the Node keeps alternating, each one holding
+    /// host Leases that block every other plan targeting those Nodes.
+    #[test]
+    fn a_run_that_applied_the_playbook_to_nobody_is_never_refunded() {
+        use v1beta1::{HostOutcome, PlayPhase};
+
+        // The single-node plan whose Node went down after the gate let it through: the whole run,
+        // and nothing in it succeeded.
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[("node-b", HostOutcome::Unreachable)],
+                &[("node-b", true)],
+            )),
+            RunFailure::Real,
+            "a run that reached nobody made no progress, whatever the reason"
+        );
+
+        // Same for a whole inventory of them — it is the absence of progress that decides, not how
+        // many Nodes were down.
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[
+                    ("node-a", HostOutcome::Unreachable),
+                    ("node-b", HostOutcome::Unreachable),
+                ],
+                &[("node-a", true), ("node-b", true)],
+            )),
+            RunFailure::Real
+        );
+
+        // And the line it must not cross: one host applied is progress, so the feature still works
+        // for the case it exists for.
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[
+                    ("node-a", HostOutcome::Succeeded),
+                    ("node-b", HostOutcome::Unreachable),
+                ],
+                &[("node-b", true)],
+            )),
+            RunFailure::OnlyUnreachableNodes
+        );
+    }
+
+    /// A host the playbook stopped short of is not progress either. The run aborted, so nothing
+    /// converged, and the down Node was not what caused it — crediting the run for reaching hosts
+    /// it left half-applied would refund an attempt that a broken playbook needs to spend.
+    #[test]
+    fn an_aborted_run_is_not_refunded_because_one_of_its_nodes_was_down() {
+        use v1beta1::{HostOutcome, PlayPhase};
+
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[
+                    ("node-a", HostOutcome::Incomplete),
+                    ("node-b", HostOutcome::Unreachable),
+                ],
                 &[("node-b", true)],
             )),
             RunFailure::Real

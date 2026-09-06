@@ -241,11 +241,19 @@ converged" on every plan at once.
 
 A `OneShot` run gets its budget back when it made all the progress that was available to it, which
 is a `Succeeded` verdict *or* a failure confined to Nodes the run recorded as not `Ready` at its
-launch commit (`classify_run_failure`, `PlayStatus::unreachable_hosts`). That record holds every host
+launch commit **and that still applied the playbook to at least one host**
+(`classify_run_failure`, `PlayStatus::unreachable_hosts`). That record holds every host
 the run excluded, each flagged with whether its Node was itself down — a host excluded because a
 `Ready` Node's proxy pod never came up is a configuration problem and is not refunded. It has to be
 captured at launch and persisted: the recap says nothing at all about a host the run excluded, and
-the Node may have recovered by the time the result is drained. That relief
+the Node may have recovered by the time the result is drained.
+
+The "applied to at least one host" half is a bound, not a nicety: the gate reads the Node at tick
+time while `node_not_ready` is read a grace window later, so a Node that alternates across that
+window passes the gate *and* earns the refund, and the plan would run every grace window forever.
+A refund is credit for progress, so a run with none spends its attempt and `maxAttempts` bounds the
+flap. Hysteresis on the gate's release was considered and rejected — it damages the reboot workflow
+the gate exists for, and only filters flaps faster than the delay it adds. That relief
 and the `node_readiness` start gate are a matched pair — the relief is what stops a stranded Node
 burning the budget, the gate is what stops the plan re-running against it every grace window. Neither
 belongs without the other.

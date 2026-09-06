@@ -206,10 +206,26 @@ where to look.
 
 A run that can still reach some of its hosts does start, and it ends `Failed` if it could not reach
 the rest. That verdict stands — the result names every host that was not reached — but it does not
-cost the plan one of its [attempts](./scheduling-and-modes.md#retries): if every host that did not
-succeed sat on a Node that was already `NotReady` when the run launched, the run applied everything
-there was to apply, and a `OneShot` plan's budget is reset exactly as a fully successful run resets
-it. What the plan is waiting for is the Node, not another try, and the next try would be identical.
+cost the plan one of its [attempts](./scheduling-and-modes.md#retries), provided both halves hold:
+
+- the run **applied the playbook to at least one host**, and
+- every host that did *not* succeed sat on a Node that was already `NotReady` when the run launched.
+
+Then the run applied everything there was to apply, and a `OneShot` plan's budget is reset exactly as
+a fully successful run resets it. What the plan is waiting for is the Node, not another try, and the
+next try would be identical.
+
+The first half is what keeps a plan from running forever against a Node that keeps coming and going.
+A refund is credit for progress, so a run that reached nobody spends its attempt however good its
+excuse — and a Node that alternates faster than the plan converges is exactly the case that would
+otherwise refund every attempt it costs. In the ordinary case this half never binds: a plan whose
+Nodes are *stably* down is held before it starts a run at all, and one with a healthy Node alongside
+the down one is applying the playbook to it.
+
+The cost is deliberate. A plan whose Nodes all go down between the readiness check and the launch
+spends an attempt, and after `maxAttempts` of that it stops — so a Node that flaps that many times
+and then genuinely returns needs someone to touch the plan (bump `maxAttempts`, or edit it) rather
+than converging on its own. Bounding the loop is worth more than converging through a flap.
 
 Only Nodes the operator recorded **at launch** count. Two failures that can look the same from the
 outside do spend an attempt, because no Node coming back resolves either:
@@ -223,7 +239,9 @@ outside do spend an attempt, because no Node coming back resolves either:
 
 A run whose recap could not be read at all (`Unknown`, see
 [Results](./results-and-troubleshooting.md)) always spends its attempt: nothing proves any of its
-hosts was reached.
+hosts was reached. So does a run the playbook aborted, since its surviving hosts are
+[`Incomplete`](./results-and-troubleshooting.md#hosts-show-incomplete) rather than applied — the
+down Node is not what stopped it, and the playbook failure is what needs the attempt.
 
 ## Requirements and limitations
 
