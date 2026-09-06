@@ -132,6 +132,11 @@ async fn run(args: RunArgs) {
     // Built inside its own future rather than awaited here: this controller waits for its Node
     // cache's initial sync before it will reconcile anything (see `reconciler::new`), and an
     // apiserver slow to answer that LIST must not also keep the other two from starting.
+    //
+    // That wait is bounded and fatal, and `join!` below is what makes it fatal: it polls all three
+    // futures in this task, so the panic unwinds through it and ends the process. Spawning them
+    // instead would park the panic in a `JoinHandle` nobody reads and leave the operator running
+    // with this controller dead — the exact silent half-alive state the bound exists to prevent.
     let playbookplan_client = client.clone();
     let playbookplan_controller = async move {
         v1beta1::playbookplancontroller::reconciler::new(

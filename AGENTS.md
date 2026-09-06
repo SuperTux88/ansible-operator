@@ -398,6 +398,13 @@ plan would launch one, take its hosts' Leases for the full proxy grace window an
 unreachable. `main` drives this controller as a future of its own so that wait does not delay the
 other two.
 
+The wait is bounded (`NODE_CACHE_SYNC_TIMEOUT`, 2 min) and **fatal**: `await_node_cache` panics
+rather than carrying on, because `Store::wait_until_ready` resolves only on a populated cache or a
+dropped writer, and a `watcher` retries a failing watch forever — so an unbounded wait would leave
+the controller pending for the life of the process while the other two kept the operator looking
+healthy. `join!` in `main` is what turns that panic into a process exit; spawning the controllers
+instead would park it in a `JoinHandle` nobody reads and restore exactly the silent half-alive state.
+
 That reflector is for **readiness only**. `node_access::enforce` keeps its own *live* Node read:
 the allow-set is a security gate and INV-5 says it is never served from a cache.
 

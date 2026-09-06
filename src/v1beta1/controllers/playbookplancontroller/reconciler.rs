@@ -56,6 +56,21 @@ const DEFAULT_RECURRING_ATTEMPTS: u32 = 1;
 /// How long a plan waits before making a try it still owes. Short because a scheduled retry has only
 /// the remainder of its tick's `startingDeadlineSeconds` window to start in.
 const RETRY_REQUEUE: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long [`new`] waits for the Node cache's initial LIST before taking the process down with it.
+///
+/// Deliberately generous, because the two ways of getting it wrong are not symmetric: too short
+/// crash-loops an operator that would have synced a moment later, taking down a working install,
+/// while too long only prolongs a state that is already broken. It has to sit comfortably above a
+/// *healthy* sync and nothing more — that is one unpaginated Node LIST at roughly 10 KB per Node, so
+/// single-digit seconds even at a thousand of them.
+///
+/// Two minutes is the value controller-runtime uses for the same question (its `CacheSyncTimeout`),
+/// and it composes with Kubernetes' crash-loop backoff rather than fighting it: a transient cause —
+/// the chart's ClusterRole landing after the Deployment, an apiserver rolling — clears itself on a
+/// later restart with nobody involved, while a permanent one shows as `CrashLoopBackOff` within a
+/// couple of minutes with the reason in the log. A knob here would only invite tuning a number whose
+/// single job is to be far above any healthy sync.
+const NODE_CACHE_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 pub struct WorkloadEgressPolicies {
     pub playbook: Option<Vec<NetworkPolicyEgressRule>>,
@@ -256,19 +271,8 @@ pub async fn new(
         reader
     };
 
-    // The start gate reads this cache to decide whether a `OneShot` run is worth starting, and a
-    // cache that has not synced yet answers "every node is Ready" for every node — which is exactly
-    // the answer that starts the runs a held plan exists to hold back. Each such run takes its
-    // hosts' Leases, creates a node-root proxy pod per host, waits out the full grace window
-    // (default 600s) blocking every other plan on those hosts, and then reports them all
-    // unreachable. That is what an operator restart would cost every held plan, so the initial LIST
-    // is waited for instead. It is the only thing this constructor waits for.
-    if let Err(error) = node_reflector_reader.wait_until_ready().await {
-        error!(
-            "Node reflector stopped before its initial sync: {error:?} — readiness checks will \
-             treat every node as Ready until it recovers"
-        );
-    }
+    // The only thing this constructor waits for.
+    await_node_cache(&node_reflector_reader).await;
 
     let context = Arc::new(ReconciliationContext {
         client: client.clone(),
@@ -339,6 +343,41 @@ pub async fn new(
         |_, _, _| Action::requeue(std::time::Duration::from_secs(15)),
         Arc::clone(&context),
     )
+}
+
+/// Blocks until the Node reflector has served its initial LIST, and **panics** if it never does.
+///
+/// The wait itself is what `node_readiness` depends on: an unsynced cache reports every node
+/// `Ready`, because [`node_readiness::unready_nodes`] reads a miss as "no such Node". That is
+/// precisely the answer that starts the runs a held plan exists to hold back — each one taking its
+/// hosts' Leases, creating a node-root proxy pod per host, waiting out the full grace window
+/// (default 600s) while blocking every other plan on those hosts, and then reporting them all
+/// unreachable. Without this wait that is what an operator restart costs every held plan.
+///
+/// **Failing to sync is fatal, not degraded, and that is the whole reason for the panic.**
+/// `Store::wait_until_ready` resolves on exactly two events — the cache is populated, or the writer
+/// is dropped — and a `watcher` retries a failing watch forever, so an apiserver that never answers
+/// leaves this pending for the life of the process. Since `main` builds this controller inside its
+/// own future, the other two would carry on and the operator would look healthy while every plan in
+/// the cluster silently stopped moving, with only the reflector task's own log line to say why.
+/// Crashing is louder, and it recovers on its own if the cause was transient.
+///
+/// A dropped writer is fatal for the same reason and not merely a warning: the writer lives in the
+/// reflector task, so losing it means the cache will never populate *and* never update again.
+async fn await_node_cache(nodes: &Store<Node>) {
+    match tokio::time::timeout(NODE_CACHE_SYNC_TIMEOUT, nodes.wait_until_ready()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!(
+            "the Node reflector stopped before its initial sync ({error}); the PlaybookPlan \
+             controller cannot judge node readiness without it"
+        ),
+        Err(_elapsed) => panic!(
+            "timed out after {}s waiting for the initial Node list; the PlaybookPlan controller \
+             cannot judge node readiness without it. Check that the operator's ClusterRole still \
+             grants list/watch on nodes, and that the apiserver is reachable",
+            NODE_CACHE_SYNC_TIMEOUT.as_secs()
+        ),
+    }
 }
 
 /// Reconciles one PlaybookPlan. Level-triggered/idempotent "ensure" style — every step re-derives
@@ -6151,6 +6190,24 @@ mod tests {
     use crate::v1beta1::{
         PlaySpec, PlaybookPlanSpec, ResolvedHosts, SecretRef, SshConfig, Toleration,
     };
+
+    /// A dropped writer means the reflector task is gone, so the Node cache will never populate and
+    /// never update again — and a cache that answers nothing is a cache that answers "every node is
+    /// Ready". Carrying on from there is the failure [`await_node_cache`] exists to prevent,
+    /// arriving through the door that used to be a `warn`.
+    ///
+    /// Pinned because "log it and continue" is what this was, and so is the shape a later reader is
+    /// most likely to restore. The timeout arm is left to the type checker: exercising it would need
+    /// a paused clock, which is a tokio feature the crate does not otherwise want.
+    #[tokio::test]
+    #[should_panic(expected = "stopped before its initial sync")]
+    async fn a_node_cache_that_can_never_sync_takes_the_operator_down() {
+        let writer = Writer::<Node>::default();
+        let reader = writer.as_reader();
+        drop(writer);
+
+        await_node_cache(&reader).await;
+    }
 
     fn managed_ssh_group(
         name: &str,
