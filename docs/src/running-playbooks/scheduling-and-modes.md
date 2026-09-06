@@ -156,11 +156,13 @@ timer. The watched inputs are:
 | The run's Job finishing | at once |
 | Nothing at all | on a timer: the time until the next scheduled tick, or an hour for an unscheduled plan |
 
-"Still waiting on" is narrower than "not current". A Node turning `Ready` wakes a plan for a host it
-has never run against, one it left [unreachable](./cluster-nodes.md#holding-instead-of-starting), one
-whose recap it could not read, or one that succeeded on an older revision. It does **not** wake a
-plan for a host Ansible connected to and failed on: that host is fixed by fixing the playbook, and
-its Node was never the thing standing in the way.
+"Still waiting on" is narrower than "not current". For a host whose `lastAppliedHash` differs from
+the current hash, a Node turning `Ready` wakes a plan if it has never run against that host, left it
+[unreachable](./cluster-nodes.md#holding-instead-of-starting), could not read its recap, or last
+succeeded on an older revision. It does **not** wake a plan for a host left `Failed`, `NotReached`,
+or `Incomplete`: none of those outcomes says that host's own Node returning to `Ready` can unblock
+the plan. See the [per-host outcome table](./results-and-troubleshooting.md#per-host-outcomes) for
+their distinct causes.
 
 The SSH key row is deliberately one-sided. Rotating a key changes how the operator connects, not what
 it applies, so it must never re-apply the playbook to hosts that are already current — which is why
