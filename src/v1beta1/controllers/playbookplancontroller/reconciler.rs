@@ -9325,6 +9325,37 @@ spec:
         }
     }
 
+    /// The reboot workflow, which is the one this behaviour was built around: a playbook reboots
+    /// its target, the connection drops, and the Node is `NotReady` for minutes. Exclusion keys off
+    /// "the proxy pod did not come up within the window", never off "this Node was down at some
+    /// point" — so on the retry that the Node's return releases, a proxy is scheduled, comes up
+    /// with a real address, and the host is in the run like any other. Keying it off the Node's
+    /// history instead would leave the post-reboot check permanently excluded from its own plan.
+    #[test]
+    fn a_node_whose_proxy_came_up_is_in_the_run_at_its_real_address() {
+        let hosts = managed_ssh_host_map(
+            vec![
+                managed_ssh::ProxyPodInfo {
+                    host: "node-a".into(),
+                    pod_ip: "10.42.1.7".into(),
+                    port: 22,
+                },
+                managed_ssh::ProxyPodInfo {
+                    host: "node-b".into(),
+                    pod_ip: "10.42.3.9".into(),
+                    port: 22,
+                },
+            ],
+            &[],
+        );
+
+        assert!(matches!(
+            hosts["node-b"],
+            ansible::ManagedSshHostInfo::Proxy { ref pod_ip, port } if pod_ip == "10.42.3.9" && port == 22
+        ));
+        assert_eq!(hosts.len(), 2);
+    }
+
     /// The guard on launching a Job at all. A run still has work whenever anything it targets can
     /// be reached, and a `StaticInventory` host never had a proxy pod to fail — so a plan spanning
     /// both kinds must not be written off because its Nodes are down.
