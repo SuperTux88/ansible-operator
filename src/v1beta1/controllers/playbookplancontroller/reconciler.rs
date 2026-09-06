@@ -755,7 +755,18 @@ async fn reconcile(
     // `PlaybookPlanStatus::observed_ssh_key_revision`. Placed before the start gate so a rotation
     // that hands the budget back takes effect on this tick rather than the next one, which is what
     // makes rotating a key an actual fix for a plan its hosts locked out.
-    let observed_ssh_key_revision = observe_ssh_key_revision(&target_groups, &secrets_api).await;
+    //
+    // Skipped entirely while a run is in flight, because `sync_ssh_key_revision` would discard the
+    // answer anyway: it neither resets the budget nor records the revision mid-run, precisely so the
+    // rotation is still there to be noticed once the run drains. Reading it regardless cost a Secret
+    // GET per Secret per tick, and a run waiting on its proxy pods ticks every 5s for up to the
+    // whole grace window. `active_run` already carries this tick's post-drain value, so the tick a
+    // run finishes on still observes.
+    let observed_ssh_key_revision = if resource_status.active_run.is_none() {
+        observe_ssh_key_revision(&target_groups, &secrets_api).await
+    } else {
+        None
+    };
     if sync_ssh_key_revision(
         &mut resource_status,
         &object.spec.mode,
@@ -4432,7 +4443,9 @@ async fn observe_ssh_key_revision(
 ///   decline to act on.
 /// - **a run in flight.** Its outcome is not known yet, and resetting mid-run would talk over the
 ///   attempt it is currently spending. Nothing is recorded either, so the rotation is still there to
-///   be noticed once the run drains.
+///   be noticed once the run drains. The caller skips the Secret read on the same condition rather
+///   than paying for an answer this would discard; the check stays here so the rule lives with the
+///   reasoning for it and does not depend on a caller remembering it.
 fn sync_ssh_key_revision(
     status: &mut PlaybookPlanStatus,
     mode: &ExecutionMode,
