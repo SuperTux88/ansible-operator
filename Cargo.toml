@@ -34,6 +34,8 @@ ssh-key = { version = "0.6", default-features = false, features = [
 ] }
 toml = "1"
 clap = { version = "4", features = ["derive"] }
+base64 = "0.22"
+flate2 = "1.1.10"
 
 [dev-dependencies]
 # Container-backed integration tests (see managed_ssh::container_tests). #[ignore]d by default;
