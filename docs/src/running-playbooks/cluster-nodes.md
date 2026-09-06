@@ -195,6 +195,13 @@ A plan can stay held indefinitely, and for a Node that is never coming back that
 resting state — the condition says exactly what it is waiting for. Removing the Node from the cluster
 or from the inventory's selector is what ends it.
 
+The hold is asked before a run starts, so it cannot catch a proxy pod that fails *after* it passed.
+If that leaves a started run with nothing it can reach, no Job is created for it: there is no host
+for a playbook to run against, so the run is recorded straight away as `Failed` with every host
+`Unreachable`. It spends an attempt or not by the same rule as any other run — see below — and
+because no Job exists, there are no run logs for it. `.status.summary` and the `Play` record are
+where to look.
+
 ### Unreachable Nodes and the attempt budget
 
 A run that can still reach some of its hosts does start, and it ends `Failed` if it could not reach

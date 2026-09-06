@@ -719,9 +719,20 @@ fn terminal_status(
         .count();
 
     let phase = match parsed {
-        None => PlayPhase::Unknown,
         Some(_) if succeeded == host_count && host_count != 0 => PlayPhase::Succeeded,
         Some(_) => PlayPhase::Failed,
+        // A run that excluded every host it targeted never launched a Job and has no recap to be
+        // missing: the exclusions settle its outcome on their own. `Unknown` is for a run that ran
+        // and whose result could not be read, and reporting that here would deny the plan the one
+        // thing it does know — that nobody could be reached.
+        None if host_count != 0
+            && host_results
+                .values()
+                .all(|result| result.outcome == HostOutcome::Unreachable) =>
+        {
+            PlayPhase::Failed
+        }
+        None => PlayPhase::Unknown,
     };
 
     PlayStatus {
@@ -1453,6 +1464,45 @@ mod tests {
             terminal.unreachable_hosts,
             vec![unreachable_host("node-b", true)]
         );
+    }
+
+    /// A run that excluded every host never launches a Job, so no recap will ever exist for it —
+    /// but its outcome is not unknown, it is `Failed` with every host `Unreachable`. Calling it
+    /// `Unknown` would send an operator looking for lost instrumentation, and would deny the plan
+    /// the refund `classify_run_failure` owes a run whose Nodes were all down.
+    #[test]
+    fn a_run_that_excluded_every_host_is_failed_rather_than_unknown() {
+        let hosts = vec!["node-a".to_string(), "node-b".to_string()];
+
+        let all_excluded = terminal_status(
+            "apply-web-abc-1",
+            &hosts,
+            None,
+            vec![
+                unreachable_host("node-a", true),
+                unreachable_host("node-b", true),
+            ],
+        );
+
+        assert_eq!(all_excluded.phase, PlayPhase::Failed);
+        assert_eq!(
+            all_excluded.hosts["node-a"].outcome,
+            HostOutcome::Unreachable
+        );
+        assert_eq!(all_excluded.failed_host_count, 2);
+        assert_eq!(all_excluded.recap.unreachable, 2);
+
+        // A run that did launch and whose recap could not be read is still `Unknown`: one of its
+        // hosts was reachable, so something ran and its result was lost.
+        let recap_lost = terminal_status(
+            "apply-web-abc-1",
+            &hosts,
+            None,
+            vec![unreachable_host("node-a", true)],
+        );
+
+        assert_eq!(recap_lost.phase, PlayPhase::Unknown);
+        assert_eq!(recap_lost.hosts["node-b"].outcome, HostOutcome::Unknown);
     }
 
     /// A host the run excluded is absent from the recap for a reason the recap cannot express, so

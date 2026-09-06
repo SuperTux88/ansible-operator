@@ -2276,6 +2276,41 @@ async fn ensure_infra_and_launch(
         );
     }
 
+    // Nothing left for a Job to do, so none is created. `ansible-playbook` would refuse a run whose
+    // `--limit` leaves no host to target and exit without writing a recap at all, which would report
+    // this as `Unknown` — "the operator could not read the result" — when the result is in fact
+    // fully known. The record is committed and finished here instead, and the next tick drains it
+    // through the same path as any finished run, so the verdict, the per-host outcomes and the
+    // attempt budget are all decided in one place.
+    //
+    // The start gate covers the common case a tick earlier and more cheaply; this is the case it
+    // cannot see, where every proxy pod fails *after* the gate has already passed.
+    if nothing_left_to_reach(&run.mirror.hosts, &unreachable) {
+        warn!(
+            "PlaybookPlan {namespace}/{name}: not launching run {} — no host it targets can be reached",
+            run.mirror.job_name
+        );
+        let play = play_history::commit_launching(
+            &context.client,
+            namespace,
+            &run.mirror.job_name,
+            &run.mirror.play_uid,
+            &unreachable,
+        )
+        .await?;
+        release_run_infrastructure(context, object, run).await?;
+        let plays_api = Api::<Play>::namespaced(context.client.clone(), namespace);
+        play_history::record_finished(
+            &plays_api,
+            play,
+            &run.mirror.play_uid,
+            &run.mirror.hosts,
+            None,
+        )
+        .await?;
+        return Ok(Some(std::time::Duration::from_secs(1)));
+    }
+
     // Proxy pod IPs are fresh every time a run's infrastructure is (re)built, so this is rendered
     // unconditionally rather than on a generation change: the workspace Secret has to describe the
     // pods that exist right now, not the plan revision it was last written for.
@@ -2329,6 +2364,18 @@ async fn ensure_infra_and_launch(
     status::set_running_condition(resource_status);
 
     Ok(None)
+}
+
+/// Whether the run has no host left it could act on.
+///
+/// Asked over the run's own recorded host list, not over the managed-ssh hosts alone: a run that
+/// also targets `StaticInventory` hosts still has work to do however many of its Nodes are down,
+/// because those hosts are reached over plain SSH and never had a proxy pod to fail.
+fn nothing_left_to_reach(hosts: &[String], unreachable: &[v1beta1::UnreachableHost]) -> bool {
+    !hosts.is_empty()
+        && hosts
+            .iter()
+            .all(|host| unreachable.iter().any(|entry| entry.host == *host))
 }
 
 /// The Ansible-facing view of this run's proxy pods: the Ready ones at their live pod IP, plus the
@@ -9276,6 +9323,40 @@ spec:
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// The guard on launching a Job at all. A run still has work whenever anything it targets can
+    /// be reached, and a `StaticInventory` host never had a proxy pod to fail — so a plan spanning
+    /// both kinds must not be written off because its Nodes are down.
+    #[test]
+    fn a_run_is_only_pointless_when_every_host_it_targets_is_unreachable() {
+        let excluded = |hosts: &[&str]| -> Vec<v1beta1::UnreachableHost> {
+            hosts
+                .iter()
+                .map(|host| v1beta1::UnreachableHost {
+                    host: host.to_string(),
+                    node_not_ready: true,
+                })
+                .collect()
+        };
+        let hosts =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|name| name.to_string()).collect() };
+
+        assert!(nothing_left_to_reach(
+            &hosts(&["node-a", "node-b"]),
+            &excluded(&["node-a", "node-b"])
+        ));
+        assert!(!nothing_left_to_reach(
+            &hosts(&["node-a", "node-b"]),
+            &excluded(&["node-a"])
+        ));
+        assert!(
+            !nothing_left_to_reach(&hosts(&["node-a", "ccu.fritz.box"]), &excluded(&["node-a"])),
+            "an SSH host is reached without a proxy pod, so the run still has work"
+        );
+        assert!(!nothing_left_to_reach(&hosts(&["node-a"]), &[]));
+        // Never reached with an empty run, and a vacuous `all` must not make one look pointless.
+        assert!(!nothing_left_to_reach(&[], &[]));
     }
 
     /// The rule the attempt budget turns on: a failure is only forgiven when every host that did
