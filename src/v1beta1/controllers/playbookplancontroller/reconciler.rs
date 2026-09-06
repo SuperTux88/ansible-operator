@@ -2451,6 +2451,15 @@ async fn ensure_infra_and_launch(
     // Recorded on the run before its Job exists, because it is only answerable here: a Node that is
     // down now may be back by the time the recap is read, and the recap says nothing at all about a
     // host the run excluded from execution.
+    //
+    // The same `unreachable` the workspace Secret was just rendered from, and that pairing is the
+    // point: the Secret's `--limit` file says which hosts the run skips, the record says which hosts
+    // it skipped, and `record_finished` reads the record long after this tick. On a resumed run this
+    // is a *re-statement* — the phase is already `Launching` and the proxy pods have moved since —
+    // so the commit rewrites the set rather than leaving the first tick's answer standing over a
+    // file that no longer matches it (see `play_history::decide_transition`). Rendering and
+    // committing from one variable is what keeps the two from drifting; splitting them, or hoisting
+    // either above `ensure_proxy_infra`, reintroduces the drift.
     play_history::commit_launching(
         &context.client,
         namespace,

@@ -188,9 +188,12 @@ pub async fn commit_starting(
 /// [`PlayStatus::unreachable_hosts`].
 ///
 /// This is the transition that means "the infrastructure has settled", which is the moment the set
-/// is both known and still true, so it is written here rather than observed later. A replay of a
-/// commit that already landed stays the no-op every step of this protocol is, so the set the first
-/// commit recorded is the one that stands — which is the intended reading of "at launch".
+/// is both known and still true, so it is written here rather than observed later.
+///
+/// A replay is the no-op every step of this protocol is *as far as the phase goes*, but the set
+/// itself is re-stated — see [`decide_transition`]. A resumed run whose Job was never created comes
+/// back through here having re-read its proxy pods, and the record has to keep describing the run
+/// the caller is about to render and launch, not the one an earlier tick was going to.
 pub async fn commit_launching(
     client: &kube::Client,
     namespace: &str,
@@ -307,6 +310,21 @@ async fn transition_phase(
 /// The whole status is carried forward and only the phase — plus, for the launch commit, the
 /// excluded hosts — is replaced, so every field a later transition inherits survives to the
 /// terminal write.
+///
+/// **Idempotence is about the phase, not about the data the phase carries.** A replayed launch
+/// commit arrives with a *newer* exclusion set than the record holds — the run's proxy pods have had
+/// another tick to come up or give up — and that set has to land, because it is the same set the
+/// caller is about to render the run's `--limit` file and host addresses from. A record left saying
+/// something else would describe a different run than the one the Job executes: a host excluded in
+/// the file but not in the record loses its `unreachable` from the recap, and one excluded in the
+/// record but not in the file runs the playbook and is still reported unreachable, never stamped,
+/// and re-run for as long as the plan exists.
+///
+/// Refreshing it does not weaken "recorded at launch", because the caller only ever reaches here
+/// while the run's Job does not exist yet — once it does, the run is adopted rather than resumed
+/// (`reconciler::decide_job_presence`), so nothing comes back through this. The last write therefore
+/// always describes the run that actually ran. An *unchanged* set still writes nothing, so a resume
+/// that changed nothing stays the no-op the rest of this protocol is.
 fn decide_transition(
     status: &PlayStatus,
     expected: &PlayPhase,
@@ -314,7 +332,14 @@ fn decide_transition(
     unreachable_hosts: Option<&[UnreachableHost]>,
 ) -> Result<Option<PlayStatus>, ReconcileError> {
     if status.phase == next {
-        return Ok(None);
+        return Ok(match unreachable_hosts {
+            Some(hosts) if hosts != status.unreachable_hosts => {
+                let mut restated = status.clone();
+                restated.unreachable_hosts = hosts.to_vec();
+                Some(restated)
+            }
+            _ => None,
+        });
     }
     if status.phase != *expected {
         return Err(ReconcileError::PreconditionFailed(
@@ -1667,6 +1692,63 @@ mod tests {
                 None
             )
             .is_err()
+        );
+    }
+
+    /// A resumed `Launching` run commits again with a *newer* set — its proxy pods have had another
+    /// tick to come up or give up — and that set has to land, because the same tick renders the
+    /// run's `--limit` file from it. Leaving the first answer standing would let the record and the
+    /// file describe different runs: a host excluded in the file but not the record loses its
+    /// `unreachable` from the recap, and one excluded in the record but not the file runs the
+    /// playbook, is reported unreachable anyway, is never stamped, and is re-run for the life of
+    /// the plan.
+    ///
+    /// The phase half of idempotence is untouched — nothing is written when the set has not moved,
+    /// which is what keeps a resume that changed nothing from being a write and another reconcile.
+    #[test]
+    fn a_replayed_launch_commit_restates_the_set_but_only_when_it_moved() {
+        let launching = decide_transition(
+            &PlayStatus {
+                phase: PlayPhase::Starting,
+                ..Default::default()
+            },
+            &PlayPhase::Starting,
+            PlayPhase::Launching,
+            Some(&[unreachable_host("node-b", true)]),
+        )
+        .unwrap()
+        .expect("the first commit writes the set");
+        assert_eq!(
+            launching.unreachable_hosts,
+            vec![unreachable_host("node-b", true)]
+        );
+
+        // The resume: node-b's proxy came up after all, and node-c's has since given up.
+        let restated = decide_transition(
+            &launching,
+            &PlayPhase::Starting,
+            PlayPhase::Launching,
+            Some(&[unreachable_host("node-c", false)]),
+        )
+        .unwrap()
+        .expect("a set that moved must be written, replay or not");
+        assert_eq!(
+            restated.unreachable_hosts,
+            vec![unreachable_host("node-c", false)]
+        );
+        assert_eq!(restated.phase, PlayPhase::Launching);
+
+        // Same set, same record: still nothing to write.
+        assert!(
+            decide_transition(
+                &restated,
+                &PlayPhase::Starting,
+                PlayPhase::Launching,
+                Some(&[unreachable_host("node-c", false)]),
+            )
+            .unwrap()
+            .is_none(),
+            "a resume that found the same hosts must not restamp the record"
         );
     }
 
