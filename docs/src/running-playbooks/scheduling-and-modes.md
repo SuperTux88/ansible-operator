@@ -164,6 +164,10 @@ or `Incomplete`: none of those outcomes says that host's own Node returning to `
 the plan. See the [per-host outcome table](./results-and-troubleshooting.md#per-host-outcomes) for
 their distinct causes.
 
+It also asks whether the *plan* could act on the wake-up at all, which is a separate question from
+what its hosts need. A **suspended** plan is waiting on you, not on a machine, so no Node wakes it
+however outdated its hosts are — resuming it is what starts the run.
+
 The SSH key row is deliberately one-sided. Rotating a key changes how the operator connects, not what
 it applies, so it must never re-apply the playbook to hosts that are already current — which is why
 the key is not part of the execution hash, and the hash is what decides which hosts are outdated. A

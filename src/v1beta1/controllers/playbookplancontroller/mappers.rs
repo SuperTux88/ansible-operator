@@ -134,10 +134,17 @@ pub fn node_to_playbookplans(
 
 /// Whether `plan` targets `node` and is waiting on something the node turning `Ready` could supply.
 ///
-/// Every part is read from the plan's own status, which is what makes this answerable without a
-/// cluster read: `eligibleHosts` is the host set the last reconcile resolved, and a host is owed a
-/// run while the hash it last *succeeded* on is not the one the plan currently wants. A host with no
-/// recorded status at all has never succeeded, so it is owed one too.
+/// Every part is read from the plan's own spec and status, which is what makes this answerable
+/// without a cluster read: `eligibleHosts` is the host set the last reconcile resolved, and a host is
+/// owed a run while the hash it last *succeeded* on is not the one the plan currently wants. A host
+/// with no recorded status at all has never succeeded, so it is owed one too.
+///
+/// The host's state is only half the question, though, and asking it alone is what let this wake a
+/// plan that could not act on the wake-up. A suspended plan is waiting on an operator, never on a
+/// Node: `spec.suspend` is not read anywhere earlier in the reconcile — `may_start_new_run` folds it
+/// in far too late to matter here — so suspending a plan and editing its playbook (which moves the
+/// hash, so every host is outdated) would otherwise wake it on every kubelet heartbeat of every
+/// matching Node for as long as it stayed suspended, which is an ordinary workflow.
 ///
 /// The outcome check is what keeps that from meaning "forever". `lastAppliedHash` is only stamped on
 /// `Succeeded` (`status::apply_terminal_play_status`), so a host that was reached and failed for real
@@ -162,6 +169,10 @@ pub fn node_to_playbookplans(
 /// readiness gate never ran, so it still carries the *previous* run's `Succeeded` outcomes, and this
 /// watch is the only thing that releases it.
 fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &str) -> bool {
+    if plan.spec.suspend {
+        return false;
+    }
+
     let Some(status) = plan.status.as_ref() else {
         return false;
     };
@@ -641,6 +652,24 @@ mod tests {
         let plan = plan_awaiting("node-a", host("older", HostOutcome::Succeeded));
 
         assert!(plan_awaits_node(&plan, "node-a"));
+    }
+
+    /// Suspending a plan and editing its playbook is an ordinary workflow, and it leaves every host
+    /// outdated against the new hash — so without this the plan is woken by every kubelet heartbeat
+    /// of every Node it targets, for as long as it stays suspended, to reach a start gate that
+    /// refuses it. The check has to live here because `spec.suspend` is read nowhere earlier in the
+    /// reconcile.
+    #[test]
+    fn a_suspended_plan_awaits_nothing() {
+        let mut plan = plan_awaiting("node-a", host("", HostOutcome::Unreachable));
+        assert!(
+            plan_awaits_node(&plan, "node-a"),
+            "the same plan unsuspended is one the watch exists for"
+        );
+
+        plan.spec.suspend = true;
+
+        assert!(!plan_awaits_node(&plan, "node-a"));
     }
 
     #[test]
