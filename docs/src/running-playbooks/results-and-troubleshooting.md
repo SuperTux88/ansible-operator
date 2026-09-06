@@ -768,6 +768,19 @@ If *every* host of one run shows `Unknown` at once, check these causes first:
   the whole run as unknown rather than leaving the plan stuck. The next run reports these hosts
   normally.
 
+### A `hosts: localhost` play has no per-host outcome
+
+Expected. Every run is launched with `--limit`, whose pattern list names `all` and `localhost` before
+excluding the hosts nothing could reach — so a `hosts: localhost` play runs exactly as it would
+without the operator, but localhost is not one of the plan's hosts. It gets no entry in
+`.status.hostsStatus`, no `lastAppliedHash`, and its counters are not part of `.status.recap`, which
+describes the hosts the plan targets. Its output is in the run's Job log.
+
+Note that `localhost` here is Ansible's *implicit* localhost, which `all` never matches: a
+`hosts: all` play does not pick it up, and neither does the operator's completion-marker play, which
+targets `all`. A `StaticInventory` host that happens to be named `localhost` is an ordinary host of
+the plan and is reported like any other.
+
 ### A change is not being picked up
 
 Only inputs that feed the [execution hash](./scheduling-and-modes.md#drift-detection) — the playbook

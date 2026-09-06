@@ -182,18 +182,29 @@ fn render_preflight_endpoints(hosts: &BTreeMap<String, ansible::ManagedSshHostIn
         .collect()
 }
 
-/// The `--limit` pattern list: `all`, then one `!host` line per host with no proxy to reach.
+/// The `--limit` pattern list: `all` and `localhost`, then one `!host` line per host with no proxy
+/// to reach.
 ///
 /// Ansible joins the lines of a `@file` limit with commas, so this reads as
-/// `all,!host-a,!host-b` — every host the play names, minus the ones nothing can dial. `all` alone
-/// (the common case) is a no-op rather than a special case, which is why the file is always written
-/// and the argument is never conditional.
+/// `all,localhost,!host-a,!host-b` — every host the play names, minus the ones nothing can dial.
+/// `all,localhost` alone (the common case) is a no-op rather than a special case, which is why the
+/// file is always written and the argument is never conditional.
 ///
 /// Excluding rather than omitting from the inventory is the point of the whole mechanism: the hosts
 /// stay in their groups, so a playbook templating fleet membership out of `groups[]` still sees
 /// them, while `ansible_play_hosts` does not and no task is attempted against them.
+///
+/// `localhost` is there because `--limit` **intersects** rather than adds, and `all` does not
+/// contain Ansible's implicit localhost: without the alias, a `hosts: localhost` play in a user's
+/// playbook is dropped with `skipping: no hosts matched` in the pod log alone, while the plan still
+/// reports success. One alias covers `127.0.0.1` and `::1` too, since Ansible reuses a single
+/// implicit-localhost host object whatever spelling asks for it. It only permits localhost, it never
+/// adds it: `all` still matches no implicit localhost, so a play targeting a group is unaffected,
+/// and an inventory host literally named `localhost` is in `all` already and stays excludable
+/// because its `!localhost` line comes after.
 fn render_limit(hosts: &BTreeMap<String, ansible::ManagedSshHostInfo>) -> String {
-    std::iter::once("all\n".to_string())
+    ["all\n".to_string(), "localhost\n".to_string()]
+        .into_iter()
         .chain(
             hosts
                 .iter()
@@ -297,8 +308,8 @@ spec:
     }
 
     /// The limit file is what turns "the operator could not reach this host" into "Ansible never
-    /// attempts it", and `all` is what makes the always-present `--limit` argument a no-op when
-    /// there is nothing to exclude.
+    /// attempts it", and `all,localhost` is what makes the always-present `--limit` argument a no-op
+    /// when there is nothing to exclude.
     #[test]
     fn the_limit_excludes_every_host_without_a_proxy_and_nothing_else() {
         let hosts = BTreeMap::from([
@@ -314,7 +325,30 @@ spec:
             ),
         ]);
 
-        assert_eq!(super::render_limit(&hosts), "all\n!node-b\n!node-d\n");
+        assert_eq!(
+            super::render_limit(&hosts),
+            "all\nlocalhost\n!node-b\n!node-d\n"
+        );
+    }
+
+    /// Pins a property nothing on the operator side can observe — only a real `ansible-playbook`
+    /// shows it. `--limit` intersects the play's hosts rather than adding to them, and `all` does
+    /// not match Ansible's *implicit* localhost, so an unconditional `--limit all` silently drops
+    /// every `hosts: localhost` play in a user's playbook: the skip appears in the pod log only, the
+    /// recap never mentions localhost, and the plan reports success while the play never ran.
+    ///
+    /// One alias is enough for `127.0.0.1` and `::1` as well, because `InventoryData` reuses a
+    /// single implicit-localhost object whatever spelling creates it. It only permits localhost — it
+    /// cannot add it, since `all` still matches no implicit localhost — and it must stay ahead of
+    /// the exclusions so a host literally named `localhost` can still be excluded.
+    #[test]
+    fn the_limit_permits_the_implicit_localhost_so_localhost_plays_still_run() {
+        let hosts = BTreeMap::from([(
+            "localhost".to_string(),
+            ansible::ManagedSshHostInfo::Unreachable,
+        )]);
+
+        assert_eq!(super::render_limit(&hosts), "all\nlocalhost\n!localhost\n");
     }
 
     /// Written even when it excludes nothing, and even for a run with no managed-ssh host at all:
@@ -333,7 +367,7 @@ spec:
                     .unwrap()
                     .get(paths::ANSIBLE_LIMIT_FILENAME)
                     .map(String::as_str),
-                Some("all\n")
+                Some("all\nlocalhost\n")
             );
         }
     }
