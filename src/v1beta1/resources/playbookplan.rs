@@ -504,17 +504,28 @@ pub enum HostOutcome {
     Succeeded,
     /// Ansible connected to the host and a task failed on it.
     Failed,
-    /// Ansible could not open a connection to the host at all, so no task ran on it — a managed-ssh
-    /// Node whose proxy pod never became Ready is rendered at an unroutable address precisely to
-    /// produce this, and a `StaticInventory` host that is down or refusing the key lands here too.
+    /// Nothing could open a connection to the host, so no task ran on it — a `StaticInventory` host
+    /// that is down or refusing the key, or a cluster Node that was itself not `Ready`, which the
+    /// run excludes rather than dialling.
     ///
-    /// Distinct from `Failed` because the two are fixed in different places, and from `NotReached`
-    /// because Ansible *did* get to this host — the connection is what did not happen. A host whose
-    /// connection dropped part-way through, leaving both failed and unreachable tasks behind, reads
-    /// `Failed`: something did run and did fail, which is the more actionable half.
+    /// Distinct from `Failed` because the two are fixed in different places. Distinct from
+    /// `NotReached` because something has to come back for this host before anything can be
+    /// attempted on it, and the operator is watching for exactly that: a Node returning to `Ready`
+    /// wakes the plan. A host whose connection dropped part-way through, leaving both failed and
+    /// unreachable tasks behind, reads `Failed`: something did run and did fail, which is the more
+    /// actionable half.
     Unreachable,
-    /// The host was in scope for this run but Ansible never reached it (e.g. an earlier host in its
-    /// `serial` batch stopped the play).
+    /// The host was in scope for this run, nothing was attempted on it, and no Node coming back will
+    /// change that. Two causes, one answer:
+    ///
+    /// - an earlier host in its `serial` batch stopped the play, so the fix is on *that* host;
+    /// - the run excluded it because its managed-ssh proxy pod never came up on a Node that was
+    ///   itself `Ready` — an untolerated taint, a failing image pull, a rejecting admission webhook.
+    ///   The fix is in the pod's scheduling, not on the Node.
+    ///
+    /// What they share is the part the operator acts on: this host's own `Ready` heartbeats carry no
+    /// news, so `mappers::plan_awaits_node` leaves it out of the Node watch's wake set. Contrast
+    /// `Unreachable`, where a Node returning is precisely what resolves it.
     NotReached,
     /// Ansible ran tasks on the host, none of them failed, and the playbook still stopped before
     /// reaching the end for it — an `any_errors_fatal` abort, a failed `serial` batch, a

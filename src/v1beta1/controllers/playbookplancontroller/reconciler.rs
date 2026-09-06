@@ -5143,6 +5143,12 @@ fn phase_for_finished_run(status: &v1beta1::PlayStatus) -> Phase {
 /// "Every", with at least one such host: a single host that ran a task and failed, that the play
 /// stopped short of, or whose recap could not be read makes the unreachable ones no longer the whole
 /// story, and the plan has something to fix rather than something to wait for.
+///
+/// A host excluded because its proxy pod never came up on a Node that was *already* `Ready` is one
+/// of those, by way of the `NotReached` it now carries. Deliberately: `HostsUnreachable` says the
+/// plan is waiting for a machine and there is nothing to fix, and an untolerated taint is somebody
+/// to fix. The phase now agrees with [`classify_run_failure`], which has always called that case
+/// `Real` and spent an attempt on it.
 fn only_unreachable_hosts_are_outstanding(status: &v1beta1::PlayStatus) -> bool {
     let mut unreachable = false;
     for result in status.hosts.values() {
@@ -10112,6 +10118,35 @@ spec:
                 ("node-b", HostOutcome::Succeeded),
             ])),
             Phase::Succeeded
+        );
+    }
+
+    /// Where the two exclusions part ways, deliberately. `HostsUnreachable` says the plan is waiting
+    /// for a machine and there is nothing to fix; an untolerated taint, a failing image pull or a
+    /// rejecting webhook is somebody to fix, and the Node it sits on is `Ready` and will stay
+    /// `Ready`. `host_results` records that as `NotReached`, so the run reads `Failed` — which is
+    /// what `classify_run_failure` has always called it, spending an attempt on it rather than
+    /// refunding one.
+    #[test]
+    fn a_run_left_only_with_ready_nodes_whose_proxies_never_came_up_is_reported_as_failed() {
+        use v1beta1::HostOutcome;
+
+        // The Node was down: nothing to fix, and its return is what the plan is waiting for.
+        assert_eq!(
+            phase_for_finished_run(&finished_with(&[
+                ("node-a", HostOutcome::Succeeded),
+                ("node-b", HostOutcome::Unreachable),
+            ])),
+            Phase::HostsUnreachable
+        );
+
+        // The Node was `Ready` throughout and the proxy never came up anyway.
+        assert_eq!(
+            phase_for_finished_run(&finished_with(&[
+                ("node-a", HostOutcome::Succeeded),
+                ("node-b", HostOutcome::NotReached),
+            ])),
+            Phase::Failed
         );
     }
 

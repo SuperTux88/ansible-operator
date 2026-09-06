@@ -154,11 +154,20 @@ still schedules the proxy pod onto it and waits for the pod to become Ready. Whi
 
 If the proxy pod does not become Ready within the wait window, the run proceeds without that Node.
 There is no address to reach it at, so the run does not try: it passes `--limit '!<node>'` to
-`ansible-playbook`, which excludes the Node from execution while leaving it in the inventory. The
-Node is recorded as [`Unreachable`](./results-and-troubleshooting.md#per-host-outcomes) in
-`.status.hostsStatus`, not `Failed`, since no task ever ran on it, and it is retried on the next run,
-so it heals on its own once it recovers. The wait window is set by the cluster operator and shrinks
-the longer a Node has been unreachable (see [Deployment](../cluster-operators/deployment.md)).
+`ansible-playbook`, which excludes the Node from execution while leaving it in the inventory. It is
+never recorded as `Failed`, since no task ever ran on it; which [outcome
+](./results-and-troubleshooting.md#per-host-outcomes) it does get in `.status.hostsStatus` depends on
+what the operator saw at launch:
+
+- the Node was itself `NotReady` — `Unreachable`. Its return to `Ready` starts the next run on its
+  own, so this heals without anyone touching the plan.
+- the Node was `Ready` and only the proxy pod failed to come up — `NotReached`. Nothing about the
+  Node is going to change, so nothing wakes the plan for it. See
+  [Unreachable Nodes and the attempt budget](#unreachable-nodes-and-the-attempt-budget) below and
+  [Hosts show `NotReached`](./results-and-troubleshooting.md#hosts-show-notreached).
+
+The wait window is set by the cluster operator and shrinks the longer a Node has been unreachable
+(see [Deployment](../cluster-operators/deployment.md)).
 
 Excluding rather than dropping is what keeps the inventory honest. The Node stays a member of its
 groups, so a playbook templating a cluster member list out of `groups['workers']` still sees the
@@ -238,7 +247,11 @@ outside do spend an attempt, because no Node coming back resolves either:
   attempt from being spent is the hold above, for as long as the Node stays down.
 - a Node Kubernetes reports `Ready` whose proxy pod never came up anyway — an untolerated taint, a
   failing image pull, a rejecting admission webhook. That is a configuration problem, and it is the
-  one the attempt budget exists to stop retrying.
+  one the attempt budget exists to stop retrying. Such a host is reported
+  [`NotReached`](./results-and-troubleshooting.md#hosts-show-notreached), not `Unreachable`: the Node
+  is already `Ready`, so its heartbeats have nothing left to announce and the operator does not wake
+  the plan on them. The plan reads `Failed` rather than `HostsUnreachable`, which is the honest
+  answer — there is a pod spec to fix, not a machine to wait for.
 
 A run whose recap could not be read at all (`Unknown`, see
 [Results](./results-and-troubleshooting.md)) always spends its attempt: nothing proves any of its
