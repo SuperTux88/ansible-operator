@@ -161,9 +161,16 @@ whose recap it could not read, or one that succeeded on an older revision. It do
 plan for a host Ansible connected to and failed on: that host is fixed by fixing the playbook, and
 its Node was never the thing standing in the way.
 
-A `StaticInventory`'s SSH key Secret is deliberately **not** in that list: rotating a key changes how
-the operator connects, not what it applies, so it does not wake a plan or re-apply the playbook to
-hosts that are already current.
+A `StaticInventory`'s SSH key Secret is **not** in that list. Rotating a key changes how the operator
+connects, not what it applies, so it deliberately does not re-apply the playbook to hosts that are
+already current — the key is not part of the execution hash, and it is the hash that decides which
+hosts are outdated.
+
+It also does not wake the plan at all, which matters if you are rotating a key **to fix a plan whose
+last run failed on it**: the new key will not be picked up until something else re-evaluates the
+plan, and if the run already spent the plan's [attempts](#retries), nothing will start a new one.
+After rotating a key to fix a failing plan, touch the plan itself — raise `spec.maxAttempts`, or
+re-apply it — so a run starts against the new key.
 
 ## Editing a plan while a run is in flight
 
