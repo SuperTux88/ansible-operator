@@ -696,10 +696,9 @@ Ansible never opened a connection, so nothing in the playbook is implicated. Whe
 how the host is reached:
 
 - a **cluster Node**: its managed-SSH proxy pod never became `Ready` within the wait window, so the
-  run was pointed at an unroutable address on purpose. Start with the Node itself
-  (`kubectl get node <name>`) and then the proxy pod — [NotReady
-  nodes](./cluster-nodes.md#notready-nodes) covers both, including the taints a proxy pod needs to
-  tolerate to schedule onto a Node that is already down.
+  run excluded it rather than dialling it. Start with the Node itself (`kubectl get node <name>`) and
+  then the proxy pod — [NotReady nodes](./cluster-nodes.md#notready-nodes) covers both, including the
+  taints a proxy pod needs to tolerate to schedule onto a Node that is already down.
 - a **`StaticInventory` host**: it is down, not accepting connections, or rejecting the key in
   `spec.ssh.secretRef`.
 

@@ -997,6 +997,13 @@ fn render_ansible_command(
     }));
 
     ansible_command.extend(["-i".into(), "inventory.yml".into()]);
+    // Relative, like `inventory.yml`: the container's working directory is the workspace mount.
+    // Which hosts this excludes lives in the file, not here — see `paths::ANSIBLE_LIMIT_FILENAME`
+    // for why that split is what keeps this function pure.
+    ansible_command.extend([
+        "--limit".into(),
+        format!("@{}", paths::ANSIBLE_LIMIT_FILENAME),
+    ]);
     ansible_command.push("playbook.yml".into());
 
     ansible_command
@@ -1271,12 +1278,33 @@ spec:
         let command = render_ansible_command(&pp, Vec::new());
 
         assert!(!command.iter().any(|arg| arg == "-c"));
-        assert!(!command.iter().any(|arg| arg == "-l"));
         assert!(!command.iter().any(|arg| arg == "--private-key"));
         assert!(command.iter().any(|arg| arg == "inventory.yml"));
         assert!(command.iter().any(|arg| arg == "playbook.yml"));
         // No verbosity requested -> no -v flag at all.
         assert!(!command.iter().any(|arg| arg.starts_with("-v")));
+    }
+
+    /// The whole point of naming a file instead of the hosts: which hosts a run excludes is only
+    /// settled at launch, while this function has to stay a pure function of the plan so a resumed
+    /// run rebuilds a byte-identical Job. Inlining the host names here would break that, silently —
+    /// a resumed run would build a Job differing from the one it committed to.
+    #[test]
+    fn the_limit_is_a_constant_file_reference_and_never_names_a_host() {
+        use crate::v1beta1::controllers::playbookplancontroller::job_builder::render_ansible_command;
+
+        let command = render_ansible_command(&minimal_plan(), Vec::new());
+
+        let limit = command
+            .iter()
+            .position(|arg| arg == "--limit")
+            .expect("every run passes a limit");
+        assert_eq!(
+            command[limit + 1],
+            format!("@{}", paths::ANSIBLE_LIMIT_FILENAME)
+        );
+        // Relative, like `inventory.yml`: resolved against the container's working directory.
+        assert!(!command[limit + 1].contains('/'));
     }
 
     #[test]

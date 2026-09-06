@@ -152,11 +152,23 @@ A Node matched by a `ClusterInventory` stays in the inventory even when it is `N
 still schedules the proxy pod onto it and waits for the pod to become Ready. While it waits, the
 `PlaybookPlan` carries a `WaitingForNodes` condition naming the pending Node(s).
 
-If the proxy pod does not become Ready within the wait window, the run proceeds without that Node:
-Ansible reports it **unreachable** for the run — `.status.hostsStatus` records it as
-[`Unreachable`](./results-and-troubleshooting.md#per-host-outcomes), not `Failed`, since no task ever
-ran on it — and the Node is retried on the next run, so it heals on its own once it recovers. The wait window is set by the cluster operator and shrinks the longer a Node
-has been unreachable (see [Deployment](../cluster-operators/deployment.md)).
+If the proxy pod does not become Ready within the wait window, the run proceeds without that Node.
+There is no address to reach it at, so the run does not try: it passes `--limit '!<node>'` to
+`ansible-playbook`, which excludes the Node from execution while leaving it in the inventory. The
+Node is recorded as [`Unreachable`](./results-and-troubleshooting.md#per-host-outcomes) in
+`.status.hostsStatus`, not `Failed`, since no task ever ran on it, and it is retried on the next run,
+so it heals on its own once it recovers. The wait window is set by the cluster operator and shrinks
+the longer a Node has been unreachable (see [Deployment](../cluster-operators/deployment.md)).
+
+Excluding rather than dropping is what keeps the inventory honest. The Node stays a member of its
+groups, so a playbook templating a cluster member list out of `groups['workers']` still sees the
+whole fleet — but nothing dials it, so a playbook that aborts on the first unreachable host
+(`any_errors_fatal: true`, a `serial` batch, `max_fail_percentage`) runs to completion on the hosts
+that are up instead of stopping at the one that is not.
+
+The one thing exclusion gives up is `max_fail_percentage` as a fleet-availability check: an excluded
+Node is not part of the denominator, so a rollout guarded that way no longer aborts because too much
+of the fleet is unavailable. It still aborts on hosts that were reached and failed.
 
 The same bounded wait applies when a proxy from an interrupted credential reset is still terminating.
 It is never reused, even if Kubernetes still reports it `Ready`; after the deadline the Node is marked
@@ -175,9 +187,9 @@ verdict that says nothing about the playbook. A held plan does none of that, and
 moment one of those Nodes reports `Ready` again, which the operator notices at once.
 
 The hold is all-or-nothing on purpose. A run that can still reach *some* of its hosts goes ahead and
-reaches them, taking the `NotReady` ones along so they are reported unreachable in the result rather
-than quietly dropped from it. `Recurring` plans never hold: their contract is to re-apply at every
-tick against whatever is reachable then.
+reaches them; the `NotReady` ones stay in its inventory and are reported unreachable in the result
+rather than quietly dropped from it. `Recurring` plans never hold: their contract is to re-apply at
+every tick against whatever is reachable then.
 
 A plan can stay held indefinitely, and for a Node that is never coming back that is the intended
 resting state — the condition says exactly what it is waiting for. Removing the Node from the cluster

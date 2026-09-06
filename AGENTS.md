@@ -228,9 +228,11 @@ tick from the first run of the next.
 
 A `OneShot` run gets its budget back when it made all the progress that was available to it, which
 is a `Succeeded` verdict *or* a failure confined to Nodes the run recorded as not `Ready` at its
-launch commit (`classify_run_failure`, `PlayStatus::nodes_not_ready`). The set has to be captured at
-launch and persisted: the recap cannot distinguish an operator-unreachable host from a reachable one
-with a broken sshd, and the Node may have recovered by the time the result is drained. That relief
+launch commit (`classify_run_failure`, `PlayStatus::unreachable_hosts`). That record holds every host
+the run excluded, each flagged with whether its Node was itself down — a host excluded because a
+`Ready` Node's proxy pod never came up is a configuration problem and is not refunded. It has to be
+captured at launch and persisted: the recap says nothing at all about a host the run excluded, and
+the Node may have recovered by the time the result is drained. That relief
 and the `node_readiness` start gate are a matched pair — the relief is what stops a stranded Node
 burning the budget, the gate is what stops the plan re-running against it every grace window. Neither
 belongs without the other.

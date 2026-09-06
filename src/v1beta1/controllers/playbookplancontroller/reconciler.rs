@@ -2269,19 +2269,10 @@ async fn ensure_infra_and_launch(
         }
     };
 
-    // Recorded on the run before its Job exists, because it is only answerable here: a Node that is
-    // down now may be back by the time the recap is read, and the recap itself cannot tell a host
-    // nobody could reach from one that was reached and failed.
-    let nodes_not_ready: Vec<String> = unreachable
-        .iter()
-        .filter(|host| host.node_not_ready)
-        .map(|host| host.host.clone())
-        .collect();
-
     if !unreachable.is_empty() {
         let hosts: Vec<&str> = unreachable.iter().map(|host| host.host.as_str()).collect();
         warn!(
-            "PlaybookPlan {namespace}/{name}: proceeding without node(s) {hosts:?} — their managed-ssh proxy pods never became Ready within the grace window; Ansible will report them unreachable, and they'll be retried on the next run",
+            "PlaybookPlan {namespace}/{name}: proceeding without node(s) {hosts:?} — their managed-ssh proxy pods never became Ready within the grace window; they stay in the inventory but are excluded from the run, are reported unreachable, and will be retried on the next run",
         );
     }
 
@@ -2296,7 +2287,7 @@ async fn ensure_infra_and_launch(
         render_secret(
             object,
             run_groups,
-            &managed_ssh_host_map(ready, unreachable),
+            &managed_ssh_host_map(ready, &unreachable),
         )?,
     )
     .await?;
@@ -2315,12 +2306,15 @@ async fn ensure_infra_and_launch(
         .await?;
     }
 
+    // Recorded on the run before its Job exists, because it is only answerable here: a Node that is
+    // down now may be back by the time the recap is read, and the recap says nothing at all about a
+    // host the run excluded from execution.
     play_history::commit_launching(
         &context.client,
         namespace,
         &run.mirror.job_name,
         &run.mirror.play_uid,
-        &nodes_not_ready,
+        &unreachable,
     )
     .await?;
     let jobs_api = Api::<Job>::namespaced(context.client.clone(), namespace);
@@ -2338,37 +2332,29 @@ async fn ensure_infra_and_launch(
 }
 
 /// The Ansible-facing view of this run's proxy pods: the Ready ones at their live pod IP, plus the
-/// ones whose proxy never came up pointed at the unroutable sentinel (with a short connect timeout,
-/// see `inventory_renderer`) so Ansible records them unreachable instead of hanging.
+/// ones with no proxy to reach, which are rendered without an address and excluded from the run.
+///
+/// Why a host has no proxy makes no difference here — the distinction only matters to the plan's
+/// attempt budget, which reads it off the run's own record.
 fn managed_ssh_host_map(
     ready: Vec<managed_ssh::ProxyPodInfo>,
-    unreachable: Vec<managed_ssh::UnreachableHost>,
+    unreachable: &[v1beta1::UnreachableHost],
 ) -> BTreeMap<String, ansible::ManagedSshHostInfo> {
     let mut hosts: BTreeMap<String, ansible::ManagedSshHostInfo> = ready
         .into_iter()
         .map(|proxy| {
             (
                 proxy.host,
-                ansible::ManagedSshHostInfo {
+                ansible::ManagedSshHostInfo::Proxy {
                     pod_ip: proxy.pod_ip,
                     port: proxy.port,
-                    unreachable: false,
                 },
             )
         })
         .collect();
 
-    // Why a host is unreachable makes no difference to Ansible — every one of them is rendered at
-    // the sentinel and reported unreachable.
     for host in unreachable {
-        hosts.insert(
-            host.host,
-            ansible::ManagedSshHostInfo {
-                pod_ip: managed_ssh::UNREACHABLE_SENTINEL_IP.to_string(),
-                port: managed_ssh::PROXY_SSH_PORT,
-                unreachable: true,
-            },
-        );
+        hosts.insert(host.host.clone(), ansible::ManagedSshHostInfo::Unreachable);
     }
 
     hosts
@@ -4073,14 +4059,16 @@ enum RunFailure {
 ///
 /// "Every non-succeeded host was a recorded not-ready Node" and "every host the operator could
 /// reach succeeded" are the same statement, and this is where it is decided — once, while the
-/// run's own status is in hand, because neither half survives the tick: the recap cannot tell an
-/// operator-unreachable host from a reachable one with a broken sshd, and re-reading the Node
-/// answers the wrong question, since it may have recovered since.
+/// run's own status is in hand, because neither half survives the tick: the recap says nothing
+/// about a host the run excluded, and re-reading the Node answers the wrong question, since it may
+/// have recovered since.
 ///
 /// Two failures deliberately stay `Real`, both because no Node event will ever resolve them:
 /// a Node that was `Ready` at launch and went down *during* the run — the operator reached it, and
 /// the start gate is what keeps the follow-up attempt from being wasted — and a `Ready` Node whose
-/// proxy pod never came up anyway (an untolerated taint, a failing image pull).
+/// proxy pod never came up anyway (an untolerated taint, a failing image pull). The second is why
+/// the test is `node_not_ready` on the run's record and not mere membership in it: both are
+/// excluded from the run identically, and only the record tells them apart.
 fn classify_run_failure(status: &v1beta1::PlayStatus) -> RunFailure {
     match status.phase {
         v1beta1::PlayPhase::Succeeded => RunFailure::None,
@@ -4092,9 +4080,12 @@ fn classify_run_failure(status: &v1beta1::PlayStatus) -> RunFailure {
                 .map(|(host, _)| host)
                 .collect();
             if !unsucceeded.is_empty()
-                && unsucceeded
-                    .iter()
-                    .all(|host| status.nodes_not_ready.contains(host))
+                && unsucceeded.iter().all(|host| {
+                    status
+                        .unreachable_hosts
+                        .iter()
+                        .any(|entry| entry.node_not_ready && entry.host == **host)
+                })
             {
                 RunFailure::OnlyUnreachableNodes
             } else {
@@ -9255,11 +9246,12 @@ spec:
     }
 
     /// A finished run's terminal status, in the shape `record_finished` writes it: a verdict, the
-    /// per-host outcomes, and the Nodes the run recorded as not `Ready` when it launched.
+    /// per-host outcomes, and the hosts the run excluded — each with whether its Node was itself
+    /// down, which is the half the budget turns on.
     fn terminal_play_status(
         phase: v1beta1::PlayPhase,
         hosts: &[(&str, v1beta1::HostOutcome)],
-        nodes_not_ready: &[&str],
+        unreachable_hosts: &[(&str, bool)],
     ) -> v1beta1::PlayStatus {
         v1beta1::PlayStatus {
             phase,
@@ -9275,7 +9267,13 @@ spec:
                     )
                 })
                 .collect(),
-            nodes_not_ready: nodes_not_ready.iter().map(|n| n.to_string()).collect(),
+            unreachable_hosts: unreachable_hosts
+                .iter()
+                .map(|(host, node_not_ready)| v1beta1::UnreachableHost {
+                    host: host.to_string(),
+                    node_not_ready: *node_not_ready,
+                })
+                .collect(),
             ..Default::default()
         }
     }
@@ -9301,9 +9299,9 @@ spec:
                 PlayPhase::Failed,
                 &[
                     ("node-a", HostOutcome::Succeeded),
-                    ("node-b", HostOutcome::Failed),
+                    ("node-b", HostOutcome::Unreachable),
                 ],
-                &["node-b"],
+                &[("node-b", true)],
             )),
             RunFailure::OnlyUnreachableNodes,
             "every host the operator could reach succeeded"
@@ -9314,12 +9312,44 @@ spec:
                 PlayPhase::Failed,
                 &[
                     ("node-a", HostOutcome::Failed),
-                    ("node-b", HostOutcome::Failed),
+                    ("node-b", HostOutcome::Unreachable),
                 ],
-                &["node-b"],
+                &[("node-b", true)],
             )),
             RunFailure::Real,
             "the playbook failed on a host that was reached"
+        );
+
+        // Excluded for a reason a Node event will never fix: Kubernetes called the Node `Ready`,
+        // and the proxy pod still never came up — an untolerated taint, a failing image pull. It
+        // is excluded from the run exactly like a down Node, so only the recorded flag separates
+        // them, and getting that wrong would refund attempts to a broken configuration forever.
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[
+                    ("node-a", HostOutcome::Succeeded),
+                    ("node-b", HostOutcome::Unreachable),
+                ],
+                &[("node-b", false)],
+            )),
+            RunFailure::Real,
+            "a Ready Node whose proxy never came up is a configuration problem"
+        );
+
+        // One of each in the same run: the refund is all-or-nothing, so the taint-blocked host
+        // makes the whole run real however many down Nodes it shared the run with.
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[
+                    ("node-a", HostOutcome::Succeeded),
+                    ("node-b", HostOutcome::Unreachable),
+                    ("node-c", HostOutcome::Unreachable),
+                ],
+                &[("node-b", true), ("node-c", false)],
+            )),
+            RunFailure::Real
         );
 
         // A Node that was `Ready` at launch: either it went down mid-run — the reboot case, where
@@ -9340,7 +9370,7 @@ spec:
             classify_run_failure(&terminal_play_status(
                 PlayPhase::Unknown,
                 &[("node-b", HostOutcome::Unknown)],
-                &["node-b"],
+                &[("node-b", true)],
             )),
             RunFailure::Real
         );

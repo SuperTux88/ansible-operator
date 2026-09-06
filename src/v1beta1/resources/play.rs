@@ -142,18 +142,31 @@ pub struct PlayStatus {
     /// Per-host recap and outcome, for drilling into which host did what.
     pub hosts: BTreeMap<String, PlayHostResult>,
 
-    /// The Nodes this run targeted that were themselves not `Ready` when it launched, so their
-    /// managed-ssh proxy never came up and they were rendered at the unroutable sentinel — Ansible
-    /// reports them `unreachable`.
+    /// The managed-ssh hosts this run excluded from execution: their proxy pod never became Ready
+    /// within the grace window, so there was no address to reach them at and the run passed
+    /// `--limit '!<host>'` rather than dialling one. They stay in the rendered inventory, so
+    /// `groups[]` still describes the full fleet, and their outcome is recorded as `Unreachable`.
     ///
-    /// Written once, at the launch commit, because the answer is only knowable then: the outcome
-    /// cannot be read back from the recap (an operator-unreachable host is indistinguishable from a
-    /// reachable one with a broken sshd), and the Node's own state cannot be re-read afterwards
-    /// because by then it may have recovered. It is what lets a `OneShot` plan tell "nobody could
-    /// reach these Nodes" apart from "the playbook failed on them" when deciding whether the run
-    /// spent one of its attempts.
+    /// Written once, at the launch commit, because neither half is knowable later: the recap says
+    /// nothing about a host it never processed, and the Node's own state cannot be re-read
+    /// afterwards because by then it may have recovered.
     #[serde(default)]
-    pub nodes_not_ready: Vec<String>,
+    pub unreachable_hosts: Vec<UnreachableHost>,
+}
+
+/// A host excluded from a run, and the one distinction the exclusion itself does not carry.
+///
+/// Both kinds are equally unreachable and are excluded identically, but they mean opposite things
+/// for the plan's attempt budget: a Node that was down is something no attempt could have helped
+/// with, while a `Ready` Node whose proxy pod never came up anyway — an untolerated taint, a failing
+/// image pull, a rejecting admission webhook — is a configuration problem that no Node event will
+/// ever resolve. Only the first is refunded.
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UnreachableHost {
+    pub host: String,
+    /// The `Node` backing this host was itself not reporting `Ready` when the run launched.
+    pub node_not_ready: bool,
 }
 
 /// The seven Ansible recap counters (`PLAY RECAP` line). Field order is irrelevant here — unlike

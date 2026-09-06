@@ -31,7 +31,7 @@ use crate::v1beta1::{
         reconcile_error::{ReconcileError, is_not_found},
     },
     labels,
-    resources::Toleration,
+    resources::{Toleration, UnreachableHost},
 };
 
 pub const PROXY_SSH_PORT: i32 = 22;
@@ -65,12 +65,6 @@ const SFTP_SUBSYSTEM_MARKER: &str = "ansible-operator-sftp";
 /// namespace, never the host's (an ancestor), so a session can't join it via nsenter — the pod's
 /// PID namespace has to start out as the host's.
 const HOST_PROC_MOUNT_PATH: &str = "/host/proc";
-
-/// Unroutable stand-in `ansible_host` for a node whose proxy pod never became Ready in time (so it
-/// has no pod IP). `192.0.2.1` is RFC 5737 TEST-NET-1, a documentation range that never routes — the
-/// SSH dial to it is certain to fail, which is exactly what makes Ansible record the host
-/// `unreachable`. Rendered with a short connect timeout (see `inventory_renderer`).
-pub const UNREACHABLE_SENTINEL_IP: &str = "192.0.2.1";
 
 /// The two taints Kubernetes automatically applies to a `NotReady`/unreachable Node. We tolerate
 /// them with an **empty `effect`** (matches every effect, i.e. both `NoSchedule` and `NoExecute`) and
@@ -120,21 +114,6 @@ pub struct ProxyPodInfo {
     pub host: String,
     pub pod_ip: String,
     pub port: i32,
-}
-
-/// A host whose proxy pod never became Ready within its grace window, and why that is as far as the
-/// operator can tell.
-///
-/// `node_not_ready` separates the two cases the run's outcome cannot: a Node that is itself down —
-/// nobody could have reached it, and it is the Node's return that will change that — from one
-/// Kubernetes reports as `Ready` whose pod never came up anyway (an untolerated taint, a failing
-/// image pull, a rejecting admission webhook), which is a configuration problem no Node event
-/// resolves. A host with no Node object at all is *not* recorded as not-ready: nothing will report
-/// it `Ready` later either, and treating it as a Node that might come back would leave a plan
-/// retrying it forever.
-pub struct UnreachableHost {
-    pub host: String,
-    pub node_not_ready: bool,
 }
 
 pub enum ProxyReadiness {
@@ -1002,6 +981,9 @@ pub async fn ensure_proxy_infra(
                     .and_then(|node| node_ready_heartbeat_age_secs(node, now));
                 let grace = effective_grace_secs(heartbeat_age, grace_policy);
                 match proxy_wait_age_secs(&pod, &state, now) {
+                    // A host with no Node object at all is deliberately not recorded as not-ready:
+                    // nothing will ever report it `Ready` again either, so crediting it as a Node
+                    // that might come back would leave a plan refunding attempts to it forever.
                     Some(age) if age >= grace => unreachable.push(UnreachableHost {
                         host: host.clone(),
                         node_not_ready: node.is_some_and(|node| !node_readiness::is_ready(&node)),

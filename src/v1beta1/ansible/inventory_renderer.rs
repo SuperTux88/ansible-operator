@@ -4,11 +4,6 @@ use serde_yaml::{Mapping, Value};
 
 use crate::v1beta1::ResolvedInventoryGroup;
 
-/// Connect timeout (seconds) rendered for a host we already know is unreachable — its proxy pod never
-/// became Ready, so `pod_ip` is the unroutable sentinel. Kept low because the dial is certain to
-/// fail; it only bounds how long Ansible waits to confirm that (vs. the 10s default × retries).
-const UNREACHABLE_CONNECT_TIMEOUT_SECONDS: i64 = 5;
-
 /// Host variables this module renders itself to drive connection and isolation. Inventory authors
 /// may not set these as group `variables` — the operator owns them, and (for the host-level ones)
 /// Ansible's host-var precedence would silently override an author's group var anyway. Rejecting
@@ -18,7 +13,6 @@ const UNREACHABLE_CONNECT_TIMEOUT_SECONDS: i64 = 5;
 pub const RESERVED_HOST_VARS: &[&str] = &[
     "ansible_host",
     "ansible_port",
-    "ansible_timeout",
     "ansible_user",
     "ansible_ssh_private_key_file",
     "ansible_ssh_common_args",
@@ -35,15 +29,15 @@ pub fn first_reserved_var(variables: &serde_json::Value) -> Option<&'static str>
         .find(|key| object.contains_key(*key))
 }
 
-/// Resolved managed-ssh connection details for the hosts in this run, keyed by hostname — proxy
-/// pod IP/port are only known once the proxy pods are Ready, so this is threaded in by the caller.
-#[derive(Default)]
-pub struct ManagedSshHostInfo {
-    pub pod_ip: String,
-    pub port: i32,
-    /// The proxy pod never became Ready in time: `pod_ip` is the unroutable sentinel, and the host is
-    /// rendered with a short connect timeout so Ansible fails fast and records it `unreachable`.
-    pub unreachable: bool,
+/// How a managed-ssh host in this run can be reached, if it can — proxy pod IPs are only known once
+/// the pods are Ready, so this is threaded in by the caller.
+///
+/// `Unreachable` carries no address on purpose. Such a host is still rendered into its groups, so
+/// `groups[]` keeps describing the full fleet, but it gets no connection vars and the run excludes
+/// it with `--limit`, so nothing ever dials it.
+pub enum ManagedSshHostInfo {
+    Proxy { pod_ip: String, port: i32 },
+    Unreachable,
 }
 
 pub struct RenderContext<'a> {
@@ -108,23 +102,15 @@ pub fn render_inventory(
 fn render_managed_ssh_host_vars(hostname: &str, ctx: &RenderContext) -> Mapping {
     let mut vars = Mapping::new();
 
-    if let Some(info) = ctx.managed_ssh_hosts.get(hostname) {
+    if let Some(ManagedSshHostInfo::Proxy { pod_ip, port }) = ctx.managed_ssh_hosts.get(hostname) {
         vars.insert(
             Value::String("ansible_host".into()),
-            Value::String(info.pod_ip.clone()),
+            Value::String(pod_ip.clone()),
         );
         vars.insert(
             Value::String("ansible_port".into()),
-            Value::Number(info.port.into()),
+            Value::Number((*port).into()),
         );
-        // Known-unreachable host: fail the (doomed) dial to the sentinel fast instead of burning the
-        // default connect timeout — Ansible then records it `unreachable`.
-        if info.unreachable {
-            vars.insert(
-                Value::String("ansible_timeout".into()),
-                Value::Number(UNREACHABLE_CONNECT_TIMEOUT_SECONDS.into()),
-            );
-        }
     }
 
     vars.insert(
@@ -193,10 +179,9 @@ mod tests {
         let mut managed_ssh_hosts = BTreeMap::new();
         managed_ssh_hosts.insert(
             "worker-1".to_string(),
-            ManagedSshHostInfo {
+            ManagedSshHostInfo::Proxy {
                 pod_ip: "10.0.0.5".into(),
                 port: 22,
-                unreachable: false,
             },
         );
 
@@ -212,8 +197,6 @@ mod tests {
 
         assert!(rendered.contains("ansible_host: 10.0.0.5"));
         assert!(rendered.contains("ansible_port: 22"));
-        // A reachable host gets no connect-timeout override.
-        assert!(!rendered.contains("ansible_timeout"));
         assert!(rendered.contains("client_key"));
         // The host cert's principal is the node name, not the proxy pod IP dialed via
         // ansible_host, so the SSH client needs HostKeyAlias to check the cert/known_hosts
@@ -221,12 +204,16 @@ mod tests {
         assert!(rendered.contains("-o HostKeyAlias=worker-1"));
     }
 
+    /// An unreachable host stays a full member of its group — that membership is what a playbook
+    /// templating a fleet list out of `groups[]` reads — but gets no address, because the run
+    /// excludes it with `--limit` rather than dialling it. Rendering one would be a second, weaker
+    /// answer to a question the operator has already settled.
     #[test]
-    fn renders_unreachable_host_with_sentinel_and_short_timeout() {
+    fn renders_unreachable_host_into_its_group_without_an_address() {
         let group = ResolvedInventoryGroup::ManagedSsh {
             hosts: ResolvedHosts {
                 name: "controlplanes".into(),
-                hosts: vec!["worker-9".into()],
+                hosts: vec!["worker-1".into(), "worker-9".into()],
             },
             tolerations: None,
             variables: None,
@@ -234,13 +221,13 @@ mod tests {
 
         let mut managed_ssh_hosts = BTreeMap::new();
         managed_ssh_hosts.insert(
-            "worker-9".to_string(),
-            ManagedSshHostInfo {
-                pod_ip: "192.0.2.1".into(),
+            "worker-1".to_string(),
+            ManagedSshHostInfo::Proxy {
+                pod_ip: "10.0.0.5".into(),
                 port: 22,
-                unreachable: true,
             },
         );
+        managed_ssh_hosts.insert("worker-9".to_string(), ManagedSshHostInfo::Unreachable);
 
         let ssh_paths = BTreeMap::new();
         let ctx = RenderContext {
@@ -252,10 +239,11 @@ mod tests {
 
         let rendered = render_inventory(&[group], &ctx).unwrap();
 
-        // Dialed at the unroutable sentinel, with a short connect timeout so Ansible fails fast and
-        // records it unreachable.
-        assert!(rendered.contains("ansible_host: 192.0.2.1"));
-        assert!(rendered.contains("ansible_timeout: 5"));
+        assert!(rendered.contains("worker-9:"));
+        assert!(rendered.contains("-o HostKeyAlias=worker-9"));
+        // The only address in the rendering belongs to the host that has one.
+        assert_eq!(rendered.matches("ansible_host").count(), 1);
+        assert!(rendered.contains("ansible_host: 10.0.0.5"));
     }
 
     #[test]
@@ -362,10 +350,9 @@ mod tests {
         let mut managed_ssh_hosts = BTreeMap::new();
         managed_ssh_hosts.insert(
             "worker-1".to_string(),
-            ManagedSshHostInfo {
+            ManagedSshHostInfo::Proxy {
                 pod_ip: "10.0.0.5".into(),
                 port: 22,
-                unreachable: false,
             },
         );
         let ssh_paths = BTreeMap::new();
@@ -401,10 +388,9 @@ mod tests {
         let mut managed_ssh_hosts = BTreeMap::new();
         managed_ssh_hosts.insert(
             "worker-1".to_string(),
-            ManagedSshHostInfo {
+            ManagedSshHostInfo::Proxy {
                 pod_ip: "10.0.0.5".into(),
                 port: 22,
-                unreachable: false,
             },
         );
         let ssh_paths = BTreeMap::new();
@@ -425,10 +411,10 @@ mod tests {
 
     #[test]
     fn reserved_vars_cover_every_rendered_host_var() {
-        // Render one host of each connection kind (the managed-ssh one unreachable, so it also
-        // emits ansible_timeout), then assert every `ansible_*` var the operator itself writes is
-        // declared reserved. This keeps RESERVED_HOST_VARS from drifting behind the renderer, so an
-        // author can never quietly shadow a connection var the operator manages.
+        // Render one host of each connection kind, then assert every `ansible_*` var the operator
+        // itself writes is declared reserved. This keeps RESERVED_HOST_VARS from drifting behind
+        // the renderer, so an author can never quietly shadow a connection var the operator
+        // manages.
         let managed = ResolvedInventoryGroup::ManagedSsh {
             hosts: ResolvedHosts {
                 name: "controlplanes".into(),
@@ -455,10 +441,9 @@ mod tests {
         let mut managed_ssh_hosts = BTreeMap::new();
         managed_ssh_hosts.insert(
             "worker-9".to_string(),
-            ManagedSshHostInfo {
-                pod_ip: "192.0.2.1".into(),
+            ManagedSshHostInfo::Proxy {
+                pod_ip: "10.0.0.5".into(),
                 port: 22,
-                unreachable: true,
             },
         );
         let mut ssh_paths = BTreeMap::new();

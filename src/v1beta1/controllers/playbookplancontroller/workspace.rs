@@ -123,6 +123,12 @@ pub fn render_secret(
     let mut string_data = BTreeMap::new();
     string_data.insert("playbook.yml".into(), rendered_playbook);
     string_data.insert("inventory.yml".into(), rendered_inventory);
+    // Written unconditionally, even when it excludes nothing: the command line always references it
+    // (see `paths::ANSIBLE_LIMIT_FILENAME`), so a missing file would fail the run outright.
+    string_data.insert(
+        paths::ANSIBLE_LIMIT_FILENAME.into(),
+        render_limit(managed_ssh_hosts),
+    );
     // Filename must stay exactly `ansible_operator_recap.py` — Ansible's `ANSIBLE_CALLBACKS_ENABLED`
     // matches local/adjacent plugins by filename, not CALLBACK_NAME, and must match the env var
     // set in `job_builder::configure_job_for_callback_plugin`.
@@ -161,14 +167,39 @@ pub fn render_secret(
 
 /// One `host<TAB>ip<TAB>port` line per proxy the preflight gate should wait for.
 ///
-/// Hosts whose proxy never became Ready are left out on purpose: their `pod_ip` is the unroutable
-/// sentinel, so waiting on them could only ever burn the gate's whole budget and delay the hosts
-/// that can be rescued. Ansible still records them `unreachable` from the inventory, unchanged.
+/// Hosts with no proxy to reach are left out on purpose: waiting on them could only ever burn the
+/// gate's whole budget and delay the hosts that can be rescued. They are excluded from the run
+/// itself by [`render_limit`].
 fn render_preflight_endpoints(hosts: &BTreeMap<String, ansible::ManagedSshHostInfo>) -> String {
     hosts
         .iter()
-        .filter(|(_, info)| !info.unreachable)
-        .map(|(host, info)| format!("{host}\t{}\t{}\n", info.pod_ip, info.port))
+        .filter_map(|(host, info)| match info {
+            ansible::ManagedSshHostInfo::Proxy { pod_ip, port } => {
+                Some(format!("{host}\t{pod_ip}\t{port}\n"))
+            }
+            ansible::ManagedSshHostInfo::Unreachable => None,
+        })
+        .collect()
+}
+
+/// The `--limit` pattern list: `all`, then one `!host` line per host with no proxy to reach.
+///
+/// Ansible joins the lines of a `@file` limit with commas, so this reads as
+/// `all,!host-a,!host-b` — every host the play names, minus the ones nothing can dial. `all` alone
+/// (the common case) is a no-op rather than a special case, which is why the file is always written
+/// and the argument is never conditional.
+///
+/// Excluding rather than omitting from the inventory is the point of the whole mechanism: the hosts
+/// stay in their groups, so a playbook templating fleet membership out of `groups[]` still sees
+/// them, while `ansible_play_hosts` does not and no task is attempted against them.
+fn render_limit(hosts: &BTreeMap<String, ansible::ManagedSshHostInfo>) -> String {
+    std::iter::once("all\n".to_string())
+        .chain(
+            hosts
+                .iter()
+                .filter(|(_, info)| matches!(info, ansible::ManagedSshHostInfo::Unreachable))
+                .map(|(host, _)| format!("!{host}\n")),
+        )
         .collect()
 }
 
@@ -221,22 +252,24 @@ spec:
         serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap()
     }
 
-    fn host(pod_ip: &str, unreachable: bool) -> ansible::ManagedSshHostInfo {
-        ansible::ManagedSshHostInfo {
+    fn host(pod_ip: &str) -> ansible::ManagedSshHostInfo {
+        ansible::ManagedSshHostInfo::Proxy {
             pod_ip: pod_ip.into(),
             port: 22,
-            unreachable,
         }
     }
 
-    /// Waiting on a host whose proxy never came up could only ever spend the gate's entire budget
-    /// on a dial that cannot succeed, delaying the hosts that are still recoverable.
+    /// Waiting on a host with no proxy to answer could only ever spend the gate's entire budget on
+    /// a dial that cannot succeed, delaying the hosts that are still recoverable.
     #[test]
     fn preflight_endpoints_list_only_the_proxies_that_can_answer() {
         let hosts = BTreeMap::from([
-            ("node-a".to_string(), host("10.0.0.1", false)),
-            ("node-b".to_string(), host("192.0.2.1", true)),
-            ("node-c".to_string(), host("10.0.0.3", false)),
+            ("node-a".to_string(), host("10.0.0.1")),
+            (
+                "node-b".to_string(),
+                ansible::ManagedSshHostInfo::Unreachable,
+            ),
+            ("node-c".to_string(), host("10.0.0.3")),
         ]);
 
         assert_eq!(
@@ -247,7 +280,7 @@ spec:
 
     #[test]
     fn a_managed_ssh_workspace_carries_the_preflight_gate_and_its_endpoints() {
-        let hosts = BTreeMap::from([("node-a".to_string(), host("10.0.0.1", false))]);
+        let hosts = BTreeMap::from([("node-a".to_string(), host("10.0.0.1"))]);
 
         let secret = super::render_secret(&plan(), &[], &hosts).unwrap();
         let data = secret.string_data.unwrap();
@@ -261,6 +294,48 @@ spec:
             data.get(paths::MANAGED_SSH_PREFLIGHT_SCRIPT_FILENAME)
                 .is_some_and(|script| script.contains("BANNER_PREFIX"))
         );
+    }
+
+    /// The limit file is what turns "the operator could not reach this host" into "Ansible never
+    /// attempts it", and `all` is what makes the always-present `--limit` argument a no-op when
+    /// there is nothing to exclude.
+    #[test]
+    fn the_limit_excludes_every_host_without_a_proxy_and_nothing_else() {
+        let hosts = BTreeMap::from([
+            ("node-a".to_string(), host("10.0.0.1")),
+            (
+                "node-b".to_string(),
+                ansible::ManagedSshHostInfo::Unreachable,
+            ),
+            ("node-c".to_string(), host("10.0.0.3")),
+            (
+                "node-d".to_string(),
+                ansible::ManagedSshHostInfo::Unreachable,
+            ),
+        ]);
+
+        assert_eq!(super::render_limit(&hosts), "all\n!node-b\n!node-d\n");
+    }
+
+    /// Written even when it excludes nothing, and even for a run with no managed-ssh host at all:
+    /// `render_ansible_command` names it unconditionally, so a missing file fails the whole run.
+    #[test]
+    fn every_workspace_carries_a_limit_file() {
+        for hosts in [
+            BTreeMap::new(),
+            BTreeMap::from([("node-a".to_string(), host("10.0.0.1"))]),
+        ] {
+            let secret = super::render_secret(&plan(), &[], &hosts).unwrap();
+
+            assert_eq!(
+                secret
+                    .string_data
+                    .unwrap()
+                    .get(paths::ANSIBLE_LIMIT_FILENAME)
+                    .map(String::as_str),
+                Some("all\n")
+            );
+        }
     }
 
     /// The name a user is most likely to have taken is the plan's own — one Secret named after the

@@ -245,22 +245,6 @@ spec:
                   Kubernetes' TTL controller; this Play outlives them.
                 nullable: true
                 type: string
-              nodesNotReady:
-                default: []
-                description: |-
-                  The Nodes this run targeted that were themselves not `Ready` when it launched, so their
-                  managed-ssh proxy never came up and they were rendered at the unroutable sentinel — Ansible
-                  reports them `unreachable`.
-
-                  Written once, at the launch commit, because the answer is only knowable then: the outcome
-                  cannot be read back from the recap (an operator-unreachable host is indistinguishable from a
-                  reachable one with a broken sshd), and the Node's own state cannot be re-read afterwards
-                  because by then it may have recovered. It is what lets a `OneShot` plan tell "nobody could
-                  reach these Nodes" apart from "the playbook failed on them" when deciding whether the run
-                  spent one of its attempts.
-                items:
-                  type: string
-                type: array
               phase:
                 enum:
                 - Prepared
@@ -311,6 +295,37 @@ spec:
                 - skipped
                 - unreachable
                 type: object
+              unreachableHosts:
+                default: []
+                description: |-
+                  The managed-ssh hosts this run excluded from execution: their proxy pod never became Ready
+                  within the grace window, so there was no address to reach them at and the run passed
+                  `--limit '!<host>'` rather than dialling one. They stay in the rendered inventory, so
+                  `groups[]` still describes the full fleet, and their outcome is recorded as `Unreachable`.
+
+                  Written once, at the launch commit, because neither half is knowable later: the recap says
+                  nothing about a host it never processed, and the Node's own state cannot be re-read
+                  afterwards because by then it may have recovered.
+                items:
+                  description: |-
+                    A host excluded from a run, and the one distinction the exclusion itself does not carry.
+
+                    Both kinds are equally unreachable and are excluded identically, but they mean opposite things
+                    for the plan's attempt budget: a Node that was down is something no attempt could have helped
+                    with, while a `Ready` Node whose proxy pod never came up anyway — an untolerated taint, a failing
+                    image pull, a rejecting admission webhook — is a configuration problem that no Node event will
+                    ever resolve. Only the first is refunded.
+                  properties:
+                    host:
+                      type: string
+                    nodeNotReady:
+                      description: The `Node` backing this host was itself not reporting `Ready` when the run launched.
+                      type: boolean
+                  required:
+                  - host
+                  - nodeNotReady
+                  type: object
+                type: array
             required:
             - failedHostCount
             - hostCount

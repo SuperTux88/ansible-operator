@@ -496,8 +496,8 @@ mod tests {
         assert!(!plan_awaits_node(&plan, "node-a"));
     }
 
-    /// The case the watch exists for: a Node that was down is rendered at the sentinel address and
-    /// comes back `Unreachable`, and its return is exactly what should start the next run.
+    /// The case the watch exists for: a Node that was down is excluded from the run and recorded
+    /// `Unreachable`, and its return is exactly what should start the next run.
     #[test]
     fn a_plan_awaits_a_host_left_unreachable_by_a_node_that_was_down() {
         let plan = plan_awaiting("node-a", host("", HostOutcome::Unreachable));

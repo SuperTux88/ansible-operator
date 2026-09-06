@@ -20,6 +20,15 @@ pub const MANAGED_SSH_PREFLIGHT_SCRIPT_FILENAME: &str = "ansible_operator_prefli
 /// inventory would need PyYAML, which the plan's image is not obliged to provide.
 pub const MANAGED_SSH_PREFLIGHT_ENDPOINTS_FILENAME: &str = "managed_ssh_endpoints";
 
+/// Filename of the `--limit` pattern list restricting the run to the hosts it can actually reach.
+///
+/// It travels in the workspace Secret rather than as `ansible-playbook` arguments because which
+/// hosts are reachable is only settled at launch, while `job_builder::create_job_blueprint` must
+/// stay a pure function of the plan so a resumed run rebuilds a byte-identical Job. The command
+/// therefore always passes the same constant `--limit @<this file>`, and the file is what varies.
+/// Extensionless for the same reason as the preflight script.
+pub const ANSIBLE_LIMIT_FILENAME: &str = "ansible_limit";
+
 pub fn managed_ssh_preflight_script_path() -> String {
     format!("{WORKSPACE_MOUNT_PATH}/{MANAGED_SSH_PREFLIGHT_SCRIPT_FILENAME}")
 }
