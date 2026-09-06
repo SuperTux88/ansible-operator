@@ -13,12 +13,14 @@ what separates them, so a bug here does not look like a bug: it looks like a con
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import sys
 import tempfile
 import types
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -90,8 +92,19 @@ def result_for(host, task):
     )
 
 
-def run(marker_hosts, summaries):
-    """Drives one playbook's worth of callbacks and returns the parsed termination message."""
+def decode(message):
+    """The reader's half of the wire format — mirrors `callback_output::parse_callback_output`."""
+    if message.startswith(recap.COMPRESSED_PREFIX):
+        payload = zlib.decompress(
+            base64.b64decode(message[len(recap.COMPRESSED_PREFIX) :])
+        ).decode("utf-8")
+    else:
+        payload = message
+    return json.loads(payload)
+
+
+def write(marker_hosts, summaries):
+    """Drives one playbook's worth of callbacks and returns the raw termination message."""
     callback = recap.CallbackModule()
     for host in marker_hosts:
         callback.v2_runner_on_ok(result_for(host, recap.COMPLETION_MARKER_TASK))
@@ -99,7 +112,12 @@ def run(marker_hosts, summaries):
         with mock.patch.object(recap, "TERMINATION_LOG_PATH", log.name):
             callback.v2_playbook_on_stats(FakeStats(summaries))
         log.seek(0)
-        return json.load(log)
+        return log.read()
+
+
+def run(marker_hosts, summaries):
+    """Drives one playbook's worth of callbacks and returns the parsed termination message."""
+    return decode(write(marker_hosts, summaries))
 
 
 class RecapTest(unittest.TestCase):
@@ -164,6 +182,64 @@ class RecapTest(unittest.TestCase):
         callback = recap.CallbackModule()
         with mock.patch.object(recap, "TERMINATION_LOG_PATH", "/nonexistent/dir/log"):
             callback.v2_playbook_on_stats(FakeStats({"node-a": summary(ok=1)}))
+
+
+class EncodingTest(unittest.TestCase):
+    """The kubelet caps the termination message at 4096 bytes and keeps the *leading* portion, so a
+    recap that does not fit does not arrive partial — it arrives as invalid JSON, and the operator
+    reads every host `Unknown` on every retry until the attempt budget is gone. These pin the escape
+    from that, and the fact that small fleets do not pay for it."""
+
+    CAP = recap.TERMINATION_MESSAGE_MAX_BYTES
+
+    @staticmethod
+    def fleet(count):
+        return {
+            f"ip-10-0-{i // 250}-{i % 250}.eu-central-1.compute.internal": summary(
+                ok=12, changed=3, skipped=7
+            )
+            for i in range(count)
+        }
+
+    def test_a_recap_that_fits_is_written_as_plain_readable_json(self):
+        message = write([], self.fleet(10))
+
+        self.assertFalse(message.startswith(recap.COMPRESSED_PREFIX))
+        self.assertEqual(json.loads(message), decode(message))
+
+    def test_a_recap_that_would_not_fit_is_compressed_and_does_fit(self):
+        hosts = self.fleet(200)
+        plain = json.dumps({h: [0] * 8 for h in hosts}, separators=(",", ":"))
+        self.assertGreater(len(plain), self.CAP, "the plain form must exceed the cap")
+
+        message = write([], hosts)
+
+        self.assertTrue(message.startswith(recap.COMPRESSED_PREFIX))
+        self.assertLessEqual(len(message.encode("utf-8")), self.CAP)
+
+    def test_compression_preserves_every_host_and_counter(self):
+        hosts = self.fleet(200)
+        hosts["ip-10-0-0-0.eu-central-1.compute.internal"] = summary(failures=1)
+
+        written = run(["ip-10-0-0-1.eu-central-1.compute.internal"], hosts)
+
+        self.assertEqual(len(written), 200)
+        self.assertEqual(written["ip-10-0-0-0.eu-central-1.compute.internal"][FAILED], 1)
+        self.assertEqual(written["ip-10-0-0-1.eu-central-1.compute.internal"][COMPLETED], 1)
+        self.assertEqual(
+            written["ip-10-0-0-2.eu-central-1.compute.internal"],
+            [12, 3, 0, 0, 7, 0, 0, 0],
+        )
+
+    def test_the_boundary_is_measured_in_bytes_not_characters(self):
+        """A non-ASCII inventory hostname costs more bytes than characters, and it is bytes the
+        kubelet counts."""
+        hosts = {f"höst-{i}-ünicode-name-padding" * 3: summary(ok=1) for i in range(60)}
+
+        message = write([], hosts)
+
+        self.assertLessEqual(len(message.encode("utf-8")), self.CAP)
+        self.assertEqual(len(run([], hosts)), 60)
 
 
 if __name__ == "__main__":

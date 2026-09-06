@@ -67,12 +67,56 @@ pub struct CallbackOutput {
     pub processed: BTreeMap<String, HostStats>,
 }
 
-/// Parses the container's termination message. Returns `None` if the message is empty or not
-/// parseable — truncated at the kubelet's size cap, or a hard crash (OOM/SIGKILL) before the
-/// stats hook ran. Callers must surface that as `HostOutcome::Unknown`, not `NotReached` (which
-/// means Ansible legitimately never got there).
+/// Marks a recap the callback deflated and base64-encoded because plain JSON would not have fitted
+/// the kubelet's termination-message cap. Must stay in lockstep with `COMPRESSED_PREFIX` in
+/// `ansible_operator_recap.py`.
+const COMPRESSED_PREFIX: &str = "z:";
+
+/// Ceiling on what a compressed recap may inflate to.
+///
+/// The termination message is written by a pod running the *user's* image, so it is untrusted input
+/// and a deflate stream is an amplifier: the kubelet's 4096-byte cap bounds what arrives, not what it
+/// expands to. The bound is far above any real recap — 800 hosts with long cloud-provider names is
+/// ~53 KB — so it can only ever reject something that was not a recap.
+const MAX_INFLATED_RECAP_BYTES: u64 = 1024 * 1024;
+
+/// Parses the container's termination message, plain or compressed. Returns `None` if the message is
+/// empty or not parseable — truncated at the kubelet's size cap, or a hard crash (OOM/SIGKILL)
+/// before the stats hook ran. Callers must surface that as `HostOutcome::Unknown`, not `NotReached`
+/// (which means Ansible legitimately never got there).
+///
+/// The compressed form exists because the cap is 4096 bytes per container and a plain recap runs out
+/// at roughly 60 hosts with cloud-provider node names — beyond which the message arrives as invalid
+/// JSON and every host reads `Unknown` on every retry until the attempt budget is gone. Compression
+/// is decided by the writer, per run, so a small fleet's message stays readable JSON; both forms are
+/// accepted here forever, since which one arrives depends on the fleet rather than on a version.
 pub fn parse_callback_output(message: &str) -> Option<CallbackOutput> {
-    serde_json::from_str(message.trim()).ok()
+    let message = message.trim();
+
+    match message.strip_prefix(COMPRESSED_PREFIX) {
+        Some(encoded) => serde_json::from_slice(&inflate(encoded)?).ok(),
+        None => serde_json::from_str(message).ok(),
+    }
+}
+
+fn inflate(base64_encoded: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    use std::io::Read as _;
+
+    let deflated = base64::engine::general_purpose::STANDARD
+        .decode(base64_encoded)
+        .ok()?;
+
+    // One byte past the ceiling, so an over-long stream is *rejected* rather than silently cut to
+    // the limit — a truncation that happened to land on a closing brace would otherwise parse as a
+    // complete recap.
+    let mut inflated = Vec::new();
+    flate2::read::ZlibDecoder::new(deflated.as_slice())
+        .take(MAX_INFLATED_RECAP_BYTES + 1)
+        .read_to_end(&mut inflated)
+        .ok()?;
+
+    (inflated.len() as u64 <= MAX_INFLATED_RECAP_BYTES).then_some(inflated)
 }
 
 #[cfg(test)]
@@ -109,6 +153,93 @@ mod tests {
         // A tail-truncated object is no longer valid JSON.
         assert!(parse_callback_output(r#"{"host-1":[2,0,0,1,0,0"#).is_none());
         assert!(parse_callback_output("not json").is_none());
+    }
+
+    fn compressed(json: &str) -> String {
+        use base64::Engine as _;
+        use std::io::Write as _;
+
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(json.as_bytes()).unwrap();
+        format!(
+            "{COMPRESSED_PREFIX}{}",
+            base64::engine::general_purpose::STANDARD.encode(encoder.finish().unwrap())
+        )
+    }
+
+    /// The compressed form has to reach exactly the same `CallbackOutput` as the plain one — it is a
+    /// transport detail the writer picks per run based on fleet size, and nothing downstream is told
+    /// which arrived.
+    #[test]
+    fn a_compressed_recap_parses_to_the_same_thing_as_the_plain_one() {
+        let json = r#"{"host-1":[2,1,0,0,0,0,0,1],"host-2":[2,0,0,1,0,0,0,0]}"#;
+
+        let from_plain = parse_callback_output(json).unwrap();
+        let from_compressed = parse_callback_output(&compressed(json)).unwrap();
+
+        assert_eq!(from_compressed.processed.len(), from_plain.processed.len());
+        let h1 = &from_compressed.processed["host-1"];
+        assert_eq!((h1.ok, h1.changed), (2, 1));
+        assert!(h1.completed);
+        assert!(from_compressed.processed["host-2"].is_failure());
+    }
+
+    /// The whole point of the format: a fleet whose plain recap cannot fit the kubelet's 4096-byte
+    /// cap still round-trips. 200 hosts with EKS-style names is ~13 KB plain.
+    #[test]
+    fn a_recap_far_larger_than_the_kubelet_cap_round_trips_compressed() {
+        let hosts: Vec<String> = (0..200)
+            .map(|i| {
+                format!(
+                    r#""ip-10-0-{}-{}.eu-central-1.compute.internal":[12,3,0,0,7,0,0,1]"#,
+                    i / 250,
+                    i % 250
+                )
+            })
+            .collect();
+        let json = format!("{{{}}}", hosts.join(","));
+        assert!(json.len() > 4096, "the plain form must exceed the cap");
+
+        let wire = compressed(&json);
+        assert!(
+            wire.len() <= 4096,
+            "the compressed form must fit: {} bytes",
+            wire.len()
+        );
+        assert_eq!(parse_callback_output(&wire).unwrap().processed.len(), 200);
+    }
+
+    /// The message comes from a pod running the user's own image, so the compressed path is
+    /// untrusted input and the cap bounds only what *arrives*. A stream that inflates past the
+    /// ceiling is rejected like any other unreadable recap rather than allocated.
+    #[test]
+    fn a_decompression_bomb_is_refused_rather_than_inflated() {
+        use std::io::Write as _;
+
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder
+            .write_all(&vec![b'a'; MAX_INFLATED_RECAP_BYTES as usize * 2])
+            .unwrap();
+        let bomb = {
+            use base64::Engine as _;
+            format!(
+                "{COMPRESSED_PREFIX}{}",
+                base64::engine::general_purpose::STANDARD.encode(encoder.finish().unwrap())
+            )
+        };
+        assert!(bomb.len() < 4096, "a bomb fits the cap; that is the point");
+
+        assert!(parse_callback_output(&bomb).is_none());
+    }
+
+    #[test]
+    fn a_corrupt_compressed_message_returns_none_not_panic() {
+        assert!(parse_callback_output("z:not-base64!!").is_none());
+        assert!(
+            parse_callback_output("z:aGVsbG8=").is_none(),
+            "valid base64, not a zlib stream"
+        );
+        assert!(parse_callback_output("z:").is_none());
     }
 
     #[test]
