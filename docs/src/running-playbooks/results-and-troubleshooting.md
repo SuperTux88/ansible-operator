@@ -27,7 +27,8 @@ per-host status, and the summary line.
 | `Delayed` | The plan is waiting for its scheduled time and has no result yet under the current playbook and inputs. |
 | `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has created or identified the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name, and with reason `RunRecordLost` that the run's `Play` record is gone and its Job is being stopped before its hosts are released. |
 | `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. |
-| `Failed` | The latest run did not succeed on every host, or its recap could not be read. A `Recurring` plan keeps this result between ticks the same way. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
+| `Failed` | The latest run did not succeed on every host, or its recap could not be read — and at least one of those hosts was *reached*, which is what separates it from `HostsUnreachable`. A `Recurring` plan keeps this result between ticks the same way. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
+| `HostsUnreachable` | The latest run applied the playbook to every host it could reach, and the only hosts left over were ones nothing could connect to. A failure, and retried like one — but nothing is wrong with the playbook, so this reads as *waiting for a machine* rather than *broken*. See [Hosts show `Unreachable`](#hosts-show-unreachable). |
 | `UnauthorizedNamespace` | The plan's namespace is not enrolled for the operator — it will not run. See below. |
 
 ## Summary
@@ -705,6 +706,11 @@ how the host is reached:
   taints a proxy pod needs to tolerate to schedule onto a Node that is already down.
 - a **`StaticInventory` host**: it is down, not accepting connections, or rejecting the key in
   `spec.ssh.secretRef`.
+
+Such a run leaves the plan in the `HostsUnreachable` phase rather than `Failed`, provided *every*
+host that did not succeed was one nothing could connect to. That is the distinction the phase exists
+for: the playbook is fine and the plan is waiting for a machine. One host that ran a task and failed
+alongside them, and the phase is `Failed` again — the unreachable hosts are no longer the whole story.
 
 A `OneShot` plan does not spend an [attempt](./scheduling-and-modes.md#retries) on a run whose only
 non-successes were hosts on Nodes that were already `NotReady` when it launched, and it holds rather

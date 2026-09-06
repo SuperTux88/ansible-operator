@@ -1083,6 +1083,7 @@ spec:
                 - Applying
                 - Failed
                 - Succeeded
+                - HostsUnreachable
                 - UnauthorizedNamespace
                 type: string
               retryCount:

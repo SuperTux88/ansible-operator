@@ -497,7 +497,7 @@ async fn reconcile(
                 });
                 finished_active_run = Some(FinishedRun {
                     failure: classify_run_failure(&status),
-                    outcome: status.phase,
+                    verdict: phase_for_finished_run(&status),
                     run: finished,
                 });
                 surviving_run = surviving;
@@ -577,7 +577,7 @@ async fn reconcile(
             }
             ActiveRunProgress::Finished {
                 run: finished,
-                outcome,
+                verdict,
                 failure,
                 record,
             } => {
@@ -590,7 +590,7 @@ async fn reconcile(
                 });
                 finished_active_run = Some(FinishedRun {
                     run: finished,
-                    outcome,
+                    verdict,
                     failure,
                 });
                 // This *was* the run a drained result was still waiting behind, and it has now
@@ -1022,7 +1022,7 @@ async fn reconcile(
         ) {
             // The result stands even though the next run is already due: it is what the plan last
             // did, and `nextRun` is what says another one is coming.
-            resource_status.phase = phase_for_finished_run(&finished.outcome);
+            resource_status.phase = finished.verdict.clone();
             resource_status.next_run = match timing {
                 Timing::Now(start) => start.map(|start| start.fixed_offset()),
                 Timing::Delayed(_) => unreachable!("the guard only accepts Timing::Now"),
@@ -1046,12 +1046,8 @@ async fn reconcile(
             let outcome = decide_terminal(
                 &object.spec.mode,
                 scheduling_configuration.schedule.as_ref(),
-                &finished.outcome,
-                retry_due(
-                    &phase_for_finished_run(&finished.outcome),
-                    resource_status.retry_count,
-                    max_attempts,
-                ),
+                &finished.verdict,
+                retry_due(&finished.verdict, resource_status.retry_count, max_attempts),
                 outdated_hosts.len(),
                 total_count,
                 now(),
@@ -1586,7 +1582,7 @@ fn attempt_budget_available(mode: &ExecutionMode, tries_spent: u32, max_attempts
 /// (`phase_for_finished_run`), so it says what the last run did rather than what the plan's drift
 /// state implies — which for a `Recurring` failure is nothing at all.
 fn retry_due(phase: &Phase, tries_spent: u32, max_attempts: u32) -> bool {
-    phase == &Phase::Failed && tries_spent < max_attempts
+    is_failure_verdict(phase) && tries_spent < max_attempts
 }
 
 /// Whether the persisted attempt budget proves that the current schedule window has no run left to
@@ -1639,10 +1635,10 @@ fn next_attempt(
 /// it is cleared with the revision it belongs to (`update_desired_hash`): an edited plan is waiting
 /// for its first run again, whatever the previous revision achieved.
 fn phase_while_waiting_for_schedule(current: &Phase) -> Phase {
-    match current {
-        Phase::Succeeded | Phase::Failed => current.clone(),
-        _ => Phase::Delayed,
+    if current == &Phase::Succeeded || is_failure_verdict(current) {
+        return current.clone();
     }
+    Phase::Delayed
 }
 
 fn duration_until<Tz: TimeZone>(until: &DateTime<Tz>, now: DateTime<Tz>) -> std::time::Duration {
@@ -2477,10 +2473,12 @@ enum ActiveRunProgress {
     Running(std::time::Duration),
     Finished {
         run: RecordedRun,
-        /// The verdict the run's record carried, which is what the plan's own phase is decided
-        /// from. A run finalized without its record reads `Unknown` here, and that is a failure
-        /// like any other: nothing proves its hosts were reached.
-        outcome: v1beta1::PlayPhase,
+        /// The plan-level verdict the run resolved to, decided here rather than carried as the
+        /// run's own phase because [`phase_for_finished_run`] needs the per-host results and this is
+        /// the last place they are in hand. A run finalized without its record resolves to `Failed`:
+        /// nothing proves its hosts were reached, so it is not a success and its hosts were not
+        /// established to be unreachable either.
+        verdict: Phase,
         /// What that verdict says about the plan's attempt budget — classified here, where the
         /// run's terminal status is still in hand. See [`classify_run_failure`].
         failure: RunFailure,
@@ -2755,13 +2753,13 @@ async fn advance_active_run(
             .ok_or(ReconcileError::PreconditionFailed(
                 "finished Play has no status",
             ))?;
-    let outcome = finished_status.phase.clone();
+    let verdict = phase_for_finished_run(finished_status);
     let failure = classify_run_failure(finished_status);
     status::apply_terminal_play_status(&run.execution_hash, finished_status, resource_status);
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
-        outcome,
+        verdict,
         failure,
         record: TerminalRecord::Present,
     })
@@ -2828,13 +2826,13 @@ async fn finalize_lost_run(
     release_run_infrastructure(context, object, run).await?;
 
     let lost_status = play_history::lost_run_status(&run.mirror.job_name, &run.mirror.hosts);
-    let outcome = lost_status.phase.clone();
+    let verdict = phase_for_finished_run(&lost_status);
     let failure = classify_run_failure(&lost_status);
     status::apply_terminal_play_status(&run.execution_hash, &lost_status, resource_status);
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
-        outcome,
+        verdict,
         failure,
         record: TerminalRecord::Lost,
     })
@@ -4006,10 +4004,10 @@ fn restore_summary_after_overlay(
     outdated_count: usize,
     clear: impl FnOnce(&mut PlaybookPlanStatus, usize) -> bool,
 ) {
-    let failed = status.phase == Phase::Failed;
+    let verdict = status.phase.clone();
     if clear(status, outdated_count) && status.active_run.is_none() {
         let total_count = distinct_host_count(&status.eligible_hosts);
-        status.summary = Some(plan_summary(outdated_count, total_count, failed));
+        status.summary = Some(plan_summary(outdated_count, total_count, &verdict));
     }
 }
 
@@ -4024,7 +4022,7 @@ fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usi
     status.phase = Phase::Succeeded;
     status.next_run = None;
     // Restoring the verdict of a plan that succeeded, so there is no failure to report.
-    status.summary = Some(plan_summary(0, total_count, false));
+    status.summary = Some(plan_summary(0, total_count, &Phase::Succeeded));
 }
 
 /// Reports a `OneShot` plan holding back a run because every node it would reach is not `Ready`.
@@ -4080,10 +4078,10 @@ fn held_back_by_unready_nodes<Tz: chrono::TimeZone>(
 /// run verdict survives — it says what the plan last did, which an outage does not undo — while a
 /// lifecycle state resets to `Pending`.
 fn phase_under_readiness_overlay(current: &Phase) -> Phase {
-    match current {
-        Phase::Succeeded | Phase::Failed => current.clone(),
-        _ => Phase::Pending,
+    if current == &Phase::Succeeded || is_failure_verdict(current) {
+        return current.clone();
     }
+    Phase::Pending
 }
 
 /// Puts a recovered run back onto the plan's status: the run itself, the `Applying` phase it
@@ -4165,7 +4163,10 @@ impl RecordedRun {
 /// failed `Recurring` run leaves no drift behind to read it back out of.
 struct FinishedRun {
     run: RecordedRun,
-    outcome: v1beta1::PlayPhase,
+    /// The plan-level verdict this run resolved to, decided once where its per-host results were
+    /// still in hand — see [`phase_for_finished_run`], which needs them and not just the run's own
+    /// phase.
+    verdict: Phase,
     failure: RunFailure,
 }
 
@@ -5000,14 +5001,14 @@ struct TerminalOutcome {
 fn decide_terminal<Tz: TimeZone>(
     mode: &ExecutionMode,
     schedule: Option<&Schedule>,
-    outcome: &v1beta1::PlayPhase,
+    verdict: &Phase,
     retry_due: bool,
     outdated_count: usize,
     total_count: usize,
     now: DateTime<Tz>,
 ) -> TerminalOutcome {
-    let phase = phase_for_finished_run(outcome);
-    let summary = plan_summary(outdated_count, total_count, phase == Phase::Failed);
+    let summary = plan_summary(outdated_count, total_count, verdict);
+    let phase = verdict.clone();
 
     // A try that is still owed is the next thing the plan does, so it is what the plan waits for:
     // the wait is short because a scheduled retry has only the rest of the tick's grace window to
@@ -5070,20 +5071,30 @@ fn decide_terminal<Tz: TimeZone>(
 /// say which. `Ready`'s restated message (`status::clear_inputs_unavailable_condition`) already
 /// counts the other way round; this brings the summary into line with it.
 ///
-/// `failed` is what stops the line reassuring a reader about a plan that just failed. A `Recurring`
-/// run that fails on a host which succeeded at this revision yesterday leaves *no* drift behind —
-/// the host still carries the current hash — so the honest drift statement is `5/5 up-to-date`,
-/// sitting beside a `Failed` phase. True, and exactly what someone scanning a summary column reads
-/// as "nothing to see here".
-fn plan_summary(outdated_count: usize, total_count: usize, failed: bool) -> String {
+/// The verdict is what stops the line reassuring a reader about a plan that just failed. A
+/// `Recurring` run that fails on a host which succeeded at this revision yesterday leaves *no* drift
+/// behind — the host still carries the current hash — so the honest drift statement is
+/// `5/5 up-to-date`, sitting beside a `Failed` phase. True, and exactly what someone scanning a
+/// summary column reads as "nothing to see here".
+///
+/// It also distinguishes the two failures, because this column sits directly beside the phase and
+/// would otherwise call a plan waiting for a machine to come back "failed" while the phase said
+/// [`Phase::HostsUnreachable`] — undoing at one column's distance exactly what that phase is for.
+fn plan_summary(outdated_count: usize, total_count: usize, verdict: &Phase) -> String {
     let current = total_count.saturating_sub(outdated_count);
     let mut summary = format!("{current}/{total_count} up-to-date");
 
-    match (outdated_count, failed) {
-        (0, false) => {}
-        (0, true) => summary.push_str(" (last run failed)"),
-        (outdated, false) => summary.push_str(&format!(" ({outdated} outdated)")),
-        (outdated, true) => summary.push_str(&format!(" ({outdated} outdated, last run failed)")),
+    let reason = match verdict {
+        Phase::HostsUnreachable => Some("could not reach every host"),
+        _ if is_failure_verdict(verdict) => Some("last run failed"),
+        _ => None,
+    };
+
+    match (outdated_count, reason) {
+        (0, None) => {}
+        (0, Some(reason)) => summary.push_str(&format!(" ({reason})")),
+        (outdated, None) => summary.push_str(&format!(" ({outdated} outdated)")),
+        (outdated, Some(reason)) => summary.push_str(&format!(" ({outdated} outdated, {reason})")),
     }
 
     summary
@@ -5097,13 +5108,49 @@ fn plan_summary(outdated_count: usize, total_count: usize, failed: bool) -> Stri
 /// report the failed run as a success. Anything short of `Succeeded` is a failure, `Unknown`
 /// included — a recap that could not be read is not evidence that the hosts were reached.
 ///
+/// [`Phase::HostsUnreachable`] splits that failure in two, which is why the per-host results are
+/// needed and not just the run's own phase. A run that applied the playbook everywhere it could and
+/// was left only with hosts nothing could connect to is failed, but not *broken*: it is waiting for
+/// a machine, and a plan parked on one that never returns would otherwise read `Failed` forever,
+/// indistinguishable at a glance from one whose playbook does not work.
+///
 /// The non-terminal phases cannot arrive here: `apply_terminal_play_status` refuses them, and both
 /// paths that produce an outcome have already been through it.
-fn phase_for_finished_run(outcome: &v1beta1::PlayPhase) -> Phase {
-    match outcome {
-        v1beta1::PlayPhase::Succeeded => Phase::Succeeded,
-        _ => Phase::Failed,
+fn phase_for_finished_run(status: &v1beta1::PlayStatus) -> Phase {
+    if status.phase == v1beta1::PlayPhase::Succeeded {
+        return Phase::Succeeded;
     }
+    if only_unreachable_hosts_are_outstanding(status) {
+        return Phase::HostsUnreachable;
+    }
+    Phase::Failed
+}
+
+/// Whether every host this run did not apply the playbook to was one nothing could connect to.
+///
+/// "Every", with at least one such host: a single host that ran a task and failed, that the play
+/// stopped short of, or whose recap could not be read makes the unreachable ones no longer the whole
+/// story, and the plan has something to fix rather than something to wait for.
+fn only_unreachable_hosts_are_outstanding(status: &v1beta1::PlayStatus) -> bool {
+    let mut unreachable = false;
+    for result in status.hosts.values() {
+        match result.outcome {
+            v1beta1::HostOutcome::Succeeded => {}
+            v1beta1::HostOutcome::Unreachable => unreachable = true,
+            _ => return false,
+        }
+    }
+    unreachable
+}
+
+/// Whether a phase is a finished run's verdict that something is not applied.
+///
+/// [`Phase::HostsUnreachable`] is a failure everywhere the mechanics ask — it owes a retry, it keeps
+/// its schedule window open, and its summary reads as a failure — and differs from [`Phase::Failed`]
+/// only in what it tells a human. Asked as one predicate so that adding a verdict cannot quietly
+/// change any of that: a phase left out here stops being retried at all.
+fn is_failure_verdict(phase: &Phase) -> bool {
+    matches!(phase, Phase::Failed | Phase::HostsUnreachable)
 }
 
 /// The `ansible-playbook` container's termination message — the recap the callback wrote to
@@ -5769,7 +5816,7 @@ fn record_invalid_scheduling_configuration(
             || phase_under_readiness_overlay(&status.phase),
             |finished| {
                 if finished.run.mirror.execution_hash == status.current_hash {
-                    phase_for_finished_run(&finished.outcome)
+                    finished.verdict.clone()
                 } else {
                     Phase::Pending
                 }
@@ -7832,7 +7879,7 @@ mod tests {
                     },
                     execution_hash: hash,
                 },
-                outcome: v1beta1::PlayPhase::Failed,
+                verdict: Phase::Failed,
                 failure: RunFailure::Real,
             }),
             "spec.timeZone is invalid".into(),
@@ -7857,7 +7904,7 @@ mod tests {
                     },
                     execution_hash: hash,
                 },
-                outcome: v1beta1::PlayPhase::Unknown,
+                verdict: Phase::Failed,
                 failure: RunFailure::Real,
             }),
             "spec.timeZone is invalid".into(),
@@ -9955,6 +10002,113 @@ spec:
         );
     }
 
+    fn finished_with(hosts: &[(&str, v1beta1::HostOutcome)]) -> v1beta1::PlayStatus {
+        let all_succeeded = hosts
+            .iter()
+            .all(|(_, outcome)| *outcome == v1beta1::HostOutcome::Succeeded);
+        v1beta1::PlayStatus {
+            phase: if all_succeeded {
+                v1beta1::PlayPhase::Succeeded
+            } else {
+                v1beta1::PlayPhase::Failed
+            },
+            ..terminal_play_status(v1beta1::PlayPhase::Failed, hosts, &[])
+        }
+    }
+
+    /// The verdict a plan parked on a machine that is not coming back reports. It is still a
+    /// failure — a host genuinely is not up to date — but it is not a *broken* one, and reporting it
+    /// as `Failed` left a plan healthily waiting for hardware indistinguishable at a glance from one
+    /// whose playbook does not work.
+    #[test]
+    fn a_run_left_only_with_hosts_it_could_not_reach_is_not_reported_as_failed() {
+        use v1beta1::HostOutcome;
+
+        assert_eq!(
+            phase_for_finished_run(&finished_with(&[
+                ("node-a", HostOutcome::Succeeded),
+                ("node-b", HostOutcome::Unreachable),
+            ])),
+            Phase::HostsUnreachable
+        );
+
+        // The single-host case, which is the one the review was written about: there are no other
+        // hosts to have succeeded, and the plan is still waiting for a machine rather than a fix.
+        assert_eq!(
+            phase_for_finished_run(&finished_with(&[("node-b", HostOutcome::Unreachable)])),
+            Phase::HostsUnreachable
+        );
+
+        assert_eq!(
+            phase_for_finished_run(&finished_with(&[
+                ("node-a", HostOutcome::Succeeded),
+                ("node-b", HostOutcome::Succeeded),
+            ])),
+            Phase::Succeeded
+        );
+    }
+
+    /// One host that was reached and did not work makes the unreachable ones no longer the whole
+    /// story: there is something to fix, and the phase has to say so.
+    #[test]
+    fn anything_reached_that_did_not_succeed_keeps_the_run_failed() {
+        use v1beta1::HostOutcome;
+
+        for spoiler in [
+            HostOutcome::Failed,
+            HostOutcome::NotReached,
+            HostOutcome::Incomplete,
+            HostOutcome::Unknown,
+        ] {
+            assert_eq!(
+                phase_for_finished_run(&finished_with(&[
+                    ("node-a", HostOutcome::Succeeded),
+                    ("node-b", HostOutcome::Unreachable),
+                    ("node-c", spoiler.clone()),
+                ])),
+                Phase::Failed,
+                "{spoiler:?} beside an unreachable host is a plan with something to fix"
+            );
+        }
+
+        // A run whose recap was never read reports every host `Unknown`, which proves nothing about
+        // reachability — it must not be dressed up as a plan waiting for hardware.
+        assert_eq!(
+            phase_for_finished_run(&play_history::lost_run_status(
+                "job",
+                &["node-a".to_string()]
+            )),
+            Phase::Failed
+        );
+    }
+
+    /// `HostsUnreachable` is a failure everywhere the mechanics ask, and only differs from `Failed`
+    /// in what it tells a human. Missing one of these would be silent: the plan would stop retrying,
+    /// or would lose its verdict to a lifecycle state the moment it went idle.
+    #[test]
+    fn the_unreachable_verdict_behaves_as_a_failure_everywhere_but_the_wording() {
+        assert!(is_failure_verdict(&Phase::HostsUnreachable));
+        assert!(retry_due(&Phase::HostsUnreachable, 1, 3));
+        assert!(!retry_due(&Phase::HostsUnreachable, 3, 3));
+        // Kept, not overwritten, once the plan goes idle — under a schedule and under the readiness
+        // hold alike. A verdict replaced by `Delayed`/`Pending` would erase the only thing on the
+        // plan that says what its last run did.
+        assert_eq!(
+            phase_while_waiting_for_schedule(&Phase::HostsUnreachable),
+            Phase::HostsUnreachable
+        );
+        assert_eq!(
+            phase_under_readiness_overlay(&Phase::HostsUnreachable),
+            Phase::HostsUnreachable
+        );
+        // And it is not a success: a rotated SSH key still wakes such a plan, since an unreachable
+        // StaticInventory host is exactly what a new key might fix.
+        assert!(status::may_need_another_run(&PlaybookPlanStatus {
+            phase: Phase::HostsUnreachable,
+            ..Default::default()
+        }));
+    }
+
     /// The bound on the refund, and the reason it is a bound rather than a nicety.
     ///
     /// A refund is credit for progress. A run that applied the playbook to nobody has none to be
@@ -10233,7 +10387,7 @@ spec:
         let outcome = decide_terminal(
             &ExecutionMode::OneShot,
             None,
-            &v1beta1::PlayPhase::Failed,
+            &Phase::Failed,
             retry_due(&Phase::Failed, max_attempts, max_attempts),
             1,
             1,
@@ -10319,7 +10473,7 @@ spec:
             let outcome = decide_terminal(
                 &mode,
                 Some(&Schedule::parse("0 3 * * *").unwrap()),
-                &v1beta1::PlayPhase::Failed,
+                &Phase::Failed,
                 true,
                 1,
                 2,
@@ -10666,17 +10820,29 @@ spec:
     /// words beside it.
     #[test]
     fn the_summary_always_counts_the_hosts_that_are_current() {
-        assert_eq!(plan_summary(0, 5, false), "5/5 up-to-date");
-        assert_eq!(plan_summary(2, 5, false), "3/5 up-to-date (2 outdated)");
+        assert_eq!(plan_summary(0, 5, &Phase::Succeeded), "5/5 up-to-date");
+        assert_eq!(
+            plan_summary(2, 5, &Phase::Succeeded),
+            "3/5 up-to-date (2 outdated)"
+        );
         // A failed run leaves no drift when its hosts already carried this revision — which is the
         // ordinary `Recurring` failure, and the one a drift count alone reports as healthy.
-        assert_eq!(plan_summary(0, 5, true), "5/5 up-to-date (last run failed)");
         assert_eq!(
-            plan_summary(2, 5, true),
+            plan_summary(0, 5, &Phase::Failed),
+            "5/5 up-to-date (last run failed)"
+        );
+        // Beside a `HostsUnreachable` phase the same line must not say the run failed: the point of
+        // that phase is that nothing is broken, and this column is the one right next to it.
+        assert_eq!(
+            plan_summary(1, 5, &Phase::HostsUnreachable),
+            "4/5 up-to-date (1 outdated, could not reach every host)"
+        );
+        assert_eq!(
+            plan_summary(2, 5, &Phase::Failed),
             "3/5 up-to-date (2 outdated, last run failed)"
         );
         // A plan with no eligible hosts states it rather than dividing by zero.
-        assert_eq!(plan_summary(0, 0, false), "0/0 up-to-date");
+        assert_eq!(plan_summary(0, 0, &Phase::Succeeded), "0/0 up-to-date");
     }
 
     #[test]
@@ -10685,7 +10851,7 @@ spec:
         let outcome = decide_terminal(
             &ExecutionMode::OneShot,
             None,
-            &v1beta1::PlayPhase::Succeeded,
+            &Phase::Succeeded,
             false,
             0,
             3,
@@ -10706,7 +10872,7 @@ spec:
         let outcome = decide_terminal(
             &ExecutionMode::OneShot,
             Some(&Schedule::parse("0 3 * * *").unwrap()),
-            &v1beta1::PlayPhase::Failed,
+            &Phase::Failed,
             false,
             1,
             3,
@@ -10731,14 +10897,11 @@ spec:
                 .unwrap(),
         );
 
-        for (outcome, expected) in [
-            (v1beta1::PlayPhase::Succeeded, Phase::Succeeded),
-            (v1beta1::PlayPhase::Failed, Phase::Failed),
-        ] {
+        for expected in [Phase::Succeeded, Phase::Failed, Phase::HostsUnreachable] {
             let terminal = decide_terminal(
                 &ExecutionMode::Recurring,
                 Some(&Schedule::parse("0 3 * * *").unwrap()),
-                &outcome,
+                &expected,
                 false,
                 0,
                 2,
@@ -10762,7 +10925,7 @@ spec:
         let outcome = decide_terminal(
             &ExecutionMode::Recurring,
             Some(&Schedule::parse("0 3 * * *").unwrap()),
-            &v1beta1::PlayPhase::Failed,
+            &Phase::Failed,
             false,
             0,
             2,
@@ -10782,7 +10945,7 @@ spec:
         let outcome = decide_terminal(
             &ExecutionMode::OneShot,
             None,
-            &v1beta1::PlayPhase::Unknown,
+            &Phase::Failed,
             false,
             0,
             2,
@@ -10798,7 +10961,7 @@ spec:
         let succeeded = decide_terminal(
             &ExecutionMode::Recurring,
             None,
-            &v1beta1::PlayPhase::Succeeded,
+            &Phase::Succeeded,
             false,
             0,
             2,
@@ -10807,7 +10970,7 @@ spec:
         let failed = decide_terminal(
             &ExecutionMode::Recurring,
             None,
-            &v1beta1::PlayPhase::Failed,
+            &Phase::Failed,
             false,
             0,
             2,
