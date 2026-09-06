@@ -516,6 +516,16 @@ fn create_job_skeleton(
         // The recap callback writes to /dev/termination-log and the reconciler reads it back from
         // this container's state.terminated.message. These are the Kubernetes defaults, set
         // explicitly so the dependency is legible and can't be silently mutated away.
+        //
+        // The pod's container count is part of that dependency. The callback sizes the recap
+        // against one container's 4096 bytes, but the status manager then divides
+        // MaxPodTerminationMessageLogLength (12 KiB) evenly over every container in the *spec* —
+        // init and ephemeral included, whether or not they write anything — so 4096 is the real
+        // budget only while this pod stays at three (preflight, the optional collections
+        // installer, and this one). A fourth cuts it to 3072 and moves the recap ceiling from
+        // several hundred hosts to a couple of hundred, which the callback cannot see: it would
+        // write a message it believes fits, and every host of that run would read `Unknown`.
+        // `kubectl debug` reaches this too, by attaching an ephemeral container to a live run.
         termination_message_path: Some("/dev/termination-log".into()),
         termination_message_policy: Some("File".into()),
         security_context: plan.spec.security_context.as_ref().map(Into::into),

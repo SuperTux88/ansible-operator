@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import json
+import zlib
 
 from ansible.plugins.callback import CallbackBase
 
@@ -16,8 +18,10 @@ description:
     terminated state instead of scraping logs, since one Job can span many hosts and its own
     exit code no longer maps to any single host's result.
   - 'Format: {"<host>": [ok, changed, unreachable, failed, skipped, rescued, ignored, completed],
-    ...} — a fixed-order array per host, no spaces, to stay well under the kubelet''s message size
-    cap. The last element is 1 when the host reached the operator''s completion marker.'
+    ...} — a fixed-order array per host, no spaces. The last element is 1 when the host reached the
+    operator''s completion marker.'
+  - The kubelet caps that message at 4096 bytes, so a fleet large enough to exceed it is written
+    deflated and base64-encoded behind a `z:` prefix instead. See TERMINATION_MESSAGE_MAX_BYTES.
 requirements:
   - Enabled via ANSIBLE_CALLBACKS_ENABLED (this callback sets CALLBACK_NEEDS_ENABLED).
 """
@@ -25,6 +29,22 @@ requirements:
 # Default terminationMessagePath; the kubelet surfaces this file's contents as the container's
 # state.terminated.message once it exits.
 TERMINATION_LOG_PATH = "/dev/termination-log"
+
+# The kubelet's MaxContainerTerminationMessageLength. Two layers trim the message to it, from
+# opposite ends: the kubelet reads the file with `tail.ReadAtMost`, keeping the *last* 4096 bytes,
+# and the status manager then keeps the *first* MaxPodTerminationMessageLogLength/containers of what
+# survived (12 KiB split evenly, see job_builder.rs). Either way an oversized recap does not arrive
+# partial — it arrives as invalid JSON, and the operator can only report every host `Unknown` and
+# spend the run's whole attempt budget re-producing it. So the prefixes below are readable only
+# because nothing here ever writes past the cap, never because of where they sit.
+# Plain JSON runs out at roughly 60 hosts with cloud-provider node names, which is why the fallback
+# below exists rather than a warning about it.
+TERMINATION_MESSAGE_MAX_BYTES = 4096
+
+# Marks a recap written deflated + base64 rather than as plain JSON. Kept out of the JSON itself so
+# the reader can tell the two apart before parsing either. Must stay in lockstep with
+# `callback_output::parse_callback_output`.
+COMPRESSED_PREFIX = "z:"
 
 # The task the operator appends to every playbook, in a play of its own, to learn which hosts the
 # playbook did not stop short of. Ansible's counters cannot say: a host that never ran the rest of
@@ -52,7 +72,7 @@ class CallbackModule(CallbackBase):
     def v2_playbook_on_stats(self, stats):
         # Fixed wire order — must stay in lockstep with HostStats::from([u32; 8]) on the reader.
         recap = {}
-        for host in stats.processed.keys():
+        for host in stats.processed:
             s = stats.summarize(host)
             completed = host in self._completed
             recap[host] = [
@@ -70,8 +90,25 @@ class CallbackModule(CallbackBase):
 
         try:
             with open(TERMINATION_LOG_PATH, "w") as f:
-                f.write(json.dumps(recap, separators=(",", ":")))
+                f.write(encode_recap(recap))
         except OSError:
             # Best-effort: if the file can't be written, the operator sees an empty termination
             # message and treats every host as Unknown (same as a hard crash before this hook).
             pass
+
+
+def encode_recap(recap):
+    """Renders the recap for the termination message, compressing only if it would not fit.
+
+    Staying with plain JSON while it fits is deliberate: it keeps the message readable with a bare
+    `kubectl get pod -o jsonpath=...` for every cluster small enough that someone would try, and it
+    keeps the compressed path off the hot path for the common case. Above the cap, the recap is
+    highly redundant — repeated node-name prefixes and long runs of zero counters — so deflate buys
+    roughly 3-5x, which moves the ceiling from ~60 hosts into the hundreds.
+    """
+    payload = json.dumps(recap, separators=(",", ":"))
+    if len(payload.encode("utf-8")) <= TERMINATION_MESSAGE_MAX_BYTES:
+        return payload
+
+    compressed = zlib.compress(payload.encode("utf-8"), 9)
+    return COMPRESSED_PREFIX + base64.b64encode(compressed).decode("ascii")
