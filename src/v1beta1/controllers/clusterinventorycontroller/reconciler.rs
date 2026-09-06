@@ -1,23 +1,21 @@
 use std::{sync::Arc, time::Duration};
 
-use futures::{Stream, StreamExt as _};
+use futures::Stream;
 use k8s_openapi::api::core::v1::Node;
 use kube::{
     Api,
-    api::{ListParams, Patch, PatchParams},
+    api::{ListParams, PartialObjectMeta, Patch, PatchParams},
     runtime::{
         Controller,
         controller::{self, Action},
-        reflector::{Lookup, ObjectRef, store::Writer},
+        reflector::{Lookup, ObjectRef},
         watcher,
     },
 };
-use tracing::error;
 
 use crate::v1beta1::{
     self, ClusterInventory, ClusterInventoryStatus,
-    clusterinventorycontroller::mappers,
-    controllers::{nodeselector::node_matches, reconcile_error::ReconcileError},
+    controllers::{nodeselector::node_matches, reconcile_error::ReconcileError, selector_trigger},
     distinct_host_count,
 };
 
@@ -37,37 +35,17 @@ pub fn new(
     });
 
     let inventories_api: Api<v1beta1::ClusterInventory> = Api::all(client.clone());
-    let nodes_api: Api<Node> = Api::all(client.clone());
+    // Metadata-only: `node_matches` reads labels and nothing else, and so does the trigger.
+    let node_metadata_api: Api<PartialObjectMeta<Node>> = Api::all(client.clone());
 
-    let inventory_reflector_reader = {
-        let inventory_reflector_writer = Writer::<v1beta1::ClusterInventory>::default();
-        let inventory_reflector_reader = Arc::new(inventory_reflector_writer.as_reader());
-
-        let inventory_reflector = kube::runtime::reflector(
-            inventory_reflector_writer,
-            watcher(inventories_api.clone(), watcher::Config::default()),
-        );
-
-        tokio::spawn(async move {
-            inventory_reflector
-                .for_each(|event| async {
-                    match event {
-                        Ok(_) => {}
-                        Err(e) => error!("Reflector error: {e:?}"),
-                    }
-                })
-                .await;
-        });
-
-        inventory_reflector_reader
-    };
-
+    // Every inventory is recomputed on every tick, which is what the Node mapper this replaced did
+    // too — a `ClusterInventory`'s status is a function of the whole Node set, so there is no
+    // narrower answer to give. What changed is the *rate*: the mapper fired on every kubelet status
+    // repost, and `selector_trigger::label_changes` fires only when the labels those inventories
+    // select over actually move. `Controller::reconcile_all_on` reads the controller's own store,
+    // so the hand-rolled reflector the mapper needed is gone with it.
     Controller::new(inventories_api, watcher::Config::default())
-        .watches(
-            nodes_api,
-            watcher::Config::default(),
-            mappers::node_to_inventories(Arc::clone(&inventory_reflector_reader)),
-        )
+        .reconcile_all_on(selector_trigger::label_changes(node_metadata_api))
         .run(
             reconcile,
             |_, _, _| Action::requeue(std::time::Duration::from_secs(15)),
