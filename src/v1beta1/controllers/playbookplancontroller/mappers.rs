@@ -145,14 +145,19 @@ pub fn node_to_playbookplans(
 /// plan whose budget is long spent once per Ready node per heartbeat, at a cost of re-resolving both
 /// inventory kinds, re-reading every referenced Secret and listing every Node for policy enforcement,
 /// none of which can change the outcome. `Failed` means Ansible connected and a task failed; a Node
-/// reporting `Ready` does not fix that. `NotReached` means an earlier host in the `serial` batch
-/// stopped the play, so it is that host's recovery that matters and that host's own heartbeats that
-/// carry it. `Incomplete` is the same shape of answer: this host ran and did not fail, and what cut
-/// it short was some *other* host's failure — so its own Node returning changes nothing, and if a
-/// Node recovery is what unblocks the run, it is the failing host's heartbeats that say so.
+/// reporting `Ready` does not fix that. `NotReached` covers two causes that agree on exactly this
+/// point: an earlier host in the `serial` batch stopped the play, so it is that host's recovery that
+/// matters and that host's own heartbeats that carry it — or the run excluded this host because its
+/// proxy pod never came up on a Node that was *already* `Ready` (an untolerated taint, a failing
+/// image pull, a rejecting admission webhook), where the Node has nothing further to report and only
+/// the pod's scheduling can resolve it. `Incomplete` is the same shape of answer: this host ran and
+/// did not fail, and what cut it short was some *other* host's failure — so its own Node returning
+/// changes nothing, and if a Node recovery is what unblocks the run, it is the failing host's
+/// heartbeats that say so.
 ///
-/// Everything else stays in: a host with no entry, one left `Unreachable` by a Node that was down,
-/// one whose recap was unreadable (`Unknown` — nothing proves it was reached), and one that
+/// Everything else stays in: a host with no entry, one left `Unreachable` — which now means a Node
+/// that was genuinely down, the one exclusion a `Ready` heartbeat does resolve — one whose recap was
+/// unreadable (`Unknown` — nothing proves it was reached), and one that
 /// `Succeeded` on an older revision. The last matters more than it looks: a plan held by the
 /// readiness gate never ran, so it still carries the *previous* run's `Succeeded` outcomes, and this
 /// watch is the only thing that releases it.
@@ -581,6 +586,19 @@ mod tests {
     /// Node; if that host is one a Node recovery unblocks, its own heartbeats carry the plan.
     #[test]
     fn a_plan_does_not_await_a_host_an_earlier_batch_stopped_the_play_for() {
+        let plan = plan_awaiting("node-a", host("", HostOutcome::NotReached));
+
+        assert!(!plan_awaits_node(&plan, "node-a"));
+    }
+
+    /// The other cause of `NotReached`, and the one this predicate was costing the most: a host the
+    /// run excluded because its proxy pod never came up on a Node that was *already* `Ready`. The
+    /// Node has nothing further to report — it is Ready and stays Ready — so every one of its
+    /// kubelet heartbeats would wake the plan, for the plan's whole life, each wake re-resolving
+    /// both inventory kinds, re-reading every referenced Secret and listing every Node. Only the
+    /// pod's scheduling can resolve it, and no Node event says anything about that.
+    #[test]
+    fn a_plan_does_not_await_a_host_whose_proxy_failed_on_a_ready_node() {
         let plan = plan_awaiting("node-a", host("", HostOutcome::NotReached));
 
         assert!(!plan_awaits_node(&plan, "node-a"));

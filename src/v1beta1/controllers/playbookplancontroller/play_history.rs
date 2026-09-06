@@ -725,10 +725,17 @@ fn terminal_status(
         // missing: the exclusions settle its outcome on their own. `Unknown` is for a run that ran
         // and whose result could not be read, and reporting that here would deny the plan the one
         // thing it does know — that nobody could be reached.
+        //
+        // Asked over membership in `unreachable_hosts`, not over the outcome, because the outcome no
+        // longer answers it: `host_results` splits an exclusion into `Unreachable` or `NotReached`
+        // depending on whether the Node was down, so one `Ready`-Node proxy failure among the
+        // exclusions would drop an entirely known run into `Unknown` — misreporting it and denying
+        // the refund, the two things this arm exists to prevent. Membership is the question that was
+        // always meant: was every host excluded before the run?
         None if host_count != 0
             && host_results
-                .values()
-                .all(|result| result.outcome == HostOutcome::Unreachable) =>
+                .keys()
+                .all(|host| unreachable_hosts.iter().any(|entry| entry.host == *host)) =>
         {
             PlayPhase::Failed
         }
@@ -798,10 +805,27 @@ fn sum_recap(parsed: Option<&CallbackOutput>, unreachable_hosts: &[UnreachableHo
 /// the recap does carry is classified from its own counters by [`outcome_from_stats`].
 ///
 /// A host the run excluded is the one outcome not read off the recap. It is absent from it — the
-/// run passed `--limit '!<host>'` precisely so nothing would be attempted against it — and calling
-/// that `NotReached` would be indistinguishable from a host a `serial` batch stopped short of.
-/// `Unreachable` is what the operator already established about it before the run began, so it is
-/// reported directly rather than inferred from an address chosen to fail.
+/// run passed `--limit '!<host>'` precisely so nothing would be attempted against it — so what it
+/// gets is what the operator established before the run began, rather than something inferred from
+/// an address chosen to fail.
+///
+/// **Which** exclusion it was decides the outcome, because the two are recovered from in different
+/// places and only one of them can be recovered from at all by a Node coming back:
+///
+/// - the Node itself was not `Ready` (`node_not_ready`) — nothing could connect to it, and its next
+///   `Ready` heartbeat is exactly what fixes that. `Unreachable`, which is in the Node watch's wake
+///   set (`mappers::plan_awaits_node`) so the plan retries the moment the Node returns.
+/// - the Node was `Ready` and its proxy pod never came up anyway — an untolerated taint, a failing
+///   image pull, a rejecting admission webhook. The Node is already `Ready`, so no Node event will
+///   ever resolve it; only the pod spec will. `NotReached` — the same answer `mappers` gives a host
+///   a `serial` batch stopped short of, and for the same reason: this host's own heartbeats carry no
+///   news. Left `Unreachable`, it would wake the plan once per kubelet heartbeat for the plan's
+///   whole life, re-resolving both inventory kinds, re-reading every referenced Secret and listing
+///   every Node, long after the attempt budget stopped it acting.
+///
+/// Both keep `unreachable: 1` in the recap: the counter records that nothing connected, which is
+/// true either way, and it is what stops [`sum_recap`] reporting the run as having reached every
+/// host it targeted. The outcome records whose problem it is; they answer different questions.
 fn host_results(
     parsed: Option<&CallbackOutput>,
     hosts: &[String],
@@ -810,29 +834,36 @@ fn host_results(
     hosts
         .iter()
         .map(|host| {
-            let excluded = unreachable_hosts.iter().any(|entry| entry.host == *host);
-            let result = match parsed {
-                _ if excluded => PlayHostResult {
+            let excluded = unreachable_hosts.iter().find(|entry| entry.host == *host);
+            let result = if let Some(entry) = excluded {
+                PlayHostResult {
                     recap: PlayRecap {
                         unreachable: 1,
                         ..PlayRecap::default()
                     },
-                    outcome: HostOutcome::Unreachable,
-                },
-                None => PlayHostResult {
-                    recap: PlayRecap::default(),
-                    outcome: HostOutcome::Unknown,
-                },
-                Some(output) => match output.processed.get(host) {
+                    outcome: if entry.node_not_ready {
+                        HostOutcome::Unreachable
+                    } else {
+                        HostOutcome::NotReached
+                    },
+                }
+            } else {
+                match parsed {
                     None => PlayHostResult {
                         recap: PlayRecap::default(),
-                        outcome: HostOutcome::NotReached,
+                        outcome: HostOutcome::Unknown,
                     },
-                    Some(stats) => PlayHostResult {
-                        recap: recap_from_stats(stats),
-                        outcome: outcome_from_stats(stats),
+                    Some(output) => match output.processed.get(host) {
+                        None => PlayHostResult {
+                            recap: PlayRecap::default(),
+                            outcome: HostOutcome::NotReached,
+                        },
+                        Some(stats) => PlayHostResult {
+                            recap: recap_from_stats(stats),
+                            outcome: outcome_from_stats(stats),
+                        },
                     },
-                },
+                }
             };
             (host.clone(), result)
         })
@@ -1693,9 +1724,13 @@ mod tests {
     }
 
     /// A run that excluded every host never launches a Job, so no recap will ever exist for it —
-    /// but its outcome is not unknown, it is `Failed` with every host `Unreachable`. Calling it
-    /// `Unknown` would send an operator looking for lost instrumentation, and would deny the plan
-    /// the refund `classify_run_failure` owes a run whose Nodes were all down.
+    /// but its outcome is not unknown, it is `Failed`, with every host carrying whichever exclusion
+    /// it was. Calling it `Unknown` would send an operator looking for lost instrumentation, and
+    /// would deny the plan the refund `classify_run_failure` owes a run whose Nodes were all down.
+    ///
+    /// The question is asked over membership in `unreachable_hosts`, not over the outcomes, and the
+    /// mixed case is why: the outcomes no longer agree with each other, so one `Ready`-Node proxy
+    /// failure among the exclusions would drop an entirely known run into `Unknown`.
     #[test]
     fn a_run_that_excluded_every_host_is_failed_rather_than_unknown() {
         let hosts = vec!["node-a".to_string(), "node-b".to_string()];
@@ -1718,6 +1753,24 @@ mod tests {
         assert_eq!(all_excluded.failed_host_count, 2);
         assert_eq!(all_excluded.recap.unreachable, 2);
 
+        let mixed_exclusions = terminal_status(
+            "apply-web-abc-1",
+            &hosts,
+            None,
+            vec![
+                unreachable_host("node-a", true),
+                unreachable_host("node-b", false),
+            ],
+        );
+
+        assert_eq!(mixed_exclusions.phase, PlayPhase::Failed);
+        assert_eq!(
+            mixed_exclusions.hosts["node-b"].outcome,
+            HostOutcome::NotReached
+        );
+        assert_eq!(mixed_exclusions.failed_host_count, 2);
+        assert_eq!(mixed_exclusions.recap.unreachable, 2);
+
         // A run that did launch and whose recap could not be read is still `Unknown`: one of its
         // hosts was reachable, so something ran and its result was lost.
         let recap_lost = terminal_status(
@@ -1731,12 +1784,13 @@ mod tests {
         assert_eq!(recap_lost.hosts["node-b"].outcome, HostOutcome::Unknown);
     }
 
-    /// A host the run excluded is absent from the recap for a reason the recap cannot express, so
-    /// the default for an absent host is wrong for it in both directions: `NotReached` would read
-    /// as "a `serial` batch stopped before it", and a run total summed over the recap alone would
-    /// claim the run reached every host it targeted.
+    /// A host excluded because its Node was down is absent from the recap for a reason the recap
+    /// cannot express, so the default for an absent host is wrong for it in both directions:
+    /// `NotReached` would put it outside the Node watch's wake set, when that Node returning is
+    /// precisely what resolves it, and a run total summed over the recap alone would claim the run
+    /// reached every host it targeted.
     #[test]
-    fn an_excluded_host_is_unreachable_rather_than_not_reached() {
+    fn a_host_excluded_by_a_down_node_is_unreachable_rather_than_not_reached() {
         let hosts = vec![
             "ran".to_string(),
             "excluded".to_string(),
@@ -1761,10 +1815,18 @@ mod tests {
         assert_eq!(results["absent"].outcome, HostOutcome::NotReached);
     }
 
-    /// Why a host was excluded makes no difference to how the run reports it — that distinction is
-    /// the attempt budget's, and reading it here would leak a budget decision into the recap.
+    /// Why a host was excluded decides its outcome, because the two exclusions are recovered from in
+    /// different places: a Node that was down is fixed by that Node returning, and `Unreachable` is
+    /// in the Node watch's wake set so the plan retries the moment it does. A `Ready` Node whose
+    /// proxy pod never came up is fixed in the pod's scheduling, and its Node has nothing further to
+    /// report — reporting that as `Unreachable` too woke the plan once per kubelet heartbeat for its
+    /// whole life, re-resolving inventories, re-reading Secrets and listing every Node, long after
+    /// the attempt budget had stopped it acting.
+    ///
+    /// The counters do not split: nothing connected either way, and that is what keeps the run's
+    /// recap from claiming it reached every host it targeted.
     #[test]
-    fn an_excluded_host_reports_the_same_however_it_became_unreachable() {
+    fn an_excluded_hosts_outcome_says_which_kind_of_exclusion_it_was() {
         let hosts = vec!["node-a".to_string(), "node-b".to_string()];
         let results = host_results(
             None,
@@ -1776,7 +1838,9 @@ mod tests {
         );
 
         assert_eq!(results["node-a"].outcome, HostOutcome::Unreachable);
-        assert_eq!(results["node-b"].outcome, HostOutcome::Unreachable);
+        assert_eq!(results["node-b"].outcome, HostOutcome::NotReached);
+        assert_eq!(results["node-a"].recap.unreachable, 1);
+        assert_eq!(results["node-b"].recap.unreachable, 1);
     }
 
     /// `abort_unlaunched` is the only way into `Aborted`, and it is only ever legitimate while the

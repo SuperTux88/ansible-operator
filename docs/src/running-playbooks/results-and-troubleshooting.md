@@ -111,8 +111,8 @@ prevents an old Job and a new revision from targeting the same host concurrently
 |---|---|
 | `Succeeded` | Ansible applied the playbook to this host successfully, **and the playbook ran to the end for it**. `lastAppliedHash` is bumped to the current hash. |
 | `Failed` | Ansible connected to the host and a task failed on it. A host whose connection dropped part-way through also reads `Failed`: something ran and failed before it went. |
-| `Unreachable` | Ansible could not connect to the host at all, so no task ran on it — a `NotReady` Node whose proxy never came up, a `StaticInventory` host that is down, or one refusing the key. Fixed on the host or the Node, not in the playbook. See [NotReady nodes](./cluster-nodes.md#notready-nodes). |
-| `NotReached` | The host was in scope but Ansible never got to it — e.g. an earlier host in its `serial` batch stopped the play. Not an error *on this host*. |
+| `Unreachable` | Nothing could connect to the host, so no task ran on it — a Node that was itself `NotReady`, a `StaticInventory` host that is down, or one refusing the key. Fixed on the host or the Node, not in the playbook. The plan is waiting for the machine, and a Node returning to `Ready` starts the next run on its own. See [NotReady nodes](./cluster-nodes.md#notready-nodes). |
+| `NotReached` | The host was in scope but nothing was attempted on it, and no Node coming back will change that — either an earlier host in its `serial` batch stopped the play, or the run excluded it because its managed-SSH proxy never came up on a Node that was otherwise `Ready`. An excluded host still counts `unreachable` in the recap — its own and the run's — because nothing connected to it, which is all that counter records; the outcome is what says where to look. See [Hosts show `NotReached`](#hosts-show-notreached). |
 | `Incomplete` | Tasks ran on this host and none of them failed, but the playbook stopped before finishing for it, because a **different** host failed — `any_errors_fatal`, a failed `serial` batch, `max_fail_percentage`. It received *part* of the playbook, so it is not recorded as converged and is re-applied on the next run. See [Hosts show `Incomplete`](#hosts-show-incomplete). |
 | `Unknown` | The operator could not read a recap for this host — its **own instrumentation** failed, not Ansible. Distinct from `NotReached`. Worth investigating (see below). |
 
@@ -699,19 +699,38 @@ Compare them run ID by run ID, against both of the last two listings. A Lease's 
 
 ### Hosts show `NotReached`
 
-Expected when a play stops early — for example a `serial` batch that failed before reaching later
-hosts, or a `run_once` task that aborted. Fix the host that actually stopped it (its outcome is
-`Failed` or `Unreachable`); the `NotReached` hosts should proceed on the next run.
+Nothing was attempted on the host. Two causes, told apart by what the rest of the run looks like:
+
+- **a play stopped early** — a `serial` batch that failed before reaching later hosts, or a
+  `run_once` task that aborted. Fix the host that actually stopped it (its outcome is `Failed` or
+  `Unreachable`); the `NotReached` hosts proceed on the next run without further action.
+- **the run excluded a cluster Node whose proxy pod never came up, on a Node that was itself
+  `Ready`.** The run's `Play` record says which it was:
+
+  ```sh
+  kubectl get play <name> -o jsonpath='{.status.unreachableHosts}'
+  # [{"host":"node-b","nodeNotReady":false}]   <- the Node was Ready; the proxy pod is the problem
+  ```
+
+  The Node is healthy; its managed-SSH proxy pod is what failed to schedule or start, so look at the
+  pod, not the machine: an untolerated taint, a failing image pull, a rejecting admission webhook, or
+  exhausted capacity. See [NotReady nodes](./cluster-nodes.md#notready-nodes) for the tolerations a
+  proxy pod needs.
+
+The second case does **not** clear itself. Nothing about the Node is going to change — it is already
+`Ready` — so the operator does not wake the plan on its heartbeats, and the plan reports `Failed` and
+spends an [attempt](./scheduling-and-modes.md#retries) on each run until the pod can start. That is
+the intended reading: there is something here for someone to fix.
 
 ### Hosts show `Unreachable`
 
-Ansible never opened a connection, so nothing in the playbook is implicated. Where to look depends on
-how the host is reached:
+Nothing opened a connection, so nothing in the playbook is implicated. Where to look depends on how
+the host is reached:
 
-- a **cluster Node**: its managed-SSH proxy pod never became `Ready` within the wait window, so the
-  run excluded it rather than dialling it. Start with the Node itself (`kubectl get node <name>`) and
-  then the proxy pod — [NotReady nodes](./cluster-nodes.md#notready-nodes) covers both, including the
-  taints a proxy pod needs to tolerate to schedule onto a Node that is already down.
+- a **cluster Node**: the Node was itself `NotReady` when the run launched, so the run excluded it
+  rather than dialling it. Start with the Node — [NotReady nodes](./cluster-nodes.md#notready-nodes).
+  (A Node that was `Ready` and whose *proxy pod* never came up reads
+  [`NotReached`](#hosts-show-notreached) instead, because that is fixed in the pod, not on the Node.)
 - a **`StaticInventory` host**: it is down, not accepting connections, or rejecting the key in
   `spec.ssh.secretRef`.
 
@@ -719,6 +738,8 @@ Such a run leaves the plan in the `HostsUnreachable` phase rather than `Failed`,
 host that did not succeed was one nothing could connect to. That is the distinction the phase exists
 for: the playbook is fine and the plan is waiting for a machine. One host that ran a task and failed
 alongside them, and the phase is `Failed` again — the unreachable hosts are no longer the whole story.
+So does one host left [`NotReached`](#hosts-show-notreached) by a proxy pod that could not start on a
+`Ready` Node: that is a configuration to fix, not a machine to wait for.
 
 A `OneShot` plan does not spend an [attempt](./scheduling-and-modes.md#retries) on a run whose only
 non-successes were hosts on Nodes that were already `NotReady` when it launched, and it holds rather
