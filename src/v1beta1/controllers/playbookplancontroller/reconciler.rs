@@ -514,13 +514,12 @@ async fn reconcile(
                 status,
                 surviving,
             } => {
-                let no_playbook_activity = playbook_produced_no_recap_activity(&status);
-                if no_playbook_activity {
-                    warn!(
-                        "PlaybookPlan {namespace}/{name}: run {} finished successfully but the playbook produced no recap activity; verify its host patterns or confirm it is intentionally empty",
-                        finished.mirror.job_name
-                    );
-                }
+                // A recovered result has only its `Play` to speak from, so the overflow half of
+                // `RunDiagnostic` is not reconstructible here — the raw termination message that
+                // carried it is long gone, and an overflowed recap is recorded exactly like a
+                // crashed one. Such a run reports the plain unreadable-recap outcome.
+                let diagnostic = RunDiagnostic::from_play_status(&status);
+                diagnostic.warn(namespace, name, &finished.mirror.job_name);
                 status::apply_terminal_play_status(
                     &finished.execution_hash,
                     &status,
@@ -544,7 +543,7 @@ async fn reconcile(
                 finished_active_run = Some(FinishedRun {
                     failure: classify_run_failure(&status),
                     verdict: phase_for_finished_run(&status),
-                    no_playbook_activity,
+                    diagnostic,
                     run: finished,
                 });
                 surviving_run = surviving;
@@ -626,7 +625,7 @@ async fn reconcile(
                 run: finished,
                 verdict,
                 failure,
-                no_playbook_activity,
+                diagnostic,
                 record,
             } => {
                 resource_status.summary =
@@ -640,7 +639,7 @@ async fn reconcile(
                     run: finished,
                     verdict,
                     failure,
-                    no_playbook_activity,
+                    diagnostic,
                 });
                 // This *was* the run a drained result was still waiting behind, and it has now
                 // finished too, so the plan may be classified on its own terms after all.
@@ -1236,11 +1235,11 @@ async fn reconcile(
         requeue_after = requeue_after.min(until_next_run);
     }
 
-    apply_no_playbook_activity_diagnostic(
+    apply_run_diagnostic(
         &mut resource_status,
         finished_active_run
             .as_ref()
-            .is_some_and(|finished| finished.no_playbook_activity),
+            .map_or(RunDiagnostic::None, |finished| finished.diagnostic),
     );
 
     finish_reconcile_tick(
@@ -2570,10 +2569,9 @@ enum ActiveRunProgress {
         /// What that verdict says about the plan's attempt budget — classified here, where the
         /// run's terminal status is still in hand. See [`classify_run_failure`].
         failure: RunFailure,
-        /// The run completed every target but the user's playbook contributed no recap counters.
-        /// This is diagnostic rather than a different verdict because an intentionally taskless
-        /// playbook has the same observable result as a host-pattern typo.
-        no_playbook_activity: bool,
+        /// Something about this run that a human has to see and that changes no verdict. See
+        /// [`RunDiagnostic`].
+        diagnostic: RunDiagnostic,
         record: TerminalRecord,
     },
     /// The cached plan status named a run that the apiserver's copy no longer has — an earlier tick
@@ -2810,7 +2808,7 @@ async fn advance_active_run(
     // a reaped run from wedging in `Applying` forever. The recap comes from the container's
     // termination message (what the callback wrote to /dev/termination-log), not logs — a dedicated
     // channel that isn't interleaved with playbook output and needs no `pods/log` access.
-    let parsed = match (&job, job_is_trusted) {
+    let termination_message = match (&job, job_is_trusted) {
         (Some(job), true) => {
             let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
             let pods = pods_api
@@ -2825,11 +2823,12 @@ async fn advance_active_run(
                     && pod_belongs_to_job(pod, job)
             });
             latest_termination_message(pods)
-                .as_deref()
-                .and_then(callback_output::parse_callback_output)
         }
         _ => None,
     };
+    let parsed = termination_message
+        .as_deref()
+        .and_then(callback_output::parse_callback_output);
 
     release_run_infrastructure(context, object, run).await?;
 
@@ -2852,20 +2851,26 @@ async fn advance_active_run(
             ))?;
     let verdict = phase_for_finished_run(finished_status);
     let failure = classify_run_failure(finished_status);
-    let no_playbook_activity = playbook_produced_no_recap_activity(finished_status);
-    if no_playbook_activity {
-        warn!(
-            "PlaybookPlan {namespace}/{name}: run {} finished successfully but the playbook produced no recap activity; verify its host patterns or confirm it is intentionally empty",
-            run.mirror.job_name
+    // The overflow marker is asked of the raw message and only here, because this is the last place
+    // it exists: `record_finished` maps an unreadable recap of either kind to the same `Unknown`
+    // hosts, so nothing downstream — including a later tick recovering this same run — can tell an
+    // overflow from a crash. It takes precedence over the record-derived half because the two cannot
+    // both hold: a message that overflowed carries no counters to be empty.
+    let diagnostic = termination_message
+        .as_deref()
+        .and_then(callback_output::recap_overflowed_host_count)
+        .map_or_else(
+            || RunDiagnostic::from_play_status(finished_status),
+            |hosts| RunDiagnostic::RecapOverflowed { hosts },
         );
-    }
+    diagnostic.warn(namespace, name, &run.mirror.job_name);
     status::apply_terminal_play_status(&run.execution_hash, finished_status, resource_status);
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
         verdict,
         failure,
-        no_playbook_activity,
+        diagnostic,
         record: TerminalRecord::Present,
     })
 }
@@ -2939,7 +2944,7 @@ async fn finalize_lost_run(
         run: run.clone(),
         verdict,
         failure,
-        no_playbook_activity: false,
+        diagnostic: RunDiagnostic::None,
         record: TerminalRecord::Lost,
     })
 }
@@ -4286,7 +4291,7 @@ struct FinishedRun {
     /// phase.
     verdict: Phase,
     failure: RunFailure,
-    no_playbook_activity: bool,
+    diagnostic: RunDiagnostic,
 }
 
 /// What a finished run's result says about the plan's attempt budget — the one question the verdict
@@ -5221,20 +5226,72 @@ fn plan_summary(outdated_count: usize, total_count: usize, verdict: &Phase) -> S
     summary
 }
 
-fn apply_no_playbook_activity_diagnostic(
-    status: &mut PlaybookPlanStatus,
-    no_playbook_activity: bool,
-) {
-    if !no_playbook_activity {
-        return;
+/// Something a finished run needs a human to see, which changes no verdict and no per-host outcome.
+///
+/// One channel rather than a flag per reason, because they arrive at the same place, are appended to
+/// the same summary, and are mutually exclusive in fact: `NoPlaybookActivity` requires a readable
+/// recap and `RecapOverflowed` means there was none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RunDiagnostic {
+    #[default]
+    None,
+    /// The run completed every target but the user's playbook contributed no recap counters.
+    /// Diagnostic rather than a different verdict because an intentionally taskless playbook has the
+    /// same observable result as a host-pattern typo.
+    NoPlaybookActivity,
+    /// The run's recap did not fit the kubelet's termination-message cap even compressed, so its
+    /// hosts fall to `Unknown` for a reason that is nothing to do with the playbook or the fleet's
+    /// health. Without this the plan reports only "the recap could not be read", which is what a
+    /// crashed container reports too, and the operator has no way to tell them apart.
+    RecapOverflowed { hosts: u32 },
+}
+
+impl RunDiagnostic {
+    /// What a finished run's own record still says, once the raw termination message is gone.
+    fn from_play_status(status: &v1beta1::PlayStatus) -> Self {
+        if playbook_produced_no_recap_activity(status) {
+            Self::NoPlaybookActivity
+        } else {
+            Self::None
+        }
     }
+
+    fn warn(self, namespace: &str, name: &str, job_name: &str) {
+        match self {
+            Self::None => {}
+            Self::NoPlaybookActivity => warn!(
+                "PlaybookPlan {namespace}/{name}: run {job_name} finished successfully but the playbook produced no recap activity; verify its host patterns or confirm it is intentionally empty"
+            ),
+            Self::RecapOverflowed { hosts } => warn!(
+                "PlaybookPlan {namespace}/{name}: run {job_name} reported {hosts} hosts, whose recap does not fit the kubelet's {} byte termination-message limit even compressed; every host is reported Unknown. Split the plan across smaller inventories",
+                callback_output::TERMINATION_MESSAGE_MAX_BYTES
+            ),
+        }
+    }
+
+    fn summary_clause(self) -> Option<String> {
+        match self {
+            Self::None => None,
+            Self::NoPlaybookActivity => Some(
+                " (playbook produced no recap activity; verify its host patterns or confirm it is intentionally empty)"
+                    .to_string(),
+            ),
+            Self::RecapOverflowed { hosts } => Some(format!(
+                " (the recap for {hosts} hosts does not fit the kubelet's termination-message limit, so no per-host result could be read; split the plan across smaller inventories)"
+            )),
+        }
+    }
+}
+
+fn apply_run_diagnostic(status: &mut PlaybookPlanStatus, diagnostic: RunDiagnostic) {
+    let Some(clause) = diagnostic.summary_clause() else {
+        return;
+    };
 
     let summary = status
         .summary
         .get_or_insert_with(|| "previous run finished".to_string());
-    summary.push_str(
-        " (playbook produced no recap activity; verify its host patterns or confirm it is intentionally empty)",
-    );
+    summary.push_str(&clause);
 }
 
 /// Whether the run reached the completion marker on every target but the user's playbook produced
@@ -8083,7 +8140,7 @@ mod tests {
                 },
                 verdict: Phase::Failed,
                 failure: RunFailure::Real,
-                no_playbook_activity: false,
+                diagnostic: RunDiagnostic::None,
             }),
             "spec.timeZone is invalid".into(),
         );
@@ -8109,7 +8166,7 @@ mod tests {
                 },
                 verdict: Phase::Failed,
                 failure: RunFailure::Real,
-                no_playbook_activity: false,
+                diagnostic: RunDiagnostic::None,
             }),
             "spec.timeZone is invalid".into(),
         );
@@ -8551,7 +8608,7 @@ spec:
             now,
             &mut status,
         );
-        apply_no_playbook_activity_diagnostic(&mut status, true);
+        apply_run_diagnostic(&mut status, RunDiagnostic::NoPlaybookActivity);
 
         assert_eq!(status.phase, Phase::Succeeded);
         assert_eq!(
@@ -8559,6 +8616,59 @@ spec:
             Some(
                 "plan currently resolves to no hosts (playbook produced no recap activity; verify its host patterns or confirm it is intentionally empty)"
             )
+        );
+    }
+
+    /// The point of the overflow variant: without it the plan's only account of itself is "the
+    /// recap could not be read", which a crashed container produces too. The number is what tells a
+    /// reader it is a size problem and not a broken playbook or a down fleet.
+    #[test]
+    fn an_overflowed_recap_says_so_and_names_the_host_count() {
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Failed,
+            summary: Some("run failed".into()),
+            ..Default::default()
+        };
+
+        apply_run_diagnostic(&mut status, RunDiagnostic::RecapOverflowed { hosts: 900 });
+
+        let summary = status.summary.as_deref().unwrap();
+        assert!(summary.starts_with("run failed"), "{summary}");
+        assert!(summary.contains("900 hosts"), "{summary}");
+        assert!(
+            summary.contains("termination-message limit"),
+            "the reason has to be nameable by someone who has never read this code: {summary}"
+        );
+    }
+
+    /// A run with nothing to report leaves the summary exactly as the rest of the tick wrote it.
+    #[test]
+    fn no_diagnostic_leaves_the_summary_untouched() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("3/3 up-to-date".into()),
+            ..Default::default()
+        };
+
+        apply_run_diagnostic(&mut status, RunDiagnostic::None);
+
+        assert_eq!(status.summary.as_deref(), Some("3/3 up-to-date"));
+    }
+
+    /// The two reasons cannot both hold — `NoPlaybookActivity` is read off recap counters and an
+    /// overflowed recap has none — so a record whose counters are empty because there *was* no
+    /// recap must not be reported as an empty playbook.
+    #[test]
+    fn an_unreadable_recap_is_not_mistaken_for_an_empty_playbook() {
+        let unreadable = v1beta1::PlayStatus {
+            phase: v1beta1::PlayPhase::Unknown,
+            host_count: 900,
+            recap: v1beta1::PlayRecap::default(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            RunDiagnostic::from_play_status(&unreadable),
+            RunDiagnostic::None
         );
     }
 
@@ -11222,7 +11332,7 @@ spec:
             summary: Some(outcome.summary),
             ..Default::default()
         };
-        apply_no_playbook_activity_diagnostic(&mut status, true);
+        apply_run_diagnostic(&mut status, RunDiagnostic::NoPlaybookActivity);
 
         assert_eq!(status.phase, Phase::Succeeded);
         assert_eq!(status.next_run, None);
