@@ -192,7 +192,10 @@ rather than quietly dropped from it. `Recurring` plans never hold: their contrac
 every tick against whatever is reachable then.
 
 A plan can stay held indefinitely, and for a Node that is never coming back that is the intended
-resting state — the condition says exactly what it is waiting for. Removing the Node from the cluster
+resting state. It reads
+[`HostsUnreachable`](./results-and-troubleshooting.md#phases) rather than `Failed` for as
+long as that lasts, provided every host it did not apply to was one nothing could reach — the
+playbook is fine, and the plan is waiting for hardware. The condition says exactly which Node. Removing the Node from the cluster
 or from the inventory's selector is what ends it.
 
 The hold is asked before a run starts, so it cannot catch a proxy pod that fails *after* it passed.

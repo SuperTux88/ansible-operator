@@ -93,6 +93,7 @@ src/v1beta1/
     callback_output.rs               parses the recap the callback wrote to the pod termination message
     triggers.rs                      validated 5-field Schedule newtype + total evaluate_schedule / forecast_next_run, timezone-aware
     status.rs                        folds a terminal Play's per-host results into PlaybookPlanStatus conditions (the only place run outcomes reach the plan)
+                                     `Phase::HostsUnreachable` splits a failed run in two: everything reachable was applied and only unreachable hosts are left. A failure everywhere the mechanics ask (`is_failure_verdict` — retries, schedule window, summary wording) and differs from `Failed` only in what it tells a human, so a plan parked on a dead machine does not read as a broken playbook. Decided by `phase_for_finished_run`, which needs the per-host results and so runs where the terminal `PlayStatus` is still in hand; `FinishedRun` carries the resulting verdict rather than the run's own `PlayPhase`.
     paths.rs                         shared mount-path conventions between workspace/inventory_renderer/job_builder
   ansible/
     playbook_renderer.rs             round-trips spec.template.playbook YAML (validation)

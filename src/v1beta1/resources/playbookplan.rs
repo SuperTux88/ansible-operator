@@ -355,6 +355,20 @@ pub enum Phase {
     /// schedule ticks, with `nextRun` naming the next one.
     Succeeded,
 
+    /// The latest run reached and applied the playbook to every host it *could* reach, and the only
+    /// hosts left over were ones nothing could connect to.
+    ///
+    /// A failure, and counted as one everywhere the budget and the schedule ask — but a different
+    /// one from `Failed`, which means something the operator did reach did not work. Nothing here is
+    /// wrong with the playbook: a machine is down, or a `StaticInventory` host is refusing
+    /// connections. The plan is waiting for hardware, not for someone to fix it, and reporting that
+    /// as `Failed` made a healthily-waiting plan indistinguishable at a glance from a broken one.
+    ///
+    /// Requires *every* non-succeeded host to be `Unreachable`. One host that ran a task and failed,
+    /// or one the play stopped short of, makes the run `Failed` — the unreachable hosts are then not
+    /// the whole story.
+    HostsUnreachable,
+
     /// The PlaybookPlan's namespace is not enrolled for the operator (not in the chart's
     /// `watchNamespaces`), so the operator has no RBAC to read its Secrets or create its Job and
     /// refuses to run it. Terminal until an administrator enrols the namespace and the operator
