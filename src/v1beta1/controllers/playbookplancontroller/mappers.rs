@@ -6,7 +6,7 @@ use tracing::debug;
 
 use crate::v1beta1::{
     self, ClusterInventory, HostOutcome, InventoryRef, NodeAccessPolicy, StaticInventory,
-    playbookplancontroller::{node_readiness, status},
+    playbookplancontroller::{node_readiness, reconciler, status},
 };
 
 /// Returns a closure that maps a `NodeAccessPolicy` change to *every* PlaybookPlan, so their
@@ -146,6 +146,20 @@ pub fn node_to_playbookplans(
 /// hash, so every host is outdated) would otherwise wake it on every kubelet heartbeat of every
 /// matching Node for as long as it stayed suspended, which is an ordinary workflow.
 ///
+/// A `OneShot` plan whose attempt budget is spent is the other half of that question, and it is
+/// asked through `reconciler::attempt_budget_available` rather than restated here so the wake set and
+/// the start gate cannot drift. It matters because two of the outcomes deliberately left in the set
+/// below outlive the budget: a host whose recap could not be read stays `Unknown` however many times
+/// the run repeats, and a host a down Node excluded stays `Unreachable` after the flap rule
+/// (`classify_run_failure`) has refused to refund the attempts. Both then sit on a Node that is
+/// `Ready` again and has nothing left to supply. Nothing that restores the budget arrives by this
+/// route either — a hash edit, an SSH key rotation and a successful run each have their own watch —
+/// so a Node event cannot be the thing that makes an exhausted plan actionable.
+///
+/// The budget check cannot strand a plan the readiness gate is holding, which is the trap the
+/// allow-list version of this predicate fell into: that hold is only ever asserted inside
+/// `eligible_to_start`, which already requires the budget, so a held plan always has one.
+///
 /// The outcome check is what keeps that from meaning "forever". `lastAppliedHash` is only stamped on
 /// `Succeeded` (`status::apply_terminal_play_status`), so a host that was reached and failed for real
 /// never advances it and would otherwise match this predicate for the life of the plan — waking a
@@ -176,6 +190,14 @@ fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &str) -> bool {
     let Some(status) = plan.status.as_ref() else {
         return false;
     };
+
+    if !reconciler::attempt_budget_available(
+        &plan.spec.mode,
+        status.retry_count,
+        reconciler::max_attempts(&plan.spec.mode, plan.spec.max_attempts),
+    ) {
+        return false;
+    }
 
     let targeted = status
         .eligible_hosts
@@ -670,6 +692,52 @@ mod tests {
         plan.spec.suspend = true;
 
         assert!(!plan_awaits_node(&plan, "node-a"));
+    }
+
+    fn plan_awaiting_with_attempts(
+        node: &str,
+        host_status: crate::v1beta1::HostStatus,
+        retry_count: u32,
+    ) -> PlaybookPlan {
+        let mut plan = plan_awaiting(node, host_status);
+        plan.spec.max_attempts = Some(3);
+        plan.status.as_mut().unwrap().retry_count = retry_count;
+        plan
+    }
+
+    /// The two outcomes that outlive the attempt budget, and the reason the host's own state is not
+    /// a sufficient answer. `Unreachable` is where a flapping Node ends up once `classify_run_failure`
+    /// has refused to refund its attempts; the Node then returns to `Ready` and reposts its status
+    /// every few minutes, with nothing the plan is allowed to do about it.
+    #[test]
+    fn a_plan_with_no_attempts_left_awaits_nothing() {
+        for outcome in [HostOutcome::Unreachable, HostOutcome::Unknown] {
+            let plan = plan_awaiting_with_attempts("node-a", host("", outcome.clone()), 3);
+
+            assert!(
+                !plan_awaits_node(&plan, "node-a"),
+                "{outcome:?}: an exhausted budget is not something a Ready Node can restore"
+            );
+            assert!(
+                plan_awaits_node(
+                    &plan_awaiting_with_attempts("node-a", host("", outcome.clone()), 2),
+                    "node-a"
+                ),
+                "{outcome:?}: a plan with a try left is exactly what the watch is for"
+            );
+        }
+    }
+
+    /// `Recurring` gets a new budget at every schedule tick, and the gate that knows about ticks is
+    /// not one a mapper can consult. `attempt_budget_available` answers `true` for that mode for the
+    /// same reason, so sharing it keeps the wake conservative rather than importing a slot rule that
+    /// would be answering a different question here.
+    #[test]
+    fn a_recurring_plan_is_woken_whatever_its_retry_count() {
+        let mut plan = plan_awaiting_with_attempts("node-a", host("", HostOutcome::Unreachable), 9);
+        plan.spec.mode = crate::v1beta1::ExecutionMode::Recurring;
+
+        assert!(plan_awaits_node(&plan, "node-a"));
     }
 
     #[test]

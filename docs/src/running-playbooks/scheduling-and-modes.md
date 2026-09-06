@@ -165,8 +165,14 @@ the plan. See the [per-host outcome table](./results-and-troubleshooting.md#per-
 their distinct causes.
 
 It also asks whether the *plan* could act on the wake-up at all, which is a separate question from
-what its hosts need. A **suspended** plan is waiting on you, not on a machine, so no Node wakes it
-however outdated its hosts are — resuming it is what starts the run.
+what its hosts need. Two answers say it could not, and neither is something a Node supplies:
+
+- a **suspended** plan is waiting on you, not on a machine, so no Node wakes it however outdated its
+  hosts are — resuming it is what starts the run.
+- a `OneShot` plan that has spent its [attempts](#retries) may not start another run, so a Node
+  turning `Ready` under it changes nothing until the budget comes back — which an edit, a
+  `StaticInventory` SSH key rotation or a successful run does, and each of those has its own row in
+  the table above. `Recurring` plans are unaffected: their budget resets at every tick.
 
 The SSH key row is deliberately one-sided. Rotating a key changes how the operator connects, not what
 it applies, so it must never re-apply the playbook to hosts that are already current — which is why

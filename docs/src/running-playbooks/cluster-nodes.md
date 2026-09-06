@@ -238,7 +238,9 @@ the down one is applying the playbook to it.
 The cost is deliberate. A plan whose Nodes all go down between the readiness check and the launch
 spends an attempt, and after `maxAttempts` of that it stops — so a Node that flaps that many times
 and then genuinely returns needs someone to touch the plan (bump `maxAttempts`, or edit it) rather
-than converging on its own. Bounding the loop is worth more than converging through a flap.
+than converging on its own. Bounding the loop is worth more than converging through a flap. Once the
+budget is gone the Node stops waking the plan too, since there is no longer anything the plan is
+allowed to do about the Node coming back; touching the plan is what restores both.
 
 Only Nodes the operator recorded **at launch** count. Two failures that can look the same from the
 outside do spend an attempt, because no Node coming back resolves either:
