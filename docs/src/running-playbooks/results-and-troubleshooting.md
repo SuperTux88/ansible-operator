@@ -151,12 +151,27 @@ that is what your own run would have reported for a host nothing could dial). By
 `hosts: localhost` play's counters are included, so the totals can exceed what the per-host rows
 account for — `Hosts` counts the machines targeted, the counters count what the playbook did.
 
-If a run succeeds but every recap counter is zero, its plan summary warns that the playbook produced
-no recap activity. This commonly means a `hosts:` pattern matched no inventory group — for example,
-`webserver` instead of `webservers`. Check the `Play`'s `Ok` column and the Job output for Ansible's
-`Could not match supplied host pattern` warning. An intentionally taskless playbook has the same
-observable result, so the operator keeps the successful verdict and asks you to confirm which case
-you intended rather than treating every empty playbook as a failure.
+If a run succeeds and any of its hosts ran no task at all, the plan summary says how many:
+`3/3 up-to-date (the playbook ran no task on 2 of 3 hosts)`, with the operator log carrying the
+longer version. This commonly means a `hosts:` pattern matched no inventory group — for example,
+`webserver` instead of `webservers`. Find the hosts in the `Play`'s `.status.hosts`, where they are
+the ones whose recap counters are all zero, and check the Job output for Ansible's
+`Could not match supplied host pattern` warning.
+
+The question is asked **per host**, not over the run's totals, because a playbook usually has more
+than one play: one working play — or a single `hosts: localhost` play, whose counters are in the
+totals — is enough to make the run look busy while a mistyped pattern quietly reaches nobody. Those
+hosts are still recorded as up to date, since applying a playbook that names none of them is vacuous
+(see [`NotReached`](#per-host-outcomes) for the case where something did stop the run short of a
+host), which is exactly why the summary says so: a `OneShot` plan will otherwise never look at them
+again.
+
+An inventory that is deliberately wider than its playbook produces the same observable result, and
+so does a playbook that leaves hosts untouched on purpose: with `gather_facts: false`, a `run_once`
+task runs — and is counted — on one host only, and a `meta: end_host` guard ends a host without
+running anything on it. Nothing can tell these apart from a mistake, so the note appears on every
+run of such a plan. The operator keeps the successful verdict either way and asks you to confirm
+which case you intended rather than treating one as a failure.
 
 `kubectl get plays -o wide` adds the less-common counters (`rescued`, `skipped`, `ignored`), the run number and
 the `Try` column — which try of its execution that run was, in the sense

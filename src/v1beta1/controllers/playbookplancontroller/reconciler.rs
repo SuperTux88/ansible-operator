@@ -5240,10 +5240,10 @@ fn plan_summary(outdated_count: usize, total_count: usize, verdict: &Phase) -> S
 enum RunDiagnostic {
     #[default]
     None,
-    /// The run completed every target but the user's playbook contributed no recap counters.
-    /// Diagnostic rather than a different verdict because an intentionally taskless playbook has the
-    /// same observable result as a host-pattern typo.
-    NoPlaybookActivity,
+    /// The run completed every target, and `hosts` of its `of` hosts came out of it having run
+    /// nothing at all. Diagnostic rather than a different verdict because an inventory deliberately
+    /// broader than its playbook has the same observable result as a host-pattern typo.
+    NoPlaybookActivity { hosts: u32, of: u32 },
     /// The run's recap did not fit the kubelet's termination-message cap even compressed, so its
     /// hosts fall to `Unknown` for a reason that is nothing to do with the playbook or the fleet's
     /// health. Without this the plan reports only "the recap could not be read", which is what a
@@ -5254,18 +5254,17 @@ enum RunDiagnostic {
 impl RunDiagnostic {
     /// What a finished run's own record still says, once the raw termination message is gone.
     fn from_play_status(status: &v1beta1::PlayStatus) -> Self {
-        if playbook_produced_no_recap_activity(status) {
-            Self::NoPlaybookActivity
-        } else {
-            Self::None
+        match hosts_without_recap_activity(status) {
+            Some((hosts, of)) => Self::NoPlaybookActivity { hosts, of },
+            None => Self::None,
         }
     }
 
     fn warn(self, namespace: &str, name: &str, job_name: &str) {
         match self {
             Self::None => {}
-            Self::NoPlaybookActivity => warn!(
-                "PlaybookPlan {namespace}/{name}: run {job_name} finished successfully but the playbook produced no recap activity; verify its host patterns or confirm it is intentionally empty"
+            Self::NoPlaybookActivity { hosts, of } => warn!(
+                "PlaybookPlan {namespace}/{name}: run {job_name} finished successfully, but the playbook ran no task at all on {hosts} of its {of} host(s), which are now recorded up to date. Verify its host patterns reach them, or confirm the playbook leaves them alone on purpose (outside every play, a run_once task, a meta: end_host guard)"
             ),
             Self::RecapOverflowed { hosts } => warn!(
                 "PlaybookPlan {namespace}/{name}: run {job_name} reported {hosts} hosts, whose recap does not fit the kubelet's {} byte termination-message limit even compressed; every host is reported Unknown. Split the plan across smaller inventories",
@@ -5274,13 +5273,15 @@ impl RunDiagnostic {
         }
     }
 
+    /// The clause appended to `.status.summary`, which is a printer column — so it states the fact
+    /// and stops. What to do about it belongs in [`Self::warn`], where there is room for it and
+    /// where somebody is already looking into the run.
     fn summary_clause(self) -> Option<String> {
         match self {
             Self::None => None,
-            Self::NoPlaybookActivity => Some(
-                " (playbook produced no recap activity; verify its host patterns or confirm it is intentionally empty)"
-                    .to_string(),
-            ),
+            Self::NoPlaybookActivity { hosts, of } => Some(format!(
+                " (the playbook ran no task on {hosts} of {of} hosts)"
+            )),
             Self::RecapOverflowed { hosts } => Some(format!(
                 " (the recap for {hosts} hosts does not fit the kubelet's termination-message limit, so no per-host result could be read; split the plan across smaller inventories)"
             )),
@@ -5299,14 +5300,51 @@ fn apply_run_diagnostic(status: &mut PlaybookPlanStatus, diagnostic: RunDiagnost
     summary.push_str(&clause);
 }
 
-/// Whether the run reached the completion marker on every target but the user's playbook produced
-/// no recap counters at all. This commonly means a `hosts:` pattern matched nothing, but an
-/// intentionally taskless playbook has the same observable result, so callers must report it as a
-/// diagnostic rather than reinterpret the successful host verdicts.
-fn playbook_produced_no_recap_activity(status: &v1beta1::PlayStatus) -> bool {
-    status.phase == v1beta1::PlayPhase::Succeeded
-        && status.host_count != 0
-        && status.recap == v1beta1::PlayRecap::default()
+/// How many of a successful run's hosts the playbook ran nothing on, out of how many it had.
+/// `None` when every host ran something, or when the run is not a clean success to ask it of.
+///
+/// **Asked per host, not over `status.recap`.** The run-level total is the sum over everything
+/// Ansible processed, so a single counter anywhere hides this: one working play beside a typo'd
+/// one, or — since `play_history::sum_recap` deliberately counts hosts outside the plan's inventory
+/// — a single `hosts: localhost` play, which is enough to mask a playbook that reached no inventory
+/// host at all. The condition being detected has always been per host; only the question was not.
+///
+/// The completion marker targets `all`, so a host no play of the author's touched still reaches the
+/// recap, with every counter zero and `completed` set. A host some play *did* touch usually cannot
+/// look like that — `gather_facts` gives it an `ok`, and a task filtered out by `when:` gives it a
+/// `skipped` — but a playbook can leave hosts untouched on purpose and produce the same signature:
+/// with `gather_facts: false`, a `run_once` task runs, and is counted, on one host only, and a
+/// `meta: end_host` guard ends a host without a counter. `Succeeded` is part of the test rather than
+/// implied by the phase, because a host the run excluded or that a `serial` batch stopped short of
+/// also carries an empty recap and must not be counted here.
+///
+/// This changes no verdict, and deliberately so: `play_history::outcome_from_stats` calls such a
+/// host `Succeeded` on the grounds that applying this playbook to it is vacuous, which is what keeps
+/// a plan whose inventory is broader than its playbook from retrying it forever. That reading is
+/// right and stays. What was missing is that nobody was told, because the host is then stamped with
+/// the current hash and a `OneShot` plan never looks at it again — so a group renamed in the
+/// inventory but not in the playbook reads as a clean, converged rollout.
+///
+/// The cost is that none of those cases is distinguishable from a mistake and never can be, so a
+/// plan whose inventory is intentionally wider than its playbook, or whose playbook skips hosts as
+/// above, carries this note on every run. That is the same trade the run-level version already made
+/// for an intentionally taskless playbook, which is why the warning offers every reading rather than
+/// asserting the mistake.
+fn hosts_without_recap_activity(status: &v1beta1::PlayStatus) -> Option<(u32, u32)> {
+    if status.phase != v1beta1::PlayPhase::Succeeded || status.hosts.is_empty() {
+        return None;
+    }
+
+    let untouched = status
+        .hosts
+        .values()
+        .filter(|result| {
+            result.outcome == v1beta1::HostOutcome::Succeeded
+                && result.recap == v1beta1::PlayRecap::default()
+        })
+        .count() as u32;
+
+    (untouched != 0).then_some((untouched, status.hosts.len() as u32))
 }
 
 /// The plan phase a finished run resolves to, in either mode.
@@ -8613,14 +8651,15 @@ spec:
             now,
             &mut status,
         );
-        apply_run_diagnostic(&mut status, RunDiagnostic::NoPlaybookActivity);
+        apply_run_diagnostic(
+            &mut status,
+            RunDiagnostic::NoPlaybookActivity { hosts: 3, of: 3 },
+        );
 
         assert_eq!(status.phase, Phase::Succeeded);
         assert_eq!(
             status.summary.as_deref(),
-            Some(
-                "plan currently resolves to no hosts (playbook produced no recap activity; verify its host patterns or confirm it is intentionally empty)"
-            )
+            Some("plan currently resolves to no hosts (the playbook ran no task on 3 of 3 hosts)")
         );
     }
 
@@ -10450,28 +10489,108 @@ spec:
         );
     }
 
+    /// Gives `touched` an `ok` of its own, which is what a host a play reached carries in the common
+    /// case — `gather_facts` alone supplies it — and leaves the rest on the empty recap the
+    /// completion marker gets them.
+    fn succeeded_with_activity(hosts: &[(&str, bool)]) -> v1beta1::PlayStatus {
+        let mut status = terminal_play_status(
+            v1beta1::PlayPhase::Succeeded,
+            &hosts
+                .iter()
+                .map(|(host, _)| (*host, v1beta1::HostOutcome::Succeeded))
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        for (host, touched) in hosts {
+            if *touched {
+                let result = status.hosts.get_mut(*host).expect("just built");
+                result.recap.ok = 1;
+                status.recap.ok += 1;
+            }
+        }
+        status.host_count = status.hosts.len() as u32;
+        status
+    }
+
     #[test]
-    fn a_successful_run_with_no_user_recap_activity_is_detected() {
+    fn a_successful_run_that_ran_nothing_anywhere_is_detected() {
         use v1beta1::{HostOutcome, PlayPhase};
 
-        let mut marker_only = finished_with(&[
-            ("node-a", HostOutcome::Succeeded),
-            ("node-b", HostOutcome::Succeeded),
-        ]);
-        marker_only.host_count = 2;
-        assert!(playbook_produced_no_recap_activity(&marker_only));
+        let marker_only = succeeded_with_activity(&[("node-a", false), ("node-b", false)]);
+        assert_eq!(hosts_without_recap_activity(&marker_only), Some((2, 2)));
 
-        let mut active = marker_only.clone();
-        active.recap.ok = 1;
-        assert!(!playbook_produced_no_recap_activity(&active));
+        let worked = succeeded_with_activity(&[("node-a", true), ("node-b", true)]);
+        assert_eq!(hosts_without_recap_activity(&worked), None);
 
         let failed =
             terminal_play_status(PlayPhase::Failed, &[("node-a", HostOutcome::Failed)], &[]);
-        assert!(!playbook_produced_no_recap_activity(&failed));
-        assert!(!playbook_produced_no_recap_activity(&v1beta1::PlayStatus {
-            phase: PlayPhase::Succeeded,
-            ..Default::default()
-        }));
+        assert_eq!(hosts_without_recap_activity(&failed), None);
+        assert_eq!(
+            hosts_without_recap_activity(&v1beta1::PlayStatus {
+                phase: PlayPhase::Succeeded,
+                ..Default::default()
+            }),
+            None
+        );
+    }
+
+    /// The case the run-level question could not see: one play works and another names a group that
+    /// does not exist, so the working play's counters fill `status.recap` while the hosts the typo
+    /// missed are stamped with the current hash having run nothing. A `OneShot` plan then never
+    /// looks at them again, and reports `3/3 up-to-date`.
+    #[test]
+    fn hosts_a_working_playbook_never_reached_are_still_reported() {
+        let partially_applied =
+            succeeded_with_activity(&[("db-1", true), ("web-1", false), ("web-2", false)]);
+
+        assert_ne!(
+            partially_applied.recap,
+            v1beta1::PlayRecap::default(),
+            "the run-level total is non-empty, which is exactly what used to hide this"
+        );
+        assert_eq!(
+            hosts_without_recap_activity(&partially_applied),
+            Some((2, 3))
+        );
+    }
+
+    /// `sum_recap` counts every host Ansible processed, including the implicit localhost of a
+    /// `hosts: localhost` play, which is not one of the plan's hosts and gets no row. One such play
+    /// is therefore enough to put an `ok` in the run-level total while no inventory host ran
+    /// anything at all — the very case the run-level check was written for.
+    #[test]
+    fn a_localhost_play_does_not_mask_a_playbook_that_reached_no_inventory_host() {
+        let mut only_localhost_ran = succeeded_with_activity(&[("web-1", false), ("web-2", false)]);
+        only_localhost_ran.recap.ok = 1;
+
+        assert_eq!(
+            hosts_without_recap_activity(&only_localhost_ran),
+            Some((2, 2))
+        );
+    }
+
+    /// An empty per-host recap is not on its own the signature: a host the run excluded, or one a
+    /// `serial` batch stopped short of, also carries one. Only a host that came out `Succeeded`
+    /// having run nothing is a host the playbook silently skipped — and neither of the others can
+    /// occur under a `Succeeded` run anyway, so this pins the reason rather than the reachability.
+    #[test]
+    fn only_a_succeeded_host_counts_as_one_the_playbook_skipped() {
+        use v1beta1::HostOutcome;
+
+        for outcome in [
+            HostOutcome::Unreachable,
+            HostOutcome::NotReached,
+            HostOutcome::Incomplete,
+        ] {
+            let mut status = succeeded_with_activity(&[("node-a", true), ("node-b", false)]);
+            status.hosts.get_mut("node-b").expect("just built").outcome = outcome.clone();
+
+            assert_eq!(
+                hosts_without_recap_activity(&status),
+                None,
+                "{outcome:?} says why the host was not reached; it is not a silent skip"
+            );
+        }
     }
 
     /// Where the two exclusions part ways, deliberately. `HostsUnreachable` says the plan is waiting
@@ -11337,15 +11456,16 @@ spec:
             summary: Some(outcome.summary),
             ..Default::default()
         };
-        apply_run_diagnostic(&mut status, RunDiagnostic::NoPlaybookActivity);
+        apply_run_diagnostic(
+            &mut status,
+            RunDiagnostic::NoPlaybookActivity { hosts: 2, of: 2 },
+        );
 
         assert_eq!(status.phase, Phase::Succeeded);
         assert_eq!(status.next_run, None);
         assert_eq!(
             status.summary.as_deref(),
-            Some(
-                "2/2 up-to-date (playbook produced no recap activity; verify its host patterns or confirm it is intentionally empty)"
-            )
+            Some("2/2 up-to-date (the playbook ran no task on 2 of 2 hosts)")
         );
         assert_eq!(outcome.requeue, None);
     }
