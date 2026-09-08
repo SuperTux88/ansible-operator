@@ -11,7 +11,7 @@ use kube::{
     Api,
     api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions},
     runtime::{
-        Controller,
+        Controller, WatchStreamExt as _,
         controller::Action,
         reflector::{ObjectRef, Store, store::Writer},
         watcher,
@@ -182,7 +182,12 @@ pub async fn new(
 
         let playbookplan_reflector = kube::runtime::reflector(
             playbookplan_reflector_writer,
-            watcher(playbookplans_api.clone(), watcher::Config::default()),
+            // Every reflector in this function needs the backoff, and nothing else supplies one: a
+            // bare `watcher` re-lists on the very next poll after an error, `Controller::run` backs
+            // off only its own trigger streams, and these run in tasks of their own. Without it a
+            // persistent failure — a revoked grant, an apiserver refusing the watch — re-LISTs the
+            // whole collection as fast as the requests come back, and logs a line each time.
+            watcher(playbookplans_api.clone(), watcher::Config::default()).default_backoff(),
         );
 
         tokio::spawn(async move {
@@ -205,7 +210,7 @@ pub async fn new(
 
         let reflector = kube::runtime::reflector(
             writer,
-            watcher(node_access_policies_api.clone(), watcher::Config::default()),
+            watcher(node_access_policies_api.clone(), watcher::Config::default()).default_backoff(),
         );
 
         tokio::spawn(async move {
@@ -230,7 +235,7 @@ pub async fn new(
 
         let reflector = kube::runtime::reflector(
             writer,
-            watcher(static_inventories_api.clone(), watcher::Config::default()),
+            watcher(static_inventories_api.clone(), watcher::Config::default()).default_backoff(),
         );
 
         tokio::spawn(async move {
@@ -255,7 +260,7 @@ pub async fn new(
 
         let reflector = kube::runtime::reflector(
             writer,
-            watcher(nodes_api.clone(), watcher::Config::default()),
+            watcher(nodes_api.clone(), watcher::Config::default()).default_backoff(),
         );
 
         tokio::spawn(async move {
