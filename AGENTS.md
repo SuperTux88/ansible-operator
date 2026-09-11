@@ -404,7 +404,11 @@ The plan controller also watches **Nodes**, through one reflector serving two jo
 in the plan's `eligibleHosts` *and* not yet on the plan's `currentHash` — because every kubelet
 reposts its Node status periodically, so an "all plans" mapping would reconcile every plan every few
 minutes forever, scaling with node count. A converged cluster matches no plans and the heartbeats
-fall on the floor.
+fall on the floor. It asks the *plan* as well as the host, because a wake the plan cannot act on
+costs exactly as much as one it can: a suspended plan, a `OneShot` plan out of attempts, and every
+`Recurring` plan are all refused. `Recurring` is refused outright because only the clock starts its
+runs — the readiness gate it would be released by is `OneShot`-only — and it is the one mode with no
+budget to bound the wakes, so one stuck host would otherwise wake it per heartbeat forever.
 
 `reconciler::new` is `async` for one reason: it waits for that reflector's initial LIST before
 handing back a controller. An unsynced Node cache reports every node `Ready`, which is precisely the

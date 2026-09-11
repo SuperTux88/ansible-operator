@@ -159,8 +159,9 @@ never recorded as `Failed`, since no task ever ran on it; which [outcome
 ](./results-and-troubleshooting.md#per-host-outcomes) it does get in `.status.hostsStatus` depends on
 what the operator saw at launch:
 
-- the Node was itself `NotReady` — `Unreachable`. Its return to `Ready` starts the next run on its
-  own, so this heals without anyone touching the plan.
+- the Node was itself `NotReady` — `Unreachable`. For a `OneShot` plan its return to `Ready` starts
+  the next run on its own, so this heals without anyone touching the plan; a `Recurring` plan heals
+  at its next tick, which is the only thing that ever starts a run for it.
 - the Node was `Ready` and only the proxy pod failed to come up — `NotReached`. Nothing about the
   Node is going to change, so nothing wakes the plan for it. See
   [Unreachable Nodes and the attempt budget](#unreachable-nodes-and-the-attempt-budget) below and
