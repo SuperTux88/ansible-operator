@@ -72,6 +72,23 @@ const RETRY_REQUEUE: std::time::Duration = std::time::Duration::from_secs(1);
 /// single job is to be far above any healthy sync.
 const NODE_CACHE_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How many consecutive Node watch failures stop looking like a blip, after which the log says what
+/// the failure *costs* rather than only that it happened.
+///
+/// The watcher backs off exponentially, so this is reached in tens of seconds rather than
+/// immediately, which is what keeps an apiserver rolling upgrade from tripping it. It changes no
+/// behaviour — see [`await_node_cache`] for why the operator does not act on this the way it acts on
+/// a cache that never synced at all.
+const NODE_WATCH_FAILURES_BEFORE_ESCALATING: u32 = 5;
+
+/// How often the detailed Node watch line is repeated while the watch stays broken.
+///
+/// Once its delay has grown the watcher fails every 30–60 s, so the detailed line on every failure
+/// would be the same few hundred characters twice a minute for as long as the outage lasts. Logged
+/// only once, it scrolls out of whatever window an admin reads with `kubectl logs --since`, leaving
+/// bare watch errors that do not say what they cost.
+const NODE_WATCH_ESCALATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 pub struct WorkloadEgressPolicies {
     pub playbook: Option<Vec<NetworkPolicyEgressRule>>,
     pub managed_ssh: Option<Vec<NetworkPolicyEgressRule>>,
@@ -264,11 +281,32 @@ pub async fn new(
         );
 
         tokio::spawn(async move {
+            // Unlike the three reflectors above, this one's failures are worth counting: those feed
+            // triggers, where a failed watch delays a reconcile, while this one feeds a *decision*
+            // that is taken from the cache whether or not it is still being updated. A `Store` keeps
+            // serving its last contents for the life of the process, so a watch that stays broken
+            // is invisible from the reading side — and the one line per attempt that a
+            // backed-off watcher produces reads the same whether it recovers a second later or
+            // never recovers at all.
+            let mut failures = NodeWatchFailures::default();
             reflector
-                .for_each(|event| async {
-                    if let Err(e) = event {
-                        error!("Node reflector error: {e:?}");
+                .for_each(|event| {
+                    match failures.observe(event, std::time::Instant::now()) {
+                        NodeWatchLog::Nothing => {}
+                        NodeWatchLog::Failure(error) => error!("Node reflector error: {error:?}"),
+                        NodeWatchLog::Escalation {
+                            consecutive_failures,
+                            error,
+                        } => error!(
+                            "Node watch has failed {consecutive_failures} times running: {error:?}. The Node cache is no longer being updated, so the OneShot readiness gate is answering from whatever it last saw — a Node that goes down from here on will read Ready, and a plan held for one that comes back will not be released until its hourly requeue. Check that the operator's ClusterRole still grants list/watch on nodes, and that the apiserver is reachable"
+                        ),
+                        NodeWatchLog::Recovery {
+                            consecutive_failures,
+                        } => info!(
+                            "Node watch recovered after {consecutive_failures} consecutive failures; the Node cache is being updated again"
+                        ),
                     }
+                    std::future::ready(())
                 })
                 .await;
         });
@@ -369,6 +407,24 @@ pub async fn new(
 ///
 /// A dropped writer is fatal for the same reason and not merely a warning: the writer lives in the
 /// reflector task, so losing it means the cache will never populate *and* never update again.
+///
+/// **This bounds the first sync only, and the same failure after it is not covered.** A watch that
+/// breaks once the cache is populated leaves the `Store` serving its last contents indefinitely, so
+/// the gate keeps answering — from a snapshot. The effect is the pre-gate behaviour the branch was
+/// written to remove, arriving quietly: a Node that goes down afterwards still reads `Ready`, so a
+/// run starts against it, takes its hosts' Leases, waits out the grace window and reports everything
+/// unreachable; and a held plan is released by nothing but its hourly requeue.
+///
+/// It is deliberately not treated the same way, because the two failures are not alike. Here there
+/// is no answer at all and never has been, so refusing to start is strictly better than guessing.
+/// There, the operator is running with an answer that was true a moment ago and degrades from there,
+/// and every way of acting on that trades one failure for another: crashing turns a self-healing
+/// apiserver blip into a restart loop, and holding every run instead would stop a fleet on the
+/// strength of a watch error. Which trade is right is a decision nobody has had to make yet, so the
+/// reflector task escalates its log after [`NODE_WATCH_FAILURES_BEFORE_ESCALATING`], repeats it
+/// every [`NODE_WATCH_ESCALATION_INTERVAL`] and says when the watch recovers, and nothing more —
+/// making the state loud, which is the half that was missing, without picking a trade on a
+/// cluster's behalf.
 async fn await_node_cache(nodes: &Store<Node>) {
     match tokio::time::timeout(NODE_CACHE_SYNC_TIMEOUT, nodes.wait_until_ready()).await {
         Ok(Ok(())) => {}
@@ -382,6 +438,75 @@ async fn await_node_cache(nodes: &Store<Node>) {
              grants list/watch on nodes, and that the apiserver is reachable",
             NODE_CACHE_SYNC_TIMEOUT.as_secs()
         ),
+    }
+}
+
+/// The Node reflector task's view of its own watch: how many failures have run together since the
+/// cache was last updated, and when the detailed line about them was last logged.
+#[derive(Default)]
+struct NodeWatchFailures {
+    consecutive: u32,
+    /// `Some` for as long as the current run of failures has been escalated.
+    last_escalated: Option<std::time::Instant>,
+}
+
+/// What the Node reflector task logs for one watch event.
+enum NodeWatchLog {
+    Nothing,
+    /// The bare watch error: a failure that still looks like a blip, or one that falls between two
+    /// detailed lines.
+    Failure(watcher::Error),
+    /// The detailed line: the cache has stopped updating, and what that costs.
+    Escalation {
+        consecutive_failures: u32,
+        error: watcher::Error,
+    },
+    /// The cache is being updated again after an escalated run of failures. Reported on the first
+    /// event that updates it, which after a resumed watch is the next Node change, so it can trail
+    /// the reconnect by up to a kubelet's status report interval.
+    Recovery {
+        consecutive_failures: u32,
+    },
+}
+
+impl NodeWatchFailures {
+    fn observe(
+        &mut self,
+        event: Result<watcher::Event<Node>, watcher::Error>,
+        now: std::time::Instant,
+    ) -> NodeWatchLog {
+        match event {
+            // Neither proves the cache is being updated: a watcher whose re-LIST keeps failing
+            // yields `Init` before every attempt, and `InitApply` only fills the buffer that
+            // `InitDone` swaps in.
+            Ok(watcher::Event::Init | watcher::Event::InitApply(_)) => NodeWatchLog::Nothing,
+            Ok(_) => {
+                let consecutive_failures = std::mem::take(&mut self.consecutive);
+                if self.last_escalated.take().is_some() {
+                    NodeWatchLog::Recovery {
+                        consecutive_failures,
+                    }
+                } else {
+                    NodeWatchLog::Nothing
+                }
+            }
+            Err(error) => {
+                self.consecutive += 1;
+                let due = self.consecutive >= NODE_WATCH_FAILURES_BEFORE_ESCALATING
+                    && self
+                        .last_escalated
+                        .is_none_or(|at| now.duration_since(at) >= NODE_WATCH_ESCALATION_INTERVAL);
+                if due {
+                    self.last_escalated = Some(now);
+                    NodeWatchLog::Escalation {
+                        consecutive_failures: self.consecutive,
+                        error,
+                    }
+                } else {
+                    NodeWatchLog::Failure(error)
+                }
+            }
+        }
     }
 }
 
@@ -6390,6 +6515,101 @@ mod tests {
         drop(writer);
 
         await_node_cache(&reader).await;
+    }
+
+    fn node_watch_failed(
+        failures: &mut NodeWatchFailures,
+        now: std::time::Instant,
+    ) -> NodeWatchLog {
+        failures.observe(Err(watcher::Error::NoResourceVersion), now)
+    }
+
+    #[test]
+    fn a_node_watch_escalates_once_its_failures_stop_looking_like_a_blip() {
+        let mut failures = NodeWatchFailures::default();
+        let now = std::time::Instant::now();
+
+        for _ in 1..NODE_WATCH_FAILURES_BEFORE_ESCALATING {
+            assert!(matches!(
+                node_watch_failed(&mut failures, now),
+                NodeWatchLog::Failure(_)
+            ));
+        }
+        assert!(matches!(
+            node_watch_failed(&mut failures, now),
+            NodeWatchLog::Escalation {
+                consecutive_failures: NODE_WATCH_FAILURES_BEFORE_ESCALATING,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_node_watch_that_stays_broken_repeats_the_detailed_line_once_per_interval() {
+        let mut failures = NodeWatchFailures::default();
+        let escalated_at = std::time::Instant::now();
+        for _ in 0..NODE_WATCH_FAILURES_BEFORE_ESCALATING {
+            node_watch_failed(&mut failures, escalated_at);
+        }
+
+        let just_before =
+            escalated_at + NODE_WATCH_ESCALATION_INTERVAL - std::time::Duration::from_secs(1);
+        assert!(matches!(
+            node_watch_failed(&mut failures, just_before),
+            NodeWatchLog::Failure(_)
+        ));
+        assert!(matches!(
+            node_watch_failed(&mut failures, escalated_at + NODE_WATCH_ESCALATION_INTERVAL),
+            NodeWatchLog::Escalation { .. }
+        ));
+    }
+
+    /// A watcher whose re-LIST keeps failing yields `Init` before every attempt. Counting that as
+    /// the cache updating reset the count on each retry, so a LIST refused forever never escalated.
+    #[test]
+    fn a_failing_relist_does_not_count_as_the_node_cache_updating() {
+        let mut failures = NodeWatchFailures::default();
+        let now = std::time::Instant::now();
+
+        let mut last = NodeWatchLog::Nothing;
+        for _ in 0..NODE_WATCH_FAILURES_BEFORE_ESCALATING {
+            assert!(matches!(
+                failures.observe(Ok(watcher::Event::Init), now),
+                NodeWatchLog::Nothing
+            ));
+            last = node_watch_failed(&mut failures, now);
+        }
+        assert!(matches!(last, NodeWatchLog::Escalation { .. }));
+    }
+
+    #[test]
+    fn a_node_watch_reports_recovering_only_from_an_escalation_and_only_once() {
+        let mut failures = NodeWatchFailures::default();
+        let now = std::time::Instant::now();
+
+        node_watch_failed(&mut failures, now);
+        assert!(matches!(
+            failures.observe(Ok(watcher::Event::Apply(Node::default())), now),
+            NodeWatchLog::Nothing
+        ));
+
+        for _ in 0..NODE_WATCH_FAILURES_BEFORE_ESCALATING {
+            node_watch_failed(&mut failures, now);
+        }
+        assert!(matches!(
+            failures.observe(Ok(watcher::Event::InitDone), now),
+            NodeWatchLog::Recovery {
+                consecutive_failures: NODE_WATCH_FAILURES_BEFORE_ESCALATING
+            }
+        ));
+        assert!(matches!(
+            failures.observe(Ok(watcher::Event::Apply(Node::default())), now),
+            NodeWatchLog::Nothing
+        ));
+        assert!(matches!(
+            node_watch_failed(&mut failures, now),
+            NodeWatchLog::Failure(_)
+        ));
     }
 
     fn managed_ssh_group(

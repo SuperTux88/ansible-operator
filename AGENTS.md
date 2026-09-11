@@ -424,6 +424,19 @@ the controller pending for the life of the process while the other two kept the 
 healthy. `join!` in `main` is what turns that panic into a process exit; spawning the controllers
 instead would park it in a `JoinHandle` nobody reads and restore exactly the silent half-alive state.
 
+**It bounds the first sync only.** A watch that breaks after the cache is populated leaves the
+`Store` serving its last contents for the life of the process, so the gate keeps answering from a
+snapshot and degrades from there — a Node that goes down afterwards still reads `Ready`. That is
+deliberately not treated the same way: with no answer at all, refusing to start is strictly better
+than guessing, while with a stale one every response trades one failure for another (crashing turns
+an apiserver blip into a restart loop; holding every run stops a fleet on a watch error). Which
+trade is right is an open decision, so the reflector task (`NodeWatchFailures`) only escalates its
+log after `NODE_WATCH_FAILURES_BEFORE_ESCALATING`, repeats that line every
+`NODE_WATCH_ESCALATION_INTERVAL` and says when the watch recovers — making the state loud, which is
+the half that was missing. Only `Apply`, `Delete` and `InitDone` count as the cache updating: a
+watcher whose re-LIST keeps failing yields `Init` before every attempt, so counting that as success
+would never let a failing re-list escalate.
+
 That reflector is for **readiness only**. `node_access::enforce` keeps its own *live* Node read:
 the allow-set is a security gate and INV-5 says it is never served from a cache.
 
