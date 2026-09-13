@@ -1597,6 +1597,12 @@ async fn schedule_window_already_taken(
 /// the status lags: the records are written before anything a run creates. The caller's
 /// `retryCountSlot`-scoped counter remains authoritative after those records are pruned, so retention
 /// cannot hand back tries the status says this slot already spent.
+///
+/// Only a failure that actually spent a try is counted, by the same [`returns_its_attempt`] the
+/// budget is reset by. A `OneShot` run that missed nothing but Nodes already down at its launch is
+/// `Failed` on its record, yet the budget handed its attempt back; counting it here anyway took
+/// back what the refund gave, so with `maxAttempts: 1` the Node's return inside the window found it
+/// closed and waited for the next tick.
 fn window_taken_by_a_record(
     plays: &[Play],
     plan: &PlaybookPlan,
@@ -1610,17 +1616,25 @@ fn window_taken_by_a_record(
         return false;
     };
     let mut failures = 0;
-    for play in plays.iter().filter(|play| {
-        play_history::play_belongs_to_plan(play, plan_name, uid)
-            && play.spec.triggered_slot == Some(slot)
-            && play.spec.execution_hash == desired_hash.to_string()
-    }) {
-        match play.status.as_ref().map(|status| &status.phase) {
+    for status in plays
+        .iter()
+        .filter(|play| {
+            play_history::play_belongs_to_plan(play, plan_name, uid)
+                && play.spec.triggered_slot == Some(slot)
+                && play.spec.execution_hash == desired_hash.to_string()
+        })
+        .filter_map(|play| play.status.as_ref())
+    {
+        match status.phase {
             // Still going, or done and done well: either way the window is not a retry's to take.
-            Some(v1beta1::PlayPhase::Running | v1beta1::PlayPhase::Succeeded) => return true,
+            v1beta1::PlayPhase::Running | v1beta1::PlayPhase::Succeeded => return true,
             // `Unknown` counts as a failure here for the same reason it does everywhere else: a
             // recap that could not be read is not evidence the hosts were reached.
-            Some(v1beta1::PlayPhase::Failed | v1beta1::PlayPhase::Unknown) => failures += 1,
+            v1beta1::PlayPhase::Failed | v1beta1::PlayPhase::Unknown
+                if !returns_its_attempt(&plan.spec.mode, &classify_run_failure(status)) =>
+            {
+                failures += 1;
+            }
             _ => {}
         }
     }
@@ -1811,6 +1825,25 @@ fn retry_budget_closes_window(
     tries_spent > 0
         && slot_already_triggered(current_slot, budget_slot)
         && !retry_due(phase, tries_spent, max_attempts)
+}
+
+/// Whether a finished run hands its attempt back instead of spending it.
+///
+/// Only `OneShot` ever does, in two cases:
+///
+///   - it succeeded. The execution is complete, and resetting its budget is what lets inventory
+///     growth trigger a new run for hosts that were not present in it.
+///   - nothing the operator could reach failed either ([`RunFailure::OnlyUnreachableNodes`]), so it
+///     made all the progress there was to make. The plan does not immediately retry on that budget:
+///     with every remaining outdated host on a Node that is down, the start gate holds it until the
+///     Node watch says one is back. Without that gate this would loop.
+///
+/// One predicate for both places that count attempts — the budget reset after a run
+/// ([`sync_desired_hash_after_finished_run`]) and the schedule window's count of its records
+/// ([`window_taken_by_a_record`]) — because a refund only one of them honours is not a refund.
+fn returns_its_attempt(mode: &ExecutionMode, failure: &RunFailure) -> bool {
+    matches!(mode, ExecutionMode::OneShot)
+        && matches!(failure, RunFailure::None | RunFailure::OnlyUnreachableNodes)
 }
 
 /// Which try a run about to start is, from the budget the plan has already spent.
@@ -4606,20 +4639,7 @@ fn sync_desired_hash_after_finished_run(
     if let Some((attempt, slot)) = surviving_attempt {
         record_retry_budget(status, attempt, slot);
     } else if finished.execution_hash == *desired_hash {
-        if matches!(mode, ExecutionMode::OneShot)
-            && matches!(
-                finished_failure,
-                // A successful OneShot execution is complete. Reset its budget so inventory growth
-                // can trigger a new run for hosts that were not present in the completed execution.
-                RunFailure::None
-                    // Nothing the operator could reach failed either, so this execution made all
-                    // the progress there was to make and the run did not spend an attempt on it.
-                    // The plan does not immediately retry on that budget: with every remaining
-                    // outdated host on a Node that is down, the start gate holds it until the Node
-                    // watch says one is back. Without that gate this would loop.
-                    | RunFailure::OnlyUnreachableNodes
-            )
-        {
+        if returns_its_attempt(mode, finished_failure) {
             record_retry_budget(status, 0, None);
         } else {
             record_retry_budget(
@@ -8159,6 +8179,133 @@ mod tests {
         let mut running = failed("run-2");
         running.status.as_mut().unwrap().phase = v1beta1::PlayPhase::Running;
         assert!(taken(&[failed("run-1"), running], 3));
+    }
+
+    /// The refund and the window must agree. A scheduled `OneShot` run that reached every host it
+    /// could and missed only Nodes already down at its launch hands its attempt back, so its
+    /// `Failed` record must not close the window as a spent try — with `maxAttempts: 1` it did, and
+    /// a Node returning inside the window waited for the next tick instead of starting the run the
+    /// refund was for.
+    #[test]
+    fn a_refunded_oneshot_run_leaves_its_window_open() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+
+        let plan_in = |mode| {
+            let mut plan = PlaybookPlan::new(
+                "plan",
+                PlaybookPlanSpec {
+                    mode,
+                    ..Default::default()
+                },
+            );
+            plan.metadata.uid = Some("plan-uid".into());
+            plan
+        };
+        let failed_record = |hosts: &[(&str, v1beta1::HostOutcome)],
+                             unreachable: &[(&str, bool)]| {
+            let mut play = Play::new(
+                "run-1",
+                v1beta1::PlaySpec {
+                    playbook_plan: "plan".into(),
+                    playbook_plan_uid: "plan-uid".into(),
+                    execution_hash: "1a".into(),
+                    run_id: "run-1".into(),
+                    preparation_fingerprint: "fp".into(),
+                    run_number: 1,
+                    attempt: 1,
+                    inventory: Vec::new(),
+                    triggered_slot: Some(slot),
+                },
+            );
+            play.metadata.owner_references = Some(vec![OwnerReference {
+                uid: "plan-uid".into(),
+                name: "plan".into(),
+                ..Default::default()
+            }]);
+            play.status = Some(terminal_play_status(
+                v1beta1::PlayPhase::Failed,
+                hosts,
+                unreachable,
+            ));
+            play
+        };
+
+        let oneshot = plan_in(ExecutionMode::OneShot);
+        let missed_a_down_node = failed_record(
+            &[
+                ("node-a", v1beta1::HostOutcome::Succeeded),
+                ("node-b", v1beta1::HostOutcome::Unreachable),
+            ],
+            &[("node-b", true)],
+        );
+
+        // Both halves of the start gate, after the refund this run earned.
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            retry_count: 1,
+            retry_count_slot: Some(slot),
+            ..Default::default()
+        };
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &ExecutionMode::OneShot,
+            &finished_run(hash, 1, 1, slot),
+            &classify_run_failure(missed_a_down_node.status.as_ref().unwrap()),
+            None,
+        );
+        assert!(!retry_budget_closes_window(
+            &Phase::HostsUnreachable,
+            status.retry_count,
+            status.retry_count_slot,
+            Some(slot),
+            1,
+        ));
+        assert!(!window_taken_by_a_record(
+            std::slice::from_ref(&missed_a_down_node),
+            &oneshot,
+            slot,
+            &hash,
+            1,
+        ));
+
+        // A run the refund turns down still spent its try, and still closes the window.
+        let reached_nobody = failed_record(
+            &[("node-b", v1beta1::HostOutcome::Unreachable)],
+            &[("node-b", true)],
+        );
+        let proxy_never_came_up = failed_record(
+            &[
+                ("node-a", v1beta1::HostOutcome::Succeeded),
+                ("node-b", v1beta1::HostOutcome::NotReached),
+            ],
+            &[("node-b", false)],
+        );
+        for (what, play) in [
+            ("a run that reached nobody", &reached_nobody),
+            (
+                "a Ready Node whose proxy never came up",
+                &proxy_never_came_up,
+            ),
+        ] {
+            assert!(
+                window_taken_by_a_record(std::slice::from_ref(play), &oneshot, slot, &hash, 1),
+                "{what}"
+            );
+        }
+
+        // `Recurring` is never refunded, and a second run in its slot is what the records exist to
+        // prevent.
+        assert!(window_taken_by_a_record(
+            std::slice::from_ref(&missed_a_down_node),
+            &plan_in(ExecutionMode::Recurring),
+            slot,
+            &hash,
+            1,
+        ));
     }
 
     #[test]

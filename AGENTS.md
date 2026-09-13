@@ -311,7 +311,9 @@ handful of decisions that are easy to undo by accident:
   `Play`s (which book revision and slot before anything is created) before a new run is prepared.
   Since `maxAttempts` the question is no longer "did a run take this slot" but "is there anything
   left for a run to do in it": a record still `Running` or one that `Succeeded` closes the window,
-  while failures close it only once they have spent the budget. `retryCountSlot` binds
+  while failures close it only once they have spent the budget. A `OneShot` failure the budget
+  refunded (`returns_its_attempt`) spent nothing and is not counted — the refund and this count must
+  answer from the same predicate, or the refund is taken back here. `retryCountSlot` binds
   `retryCount` to its recurring execution, so status can close an exhausted window after its records
   have been pruned and `next_attempt` does not restart at one when `lastTriggeredRun` is stale.
 - **`spec.suspend` is decided before the inventory is read** (`resolve_unlaunched_before_inputs`),

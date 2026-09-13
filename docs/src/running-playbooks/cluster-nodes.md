@@ -229,7 +229,9 @@ cost the plan one of its [attempts](./scheduling-and-modes.md#retries), provided
 
 Then the run applied everything there was to apply, and a `OneShot` plan's budget is reset exactly as
 a fully successful run resets it. What the plan is waiting for is the Node, not another try, and the
-next try would be identical.
+next try would be identical. On a scheduled plan the Node's return still starts that run within the
+same tick's `startingDeadlineSeconds` window, whatever `maxAttempts` is; once the window has closed
+it waits for the next tick.
 
 The first half is what keeps a plan from running forever against a Node that keeps coming and going.
 A refund is credit for progress, so a run that reached nobody spends its attempt however good its
