@@ -189,7 +189,9 @@ unreachable for that run rather than holding the run and its host locks indefini
 All of the above is about a run that has already started. A `OneShot` plan that has *not* started one
 asks a cheaper question first: if **every** Node the run would target is `NotReady`, there is nothing
 for the run to do, so the plan holds instead of starting it. It carries a `WaitingForNodes` condition
-with reason `NodesNotReady`, and `.status.summary` names the Nodes it is waiting for.
+with reason `NodesNotReady`, and `.status.summary` names the Nodes it is waiting for. `Ready` is
+`False` with the same reason for as long as the hold lasts — the phase keeps the last run's
+verdict, but a plan holding a run has hosts it has not applied the current revision to.
 
 Holding rather than running matters because the run would achieve nothing and take the full wait
 window to find that out — a proxy pod per Node, every host lock held for the duration, and a `Failed`

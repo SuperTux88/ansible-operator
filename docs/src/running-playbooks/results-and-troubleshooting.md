@@ -64,7 +64,10 @@ printer columns:
   `HostsOutdated` describe **the whole plan**, counted over every eligible host. The two are worded
   differently on purpose: `n/m hosts completed successfully` is a statement about an execution,
   `n/m hosts on the current revision` about the plan's standing, and the second is not a claim that
-  anything ran.
+  anything ran. While a `OneShot` plan is
+  [held for `NotReady` Nodes](./cluster-nodes.md#holding-instead-of-starting), `Ready` is `False`
+  with reason `NodesNotReady` even if the phase still shows the last run's `Succeeded`: the phase is
+  what the plan last did, and `Ready` says it has hosts it has not yet applied to.
 - **`Running`** — the operator has identified this run's own Job in a non-terminal state
   (`JobRunning`). It is set in the same reconcile that creates the Job (a run adopted during recovery
   picks it up on the next tick), and re-asserted on every tick that observes it unfinished, so it
@@ -92,7 +95,10 @@ printer columns:
     operator notices at once — and also whenever the plan stops being held for any other reason:
     suspending it, a schedule window closing, or an inventory change that leaves it no such hosts.
     A held plan that is then suspended reports `suspended; no new run will start` instead, since
-    suspension is what is stopping the run at that point, not the Node.
+    suspension is what is stopping the run at that point, not the Node. While the hold stands,
+    `Ready` is `False` with the same reason; when it clears, `Ready` goes back to describing the
+    hosts (`HostsUpToDate` / `HostsOutdated`), so a plan whose down Node left the inventory reads
+    `Ready=True` again without another run.
     See [Holding instead of starting](./cluster-nodes.md#holding-instead-of-starting).
 
 `.status.summary` is a one-line human summary (also a column), and `.status.currentHash` is the

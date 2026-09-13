@@ -1037,7 +1037,7 @@ async fn reconcile(
         // `status::held_for_unready_nodes`. Nothing else needs the unconditional clear; the paths
         // that end a proxy wait (`ensure_infra_and_launch`, `clear_run_conditions`) each clear it
         // themselves.
-        status::set_waiting_for_nodes_condition(&mut resource_status, None);
+        release_node_readiness_hold(&mut resource_status, outdated_hosts.len());
     }
 
     // Plain `?`, unlike the desired-input reads above: this hashes two already-deserialized values,
@@ -1909,7 +1909,8 @@ fn update_idle_recurring_status<Tz: TimeZone>(
 ///   back. Suspension is why no run is starting now, not the Node, and the hold's summary names the
 ///   Node as the reason — so the summary is replaced along with the condition. Only ever *this*
 ///   hold: the condition is shared with the proxy-pod wait, which belongs to a run that is already
-///   under way and that suspension deliberately lets finish.
+///   under way and that suspension deliberately lets finish. The hold's `Ready` overlay goes with it
+///   and is restated from the per-host results, so `Ready` does not keep naming the Node either.
 ///
 /// Held where the status is *written* rather than at the end of the pipeline, because a tick has
 /// more than one way to write one and only one way to reach the end. A tick that finalizes a run, or
@@ -1931,6 +1932,12 @@ fn suspended_advertises_no_pending_run(suspend: bool, status: &mut PlaybookPlanS
     status.next_run = None;
     if status::held_for_unready_nodes(status) {
         status::set_waiting_for_nodes_condition(status, None);
+        // An unparseable hash is treated as every host outdated: it can only understate `Ready`.
+        let outdated_count = ExecutionHash::from_hex(&status.current_hash).map_or_else(
+            || distinct_host_count(&status.eligible_hosts),
+            |hash| find_outdated_hosts(status, &hash).len(),
+        );
+        status::clear_nodes_not_ready_condition(status, outdated_count);
         status.summary = Some("suspended; no new run will start".to_string());
     }
 }
@@ -4294,15 +4301,31 @@ fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usi
 /// *scheduled* plan is being held inside the starting-deadline window of a slot it still owes a run
 /// for, and that forecast is exactly what a reader needs while the hold lasts. An unscheduled plan
 /// has no forecast to keep.
+///
+/// `Ready` is the one part of the verdict that does not survive. The phase says what the last run
+/// did; `Ready` is read as whether the plan is converged, and a held plan has by definition hosts it
+/// has not applied the current revision to.
 fn hold_plan_for_unready_nodes(status: &mut PlaybookPlanStatus, unready: &[String]) {
     status.phase = phase_under_readiness_overlay(&status.phase);
-    status.summary = Some(format!(
-        "waiting for node(s) {} to become Ready",
-        unready.join(", ")
-    ));
+    let summary = format!("waiting for node(s) {} to become Ready", unready.join(", "));
+    status::set_nodes_not_ready_condition(status, &summary);
+    status.summary = Some(summary);
     status::set_waiting_for_nodes_condition(
         status,
         Some(status::WaitingForNodes::NodesNotReady(unready)),
+    );
+}
+
+/// Retires a hold this plan is no longer under, restating `Ready` and the summary from its per-host
+/// results the way an input outage's retirement does. Without the restate, a plan whose down host
+/// left the inventory would keep `Ready=False` and a summary naming that Node indefinitely: nothing
+/// else rewrites either for an idle `OneShot` plan with no outdated hosts.
+fn release_node_readiness_hold(status: &mut PlaybookPlanStatus, outdated_count: usize) {
+    status::set_waiting_for_nodes_condition(status, None);
+    restore_summary_after_overlay(
+        status,
+        outdated_count,
+        status::clear_nodes_not_ready_condition,
     );
 }
 
@@ -9135,6 +9158,13 @@ spec:
             "the Node is not why nothing is running any more: {summary}"
         );
         assert!(summary.contains("suspended"), "{summary}");
+        assert!(
+            status
+                .conditions
+                .iter()
+                .all(|condition| condition.type_ != "Ready"),
+            "a plan that never ran had no Ready before the hold, and gets none back"
+        );
     }
 
     /// The proxy-pod wait shares the condition but belongs to a run that is already under way, and
@@ -9790,6 +9820,13 @@ spec:
             Some("NodesNotReady"),
             "distinguishable from a run waiting on its proxy pods"
         );
+        let ready = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Ready")
+            .expect("a held plan is not converged, whatever its last verdict");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason.as_deref(), Some("NodesNotReady"));
     }
 
     /// A plan with no verdict yet has no lifecycle state worth keeping while it waits, so the hold
@@ -9804,6 +9841,101 @@ spec:
         hold_plan_for_unready_nodes(&mut status, &["worker-1".to_string()]);
 
         assert_eq!(status.phase, Phase::Pending);
+    }
+
+    /// A `OneShot` plan whose last run converged `worker-1`, and whose inventory has since gained
+    /// `worker-2` — the host a Node outage then holds it back from.
+    fn converged_plan_gaining_a_host(hash: &ExecutionHash) -> PlaybookPlanStatus {
+        PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            phase: Phase::Succeeded,
+            summary: Some("1/1 up-to-date".into()),
+            eligible_hosts: vec![ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["worker-1".into(), "worker-2".into()],
+            }],
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".into(),
+                v1beta1::HostStatus {
+                    last_applied_hash: hash.to_string(),
+                    last_outcome: v1beta1::HostOutcome::Succeeded,
+                    ..Default::default()
+                },
+            )])),
+            conditions: vec![v1beta1::PlaybookPlanCondition {
+                type_: "Ready".into(),
+                status: "True".into(),
+                reason: Some("AllHostsSucceeded".into()),
+                message: Some("1/1 hosts completed successfully".into()),
+                last_transition_time: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn ready_condition(status: &PlaybookPlanStatus) -> v1beta1::PlaybookPlanCondition {
+        status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Ready")
+            .cloned()
+            .expect("the plan carries a Ready condition")
+    }
+
+    /// The phase keeps the last run's verdict while the plan is held, but `Ready` must not: the
+    /// new host has never been applied to, and a green `Ready` over it reads as converged. Once
+    /// that host leaves the inventory the plan *is* converged again, and `Ready` and the summary
+    /// have to say so on that tick — there is no run coming that would say it for them.
+    #[test]
+    fn a_held_plan_is_not_ready_until_the_down_host_leaves_its_inventory() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = converged_plan_gaining_a_host(&hash);
+
+        hold_plan_for_unready_nodes(&mut status, &["worker-2".to_string()]);
+
+        assert_eq!(status.phase, Phase::Succeeded);
+        let held = ready_condition(&status);
+        assert_eq!(held.status, "False");
+        assert_eq!(held.reason.as_deref(), Some("NodesNotReady"));
+
+        hold_plan_for_unready_nodes(&mut status, &["worker-2".to_string()]);
+        assert_eq!(
+            ready_condition(&status).last_transition_time,
+            held.last_transition_time,
+            "every tick of the hold re-asserts it, and that must not read as a transition"
+        );
+
+        status.eligible_hosts[0]
+            .hosts
+            .retain(|host| host == "worker-1");
+        let outdated = find_outdated_hosts(&status, &hash);
+        release_node_readiness_hold(&mut status, outdated.len());
+
+        assert!(!status::held_for_unready_nodes(&status));
+        let released = ready_condition(&status);
+        assert_eq!(released.status, "True");
+        assert_eq!(released.reason.as_deref(), Some("HostsUpToDate"));
+        assert_eq!(status.summary.as_deref(), Some("1/1 up-to-date"));
+    }
+
+    /// Suspension retires the hold, `Ready` overlay included — but the host it was waiting for is
+    /// still not applied to, so `Ready` is restated as outdated rather than handed back the `True`
+    /// of the run before it.
+    #[test]
+    fn a_suspended_hold_restates_ready_from_the_hosts_it_left_unapplied() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = converged_plan_gaining_a_host(&hash);
+        hold_plan_for_unready_nodes(&mut status, &["worker-2".to_string()]);
+
+        suspended_advertises_no_pending_run(true, &mut status);
+
+        let ready = ready_condition(&status);
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason.as_deref(), Some("HostsOutdated"));
+        assert_eq!(
+            ready.message.as_deref(),
+            Some("1/2 hosts on the current revision")
+        );
     }
 
     /// A recovered run is put back onto the plan whole, but its retry number only counts towards
