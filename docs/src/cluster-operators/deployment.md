@@ -39,6 +39,30 @@ applies:
 - **`managedSsh.proxyImage` is unset.** There is deliberately no default for this node-root image;
   see [The managed-SSH proxy image](#the-managed-ssh-proxy-image).
 
+### If the operator stops being able to watch Nodes later
+
+The same loss of access *after* startup does not crash the operator, and does not stop it either —
+which is why it is worth knowing about. The Node cache keeps serving whatever it last saw, so the
+operator carries on making readiness decisions from a snapshot: a Node that goes down from then on
+still reads `Ready`, so a `OneShot` run starts against it and spends the full proxy wait discovering
+otherwise, and a plan already
+[held](../running-playbooks/cluster-nodes.md#holding-instead-of-starting) for a Node is not released
+when that Node comes back until its hourly re-check. Nothing else misbehaves, and everything
+recovers on its own the moment the watch does.
+
+It is not silent. After a handful of consecutive failures the operator logs a line saying the Node
+cache has stopped updating and what that costs, rather than repeating a bare watch error. It repeats
+that line every five minutes for as long as the watch stays broken, and logs `Node watch recovered`
+once the cache is being updated again:
+
+```sh
+kubectl -n ansible-system logs deploy/<release> | grep -E 'Node watch (has failed|recovered)'
+```
+
+The causes are the startup ones: a `ClusterRole` that lost its `list`/`watch` on `nodes` in an
+upgrade, or an API server the operator can no longer reach. Restoring either is enough — there is
+nothing to restart.
+
 ## Pod Security Admission
 
 Managed-SSH proxy pods (created dynamically by the operator at runtime, not by the chart) run with

@@ -159,8 +159,9 @@ never recorded as `Failed`, since no task ever ran on it; which [outcome
 ](./results-and-troubleshooting.md#per-host-outcomes) it does get in `.status.hostsStatus` depends on
 what the operator saw at launch:
 
-- the Node was itself `NotReady` — `Unreachable`. Its return to `Ready` starts the next run on its
-  own, so this heals without anyone touching the plan.
+- the Node was itself `NotReady` — `Unreachable`. For a `OneShot` plan its return to `Ready` starts
+  the next run on its own, so this heals without anyone touching the plan; a `Recurring` plan heals
+  at its next tick, which is the only thing that ever starts a run for it.
 - the Node was `Ready` and only the proxy pod failed to come up — `NotReached`. Nothing about the
   Node is going to change, so nothing wakes the plan for it. See
   [Unreachable Nodes and the attempt budget](#unreachable-nodes-and-the-attempt-budget) below and
@@ -188,7 +189,9 @@ unreachable for that run rather than holding the run and its host locks indefini
 All of the above is about a run that has already started. A `OneShot` plan that has *not* started one
 asks a cheaper question first: if **every** Node the run would target is `NotReady`, there is nothing
 for the run to do, so the plan holds instead of starting it. It carries a `WaitingForNodes` condition
-with reason `NodesNotReady`, and `.status.summary` names the Nodes it is waiting for.
+with reason `NodesNotReady`, and `.status.summary` names the Nodes it is waiting for. `Ready` is
+`False` with the same reason for as long as the hold lasts — the phase keeps the last run's
+verdict, but a plan holding a run has hosts it has not applied the current revision to.
 
 Holding rather than running matters because the run would achieve nothing and take the full wait
 window to find that out — a proxy pod per Node, every host lock held for the duration, and a `Failed`
@@ -226,7 +229,9 @@ cost the plan one of its [attempts](./scheduling-and-modes.md#retries), provided
 
 Then the run applied everything there was to apply, and a `OneShot` plan's budget is reset exactly as
 a fully successful run resets it. What the plan is waiting for is the Node, not another try, and the
-next try would be identical.
+next try would be identical. On a scheduled plan the Node's return still starts that run within the
+same tick's `startingDeadlineSeconds` window, whatever `maxAttempts` is; once the window has closed
+it waits for the next tick.
 
 The first half is what keeps a plan from running forever against a Node that keeps coming and going.
 A refund is credit for progress, so a run that reached nobody spends its attempt however good its

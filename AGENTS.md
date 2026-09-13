@@ -311,7 +311,9 @@ handful of decisions that are easy to undo by accident:
   `Play`s (which book revision and slot before anything is created) before a new run is prepared.
   Since `maxAttempts` the question is no longer "did a run take this slot" but "is there anything
   left for a run to do in it": a record still `Running` or one that `Succeeded` closes the window,
-  while failures close it only once they have spent the budget. `retryCountSlot` binds
+  while failures close it only once they have spent the budget. A `OneShot` failure the budget
+  refunded (`returns_its_attempt`) spent nothing and is not counted — the refund and this count must
+  answer from the same predicate, or the refund is taken back here. `retryCountSlot` binds
   `retryCount` to its recurring execution, so status can close an exhausted window after its records
   have been pruned and `next_attempt` does not restart at one when `lastTriggeredRun` is stale.
 - **`spec.suspend` is decided before the inventory is read** (`resolve_unlaunched_before_inputs`),
@@ -404,7 +406,11 @@ The plan controller also watches **Nodes**, through one reflector serving two jo
 in the plan's `eligibleHosts` *and* not yet on the plan's `currentHash` — because every kubelet
 reposts its Node status periodically, so an "all plans" mapping would reconcile every plan every few
 minutes forever, scaling with node count. A converged cluster matches no plans and the heartbeats
-fall on the floor.
+fall on the floor. It asks the *plan* as well as the host, because a wake the plan cannot act on
+costs exactly as much as one it can: a suspended plan, a `OneShot` plan out of attempts, and every
+`Recurring` plan are all refused. `Recurring` is refused outright because only the clock starts its
+runs — the readiness gate it would be released by is `OneShot`-only — and it is the one mode with no
+budget to bound the wakes, so one stuck host would otherwise wake it per heartbeat forever.
 
 `reconciler::new` is `async` for one reason: it waits for that reflector's initial LIST before
 handing back a controller. An unsynced Node cache reports every node `Ready`, which is precisely the
@@ -419,6 +425,19 @@ dropped writer, and a `watcher` retries a failing watch forever — so an unboun
 the controller pending for the life of the process while the other two kept the operator looking
 healthy. `join!` in `main` is what turns that panic into a process exit; spawning the controllers
 instead would park it in a `JoinHandle` nobody reads and restore exactly the silent half-alive state.
+
+**It bounds the first sync only.** A watch that breaks after the cache is populated leaves the
+`Store` serving its last contents for the life of the process, so the gate keeps answering from a
+snapshot and degrades from there — a Node that goes down afterwards still reads `Ready`. That is
+deliberately not treated the same way: with no answer at all, refusing to start is strictly better
+than guessing, while with a stale one every response trades one failure for another (crashing turns
+an apiserver blip into a restart loop; holding every run stops a fleet on a watch error). Which
+trade is right is an open decision, so the reflector task (`NodeWatchFailures`) only escalates its
+log after `NODE_WATCH_FAILURES_BEFORE_ESCALATING`, repeats that line every
+`NODE_WATCH_ESCALATION_INTERVAL` and says when the watch recovers — making the state loud, which is
+the half that was missing. Only `Apply`, `Delete` and `InitDone` count as the cache updating: a
+watcher whose re-LIST keeps failing yields `Init` before every attempt, so counting that as success
+would never let a failing re-list escalate.
 
 That reflector is for **readiness only**. `node_access::enforce` keeps its own *live* Node read:
 the allow-set is a security gate and INV-5 says it is never served from a cache.
@@ -465,6 +484,11 @@ dedicated to Ansible ops (see `THREAT_MODEL.md` §6 / T-INFO-1).
 - The `NodeAccessPolicy` CRD is *cluster-scoped* — creating one requires cluster RBAC, which is
   what makes it an admin (not tenant) control. Enforcement reads **every** policy in the cluster;
   a namespace's allow-set is the union across all policies whose `namespaceSelector` matches it.
+- **`watcher` streams back off through `controllers::watch_backoff::WatchBackoff`, not
+  `.default_backoff()`.** kube's `StreamBackoff` resets its delay on every `Ok` item, and a watcher
+  whose re-LIST fails yields `Ok(Event::Init)` before every retry, so `.default_backoff()` retries a
+  refused LIST about once a second for as long as it is refused. `WatchBackoff` drops that reset and
+  keeps only the one after two quiet minutes; use it for any new `watcher` stream.
 
 ## User & operator documentation (`docs/` mdBook) — keep in sync with the code
 

@@ -5,7 +5,8 @@ use kube::runtime::reflector::{ObjectRef, Store};
 use tracing::debug;
 
 use crate::v1beta1::{
-    self, ClusterInventory, HostOutcome, InventoryRef, NodeAccessPolicy, StaticInventory,
+    self, ClusterInventory, ExecutionMode, HostOutcome, InventoryRef, NodeAccessPolicy,
+    StaticInventory,
     playbookplancontroller::{node_readiness, reconciler, status},
 };
 
@@ -146,6 +147,21 @@ pub fn node_to_playbookplans(
 /// hash, so every host is outdated) would otherwise wake it on every kubelet heartbeat of every
 /// matching Node for as long as it stayed suspended, which is an ordinary workflow.
 ///
+/// `Recurring` is not woken at all, whatever its hosts say, because nothing it does is started by a
+/// Node. Its runs are started by the clock: a tick outside its schedule window lands in the
+/// `Timing::Delayed` arm and does nothing, and inside the window the plan is already requeueing on
+/// its own. The one thing a Node event releases — the readiness gate — is `OneShot`-only by
+/// construction (`node_readiness::holds_for_unready_nodes`), and every path that can make a
+/// `Recurring` plan actionable has a trigger of its own: the slot arriving is its own requeue, a hash
+/// edit the plan watch, a key rotation the Secret watch, a result the Job watch.
+///
+/// Leaving it in cost what the rest of this predicate exists to avoid, with nothing to bound it: the
+/// budget check below cannot answer for that mode (`attempt_budget_available` returns `true`
+/// unconditionally for `Recurring`, because its slot-scoped budget is enforced by the window gate),
+/// so a single host left `Unknown` or `Unreachable` kept a `Recurring` plan woken by that Node's
+/// every kubelet heartbeat for the life of the plan. A `OneShot` plan in the same state at least
+/// stops once its attempts are spent.
+///
 /// A `OneShot` plan whose attempt budget is spent is the other half of that question, and it is
 /// asked through `reconciler::attempt_budget_available` rather than restated here so the wake set and
 /// the start gate cannot drift. It matters because two of the outcomes deliberately left in the set
@@ -183,7 +199,7 @@ pub fn node_to_playbookplans(
 /// readiness gate never ran, so it still carries the *previous* run's `Succeeded` outcomes, and this
 /// watch is the only thing that releases it.
 fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &str) -> bool {
-    if plan.spec.suspend {
+    if plan.spec.suspend || !matches!(plan.spec.mode, ExecutionMode::OneShot) {
         return false;
     }
 
@@ -728,16 +744,46 @@ mod tests {
         }
     }
 
-    /// `Recurring` gets a new budget at every schedule tick, and the gate that knows about ticks is
-    /// not one a mapper can consult. `attempt_budget_available` answers `true` for that mode for the
-    /// same reason, so sharing it keeps the wake conservative rather than importing a slot rule that
-    /// would be answering a different question here.
+    /// A `Recurring` plan is started by its schedule and by nothing else, so a Node reporting
+    /// `Ready` is never what it was waiting for — and it is the one mode the budget check cannot
+    /// bound, since `attempt_budget_available` answers `true` for it unconditionally (its
+    /// slot-scoped budget lives in the window gate). Left in the wake set, one host stuck
+    /// `Unreachable` or `Unknown` woke such a plan on that Node's every heartbeat for the life of
+    /// the plan, with every woken tick falling straight through to the schedule arm.
     #[test]
-    fn a_recurring_plan_is_woken_whatever_its_retry_count() {
-        let mut plan = plan_awaiting_with_attempts("node-a", host("", HostOutcome::Unreachable), 9);
-        plan.spec.mode = crate::v1beta1::ExecutionMode::Recurring;
+    fn a_recurring_plan_is_never_woken_by_a_node() {
+        for outcome in [HostOutcome::Unreachable, HostOutcome::Unknown] {
+            let oneshot = plan_awaiting("node-a", host("", outcome.clone()));
+            assert!(
+                plan_awaits_node(&oneshot, "node-a"),
+                "{outcome:?}: the same plan as OneShot is one the watch exists for"
+            );
 
-        assert!(plan_awaits_node(&plan, "node-a"));
+            let mut recurring = oneshot;
+            recurring.spec.mode = ExecutionMode::Recurring;
+
+            assert!(!plan_awaits_node(&recurring, "node-a"));
+        }
+    }
+
+    /// The budget is asked of `OneShot` alone, so a `Recurring` plan must not reach it — the mode
+    /// check is what decides, not `retryCount`. Pinned separately so the two reasons stay legible:
+    /// a `Recurring` plan with attempts left is refused for the same reason as one without.
+    #[test]
+    fn a_recurring_plan_is_refused_whatever_its_retry_count() {
+        for retry_count in [0, 9] {
+            let mut plan = plan_awaiting_with_attempts(
+                "node-a",
+                host("", HostOutcome::Unreachable),
+                retry_count,
+            );
+            plan.spec.mode = ExecutionMode::Recurring;
+
+            assert!(
+                !plan_awaits_node(&plan, "node-a"),
+                "retryCount {retry_count}"
+            );
+        }
     }
 
     #[test]

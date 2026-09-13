@@ -7,6 +7,8 @@ use kube::{Api, Resource, ResourceExt as _};
 use serde::de::DeserializeOwned;
 use tracing::{debug, error};
 
+use crate::v1beta1::controllers::watch_backoff::WatchBackoff;
+
 /// Emits one tick whenever a watched object's **labels** change, it appears, or it disappears —
 /// and stays silent for every other update.
 ///
@@ -50,7 +52,7 @@ where
         // ever sees the errors that reach it as stream items. This one answers them here, so
         // without this a persistent failure — a revoked `nodes` grant, an apiserver refusing the
         // watch — would re-list as fast as the requests come back, and log a line each time.
-        .default_backoff()
+        .backoff(WatchBackoff::default())
         .scan(TrackedLabels::default(), move |tracked, event| {
             let tick = match event {
                 Ok(event) => tracked.absorb(&kind, event),

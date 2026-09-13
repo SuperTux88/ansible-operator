@@ -306,7 +306,14 @@ pub fn set_invalid_scheduling_configuration_condition(
     set_ready_overlay(status, "InvalidSchedulingConfiguration", message);
 }
 
-/// Temporarily replaces the host-derived `Ready` verdict with a configuration failure.
+/// Marks the plan as not ready while the readiness gate holds it back: its last verdict still
+/// stands, but there are hosts it has not applied the current revision to and cannot reach. Without
+/// this a converged plan that gains a host on a down Node keeps the `Ready=True` of its previous run.
+pub fn set_nodes_not_ready_condition(status: &mut PlaybookPlanStatus, message: &str) {
+    set_ready_overlay(status, "NodesNotReady", message);
+}
+
+/// Temporarily replaces the host-derived `Ready` verdict with a reason the plan cannot act on.
 fn set_ready_overlay(status: &mut PlaybookPlanStatus, reason: &str, message: &str) {
     upsert_condition(
         &mut status.conditions,
@@ -337,6 +344,15 @@ pub fn clear_invalid_scheduling_configuration_condition(
     outdated_count: usize,
 ) -> bool {
     clear_ready_overlay(status, outdated_count, "InvalidSchedulingConfiguration")
+}
+
+/// Retires the [`set_nodes_not_ready_condition`] overlay once the plan is no longer held, returning
+/// whether that overlay was present so the caller only replaces its matching plan summary.
+pub fn clear_nodes_not_ready_condition(
+    status: &mut PlaybookPlanStatus,
+    outdated_count: usize,
+) -> bool {
+    clear_ready_overlay(status, outdated_count, "NodesNotReady")
 }
 
 /// Retires one temporary readiness overlay, restating `Ready` from the plan's per-host results.

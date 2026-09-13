@@ -151,7 +151,7 @@ timer. The watched inputs are:
 | A Secret it names in `variables` or `files` | at once |
 | A `ClusterInventory` or `StaticInventory` it names — including the Nodes a `ClusterInventory` resolves to | at once |
 | A `NodeAccessPolicy` (which may change [which Nodes the namespace may target](../cluster-operators/node-access-policies.md)) | at once |
-| A Node it is still waiting on becoming `Ready` | at once |
+| A Node it is still waiting on becoming `Ready` | at once, for a `OneShot` plan |
 | A `StaticInventory`'s SSH key Secret | at once, but **only for a plan whose last run did not succeed** |
 | The run's Job finishing | at once |
 | Nothing at all | on a timer: the time until the next scheduled tick, or an hour for an unscheduled plan |
@@ -165,14 +165,18 @@ the plan. See the [per-host outcome table](./results-and-troubleshooting.md#per-
 their distinct causes.
 
 It also asks whether the *plan* could act on the wake-up at all, which is a separate question from
-what its hosts need. Two answers say it could not, and neither is something a Node supplies:
+what its hosts need. Three answers say it could not, and none of them is something a Node supplies:
 
 - a **suspended** plan is waiting on you, not on a machine, so no Node wakes it however outdated its
   hosts are — resuming it is what starts the run.
 - a `OneShot` plan that has spent its [attempts](#retries) may not start another run, so a Node
   turning `Ready` under it changes nothing until the budget comes back — which an edit, a
   `StaticInventory` SSH key rotation or a successful run does, and each of those has its own row in
-  the table above. `Recurring` plans are unaffected: their budget resets at every tick.
+  the table above.
+- a **`Recurring`** plan is started by its schedule and by nothing else, so a Node is never what it
+  is waiting for: it runs at its next tick against whatever it can reach then, and it is never
+  [held](./cluster-nodes.md#holding-instead-of-starting) in the meantime. A Node returning early
+  brings its tick no closer.
 
 The SSH key row is deliberately one-sided. Rotating a key changes how the operator connects, not what
 it applies, so it must never re-apply the playbook to hosts that are already current — which is why
