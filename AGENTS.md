@@ -482,6 +482,11 @@ dedicated to Ansible ops (see `THREAT_MODEL.md` §6 / T-INFO-1).
 - The `NodeAccessPolicy` CRD is *cluster-scoped* — creating one requires cluster RBAC, which is
   what makes it an admin (not tenant) control. Enforcement reads **every** policy in the cluster;
   a namespace's allow-set is the union across all policies whose `namespaceSelector` matches it.
+- **`watcher` streams back off through `controllers::watch_backoff::WatchBackoff`, not
+  `.default_backoff()`.** kube's `StreamBackoff` resets its delay on every `Ok` item, and a watcher
+  whose re-LIST fails yields `Ok(Event::Init)` before every retry, so `.default_backoff()` retries a
+  refused LIST about once a second for as long as it is refused. `WatchBackoff` drops that reset and
+  keeps only the one after two quiet minutes; use it for any new `watcher` stream.
 
 ## User & operator documentation (`docs/` mdBook) — keep in sync with the code
 

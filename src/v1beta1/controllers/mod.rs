@@ -5,5 +5,6 @@ mod nodeselector;
 pub mod playbookplancontroller;
 mod reconcile_error;
 mod selector_trigger;
+mod watch_backoff;
 
 pub use ansible_inventory::*;
