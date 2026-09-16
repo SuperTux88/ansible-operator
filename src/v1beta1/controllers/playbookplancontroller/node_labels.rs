@@ -25,7 +25,7 @@
 use k8s_openapi::api::core::v1::Node;
 use kube::runtime::reflector::{ObjectRef, Store};
 
-use crate::v1beta1::{PlaybookPlanStatus, ResolvedInventoryGroup};
+use crate::v1beta1::{PlaybookPlan, PlaybookPlanStatus, ResolvedInventoryGroup};
 
 use super::node_recreation::node_replaced_since;
 
@@ -47,6 +47,76 @@ pub const KEY_DOMAIN: &str = ".plan.ansible.cloudbending.dev";
 /// and its CRD rule, which the reconciler refuses a plan for before it ever reaches this.
 pub fn label_key(namespace: &str, plan: &str) -> String {
     format!("{namespace}{KEY_DOMAIN}/{plan}")
+}
+
+/// Whether `key` is one this operator manages, for any namespace and any plan.
+pub fn is_operator_key(key: &str) -> bool {
+    key.contains(&format!("{KEY_DOMAIN}/"))
+}
+
+/// The namespace and plan name an operator-owned key encodes, or `None` for any other key.
+///
+/// The inverse of [`label_key`], and the reason a key carries both: a label found on a Node names
+/// the plan that must still exist for it to be legitimate, without the operator having to keep a
+/// record of what it wrote.
+pub fn decode_key(key: &str) -> Option<(&str, &str)> {
+    let (prefix, plan) = key.split_once('/')?;
+    let namespace = prefix.strip_suffix(KEY_DOMAIN)?;
+
+    (!namespace.is_empty() && !plan.is_empty()).then_some((namespace, plan))
+}
+
+/// A Node label this operator owns whose plan no longer exists.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Orphan {
+    pub node: String,
+    pub key: String,
+}
+
+/// Every operator-owned label in the cluster whose plan is gone.
+///
+/// The backstop for the deletions nothing reacted to: a plan removed while the operator was down,
+/// one removed during a watch disconnection (a re-LIST announces no deletion, it simply drops the
+/// object), or the operator being uninstalled and reinstalled. Those labels would otherwise stand
+/// for ever, and dependents would keep treating those Nodes as ready — the one place this design
+/// fails open, which is why it is swept rather than merely documented.
+///
+/// **`plans` must be a fully populated store.** Every judgement here is "no such plan", so a store
+/// that is empty because it has not synced yet would strip every dependency label in the cluster.
+/// The caller runs this only on a `watcher::Event::InitDone`, which the reflector emits *after*
+/// swapping a complete LIST into the store.
+///
+/// A plan that exists but has dropped `spec.provides` is deliberately **not** swept: that is its own
+/// reconcile's job, which knows the difference between "stopped providing" and "was never here".
+/// This only ever judges absence, which is the one thing a reconcile can never observe.
+pub fn orphaned_labels(nodes: &Store<Node>, plans: &Store<PlaybookPlan>) -> Vec<Orphan> {
+    let mut orphans: Vec<Orphan> = nodes
+        .state()
+        .iter()
+        .flat_map(|node| {
+            let node_name = node.metadata.name.clone();
+            node.metadata
+                .labels
+                .iter()
+                .flatten()
+                .filter(|(key, _)| is_operator_key(key))
+                .filter(|(key, _)| {
+                    decode_key(key).is_none_or(|(namespace, plan)| {
+                        plans.get(&ObjectRef::new(plan).within(namespace)).is_none()
+                    })
+                })
+                .filter_map(|(key, _)| {
+                    Some(Orphan {
+                        node: node_name.clone()?,
+                        key: key.clone(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    orphans.sort();
+    orphans
 }
 
 /// The Nodes in the cache that carry `key`, whatever its value.
@@ -541,6 +611,113 @@ mod tests {
 
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].node, "node-a");
+    }
+
+    fn plan_store(plans: &[(&str, &str)]) -> Store<PlaybookPlan> {
+        let mut writer = Writer::<PlaybookPlan>::default();
+        let reader = writer.as_reader();
+        writer.apply_watcher_event(&watcher::Event::Init);
+        for (namespace, name) in plans {
+            let mut plan = PlaybookPlan::new(name, Default::default());
+            plan.metadata.namespace = Some((*namespace).to_string());
+            writer.apply_watcher_event(&watcher::Event::InitApply(plan));
+        }
+        writer.apply_watcher_event(&watcher::Event::InitDone);
+        reader
+    }
+
+    #[test]
+    fn a_key_decodes_back_to_the_plan_that_wrote_it() {
+        assert_eq!(decode_key(KEY), Some(("platform", "containerd")));
+        assert_eq!(
+            decode_key(&label_key("team-a", "harden")),
+            Some(("team-a", "harden"))
+        );
+
+        assert_eq!(decode_key("node-role.kubernetes.io/worker"), None);
+        assert_eq!(
+            decode_key("plan.ansible.cloudbending.dev/x"),
+            None,
+            "the namespace segment and its dot are part of the format"
+        );
+        assert_eq!(
+            decode_key("a.plan.ansible.cloudbending.dev.evil/x"),
+            None,
+            "the domain has to end the prefix, not merely appear in it"
+        );
+        assert!(is_operator_key(KEY));
+        assert!(!is_operator_key("node-role.kubernetes.io/worker"));
+    }
+
+    /// The backstop for a deletion nothing reacted to. Only absence is judged — a plan that still
+    /// exists is its own reconcile's business, whether or not it still provides anything.
+    #[test]
+    fn only_labels_whose_plan_is_gone_are_swept() {
+        let nodes = store(vec![
+            node(
+                "node-a",
+                "2026-01-01T00:00:00Z",
+                &[
+                    (KEY, "1.4.2"),
+                    ("team-a.plan.ansible.cloudbending.dev/gone", "2.0"),
+                    ("node-role.kubernetes.io/worker", ""),
+                ],
+            ),
+            node(
+                "node-b",
+                "2026-01-01T00:00:00Z",
+                &[("team-a.plan.ansible.cloudbending.dev/gone", "2.0")],
+            ),
+        ]);
+
+        let orphans = orphaned_labels(&nodes, &plan_store(&[("platform", "containerd")]));
+
+        assert_eq!(
+            orphans,
+            vec![
+                Orphan {
+                    node: "node-a".into(),
+                    key: "team-a.plan.ansible.cloudbending.dev/gone".into()
+                },
+                Orphan {
+                    node: "node-b".into(),
+                    key: "team-a.plan.ansible.cloudbending.dev/gone".into()
+                },
+            ],
+            "the live plan's label stays, and a foreign label is never touched"
+        );
+    }
+
+    /// A plan of the same name in another namespace is a different plan. Getting this wrong would
+    /// sweep a healthy plan's labels the moment a same-named plan elsewhere was deleted.
+    #[test]
+    fn a_plan_is_matched_within_its_own_namespace() {
+        let nodes = store(vec![node(
+            "node-a",
+            "2026-01-01T00:00:00Z",
+            &[(&label_key("platform", "harden"), "1.0")],
+        )]);
+
+        assert!(orphaned_labels(&nodes, &plan_store(&[("platform", "harden")])).is_empty());
+        assert_eq!(
+            orphaned_labels(&nodes, &plan_store(&[("other", "harden")])).len(),
+            1,
+            "same name, different namespace, different plan"
+        );
+    }
+
+    /// The property the caller's `InitDone` gating exists for, stated as a test: against a store
+    /// that has not synced, *everything* reads as orphaned. Nothing in this function can detect
+    /// that, which is why it is documented as a precondition and gated at the call site.
+    #[test]
+    fn an_empty_plan_store_would_condemn_every_label() {
+        let nodes = store(vec![node(
+            "node-a",
+            "2026-01-01T00:00:00Z",
+            &[(KEY, "1.4.2")],
+        )]);
+
+        assert_eq!(orphaned_labels(&nodes, &plan_store(&[])).len(), 1);
     }
 
     /// What the removal paths start from. It cannot come from the plan's host set: a label outlives

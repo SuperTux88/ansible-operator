@@ -217,7 +217,9 @@ pub async fn new(
 
     let enrolled_namespaces = Arc::new(enrolled_namespaces);
 
-    let playbookplan_reflector_reader = {
+    // Built here but **driven** further down, once the Node cache exists: its task is also where a
+    // plan deletion and a cache resync are noticed, and both of those have to read Nodes.
+    let (playbookplan_reflector, playbookplan_reflector_reader) = {
         let playbookplan_reflector_writer = Writer::<v1beta1::PlaybookPlan>::default();
         let playbookplan_reflector_reader = Arc::new(playbookplan_reflector_writer.as_reader());
 
@@ -232,35 +234,7 @@ pub async fn new(
                 .backoff(WatchBackoff::default()),
         );
 
-        // The deletion path for a plan's Node labels, and the reason it is here rather than in
-        // `reconcile`. A deleted plan never reaches the reconciler: `Controller::new` decodes its
-        // primary watch with `applied_objects()`, which drops `Event::Delete` outright, and the
-        // object is gone from the store by then anyway. The run-cleanup finalizer is no help
-        // either — it is held only while a run owns resources, so a converged provider, which is
-        // exactly the plan whose labels matter, carries none.
-        //
-        // This stream still sees the deletion, with the whole object, which is all a withdrawal
-        // needs. Best effort on purpose: no finalizer means a plan is never held open waiting for
-        // the operator, and the two cases this misses — the operator being down, and a deletion
-        // during a watch disconnection, where the re-LIST announces nothing and simply drops the
-        // object — are what the startup sweep exists to catch.
-        let delete_handler_client = client.clone();
-        let labels_enabled = settings.node_labels_enabled;
-        tokio::spawn(async move {
-            playbookplan_reflector
-                .for_each(|event| async {
-                    match event {
-                        Ok(watcher::Event::Delete(plan)) if labels_enabled => {
-                            withdraw_deleted_plans_labels(&delete_handler_client, &plan).await;
-                        }
-                        Ok(_) => {}
-                        Err(e) => error!("Reflector error: {e:?}"),
-                    }
-                })
-                .await;
-        });
-
-        playbookplan_reflector_reader
+        (playbookplan_reflector, playbookplan_reflector_reader)
     };
 
     let node_access_policy_reflector_reader = {
@@ -360,6 +334,48 @@ pub async fn new(
 
     // The only thing this constructor waits for.
     await_node_cache(&node_reflector_reader).await;
+
+    // Now that the Node cache is populated, drive the plan reflector — the stream that carries the
+    // two things about a plan the reconciler never sees.
+    //
+    // **A deletion.** `Controller::new` decodes its primary watch with `applied_objects()`, which
+    // drops `Event::Delete` outright, and the object has left the store by then anyway, so a
+    // deleted plan never reconciles. The run-cleanup finalizer is no help either: it is held only
+    // while a run owns resources, so a converged provider — exactly the plan whose labels matter —
+    // carries none. This stream still sees the deletion, with the whole object.
+    //
+    // **A completed LIST.** `InitDone` means the store now holds every plan in the cluster, which
+    // is the one moment "this label's plan does not exist" can be asked safely. Asked on every
+    // resync rather than only the first, because a deletion during a watch disconnection produces
+    // no `Delete` event at all — the re-LIST simply drops the object.
+    {
+        let client = client.clone();
+        let plans = Arc::clone(&playbookplan_reflector_reader);
+        let nodes = Arc::clone(&node_reflector_reader);
+        let labels_enabled = settings.node_labels_enabled;
+        tokio::spawn(async move {
+            playbookplan_reflector
+                .for_each(|event| {
+                    let client = client.clone();
+                    let plans = Arc::clone(&plans);
+                    let nodes = Arc::clone(&nodes);
+                    async move {
+                        match event {
+                            Ok(watcher::Event::Delete(plan)) if labels_enabled => {
+                                withdraw_deleted_plans_labels(&client, &plan).await;
+                            }
+                            Ok(watcher::Event::InitDone) => {
+                                sweep_orphaned_node_labels(&client, &nodes, &plans, labels_enabled)
+                                    .await;
+                            }
+                            Ok(_) => {}
+                            Err(e) => error!("Reflector error: {e:?}"),
+                        }
+                    }
+                })
+                .await;
+        });
+    }
 
     let context = Arc::new(ReconciliationContext {
         client: client.clone(),
@@ -1584,6 +1600,55 @@ async fn reconcile_node_labels(
     if !stale.is_empty() {
         info!("PlaybookPlan {plan} no longer provides anything; removing {key} from {stale:?}");
         node_labels::remove_labels(&context.client, &key, &stale, &plan).await;
+    }
+}
+
+/// Removes every operator-owned Node label whose plan no longer exists.
+///
+/// The backstop for deletions nothing reacted to — the operator was down, or the plan watch was
+/// disconnected and its re-LIST announced no deletion. Without it those labels stand for ever and
+/// dependents keep treating their Nodes as ready, which is the one way this design can fail open.
+///
+/// Both caches are populated before this can run: the Node store because `await_node_cache` gates
+/// the whole constructor on it, and the plan store because this is only ever called on an
+/// `InitDone`, which the reflector emits after swapping a complete LIST in. That ordering is the
+/// safety property — judged against an empty plan store, every dependency label in the cluster
+/// looks orphaned.
+///
+/// With the feature disabled the operator still reads Nodes but cannot patch them, so the leftovers
+/// are reported rather than removed. Saying nothing would leave an admin who turned the feature off
+/// with stale labels still steering inventories and no indication of it.
+async fn sweep_orphaned_node_labels(
+    client: &kube::Client,
+    nodes: &Store<Node>,
+    plans: &Store<PlaybookPlan>,
+    labels_enabled: bool,
+) {
+    let orphans = node_labels::orphaned_labels(nodes, plans);
+    if orphans.is_empty() {
+        return;
+    }
+
+    if !labels_enabled {
+        warn!(
+            "{} Node labels belong to PlaybookPlans that no longer exist ({orphans:?}), and node labels are disabled (chart nodeLabels.enabled=false) so the operator cannot remove them. Plans selecting on these labels still treat those Nodes as ready. Remove them with `kubectl label nodes --all <key>-`",
+            orphans.len()
+        );
+        return;
+    }
+
+    info!(
+        "removing {} Node labels left behind by PlaybookPlans that no longer exist",
+        orphans.len()
+    );
+    for orphan in &orphans {
+        node_labels::remove_labels(
+            client,
+            &orphan.key,
+            std::slice::from_ref(&orphan.node),
+            "<deleted>",
+        )
+        .await;
     }
 }
 

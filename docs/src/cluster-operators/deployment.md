@@ -375,12 +375,20 @@ unguarded. The chart does not detect this for you on purpose — `helm template`
 while keeping the permission, and a security control that disappears without a word is worse than
 one you turned off knowingly.
 
+**Labels left behind** — by a plan deleted while the operator was down, or by uninstalling the
+operator — are swept whenever the operator's plan cache completes a full listing: at startup, and
+again after any watch reconnection. A label is removed only when the plan named in its key no longer
+exists; a plan that still exists but has stopped providing is handled by its own reconcile.
+
 **To keep the operator off Node objects entirely**, set `nodeLabels.enabled=false`. Plans with
 `spec.provides` still run; they report in their status that node labels are disabled on this
 cluster, so a plan waiting on one of them says why instead of waiting silently. Note that this also
-removes the permission to *remove* labels already written: the operator logs the leftovers it finds
-at startup rather than cleaning them up, and you remove them with
+removes the permission to *remove* labels already written: the sweep above still runs, but it can
+only report what it found — a warning naming the orphaned labels — and you remove them with
 `kubectl label nodes --all <namespace>.plan.ansible.cloudbending.dev/<plan-name>-`.
+
+Watch for that warning after turning the feature off: until those labels are gone, plans selecting
+on them still treat those Nodes as ready.
 
 See [Playbook plans](../running-playbooks/playbook-plans.md) for authoring `spec.provides`, and
 [Cluster nodes](../running-playbooks/cluster-nodes.md) for selecting on the labels.
