@@ -49,6 +49,87 @@ pub fn label_key(namespace: &str, plan: &str) -> String {
     format!("{namespace}{KEY_DOMAIN}/{plan}")
 }
 
+/// The Nodes in the cache that carry `key`, whatever its value.
+///
+/// A linear scan of the Node store, which is where the removal paths start: they have to answer
+/// "is anything still labelled for this plan?", and unlike the publish diff they cannot get that
+/// from the plan's own host set — a label outlives the host leaving the inventory. In memory, so it
+/// costs no API call on the overwhelmingly common answer of "nothing".
+pub fn nodes_carrying(key: &str, nodes: &Store<Node>) -> Vec<String> {
+    let mut carrying: Vec<String> = nodes
+        .state()
+        .iter()
+        .filter(|node| {
+            node.metadata
+                .labels
+                .as_ref()
+                .is_some_and(|labels| labels.contains_key(key))
+        })
+        .filter_map(|node| node.metadata.name.clone())
+        .collect();
+
+    carrying.sort();
+    carrying
+}
+
+/// The Nodes carrying `key` according to the API server rather than the cache.
+///
+/// For the paths that run where no cache answer can be trusted — chiefly a plan's deletion, which
+/// is handled off the watch stream and has no reconcile, no status and no resolved inventory behind
+/// it. A label selector does the filtering server-side, so this returns the Nodes to clean and
+/// nothing else.
+pub async fn nodes_carrying_live(
+    client: &kube::Client,
+    key: &str,
+) -> Result<Vec<String>, kube::Error> {
+    let nodes: kube::Api<Node> = kube::Api::all(client.clone());
+    let list = nodes
+        .list(&kube::api::ListParams::default().labels(key))
+        .await?;
+
+    Ok(list
+        .items
+        .into_iter()
+        .filter_map(|node| node.metadata.name)
+        .collect())
+}
+
+/// Strips `key` from the named Nodes, and returns how many lost it.
+///
+/// A JSON merge patch deletes a key only when it is explicitly `null` — omitting it means "leave it
+/// alone", which is precisely the no-op this must not be.
+pub async fn remove_labels(
+    client: &kube::Client,
+    key: &str,
+    nodes: &[String],
+    plan: &str,
+) -> usize {
+    let api: kube::Api<Node> = kube::Api::all(client.clone());
+    let patch = serde_json::json!({ "metadata": { "labels": { key: serde_json::Value::Null } } });
+    let mut removed = 0;
+
+    for node in nodes {
+        match api
+            .patch(
+                node,
+                &kube::api::PatchParams::default(),
+                &kube::api::Patch::Merge(&patch),
+            )
+            .await
+        {
+            Ok(_) => {
+                removed += 1;
+                tracing::info!("PlaybookPlan {plan}: removed {key} from Node {node}");
+            }
+            Err(error) => tracing::warn!(
+                "PlaybookPlan {plan}: could not remove {key} from Node {node}: {error}"
+            ),
+        }
+    }
+
+    removed
+}
+
 /// One Node whose label has to change, and what it has to become.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LabelWrite {
@@ -460,6 +541,25 @@ mod tests {
 
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].node, "node-a");
+    }
+
+    /// What the removal paths start from. It cannot come from the plan's host set: a label outlives
+    /// the host leaving the inventory, so "everything still carrying my key" is a different question
+    /// from "everything I currently target".
+    #[test]
+    fn nodes_carrying_the_key_are_found_whatever_their_value() {
+        let nodes = store(vec![
+            node("node-a", "2026-01-01T00:00:00Z", &[(KEY, "1.4.2")]),
+            node("node-b", "2026-01-01T00:00:00Z", &[(KEY, "1.5.0")]),
+            node("node-c", "2026-01-01T00:00:00Z", &[("other", "x")]),
+            node("node-d", "2026-01-01T00:00:00Z", &[]),
+        ]);
+
+        assert_eq!(nodes_carrying(KEY, &nodes), vec!["node-a", "node-b"]);
+        assert!(
+            nodes_carrying("team-b.plan.ansible.cloudbending.dev/other", &nodes).is_empty(),
+            "another plan's key is not this plan's to remove"
+        );
     }
 
     #[test]

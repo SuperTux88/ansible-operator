@@ -184,6 +184,18 @@ not that the host is currently healthy. Specifically:
 - Only cluster Nodes take part. `StaticInventory` hosts cannot — there is no Kubernetes object to
   label. See [External hosts](./external-hosts.md).
 
+### When the labels are removed
+
+A label is never withdrawn because a run went badly — only when the plan stops claiming it:
+
+- **You remove `provides` from the spec.** The labels go on the next tick. (Because the version is
+  part of the hash, this also re-runs the playbook once; harmless for an idempotent playbook.)
+- **You delete the plan.** Its labels are removed within seconds, and deleting is never blocked
+  waiting for that — if the operator is down at the time, it cleans them up when it next starts.
+- **Your namespace is un-enrolled** by an administrator. The operator refuses to run the plan at
+  all, so its claim is withdrawn too and dependents elsewhere lose those hosts. Re-enrolling
+  restores the labels from the recorded results on the first tick, **without** re-running anything.
+
 If your cluster administrator has disabled node labels (`nodeLabels.enabled=false` in the chart),
 plans with `provides` still run but publish nothing, and say so in their status through a
 `ProvidesLabels` condition with reason `NodeLabelsDisabled`.
