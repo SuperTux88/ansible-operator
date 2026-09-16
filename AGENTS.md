@@ -447,19 +447,25 @@ that cache. So each spawns a task, unserialized: both only ever *remove* labels,
 one is a no-op, and a late-starting sweep still reads a complete store because `Writer` buffers a
 re-LIST and only swaps it in on `InitDone`.
 
-`reconciler::new` is `async` for one reason: it waits for that reflector's initial LIST before
-handing back a controller. An unsynced Node cache reports every node `Ready`, which is precisely the
-answer that starts the runs the readiness gate exists to hold back — so after a restart every held
-plan would launch one, take its hosts' Leases for the full proxy grace window and report everything
-unreachable. `main` drives this controller as a future of its own so that wait does not delay the
-other two.
+`reconciler::new` is `async` because it waits for two initial LISTs before handing back a
+controller, and both waits exist because an unsynced `Store` does not fail — it answers wrongly.
+An unsynced **Node** cache reports every node `Ready`, which is precisely the answer that starts the
+runs the readiness gate exists to hold back: after a restart every held plan would launch one, take
+its hosts' Leases for the full proxy grace window and report everything unreachable. An unsynced
+**plan** cache reports every plan *deleted*, so `plan_still_exists` would withhold the Node labels
+the first tick after a restart is there to republish — the crash-between-status-and-labels case
+deriving them every tick exists for — and not retry until the plan's next requeue, an hour for an
+idle `OneShot`. The plan wait comes second because the task that drives that reflector is spawned
+between them. `main` drives this controller as a future of its own so neither wait delays the other
+two.
 
-The wait is bounded (`NODE_CACHE_SYNC_TIMEOUT`, 2 min) and **fatal**: `await_node_cache` panics
-rather than carrying on, because `Store::wait_until_ready` resolves only on a populated cache or a
-dropped writer, and a `watcher` retries a failing watch forever — so an unbounded wait would leave
-the controller pending for the life of the process while the other two kept the operator looking
-healthy. `join!` in `main` is what turns that panic into a process exit; spawning the controllers
-instead would park it in a `JoinHandle` nobody reads and restore exactly the silent half-alive state.
+Both waits are bounded (`CACHE_SYNC_TIMEOUT`, 2 min) and **fatal**: `await_node_cache` and
+`await_plan_cache` panic rather than carrying on, because `Store::wait_until_ready` resolves only on
+a populated cache or a dropped writer, and a `watcher` retries a failing watch forever — so an
+unbounded wait would leave the controller pending for the life of the process while the other two
+kept the operator looking healthy. `join!` in `main` is what turns that panic into a process exit;
+spawning the controllers instead would park it in a `JoinHandle` nobody reads and restore exactly
+the silent half-alive state.
 
 **It bounds the first sync only.** A watch that breaks after the cache is populated leaves the
 `Store` serving its last contents for the life of the process, so the gate keeps answering from a

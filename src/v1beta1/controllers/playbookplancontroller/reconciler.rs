@@ -60,12 +60,12 @@ const DEFAULT_RECURRING_ATTEMPTS: u32 = 1;
 /// How long a plan waits before making a try it still owes. Short because a scheduled retry has only
 /// the remainder of its tick's `startingDeadlineSeconds` window to start in.
 const RETRY_REQUEUE: std::time::Duration = std::time::Duration::from_secs(1);
-/// How long [`new`] waits for the Node cache's initial LIST before taking the process down with it.
+/// How long [`new`] waits for a reflector's initial LIST before taking the process down with it.
 ///
 /// Deliberately generous, because the two ways of getting it wrong are not symmetric: too short
 /// crash-loops an operator that would have synced a moment later, taking down a working install,
 /// while too long only prolongs a state that is already broken. It has to sit comfortably above a
-/// *healthy* sync and nothing more — that is one unpaginated Node LIST at roughly 10 KB per Node, so
+/// *healthy* sync and nothing more — that is one unpaginated LIST at roughly 10 KB per object, so
 /// single-digit seconds even at a thousand of them.
 ///
 /// Two minutes is the value controller-runtime uses for the same question (its `CacheSyncTimeout`),
@@ -74,7 +74,7 @@ const RETRY_REQUEUE: std::time::Duration = std::time::Duration::from_secs(1);
 /// later restart with nobody involved, while a permanent one shows as `CrashLoopBackOff` within a
 /// couple of minutes with the reason in the log. A knob here would only invite tuning a number whose
 /// single job is to be far above any healthy sync.
-const NODE_CACHE_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const CACHE_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How many consecutive Node watch failures stop looking like a blip, after which the log says what
 /// the failure *costs* rather than only that it happened.
@@ -338,7 +338,8 @@ pub async fn new(
         reader
     };
 
-    // The only thing this constructor waits for.
+    // The first of the two things this constructor waits for; the plan cache is the other, and has
+    // to come after the task that drives it is spawned below.
     await_node_cache(&node_reflector_reader).await;
 
     // Now that the Node cache is populated, drive the plan reflector — the stream that carries the
@@ -404,6 +405,12 @@ pub async fn new(
                 .await;
         });
     }
+
+    // The second and last thing this constructor waits for, and only now that the task above is
+    // driving the stream that fills it. Reconciles must not start against a store that has not
+    // synced: every plan reads as deleted there, and `plan_still_exists` would withhold labels the
+    // first tick after a restart is meant to republish.
+    await_plan_cache(&playbookplan_reflector_reader).await;
 
     let context = Arc::new(ReconciliationContext {
         client: client.clone(),
@@ -516,7 +523,7 @@ pub async fn new(
 /// making the state loud, which is the half that was missing, without picking a trade on a
 /// cluster's behalf.
 async fn await_node_cache(nodes: &Store<Node>) {
-    match tokio::time::timeout(NODE_CACHE_SYNC_TIMEOUT, nodes.wait_until_ready()).await {
+    match tokio::time::timeout(CACHE_SYNC_TIMEOUT, nodes.wait_until_ready()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => panic!(
             "the Node reflector stopped before its initial sync ({error}); the PlaybookPlan \
@@ -526,7 +533,42 @@ async fn await_node_cache(nodes: &Store<Node>) {
             "timed out after {}s waiting for the initial Node list; the PlaybookPlan controller \
              cannot judge node readiness without it. Check that the operator's ClusterRole still \
              grants list/watch on nodes, and that the apiserver is reachable",
-            NODE_CACHE_SYNC_TIMEOUT.as_secs()
+            CACHE_SYNC_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+/// Blocks until the `PlaybookPlan` reflector has served its initial LIST, and **panics** if it never
+/// does — the same contract as [`await_node_cache`], and for the same shape of reason: an unsynced
+/// store here does not fail, it answers wrongly.
+///
+/// [`plan_still_exists`] asks this store whether the plan a tick is about to label is still in the
+/// cluster. Against a store that has not synced, *every* plan reads as deleted — so the labels of a
+/// plan recovering from a crash between its status write and its label write, which is the case
+/// deriving labels on every tick exists for, would be withheld and not tried again until the plan's
+/// next requeue: an hour for an idle `OneShot`. The same is true of the first tick after a namespace
+/// is re-enrolled, which restores a provider's labels from its recorded results with no run behind
+/// them.
+///
+/// The mappers read it too, where an empty store means a Secret or inventory change wakes no plan at
+/// all. That was always so and was survivable, because the next requeue recovers it; it is the label
+/// publish that has no second chance worth waiting for.
+///
+/// The orphan sweep is deliberately *not* among the readers this protects: it is gated on the
+/// `InitDone` event itself, which is strictly stronger than this.
+async fn await_plan_cache(plans: &Store<PlaybookPlan>) {
+    match tokio::time::timeout(CACHE_SYNC_TIMEOUT, plans.wait_until_ready()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!(
+            "the PlaybookPlan reflector stopped before its initial sync ({error}); the controller \
+             cannot tell a deleted plan from an unread one without it"
+        ),
+        Err(_elapsed) => panic!(
+            "timed out after {}s waiting for the initial PlaybookPlan list; the controller cannot \
+             tell a deleted plan from an unread one without it. Check that the operator's \
+             ClusterRole still grants list/watch on playbookplans, and that the apiserver is \
+             reachable",
+            CACHE_SYNC_TIMEOUT.as_secs()
         ),
     }
 }
@@ -7072,6 +7114,19 @@ mod tests {
         drop(writer);
 
         await_node_cache(&reader).await;
+    }
+
+    /// The same contract for the plan cache, and pinned for the same reason: an unsynced store here
+    /// does not fail, it answers "deleted" for every plan — so the first tick after a restart would
+    /// withhold exactly the labels that restart is meant to republish, and nothing would say why.
+    #[tokio::test]
+    #[should_panic(expected = "stopped before its initial sync")]
+    async fn a_plan_cache_that_can_never_sync_takes_the_operator_down() {
+        let writer = Writer::<PlaybookPlan>::default();
+        let reader = writer.as_reader();
+        drop(writer);
+
+        await_plan_cache(&reader).await;
     }
 
     /// A tick keeps the object it was handed, so a plan deleted while it runs still looks present to
