@@ -27,7 +27,16 @@ rules:
   # ClusterInventory resolves node label selectors against real Nodes (cluster-scoped resource).
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch"{{ if .Values.nodeLabels.enabled }}, "patch"{{ end }}]
+{{- if .Values.nodeLabels.enabled }}
+  # `patch` above is what lets a PlaybookPlan with `spec.provides` label the Nodes it converged, so
+  # that another plan's ClusterInventory can select on that label and stay off hosts that are not
+  # ready yet. RBAC cannot narrow a verb to one field: the same `patch` can change taints,
+  # spec.unschedulable or any other label, which is why the ValidatingAdmissionPolicy in
+  # validatingadmissionpolicy.yaml exists and why turning `nodeLabels.enabled` off removes the
+  # permission rather than only the feature. See THREAT_MODEL.md (T-ESC-9) and
+  # docs/src/cluster-operators/deployment.md.
+{{- end }}
   # NodeAccessPolicy enforcement reads the plan namespace's labels to match a policy's
   # namespaceSelector (Namespaces are cluster-scoped resources).
   - apiGroups: [""]

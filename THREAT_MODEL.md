@@ -127,7 +127,11 @@ Numbered entry points where an actor injects data or makes a request:
 4. **Referenced Secrets** — variable/file/SSH-key Secrets in the plan namespace.
 5. **NodeAccessPolicy spec** — namespaceSelector + nodeSelector. Admin-controlled.
 6. **Node & Namespace labels** — consumed by selectors on both sides. Controlled by
-   whoever can label nodes/namespaces (normally cluster admin; see T-ESC-3).
+   whoever can label nodes/namespaces (normally cluster admin; see T-ESC-3) — **and, for keys under
+   `<namespace>.plan.ansible.cloudbending.dev/`, by the operator itself**, which publishes a plan's
+   `spec.provides` version onto the Nodes that plan converged (T-ESC-9). Those keys are therefore
+   the one part of this entry that is not admin-controlled; the value on a Node follows from what a
+   tenant's playbook did, bounded by that namespace's own NodeAccessPolicy ceiling.
 7. **Helm values** — proxy image, operator namespace, RBAC. Admin-controlled.
 8. **The proxy pod SSH endpoint** — TCP/22, authenticated by client cert. Reachable by
    whatever the NetworkPolicy + CNI allow.
@@ -453,6 +457,38 @@ enrolled namespace could therefore try to rewrite what a committed run does.
   can edit a spec the operator has no verb to repair.
 - *Severity:* Low.
 
+**T-ESC-9 — The operator's cluster-wide `nodes: patch`.**
+So that a plan can publish what it provides, the operator holds `patch` on every Node in the
+cluster (chart `nodeLabels.enabled`, default on). RBAC cannot narrow a verb to one field, so the
+same grant can change taints, `spec.unschedulable`, `podCIDR`, `node-role.kubernetes.io/*` and any
+other label — none of which the operator ever writes.
+- *Scale of the change:* smaller than it looks. The operator is already root on every Node it can
+  reach, through managed-SSH proxy pods (T-ESC-4), so this grants no new reach over the machines.
+  What is new is a write on the **API** that needs no run behind it: a compromised operator process
+  could cordon or relabel Nodes directly, without a playbook and without a proxy pod.
+- *Mitigation:* a `ValidatingAdmissionPolicy` and binding (chart `nodeLabels.admissionPolicy`,
+  default on) allow the operator's ServiceAccount to add, change and remove **only** label keys
+  containing `.plan.ansible.cloudbending.dev/`, and require the Node's spec, annotations,
+  ownerReferences, finalizers and every other label to be unchanged. It is scoped by
+  `matchConditions` to that ServiceAccount, so it never constrains an administrator — including one
+  cleaning these labels up by hand.
+- *Assumption:* `ValidatingAdmissionPolicy` is GA only from Kubernetes 1.30, while the chart
+  supports 1.25 and up. A cluster older than that must set `nodeLabels.admissionPolicy=false` and
+  runs with the permission unguarded, or set `nodeLabels.enabled=false` and give up the feature.
+  The chart deliberately does not detect the API: `helm template` without `--api-versions` reports
+  it as missing, so a capability check would drop the guard silently while keeping the permission.
+  An explicit value fails the install loudly instead.
+- *Not a tenant escalation:* a tenant cannot choose the key. It is derived from the plan's namespace
+  and name, so no plan can write a label that widens its own NodeAccessPolicy ceiling, steer another
+  namespace's workloads through a well-known key, or overwrite another plan's claim (T-ESC-3). What
+  a NodeAccessPolicy keyed on one of these labels *does* delegate is covered in the node-access
+  guide — the ceiling then follows the providing plan's tenant, up to that plan's own ceiling.
+- *Residual:* anything with root on a Node can forge its own Node's label through the kubelet
+  (`NodeRestriction` permits a kubelet to label its own Node outside the reserved prefixes), which
+  every managed-SSH playbook already has. For ordering this costs nothing — that tenant is root on
+  the machine either way. For a NodeAccessPolicy built on such a label it is the delegation above.
+- *Severity:* Low with the policy, Medium without it.
+
 ---
 
 ## 6. Deployment assumptions & required controls
@@ -513,6 +549,12 @@ This design is **only** as strong as the environment it runs in. The following a
   execution hash.
 - **INV-7 — Proxy pods carry both `PLAYBOOKPLAN_HASH` and `PLAYBOOKPLAN_HOST`** so cleanup's
   label-scoped `delete_collection` cannot sweep the ansible Job pod (which lacks `_HOST`).
+- **INV-8 — The operator writes only its own Node labels.** Every Node write the operator makes MUST
+  be confined to label keys of the form `<namespace>.plan.ansible.cloudbending.dev/<plan>`, derived
+  from the plan's own namespace and name and never from anything a tenant supplies. It MUST never
+  write a Node's spec, annotations, or any label outside that form. The key being operator-derived
+  is what stops a plan labelling its way past a NodeAccessPolicy ceiling (T-ESC-3/T-ESC-9); where
+  the chart's `ValidatingAdmissionPolicy` is enabled, the API server enforces the same bound.
 
 Any change touching these paths should re-verify the corresponding unit tests and this list.
 
@@ -537,6 +579,7 @@ From [`clusterrole.yaml`](chart/templates/clusterrole.yaml) (cluster-wide) and
 | networkpolicies | deletecollection | **operator ns only** | Run isolation cleanup for proxy policies. |
 | leases | get,create,update,delete | operator ns | Per-node mutual exclusion. |
 | nodes | get,list,watch | cluster-wide | Selector resolution / NAP allow-set (cluster-scoped resource). |
+| nodes | patch | cluster-wide | Only with `nodeLabels.enabled` (default on). Publishes a plan's `spec.provides` version as `<namespace>.plan.ansible.cloudbending.dev/<plan>` on the Nodes that plan converged, so other plans can depend on it. The operator writes nothing else on a Node (INV-8), but RBAC cannot scope `patch` to one label key: the grant permits taints, `spec.unschedulable` and any label on any Node. `nodeLabels.admissionPolicy` (default on) renders a `ValidatingAdmissionPolicy` that holds the operator's own ServiceAccount to exactly those keys; below Kubernetes 1.30 that API does not exist and the grant is unguarded (T-ESC-9). |
 | namespaces | get,list,watch | cluster-wide | namespaceSelector matching (cluster-scoped resource). |
 | playbookplans/clusterinventories/staticinventories/nodeaccesspolicies | get,list,watch | cluster-wide | CRDs — read cluster-wide so plans in non-enrolled namespaces are seen and reported. |
 | playbookplans/clusterinventories/nodeaccesspolicies (/status) | patch | cluster-wide | Status writes (incl. `UnauthorizedNamespace`); StaticInventory has no status-writing controller. |

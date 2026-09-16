@@ -101,6 +101,19 @@ async fn run(args: RunArgs) {
         enrolled_namespaces
     );
 
+    // Whether a plan's `spec.provides` version may be published onto the Nodes it converged. Said
+    // out loud at startup either way: with it off, a plan that provides something still runs but
+    // publishes nothing, so a dependent waiting on it looks like a broken selector unless an admin
+    // can see this was a deliberate choice. The chart moves this flag and the ClusterRole's
+    // `nodes: patch` together (`nodeLabels.enabled`).
+    if operator_config.node_labels.enabled {
+        tracing::info!("node labels are enabled: plans with spec.provides will label their Nodes");
+    } else {
+        tracing::warn!(
+            "node labels are disabled (chart nodeLabels.enabled=false): plans with spec.provides will run but label nothing, and any labels already on Nodes stay there — the operator has no permission to remove them. Clean up with `kubectl label nodes --all <key>-`"
+        );
+    }
+
     // Managed-ssh proxy image (T-ESC-5): set via the chart's `managedSsh.proxyImage`, surfaced here
     // through the config file. There is NO built-in default for this node-root image — it must be an
     // explicit admin choice — so a missing/empty value is a fatal startup error. Pin to a trusted
