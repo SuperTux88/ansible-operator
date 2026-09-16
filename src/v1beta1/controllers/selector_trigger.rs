@@ -9,6 +9,24 @@ use tracing::{debug, error};
 
 use crate::v1beta1::controllers::watch_backoff::WatchBackoff;
 
+/// How long a set-valued controller waits for label churn to stop before recomputing, as
+/// `Controller::with_config(Config::default().debounce(…))`.
+///
+/// [`label_changes`] emits one tick per label change, and `reconcile_all_on` fans each tick out to
+/// *every* object the controller owns — so a burst of label writes costs
+/// `writes × objects` reconciles, each of which lists every Node in the cluster and patches a
+/// status. That burst is not hypothetical: a `PlaybookPlan` with `spec.provides` labels every Node
+/// it converged, one PATCH at a time, as each run finishes
+/// (`playbookplancontroller::node_labels`). Recomputing per Node while the fleet is being labelled
+/// answers the same question hundreds of times and publishes the same answer at the end.
+///
+/// The scheduler's debounce is trailing-edge and resets on each request for the same object, so a
+/// burst collapses into one reconcile per object once it goes quiet. Kept short deliberately: it
+/// delays *every* trigger of these controllers, a spec edit included, and a `ClusterInventory` that
+/// is slow to publish `observedGeneration` holds the plans that reference it
+/// (`ReconcileError::InventoryNotSynced`). A second buys the coalescing without being felt.
+pub const RECOMPUTE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Emits one tick whenever a watched object's **labels** change, it appears, or it disappears —
 /// and stays silent for every other update.
 ///
