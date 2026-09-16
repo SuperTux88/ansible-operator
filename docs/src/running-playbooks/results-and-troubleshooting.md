@@ -82,11 +82,17 @@ printer columns:
   what the plan last did, and `Ready` says it has hosts it has not yet applied to.
 - **`ProvidesLabels`** — only on a plan that declares
   [`spec.provides`](./playbook-plans.md#declaring-what-a-plan-provides), saying whether its claim is
-  actually reaching Nodes. `True`/`PublishingNodeLabels` is the normal state.
+  actually reaching Nodes and how far. `True`/`PublishingNodeLabels` is the normal state, and its
+  message names the key, the version and the number of Nodes carrying it —
+  `publishing platform.plan.ansible.cloudbending.dev/containerd=1.4.2 on 5 Node(s) …`. That count is
+  the plan's own **reach**, not a claim about any dependent's inventory, which a
+  [`NodeAccessPolicy`](../cluster-operators/node-access-policies.md) may narrow further.
   `False`/`NodeLabelsDisabled` means the cluster administrator turned node labels off
   (`nodeLabels.enabled=false`); the plan still runs, but it publishes nothing and every plan
   depending on it will wait without ever seeing its hosts. That is the condition to check first when
-  a dependent plan resolves to fewer hosts than you expect and the provider looks healthy.
+  a dependent plan resolves to fewer hosts than you expect and the provider looks healthy. Its count
+  means something different: Nodes still carrying the label from before the feature was switched
+  off, which still steer inventories and which only an administrator can remove now.
 - **`DependenciesWaiting`** — only on a plan whose inventories express a
   [dependency](./cluster-nodes.md#depending-on-another-plan), saying whether any of them is still
   holding Nodes back. `True`/`HostsWaiting` names up to three of them — the inventory, the group,
