@@ -67,10 +67,26 @@ pub struct SelectorExpression {
     pub values: Option<Vec<String>>,
 }
 
+/// How a `matchExpressions` term compares a label against the values it lists.
+///
+/// `In`, `NotIn`, `Exists` and `DoesNotExist` behave exactly as Kubernetes' own label selectors do.
+///
+/// `Gt`, `Ge`, `Lt` and `Le` order the label value against the term's single value **as a version**,
+/// which Kubernetes itself cannot do: its own `Gt`/`Lt` parse both sides as integers, so a dotted
+/// version never matches, and plain string ordering would sort 1.10.0 before 1.9.0. An optional
+/// leading `v` is accepted, missing components are read as `0` (so `1.4` is `1.4.0` and an integer
+/// is a one-component version, comparing exactly as Kubernetes would compare it), a pre-release
+/// sorts before its release (`Ge 1.4.0` excludes `1.4.0-rc.1`), and build metadata after `+` or `_`
+/// is ignored. A comparison that cannot be answered matches nothing: no such label on the object,
+/// anything other than exactly one value listed, or either side not a version.
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, PartialEq)]
 pub enum SelectorOperator {
     In,
     NotIn,
     Exists,
     DoesNotExist,
+    Gt,
+    Ge,
+    Lt,
+    Le,
 }

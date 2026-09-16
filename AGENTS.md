@@ -83,6 +83,7 @@ src/v1beta1/
     selector_trigger.rs              label_changes: the set-valued controllers' watch trigger — ticks only on a label change, an appearance or a disappearance; must stay in lockstep with what nodeselector.rs reads
     ansible_inventory.rs             ResolvedInventoryGroup (ManagedSsh | Ssh) + ResolvedHosts; AnsibleInventory trait (get_hosts); distinct_hosts/_count (every host-population count, in both controllers)
     nodeselector.rs                  node_matches / selector_matches / selector_matches_fail_closed (INV-1)
+    version.rs                       parses a label or selector value as a version for the ordered operators (`Gt`/`Ge`/`Lt`/`Le`), which Kubernetes' own integer-only `Gt`/`Lt` cannot express. Lenient on the way in (optional `v`, one to three components, `_` build metadata as Helm writes it), SemVer on the way out, and `None` for anything else — an unanswerable comparison is a non-match, so a dependency selector waits instead of running
     reconcile_error.rs               shared ReconcileError (thiserror)
   controllers/playbookplancontroller/
     reconciler.rs                    the reconcile pipeline (below); patch_status via JSON merge patch
