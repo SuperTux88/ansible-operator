@@ -51,6 +51,10 @@ pub fn new(
     // select over actually move. `Controller::reconcile_all_on` reads the controller's own store,
     // so the hand-rolled reflector the mapper needed is gone with it.
     Controller::new(inventories_api, watcher::Config::default())
+        // Every tick recomputes every inventory against the whole Node set, so a fleet being
+        // labelled by a providing plan would otherwise buy one full recompute per Node —
+        // see `selector_trigger::RECOMPUTE_DEBOUNCE`.
+        .with_config(controller::Config::default().debounce(selector_trigger::RECOMPUTE_DEBOUNCE))
         .reconcile_all_on(selector_trigger::label_changes(node_metadata_api))
         .run(
             reconcile,
