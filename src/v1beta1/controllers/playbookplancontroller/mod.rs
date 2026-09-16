@@ -1,4 +1,5 @@
 mod callback_output;
+mod departed_hosts;
 mod execution_evaluator;
 mod job_builder;
 mod locking;
