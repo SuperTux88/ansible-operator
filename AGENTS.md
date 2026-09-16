@@ -83,6 +83,7 @@ src/v1beta1/
     mappers.rs                       maps Secret, NodeAccessPolicy, ClusterInventory and StaticInventory changes to affected plans; the Secret watch asks two rules (named in `variables`/`files`, or holding a StaticInventory's SSH key)
     node_access.rs                   NodeAccessPolicy enforcement: fail-closed intersection clamp (INV-2/3/5)
     node_readiness.rs                Node Ready-condition predicates + the OneShot "hold instead of starting" gate; readiness only, never authorization
+    node_recreation.rs               drops a host's recorded application when its Node was registered after `appliedAt` — a rebuilt machine inherits the name, never the claim. Level-triggered on purpose: a deletion the operator was down for leaves no event to react to
     managed_ssh.rs                   proxy pods (hostPID + nsenter = NODE ROOT), per-run sshd config/certs/principals, NetworkPolicy, cleanup (INV-4/7)
     locking.rs                       per-host Leases (operator ns) for run mutual-exclusion
     play_history.rs                  writes/prunes the immutable Play run records; its module doc is the authoritative PlayPhase state machine
