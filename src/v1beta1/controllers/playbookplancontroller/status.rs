@@ -283,15 +283,38 @@ pub fn set_dependencies_waiting_condition(
     upsert_condition(&mut status.conditions, condition);
 }
 
-/// Adds the one clause the summary column has room for: how many hosts a dependency is keeping out.
+/// How every dependency clause ends, and the only thing that identifies one already on a summary.
 ///
-/// **Appended, never substituted.** The summary's job is to say what the plan is doing, and a wait
-/// for another plan does not replace that — it qualifies it. `5/5 up-to-date` beside an inventory
-/// holding eight more machines back is true and misleading in exactly the way this fixes.
+/// The clause is always the last thing appended — `apply_run_diagnostic`'s runs earlier in the tick
+/// — so matching the end of the string is enough to find it.
+const WAITING_CLAUSE_TAIL: &str = " host(s) waiting for dependencies)";
+
+/// Restates the one clause the summary column has room for: how many hosts a dependency is keeping
+/// out.
 ///
-/// Only while the plan is idle. A plan mid-run has a summary about that run, which is what someone
-/// watching it wants; the dependencies are still on the condition, and the clause reappears when the
-/// run ends.
+/// **A qualifier, never a substitute.** The summary's job is to say what the plan is doing, and a
+/// wait for another plan does not replace that. `5/5 up-to-date` beside an inventory holding eight
+/// more machines back is true and misleading in exactly the way this fixes.
+///
+/// **Idempotent, and that is load-bearing.** An idle tick does not rewrite `summary` at all — it
+/// carries the stored one forward — so the clause a previous tick added is still on it. Appending
+/// to that would grow the summary by a clause per reconcile, and because every changed status is a
+/// write, every write is a watch event and every event is the next reconcile, it would never settle:
+/// a printer column growing until the object hits the size limit and no status can be written at
+/// all. So the previous clause is stripped first and the result is a fixed point, which makes the
+/// merge patch a no-op as soon as the count stops moving. Stripping is also what *removes* the
+/// clause when the last dependency is satisfied, since nothing else would.
+///
+/// The clause is only *added* while the plan is idle. A plan mid-run has a summary about that run,
+/// which is what someone watching it wants; the dependencies are still on the condition, and the
+/// clause comes back when the run ends.
+///
+/// The **strip runs either way**, so no clause can outlive the tick that wrote it. Every path that
+/// starts or adopts a run replaces the summary with the run's own, which would carry the stale
+/// clause off with it — but that is an invariant spread across several call sites, and being wrong
+/// about it once would leave a stale count on a running plan and break the exact-match in
+/// `summary_unclaimed_since_adoption`. Stripping unconditionally costs one comparison and does not
+/// depend on being right.
 ///
 /// Counted over distinct requirements' waiting hosts, which may name the same Node twice if two
 /// dependencies hold it — the condition is where the breakdown is, and the largest single wait is
@@ -300,6 +323,17 @@ pub fn append_dependency_summary_clause(
     status: &mut PlaybookPlanStatus,
     dependencies: &[InventoryDependency],
 ) {
+    if let Some(summary) = status.summary.as_mut() {
+        // A loop rather than one strip, so a status already carrying several from before this was
+        // idempotent is healed on the first tick instead of shedding one clause per reconcile.
+        while summary.ends_with(WAITING_CLAUSE_TAIL) {
+            let Some(clause_start) = summary.rfind(" (") else {
+                break;
+            };
+            summary.truncate(clause_start);
+        }
+    }
+
     if status.active_run.is_some() {
         return;
     }
@@ -314,7 +348,7 @@ pub fn append_dependency_summary_clause(
     };
 
     if let Some(summary) = status.summary.as_mut() {
-        summary.push_str(&format!(" ({waiting} host(s) waiting for dependencies)"));
+        summary.push_str(&format!(" ({waiting}{WAITING_CLAUSE_TAIL}"));
     }
 }
 
@@ -858,6 +892,109 @@ mod tests {
         );
     }
 
+    /// **The property, not the single application.** No idle path rewrites `summary` — the stored
+    /// one is carried forward — so this runs against its own previous output on every tick. A clause
+    /// that stacked would grow the summary by forty bytes a reconcile, and since a changed status is
+    /// a write, a write is a watch event and an event is the next reconcile, it would never settle:
+    /// a printer column growing until the object hits its size limit and no status can be written at
+    /// all.
+    #[test]
+    fn restating_the_clause_every_tick_is_a_fixed_point() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("5/5 up-to-date".into()),
+            ..Default::default()
+        };
+        let waiting = [dependency("workers-ci", "containerd", 3)];
+
+        for _ in 0..3 {
+            append_dependency_summary_clause(&mut status, &waiting);
+            assert_eq!(
+                status.summary.as_deref(),
+                Some("5/5 up-to-date (3 host(s) waiting for dependencies)")
+            );
+        }
+    }
+
+    /// A rollout is the count moving, tick after tick, against a summary that still carries the last
+    /// one. Each has to replace its predecessor rather than queue behind it.
+    #[test]
+    fn a_moving_count_replaces_the_clause_rather_than_stacking() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("5/5 up-to-date".into()),
+            ..Default::default()
+        };
+
+        for remaining in [3, 2, 1] {
+            append_dependency_summary_clause(
+                &mut status,
+                &[dependency("workers-ci", "containerd", remaining)],
+            );
+        }
+
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("5/5 up-to-date (1 host(s) waiting for dependencies)")
+        );
+    }
+
+    /// The provider finishes, and the clause has to go with the wait. Stripping is the only thing
+    /// that removes it: an idle tick never rewrites the summary it was appended to.
+    #[test]
+    fn the_clause_disappears_when_the_last_wait_clears() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("5/5 up-to-date".into()),
+            ..Default::default()
+        };
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 3)]);
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 0)]);
+
+        assert_eq!(status.summary.as_deref(), Some("5/5 up-to-date"));
+    }
+
+    /// A status written by a version that stacked them is healed on the first tick, not one clause
+    /// per reconcile — an operator upgrade must not leave a plan reporting nonsense for as long as
+    /// it takes to unwind.
+    #[test]
+    fn a_summary_that_already_stacked_clauses_is_healed_at_once() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some(
+                "5/5 up-to-date (3 host(s) waiting for dependencies) \
+                 (3 host(s) waiting for dependencies) (3 host(s) waiting for dependencies)"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 3)]);
+
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("5/5 up-to-date (3 host(s) waiting for dependencies)")
+        );
+    }
+
+    /// The clause is appended after `apply_run_diagnostic`'s, so stripping must stop at the
+    /// dependency clause and leave a diagnostic that happens to sit in front of it alone.
+    #[test]
+    fn stripping_leaves_a_run_diagnostics_clause_in_place() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("1/5 up-to-date (the playbook ran no task on 2 of 5 hosts)".into()),
+            ..Default::default()
+        };
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 3)]);
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 3)]);
+
+        assert_eq!(
+            status.summary.as_deref(),
+            Some(
+                "1/5 up-to-date (the playbook ran no task on 2 of 5 hosts) \
+                 (3 host(s) waiting for dependencies)"
+            )
+        );
+    }
+
     /// Nothing to qualify: a plan whose dependencies are all met is simply doing what its summary
     /// says.
     #[test]
@@ -894,6 +1031,33 @@ mod tests {
         append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 3)]);
 
         assert_eq!(status.summary.as_deref(), Some("applying to 3 hosts"));
+    }
+
+    /// No clause outlives the tick that wrote it, not even onto a summary this function will not add
+    /// one to. Every path that starts a run replaces the summary with the run's own and would carry
+    /// the clause off with it — but that is an invariant across several call sites, and a stale
+    /// count on a running plan would also break the exact match in
+    /// `summary_unclaimed_since_adoption`. So the strip does not depend on that invariant holding.
+    #[test]
+    fn a_run_starting_does_not_inherit_the_idle_plans_clause() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("5/5 up-to-date (3 host(s) waiting for dependencies)".into()),
+            active_run: Some(crate::v1beta1::ActiveRun {
+                execution_hash: "abc".into(),
+                run_id: "run".into(),
+                job_name: "plan-1".into(),
+                play_uid: "uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: None,
+            }),
+            ..Default::default()
+        };
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 3)]);
+
+        assert_eq!(status.summary.as_deref(), Some("5/5 up-to-date"));
     }
 
     /// The version travels with the hash and the timestamp, under one condition, so the three can
