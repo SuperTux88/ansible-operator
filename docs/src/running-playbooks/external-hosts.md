@@ -84,6 +84,19 @@ and key Secret; they are mounted at distinct paths and do not collide. You can a
 `StaticInventory` and `ClusterInventory` references in one plan; external hosts and cluster Nodes then
 appear in the same rendered inventory and are applied by the same Job.
 
+## Dependencies between plans are cluster-Nodes only
+
+The [`spec.provides`](./playbook-plans.md#declaring-what-a-plan-provides) mechanism — a plan
+publishing what it has finished so other plans can wait for it — works by labelling **Node objects**,
+so it does not extend to `StaticInventory` hosts. An external machine has no Kubernetes object to
+carry the label.
+
+That cuts both ways. A plan whose hosts are external can still set `provides`, but nothing is
+published for those hosts (if the plan also targets cluster Nodes, those are labelled as usual). And
+a dependent plan's `StaticInventory` groups are unaffected by dependency labels: they use no
+selectors at all, so their hosts are always in the run. Order work on external machines within a
+single playbook instead, or across plans by hand.
+
 ## What you do not set
 
 As with cluster nodes, the operator renders `ansible_user`, `ansible_ssh_private_key_file`, and the

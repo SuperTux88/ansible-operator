@@ -68,6 +68,13 @@ printer columns:
   [held for `NotReady` Nodes](./cluster-nodes.md#holding-instead-of-starting), `Ready` is `False`
   with reason `NodesNotReady` even if the phase still shows the last run's `Succeeded`: the phase is
   what the plan last did, and `Ready` says it has hosts it has not yet applied to.
+- **`ProvidesLabels`** — only on a plan that declares
+  [`spec.provides`](./playbook-plans.md#declaring-what-a-plan-provides), saying whether its claim is
+  actually reaching Nodes. `True`/`PublishingNodeLabels` is the normal state.
+  `False`/`NodeLabelsDisabled` means the cluster administrator turned node labels off
+  (`nodeLabels.enabled=false`); the plan still runs, but it publishes nothing and every plan
+  depending on it will wait without ever seeing its hosts. That is the condition to check first when
+  a dependent plan resolves to fewer hosts than you expect and the provider looks healthy.
 - **`Running`** — the operator has identified this run's own Job in a non-terminal state
   (`JobRunning`). It is set in the same reconcile that creates the Job (a run adopted during recovery
   picks it up on the next tick), and re-asserted on every tick that observes it unfinished, so it
@@ -123,8 +130,15 @@ prevents an old Job and a new revision from targeting the same host concurrently
 | `Unknown` | The operator could not read a recap for this host — its **own instrumentation** failed, not Ansible. Distinct from `NotReached`. Worth investigating (see below). |
 
 Each host also records `lastAppliedHash` (the hash it last *succeeded* on — this is what drift
-detection compares against), `appliedAt` (when that hash was stamped) and `lastTransitionTime` (when
-the host last recorded any outcome, successful or not).
+detection compares against), `appliedAt` (when that hash was stamped), `appliedVersion` (the
+[`spec.provides`](./playbook-plans.md#declaring-what-a-plan-provides) version of the revision that
+stamped it, for plans that declare one — this is the value published as that Node's dependency
+label) and `lastTransitionTime` (when the host last recorded any outcome, successful or not).
+
+The three claim fields move together, under exactly the outcome that stamps the hash. So a host
+whose `appliedVersion` lags another's is genuinely still on the older revision, and a host with no
+`appliedVersion` has not succeeded under a revision that declared one — which is why it carries no
+label.
 
 `appliedAt` is what tells a **replaced machine** from the one the record was written about.
 `.status.hostsStatus` is keyed by host name, and the name is all a rebuilt machine inherits — so a
