@@ -50,6 +50,10 @@ pub fn new(
     // a status patch. `selector_trigger::label_changes` fires only when a label those selectors read
     // actually moves, or an object appears or disappears.
     Controller::new(policies_api, watcher::Config::default())
+        // Two triggers into `reconcile_all_on`, both firing on Node and Namespace label churn, so
+        // this pays the same per-write recompute a labelling plan sets off —
+        // see `selector_trigger::RECOMPUTE_DEBOUNCE`.
+        .with_config(controller::Config::default().debounce(selector_trigger::RECOMPUTE_DEBOUNCE))
         .reconcile_all_on(selector_trigger::label_changes(namespace_metadata_api))
         .reconcile_all_on(selector_trigger::label_changes(node_metadata_api))
         .run(
