@@ -3,8 +3,8 @@ use k8s_openapi::api::batch;
 use crate::{
     utils::upsert_condition,
     v1beta1::{
-        HostOutcome, Phase, PlayPhase, PlayStatus, PlaybookPlanCondition, PlaybookPlanStatus,
-        distinct_host_count,
+        DependencyStatus, HostOutcome, Phase, PlayPhase, PlayStatus, PlaybookPlanCondition,
+        PlaybookPlanStatus, distinct_host_count,
     },
 };
 
@@ -160,6 +160,137 @@ pub fn set_provides_labels_condition(
     };
 
     upsert_condition(&mut status.conditions, condition);
+}
+
+/// One dependency a plan inherits from an inventory it references.
+///
+/// The inventory's name travels with it because the plan references several and the fix is in one of
+/// them: "3 hosts waiting" is a fact, "3 hosts waiting, in `workers-with-containerd`" is something a
+/// reader can act on.
+#[derive(Clone, Debug)]
+pub struct InventoryDependency {
+    pub inventory: String,
+    pub dependency: DependencyStatus,
+}
+
+/// How many dependencies a condition message names before it gives up and counts the rest.
+///
+/// A condition message is read, not parsed. A plan referencing a handful of inventories that each
+/// gate on a handful of providers would otherwise produce a paragraph nobody finishes.
+const NAMED_DEPENDENCIES: usize = 3;
+
+/// Reports the hosts this plan would run on if another plan had finished with them.
+///
+/// Absent on a plan that references no dependency at all, for the same reason as `ProvidesLabels`:
+/// a condition answering a question the plan does not pose is noise on every object that does not
+/// have the problem.
+///
+/// The counts are the inventories' own, copied rather than recomputed. Two controllers deriving the
+/// same number by different routes would eventually disagree, and a plan contradicting the inventory
+/// it names is worse than either number on its own.
+///
+/// Note what the numbers are *not*: they are the inventory's view, taken before the
+/// `NodeAccessPolicy` clamp this plan is subject to. A Node counted as satisfied may still be out of
+/// this plan's reach — `eligibleHosts` is what says which hosts it actually has.
+pub fn set_dependencies_waiting_condition(
+    status: &mut PlaybookPlanStatus,
+    dependencies: &[InventoryDependency],
+) {
+    if dependencies.is_empty() {
+        status
+            .conditions
+            .retain(|condition| condition.type_ != "DependenciesWaiting");
+        return;
+    }
+
+    let now = chrono::Local::now().fixed_offset();
+    let waiting: Vec<&InventoryDependency> = dependencies
+        .iter()
+        .filter(|entry| entry.dependency.waiting > 0)
+        .collect();
+
+    let condition = if waiting.is_empty() {
+        PlaybookPlanCondition {
+            type_: "DependenciesWaiting".into(),
+            status: "False".into(),
+            reason: Some("DependenciesMet".into()),
+            message: Some(
+                "every host the plan's inventories resolve to has the dependencies they require"
+                    .into(),
+            ),
+            last_transition_time: Some(now),
+        }
+    } else {
+        let named: Vec<String> = waiting
+            .iter()
+            .take(NAMED_DEPENDENCIES)
+            .map(|entry| {
+                let dependency = &entry.dependency;
+                format!(
+                    "{} host(s) in group '{}' of ClusterInventory '{}' waiting for {}/{} ({})",
+                    dependency.waiting,
+                    dependency.group,
+                    entry.inventory,
+                    dependency.provider_namespace,
+                    dependency.provider_name,
+                    dependency.requirement
+                )
+            })
+            .collect();
+        let mut message = named.join("; ");
+        if let Some(rest) = waiting
+            .len()
+            .checked_sub(NAMED_DEPENDENCIES)
+            .filter(|rest| *rest > 0)
+        {
+            message.push_str(&format!("; and {rest} more"));
+        }
+
+        PlaybookPlanCondition {
+            type_: "DependenciesWaiting".into(),
+            status: "True".into(),
+            reason: Some("HostsWaiting".into()),
+            message: Some(message),
+            last_transition_time: Some(now),
+        }
+    };
+
+    upsert_condition(&mut status.conditions, condition);
+}
+
+/// Adds the one clause the summary column has room for: how many hosts a dependency is keeping out.
+///
+/// **Appended, never substituted.** The summary's job is to say what the plan is doing, and a wait
+/// for another plan does not replace that — it qualifies it. `5/5 up-to-date` beside an inventory
+/// holding eight more machines back is true and misleading in exactly the way this fixes.
+///
+/// Only while the plan is idle. A plan mid-run has a summary about that run, which is what someone
+/// watching it wants; the dependencies are still on the condition, and the clause reappears when the
+/// run ends.
+///
+/// Counted over distinct requirements' waiting hosts, which may name the same Node twice if two
+/// dependencies hold it — the condition is where the breakdown is, and the largest single wait is
+/// the honest headline for one clause.
+pub fn append_dependency_summary_clause(
+    status: &mut PlaybookPlanStatus,
+    dependencies: &[InventoryDependency],
+) {
+    if status.active_run.is_some() {
+        return;
+    }
+
+    let Some(waiting) = dependencies
+        .iter()
+        .map(|entry| entry.dependency.waiting)
+        .max()
+        .filter(|waiting| *waiting > 0)
+    else {
+        return;
+    };
+
+    if let Some(summary) = status.summary.as_mut() {
+        summary.push_str(&format!(" ({waiting} host(s) waiting for dependencies)"));
+    }
 }
 
 /// Sets the plan-level `Blocked` condition, which reports whether this run is currently waiting on
@@ -540,6 +671,181 @@ mod tests {
                 .any(|condition| condition.type_ == "Running"),
             "and nothing else is disturbed"
         );
+    }
+
+    fn dependency(inventory: &str, provider: &str, waiting: usize) -> InventoryDependency {
+        InventoryDependency {
+            inventory: inventory.to_string(),
+            dependency: DependencyStatus {
+                group: "workers".into(),
+                key: format!("platform.plan.ansible.cloudbending.dev/{provider}"),
+                provider_namespace: "platform".into(),
+                provider_name: provider.to_string(),
+                requirement: "Ge 1.4.0".into(),
+                waiting,
+                satisfied: 1,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The condition a dependent's author reads to tell "not yet" from "never": which inventory,
+    /// which group, which provider, and how many machines are still to come.
+    #[test]
+    fn a_waiting_dependency_is_named_on_the_plan() {
+        let mut status = PlaybookPlanStatus::default();
+
+        set_dependencies_waiting_condition(
+            &mut status,
+            &[dependency("workers-ci", "containerd", 3)],
+        );
+
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "DependenciesWaiting")
+            .expect("a plan with a dependency carries the condition");
+        assert_eq!(condition.status, "True");
+        assert_eq!(condition.reason.as_deref(), Some("HostsWaiting"));
+        let message = condition.message.as_deref().unwrap();
+        for expected in [
+            "3 host(s)",
+            "workers",
+            "workers-ci",
+            "platform/containerd",
+            "Ge 1.4.0",
+        ] {
+            assert!(
+                message.contains(expected),
+                "{message} should name {expected}"
+            );
+        }
+    }
+
+    /// A satisfied dependency is still a dependency: the plan says so rather than going quiet, so a
+    /// reader can tell "this plan depends on nothing" from "everything it depends on is done".
+    #[test]
+    fn a_satisfied_dependency_reports_false_rather_than_nothing() {
+        let mut status = PlaybookPlanStatus::default();
+
+        set_dependencies_waiting_condition(
+            &mut status,
+            &[dependency("workers-ci", "containerd", 0)],
+        );
+
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "DependenciesWaiting")
+            .unwrap();
+        assert_eq!(condition.status, "False");
+        assert_eq!(condition.reason.as_deref(), Some("DependenciesMet"));
+    }
+
+    /// A condition answering a question the plan does not pose is noise on every object that does
+    /// not have the problem — which is most of them.
+    #[test]
+    fn a_plan_without_dependencies_carries_no_condition() {
+        let mut status = PlaybookPlanStatus::default();
+        set_dependencies_waiting_condition(
+            &mut status,
+            &[dependency("workers-ci", "containerd", 3)],
+        );
+        set_running_condition(&mut status);
+
+        set_dependencies_waiting_condition(&mut status, &[]);
+
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|condition| condition.type_ == "DependenciesWaiting")
+        );
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.type_ == "Running"),
+            "and nothing else is disturbed"
+        );
+    }
+
+    /// A condition message is read, not parsed, so a plan gated on a dozen providers has to stop
+    /// somewhere and say how much it left out.
+    #[test]
+    fn the_message_names_three_dependencies_and_counts_the_rest() {
+        let mut status = PlaybookPlanStatus::default();
+        let dependencies: Vec<InventoryDependency> = (0..5)
+            .map(|index| dependency("workers-ci", &format!("provider-{index}"), 1))
+            .collect();
+
+        set_dependencies_waiting_condition(&mut status, &dependencies);
+
+        let message = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "DependenciesWaiting")
+            .and_then(|condition| condition.message.clone())
+            .unwrap();
+        assert!(message.contains("provider-2"));
+        assert!(!message.contains("provider-3"), "{message} stops at three");
+        assert!(message.ends_with("; and 2 more"), "{message}");
+    }
+
+    /// The summary says what the plan is doing; the wait qualifies it rather than replacing it. A
+    /// converged plan reading `5/5 up-to-date` beside an inventory holding eight machines back is
+    /// true and misleading in exactly the way this fixes.
+    #[test]
+    fn the_summary_clause_is_appended_to_an_idle_plan() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("5/5 up-to-date".into()),
+            ..Default::default()
+        };
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 3)]);
+
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("5/5 up-to-date (3 host(s) waiting for dependencies)")
+        );
+    }
+
+    /// Nothing to qualify: a plan whose dependencies are all met is simply doing what its summary
+    /// says.
+    #[test]
+    fn a_satisfied_dependency_leaves_the_summary_alone() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("5/5 up-to-date".into()),
+            ..Default::default()
+        };
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 0)]);
+
+        assert_eq!(status.summary.as_deref(), Some("5/5 up-to-date"));
+    }
+
+    /// A plan mid-run has a summary about that run, which is what someone watching it wants. The
+    /// wait is still on the condition, and the clause comes back when the run ends.
+    #[test]
+    fn a_running_plan_keeps_its_summary_about_the_run() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("applying to 3 hosts".into()),
+            active_run: Some(crate::v1beta1::ActiveRun {
+                execution_hash: "abc".into(),
+                run_id: "run".into(),
+                job_name: "plan-1".into(),
+                play_uid: "uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: None,
+            }),
+            ..Default::default()
+        };
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 3)]);
+
+        assert_eq!(status.summary.as_deref(), Some("applying to 3 hosts"));
     }
 
     /// The version travels with the hash and the timestamp, under one condition, so the three can

@@ -52,6 +52,18 @@ The drift count is genuinely `5/5` there, so the failure is named separately rat
 inferred from a column that reads like good news. The `Ready` condition says how that run went
 per-host.
 
+An idle plan whose inventories are [waiting on another plan](./cluster-nodes.md#depending-on-another-plan)
+adds one more clause:
+
+```text
+5/5 up-to-date (3 host(s) waiting for dependencies)
+```
+
+It qualifies the line rather than replacing it, because both halves are true: the five hosts the
+plan *has* are up to date, and three more are not its hosts yet. The clause reports the largest
+single wait and does not appear while a run is in progress, where the summary is about that run —
+the `DependenciesWaiting` condition has the full breakdown either way.
+
 ## Conditions
 
 `.status.conditions` carries `True`/`False` conditions. `Ready` and `Running` are also surfaced as
@@ -75,6 +87,15 @@ printer columns:
   (`nodeLabels.enabled=false`); the plan still runs, but it publishes nothing and every plan
   depending on it will wait without ever seeing its hosts. That is the condition to check first when
   a dependent plan resolves to fewer hosts than you expect and the provider looks healthy.
+- **`DependenciesWaiting`** — only on a plan whose inventories express a
+  [dependency](./cluster-nodes.md#depending-on-another-plan), saying whether any of them is still
+  holding Nodes back. `True`/`HostsWaiting` names up to three of them — the inventory, the group,
+  the provider and the requirement, with the count — and says "and N more" for the rest;
+  `False`/`DependenciesMet` means every host the plan's inventories resolve to has what it requires.
+  A plan that depends on nothing carries no such condition at all. The counts are the inventories'
+  own, copied rather than recomputed, so the plan and the `ClusterInventory` it names never
+  disagree — and they are therefore taken *before* the `NodeAccessPolicy` clamp this plan is subject
+  to: `.status.eligibleHosts` is what says which hosts it actually has.
 - **`Running`** — the operator has identified this run's own Job in a non-terminal state
   (`JobRunning`). It is set in the same reconcile that creates the Job (a run adopted during recovery
   picks it up on the next tick), and re-asserted on every tick that observes it unfinished, so it
@@ -911,6 +932,11 @@ one of three things, and the `ClusterInventory`'s `.status.dependencies` entry f
   problem: it declared a `spec.provides.version` that is not a version, so no ordered term will ever
   match its Nodes. Either give the provider a real version, or depend on it with `Exists` or `In`,
   which compare strings and need no ordering.
+
+A wait, a mistyped key and a provider that has been deleted all read the same way — as waiting for
+the plan the key names — and that is deliberate. The operator does not look the provider up, so it
+never claims one exists or does not; it prints the name it decoded, and `nosuch/typo` sitting in
+`providerName` is the mistake staring back at you.
 
 If nothing is flagged and `waiting` still does not move, the provider is not converging those hosts.
 Look at the provider plan named in `providerNamespace`/`providerName`: its `ProvidesLabels`
