@@ -19,7 +19,8 @@ group may use either selector form, following Kubernetes' label-selector semanti
 
 - **`matchLabels`** — an exact-match map; a Node must carry every listed label and value.
 - **`matchExpressions`** — a list of `{ key, operator, values }` terms with operators `In`, `NotIn`,
-  `Exists`, `DoesNotExist`.
+  `Exists`, `DoesNotExist`, and the ordered `Gt`, `Ge`, `Lt`, `Le` described under
+  [Comparing versions](#comparing-versions).
 
 ```yaml
 apiVersion: ansible.cloudbending.dev/v1beta1
@@ -54,6 +55,40 @@ their summary; the catching-up status write wakes them, normally within seconds.
 for a single `helm upgrade` that changes an inventory and a plan together, since Helm applies both in
 one pass and waits for no status.
 
+## Comparing versions
+
+`Gt`, `Ge`, `Lt` and `Le` order a Node's label value against the term's **single** value as a
+version — "at least 1.4.0", rather than one exact string you have to edit at every bump:
+
+```yaml
+matchExpressions:
+  - { key: platform.plan.ansible.cloudbending.dev/containerd-config, operator: Ge, values: ["1.4.0"] }
+```
+
+Both sides are read leniently and then ordered by [SemVer](https://semver.org): a leading `v` is
+optional, missing components count as zero (`1.4` is `1.4.0`), and build metadata after `+` or `_` is
+ignored. Two consequences to keep in mind:
+
+- **A pre-release sorts *before* its release.** `Ge 1.4.0` does not match `1.4.0-rc.1`, which is
+  usually what you want from a release candidate.
+- **A short value is filled up with zeros, including yours.** `Ge 2` is `Ge 2.0.0`, so it matches
+  `2.1.1` and every other 2.x — you do not have to spell out `2.0.0`. It only reads as "the 2.x
+  series" in that direction, though: `Le 2` is `Le 2.0.0` and therefore *excludes* `2.1.1`. To cap a
+  series, say `Lt 3`.
+- **A range is two terms.** Each term takes one value, and all terms in a group must hold, so
+  `Ge 1.4.0` plus `Lt 2.0.0` is how you express "1.x from 1.4 on".
+
+This is not the same as Kubernetes' own `Gt`/`Lt`, which exist only for node affinity and parse
+**both** sides as integers — a dotted version never matches one. Comparing as plain strings would be
+worse than useless here, since it sorts `1.10.0` before `1.9.0`. An integer is simply a
+one-component version to these operators, so anything Kubernetes' versions of them accept compares
+exactly as it would there.
+
+Anything the comparison cannot answer **does not match**: a Node without that label, a label value
+or term value that is not a version (`latest`, say), or a term listing zero or several values. A
+selector you expected to match nothing but Nodes that are ready therefore errs towards *not*
+running, never towards running somewhere it should not.
+
 ## Depending on another plan
 
 A plan that declares [`spec.provides`](./playbook-plans.md#declaring-what-a-plan-provides) labels
@@ -74,7 +109,16 @@ spec:
           operator: Exists
 ```
 
-Use `In` with `values` to require a particular version rather than any.
+`Exists` accepts whatever version the providing plan has applied. To require a particular one, use
+`In` for an exact value or `Ge` for "this version or newer" — see
+[Comparing versions](#comparing-versions):
+
+```yaml
+      matchExpressions:
+        - key: platform.plan.ansible.cloudbending.dev/containerd-config
+          operator: Ge
+          values: ["1.4.0"]
+```
 
 A host that is not ready yet is simply **not in the run** — it costs no attempt, holds no Lease and
 starts no proxy pod, which is exactly why this is expressed as a host set rather than as a wait

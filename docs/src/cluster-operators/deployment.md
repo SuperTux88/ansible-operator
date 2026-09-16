@@ -322,6 +322,13 @@ manifests are generated from the operator binary itself (`ansible-operator crds`
 the subchart's `templates/` directory.
 The regeneration procedure lives in `chart/README.md`.
 
+### Schema changes are part of an upgrade
+
+A release using `crds.install: false` owns this step itself: apply the definitions shipped with the
+new chart version *before* the operator that expects them. A field or a selector operator a plan
+author writes is rejected by the API server while an older schema is installed, and the rejection
+names the CRD rather than the chart, so it reads like an authoring mistake.
+
 The chart declares `kubeVersion: ">=1.25.0-0"` because two CRDs use **CRD validation rules**
 (`x-kubernetes-validations`):
 
