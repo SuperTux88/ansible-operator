@@ -140,6 +140,12 @@ struct ReconciliationContext {
     /// own live read, because the allow-set is a security gate and must not be served from a cache
     /// (INV-5).
     nodes: Arc<Store<Node>>,
+    /// Reflector-backed cache of every `PlaybookPlan` in the cluster, read for one question: is the
+    /// plan this tick is reconciling still there, asked immediately before its Node labels are
+    /// published (`plan_still_exists`). It is a *different* store from the one the `Controller`
+    /// handed this reconcile its object out of, and it is the one the delete handler's stream keeps
+    /// current — which is what makes it the freshest answer available without a request.
+    plans: Arc<Store<PlaybookPlan>>,
     /// Image for the managed-ssh proxy pods (the node-root primitive — THREAT_MODEL T-ESC-5). Set by
     /// the admin via the chart's `managedSsh.proxyImage` (rendered to `proxy_image`); there is **no
     /// built-in default** — the operator refuses to start without it (see `config::require_proxy_image`
@@ -406,6 +412,7 @@ pub async fn new(
         ca,
         node_access_policies: Arc::clone(&node_access_policy_reflector_reader),
         nodes: Arc::clone(&node_reflector_reader),
+        plans: Arc::clone(&playbookplan_reflector_reader),
         proxy_image: settings.proxy_image,
         proxy_grace: settings.proxy_grace,
         node_labels_enabled: settings.node_labels_enabled,
@@ -1619,7 +1626,7 @@ async fn reconcile_node_labels(
         };
         let writes =
             node_labels::desired_labels(&key, target_groups, resource_status, &context.nodes);
-        if !writes.is_empty() {
+        if !writes.is_empty() && plan_still_exists(&context.plans, namespace, name) {
             node_labels::write_labels(&context.client, &key, &writes, &plan).await;
         }
         return;
@@ -1633,6 +1640,35 @@ async fn reconcile_node_labels(
         info!("PlaybookPlan {plan} no longer provides anything; removing {key} from {stale:?}");
         node_labels::remove_labels(&context.client, &key, &stale, &plan).await;
     }
+}
+
+/// Whether the plan this tick is reconciling is still in the cluster, asked immediately before its
+/// labels are published.
+///
+/// A tick holds the object it was handed at the start, so a plan deleted while it runs still looks
+/// present to it — and a label written after `withdraw_deleted_plans_labels` has already taken it
+/// off stands as a claim for a plan nobody has, with every dependent's inventory admitting that Node
+/// as ready. The plan reflector's store is the freshest answer available without a request: it is
+/// updated by the very stream that delivers `Event::Delete`, and is a different store from the one
+/// the `Controller` handed this reconcile its object out of.
+///
+/// This narrows the window to the write loop rather than closing it — a plan deleted just after the
+/// check still slips through, which is inherent in this design having no finalizer to hold (a plan
+/// must stay deletable while the operator is down). What is left is caught by
+/// [`sweep_orphaned_node_labels`] at the operator's next startup.
+///
+/// Only consulted when there is something to write. A converged provider produces an empty diff, so
+/// the common case never asks.
+fn plan_still_exists(plans: &Store<PlaybookPlan>, namespace: &str, name: &str) -> bool {
+    let present = plans.get(&ObjectRef::new(name).within(namespace)).is_some();
+
+    if !present {
+        info!(
+            "PlaybookPlan {namespace}/{name} was deleted while this tick ran; not publishing its Node labels"
+        );
+    }
+
+    present
 }
 
 /// Removes every operator-owned Node label whose plan no longer exists.
@@ -7070,6 +7106,33 @@ mod tests {
         drop(writer);
 
         await_node_cache(&reader).await;
+    }
+
+    /// A tick keeps the object it was handed, so a plan deleted while it runs still looks present to
+    /// it — and the labels it would then publish outlive the withdrawal the delete handler already
+    /// did, leaving a claim for a plan nobody has on every dependent's inventory. The reflector store
+    /// is asked instead, because the stream that keeps it current is the one that carries the
+    /// deletion.
+    #[test]
+    fn a_plan_deleted_while_its_tick_ran_does_not_publish_labels() {
+        let mut plan = PlaybookPlan::new("containerd", PlaybookPlanSpec::default());
+        plan.metadata.namespace = Some("platform".into());
+
+        let mut writer = Writer::<PlaybookPlan>::default();
+        let plans = writer.as_reader();
+        writer.apply_watcher_event(&watcher::Event::Init);
+        writer.apply_watcher_event(&watcher::Event::InitApply(plan.clone()));
+        writer.apply_watcher_event(&watcher::Event::InitDone);
+
+        assert!(plan_still_exists(&plans, "platform", "containerd"));
+        assert!(
+            !plan_still_exists(&plans, "other", "containerd"),
+            "the key is namespaced, so a same-named plan elsewhere is not this one"
+        );
+
+        writer.apply_watcher_event(&watcher::Event::Delete(plan));
+
+        assert!(!plan_still_exists(&plans, "platform", "containerd"));
     }
 
     fn node_watch_failed(
