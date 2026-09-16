@@ -1,5 +1,6 @@
 mod ansible_inventory;
 pub mod clusterinventorycontroller;
+pub mod dependency_keys;
 pub mod nodeaccesspolicycontroller;
 mod nodeselector;
 pub mod playbookplancontroller;
