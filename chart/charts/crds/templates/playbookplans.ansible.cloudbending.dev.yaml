@@ -1060,6 +1060,21 @@ spec:
                         `#[serde(default, ...)]` note on `PlaybookPlanStatus::next_run`.
                       nullable: true
                       type: string
+                    appliedVersion:
+                      description: |-
+                        The `spec.provides` version of the revision that stamped `lastAppliedHash` — moved by exactly
+                        the same outcome, and taken from that run's own `Play` rather than from the plan as it reads
+                        now.
+
+                        This is what a Node label is derived from, which is why it is recorded per host instead of
+                        read from the spec: the plan converges one host at a time, so at any moment some hosts carry
+                        the new revision and some still carry the old one, and each must be labelled with what it
+                        actually has.
+
+                        Absent for a plan that provides nothing, and absent on a record stamped before this field
+                        existed. A host with no version here is never labelled — see `node_labels`.
+                      nullable: true
+                      type: string
                     lastAppliedHash:
                       description: The execution hash last SUCCESSFULLY applied to this host. Only bumped on `HostOutcome::Succeeded`.
                       type: string

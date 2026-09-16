@@ -30,8 +30,13 @@ pub fn job_finished(job: &batch::v1::Job) -> bool {
 /// A non-terminal `Play` is a no-op rather than a partial application: the phase is decided *before*
 /// anything is written, so a caller that ever passes one leaves the plan untouched instead of
 /// half-updated.
+///
+/// `provides_version` is the version *that run's* record declared, not the plan's current one, and
+/// is `None` for a plan that provides nothing or a run whose record is gone. It is stamped beside
+/// the hash under exactly the same condition, so a host can never carry one without the other.
 pub fn apply_terminal_play_status(
     execution_hash: &ExecutionHash,
+    provides_version: Option<&str>,
     play_status: &PlayStatus,
     status: &mut PlaybookPlanStatus,
 ) {
@@ -84,6 +89,11 @@ pub fn apply_terminal_play_status(
             // Same source as `lastTransitionTime` below, so a replayed recovery dates the claim when
             // the run finished rather than when it was noticed.
             entry.applied_at = play_status.finished_at.or(Some(now));
+            // From the run, so the three halves of one claim — the revision, when it was made and
+            // what it provides — are always the same run's. A plan edited while this run was in
+            // flight already advertises the next version, and stamping that here would label the
+            // host for a revision it never received.
+            entry.applied_version = provides_version.map(str::to_string);
         }
         entry.last_outcome = result.outcome.clone();
         // The run's own finish time when the record carries one, so replaying a recovered result
@@ -435,6 +445,89 @@ mod tests {
         )
     }
 
+    /// The version travels with the hash and the timestamp, under one condition, so the three can
+    /// never describe different runs. A host that did not succeed keeps whatever it had: the label
+    /// derived from it still says "this version was applied here at some point", which a later
+    /// failure does not undo.
+    #[test]
+    fn only_a_succeeding_host_is_given_the_runs_version() {
+        let mut status = PlaybookPlanStatus::default();
+        let play_status = |outcome: HostOutcome| PlayStatus {
+            phase: PlayPhase::Failed,
+            host_count: 2,
+            hosts: BTreeMap::from([
+                (
+                    "worker-1".into(),
+                    crate::v1beta1::PlayHostResult {
+                        outcome: HostOutcome::Succeeded,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "worker-2".into(),
+                    crate::v1beta1::PlayHostResult {
+                        outcome,
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        apply_terminal_play_status(
+            &hash(),
+            Some("1.4.2"),
+            &play_status(HostOutcome::Succeeded),
+            &mut status,
+        );
+        let hosts = status.hosts_status.clone().unwrap();
+        assert_eq!(hosts["worker-1"].applied_version.as_deref(), Some("1.4.2"));
+        assert_eq!(hosts["worker-2"].applied_version.as_deref(), Some("1.4.2"));
+
+        // The next revision succeeds on worker-1 only.
+        apply_terminal_play_status(
+            &hash(),
+            Some("1.5.0"),
+            &play_status(HostOutcome::Failed),
+            &mut status,
+        );
+        let hosts = status.hosts_status.unwrap();
+        assert_eq!(hosts["worker-1"].applied_version.as_deref(), Some("1.5.0"));
+        assert_eq!(
+            hosts["worker-2"].applied_version.as_deref(),
+            Some("1.4.2"),
+            "a failed host keeps the version it did apply, like its hash"
+        );
+    }
+
+    /// A plan that declares nothing must leave the field absent rather than blank it to something —
+    /// `node_labels` reads "no version" as "label nothing", and that is the fail-closed answer.
+    #[test]
+    fn a_run_that_provides_nothing_records_no_version() {
+        let mut status = PlaybookPlanStatus::default();
+        let play_status = PlayStatus {
+            phase: PlayPhase::Succeeded,
+            host_count: 1,
+            hosts: BTreeMap::from([(
+                "worker-1".into(),
+                crate::v1beta1::PlayHostResult {
+                    outcome: HostOutcome::Succeeded,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        apply_terminal_play_status(&hash(), None, &play_status, &mut status);
+
+        let hosts = status.hosts_status.unwrap();
+        assert_eq!(hosts["worker-1"].applied_version, None);
+        assert_ne!(
+            hosts["worker-1"].last_applied_hash, "",
+            "the host is still converged; it just provides nothing"
+        );
+    }
+
     #[test]
     fn recovered_terminal_play_replaces_running_conditions() {
         let h = hash();
@@ -453,7 +546,7 @@ mod tests {
             ..Default::default()
         };
 
-        apply_terminal_play_status(&h, &play_status, &mut status);
+        apply_terminal_play_status(&h, None, &play_status, &mut status);
 
         let running = status
             .conditions
@@ -509,7 +602,7 @@ mod tests {
             ..Default::default()
         };
 
-        apply_terminal_play_status(&h, &play_status, &mut status);
+        apply_terminal_play_status(&h, None, &play_status, &mut status);
 
         let hosts = status.hosts_status.unwrap();
         assert_eq!(hosts["succeeded"].last_applied_hash, h.to_string());
@@ -576,7 +669,7 @@ mod tests {
             ..Default::default()
         };
 
-        apply_terminal_play_status(&h, &play_status, &mut status);
+        apply_terminal_play_status(&h, None, &play_status, &mut status);
 
         let hosts = status.hosts_status.unwrap();
         assert_eq!(
@@ -781,7 +874,7 @@ mod tests {
             ..Default::default()
         };
 
-        apply_terminal_play_status(&hash(), &play_status, &mut status);
+        apply_terminal_play_status(&hash(), None, &play_status, &mut status);
 
         let ready = status
             .conditions
@@ -802,6 +895,7 @@ mod tests {
         let mut status = PlaybookPlanStatus::default();
         apply_terminal_play_status(
             &hash(),
+            None,
             &PlayStatus {
                 phase: PlayPhase::Succeeded,
                 host_count: 1,
@@ -923,6 +1017,7 @@ mod tests {
 
         apply_terminal_play_status(
             &hash(),
+            None,
             &PlayStatus {
                 phase: PlayPhase::Unknown,
                 host_count: 1,
@@ -1067,6 +1162,7 @@ mod tests {
         );
         apply_terminal_play_status(
             &hash(),
+            None,
             &PlayStatus {
                 phase: PlayPhase::Failed,
                 host_count: 2,
@@ -1184,7 +1280,7 @@ mod tests {
             )]),
             ..Default::default()
         };
-        apply_terminal_play_status(&hash(), &play_status, &mut status);
+        apply_terminal_play_status(&hash(), None, &play_status, &mut status);
 
         assert!(!clear_inputs_unavailable_condition(&mut status, 0));
 

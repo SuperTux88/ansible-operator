@@ -96,6 +96,19 @@ pub struct PlaySpec {
     /// filtered to the hosts this run actually ran.
     pub inventory: Vec<ResolvedHosts>,
 
+    /// The version this run's revision declared in the plan's `spec.provides`, if it declared one.
+    ///
+    /// Recorded here rather than read from the live plan when a result is folded in, because the
+    /// two can legitimately differ: a plan edited while a run was in flight already advertises the
+    /// *next* version, and stamping that onto the hosts this run converged would label them for a
+    /// revision they never received. The run's own record is the only copy that still describes
+    /// what actually ran.
+    ///
+    /// Absent for a plan that provides nothing, and absent on every record written before this
+    /// field existed — no Node is ever labelled from such a record.
+    #[serde(default)]
+    pub provides_version: Option<String>,
+
     /// Start of the schedule slot consumed by this run. Unscheduled runs leave this absent. Keeping
     /// it in the immutable run record lets restart recovery distinguish this run's slot from a later
     /// slot that becomes due while the operator is unavailable.

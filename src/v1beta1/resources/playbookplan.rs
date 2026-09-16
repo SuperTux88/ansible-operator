@@ -546,6 +546,19 @@ pub struct HostStatus {
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub applied_at: Option<DateTime<FixedOffset>>,
+    /// The `spec.provides` version of the revision that stamped `lastAppliedHash` — moved by exactly
+    /// the same outcome, and taken from that run's own `Play` rather than from the plan as it reads
+    /// now.
+    ///
+    /// This is what a Node label is derived from, which is why it is recorded per host instead of
+    /// read from the spec: the plan converges one host at a time, so at any moment some hosts carry
+    /// the new revision and some still carry the old one, and each must be labelled with what it
+    /// actually has.
+    ///
+    /// Absent for a plan that provides nothing, and absent on a record stamped before this field
+    /// existed. A host with no version here is never labelled — see `node_labels`.
+    #[serde(default)]
+    pub applied_version: Option<String>,
     // See the `#[serde(default, ...)]` note on `PlaybookPlanStatus::next_run`.
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
@@ -636,6 +649,19 @@ impl Condition for PlaybookPlanCondition {
 }
 
 impl PlaybookPlan {
+    /// The version this plan declares in `spec.provides`, if it declares one.
+    ///
+    /// One accessor rather than the field read spelled out at each site: the version is read by the
+    /// execution hash, by the run record that a host's claim is later dated against, and by the Node
+    /// label diff. Those three answering differently is the one disagreement this design has no room
+    /// for — the label would then claim a revision that never ran.
+    pub fn provides_version(&self) -> Option<&str> {
+        self.spec
+            .provides
+            .as_ref()
+            .map(|provides| provides.version.as_str())
+    }
+
     pub fn timezone(&self) -> Result<Tz, chrono_tz::ParseError> {
         self.spec
             .time_zone
