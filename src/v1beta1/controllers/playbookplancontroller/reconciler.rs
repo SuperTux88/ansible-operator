@@ -853,7 +853,7 @@ async fn reconcile(
                     &api,
                     &unlaunched,
                     &mut resource_status,
-                    &error,
+                    &error.to_string(),
                 )
                 .await;
                 return Err(error);
@@ -995,7 +995,7 @@ async fn reconcile(
             unlaunched_run.as_ref(),
             &mut resource_status,
             &error,
-            error.to_string(),
+            InputFailure::same(error.to_string()),
         )
         .await?;
         return Err(error);
@@ -1019,7 +1019,7 @@ async fn reconcile(
                 unlaunched_run.as_ref(),
                 &mut resource_status,
                 &error,
-                format!("cannot resolve the plan's inventories: {error}"),
+                inventory_input_failure(&error),
             )
             .await?;
             return Err(error);
@@ -1112,7 +1112,7 @@ async fn reconcile(
                 unlaunched_run.as_ref(),
                 &mut resource_status,
                 &error,
-                format!("cannot read referenced Secrets: {error}"),
+                InputFailure::same(format!("cannot read referenced Secrets: {error}")),
             )
             .await?;
             return Err(error);
@@ -3959,6 +3959,55 @@ fn prune_retry_after(current: std::time::Duration) -> std::time::Duration {
     current.min(std::time::Duration::from_secs(15))
 }
 
+/// What a failed desired-input read says on the plan, in each of the two places it is said.
+///
+/// `summary` lands in the `Summary` print column, which `kubectl get playbookplans` renders on one
+/// line per plan, so it stays short enough to read there. `detail` is the `Ready`/`InputsUnavailable`
+/// message, which only a `describe` or a status read shows and therefore has room for the whole
+/// error. Both are built once at the call site, because only that site knows which error it just
+/// caught.
+struct InputFailure {
+    summary: String,
+    detail: String,
+}
+
+impl InputFailure {
+    /// One wording for both, for a read whose error text already fits a column.
+    fn same(text: String) -> Self {
+        Self {
+            summary: text.clone(),
+            detail: text,
+        }
+    }
+}
+
+/// How an inventory that would not resolve is stated in each place.
+///
+/// The full error goes to the condition, not the column: the column is one line beside a dozen
+/// others, and a name, a kind, a generation and the generation observed push every column after it
+/// off the terminal. What a reader needs there is which inventory, and whether this is a wait or a
+/// mistake; `describe` has the rest.
+///
+/// The wait gets the shortest form of all, because it is the one of these a healthy cluster meets
+/// during normal operation — every edit to an inventory's spec produces it — and it clears itself
+/// within seconds.
+fn inventory_input_failure(error: &ReconcileError) -> InputFailure {
+    let summary = match error {
+        ReconcileError::InventoryNotFound { kind, name } => format!("{kind} {name:?} not found"),
+        ReconcileError::InventoryNotSynced { name, .. } => {
+            format!("inventory {name:?} not in sync")
+        }
+        ReconcileError::ReservedInventoryVariable { group, key } => {
+            format!("inventory group {group:?} sets managed variable {key:?}")
+        }
+        _ => "cannot read the plan's inventories".to_string(),
+    };
+    InputFailure {
+        summary,
+        detail: format!("cannot resolve the plan's inventories: {error}"),
+    }
+}
+
 /// Reports on the plan that its desired inputs could not be read, for a tick with no run in
 /// flight to hold open.
 ///
@@ -3984,9 +4033,9 @@ async fn report_input_failure(
     api: &Api<PlaybookPlan>,
     object: &PlaybookPlan,
     resource_status: &mut PlaybookPlanStatus,
-    summary: String,
+    failure: InputFailure,
 ) {
-    record_input_failure(resource_status, summary);
+    record_input_failure(resource_status, failure);
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
         warn!(
             "Could not report a desired-input read failure on {:?}/{:?}: {patch_error}",
@@ -3997,9 +4046,9 @@ async fn report_input_failure(
 
 /// The status half of [`report_input_failure`], split from the write so the guard is unit-testable
 /// without a kube client — see that function for why each field is (or is not) touched.
-fn record_input_failure(status: &mut PlaybookPlanStatus, summary: String) {
-    status::set_inputs_unavailable_condition(status, &summary);
-    status.summary = Some(summary);
+fn record_input_failure(status: &mut PlaybookPlanStatus, failure: InputFailure) {
+    status::set_inputs_unavailable_condition(status, &failure.detail);
+    status.summary = Some(failure.summary);
     if status.active_run.is_none() {
         status.phase = phase_under_readiness_overlay(&status.phase);
         status.next_run = None;
@@ -4029,13 +4078,17 @@ fn record_input_failure(status: &mut PlaybookPlanStatus, summary: String) {
 /// node-root proxy pods and host Leases could not be released, and tells the reader which manual
 /// cleanup applies. Writing "run recovery paused" over that would replace a specific, actionable
 /// diagnosis with a vague one, for the same error.
+///
+/// `reason` is what the summary says after "run recovery paused". A desired-input read passes its
+/// [`InputFailure::summary`], so a held run states an inventory outage as briefly as the no-run
+/// path does; the condition beside it carries the whole error.
 async fn preserve_unlaunched_run_after_error(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
     api: &Api<PlaybookPlan>,
     unlaunched: &UnlaunchedRun,
     resource_status: &mut PlaybookPlanStatus,
-    error: &ReconcileError,
+    reason: &str,
 ) {
     let Ok((namespace, name)) = namespace_and_name(object) else {
         return;
@@ -4057,11 +4110,21 @@ async fn preserve_unlaunched_run_after_error(
         }
     }
 
-    if summary_unclaimed_since_adoption(resource_status, &unlaunched.run.mirror) {
-        resource_status.summary = Some(format!("run recovery paused: {error}"));
-    }
+    claim_paused_recovery_summary(resource_status, &unlaunched.run.mirror, reason);
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
         warn!("Could not report paused run recovery on {namespace}/{name}: {patch_error}");
+    }
+}
+
+/// The summary half of [`preserve_unlaunched_run_after_error`], split from the Lease renewal and the
+/// write so it is unit-testable without a kube client.
+fn claim_paused_recovery_summary(
+    status: &mut PlaybookPlanStatus,
+    active_run: &ActiveRun,
+    reason: &str,
+) {
+    if summary_unclaimed_since_adoption(status, active_run) {
+        status.summary = Some(format!("run recovery paused: {reason}"));
     }
 }
 
@@ -4081,7 +4144,7 @@ async fn report_desired_input_error(
     unlaunched: Option<&UnlaunchedRun>,
     resource_status: &mut PlaybookPlanStatus,
     error: &ReconcileError,
-    summary: String,
+    failure: InputFailure,
 ) -> Result<(), ReconcileError> {
     match unlaunched {
         Some(unlaunched) => {
@@ -4092,7 +4155,7 @@ async fn report_desired_input_error(
                 unlaunched,
                 resource_status,
                 error,
-                &summary,
+                &failure,
             )
             .await
         }
@@ -4100,7 +4163,7 @@ async fn report_desired_input_error(
         // deleted inventory or Secret would otherwise leave the last successful run's summary
         // standing while every tick fails in the log only.
         None => {
-            report_input_failure(api, object, resource_status, summary).await;
+            report_input_failure(api, object, resource_status, failure).await;
             Ok(())
         }
     }
@@ -4109,7 +4172,7 @@ async fn report_desired_input_error(
 /// Decides what a failed desired-input read means for a run whose Job does not exist yet, and
 /// reports the outage on the plan either way.
 ///
-/// `summary` is the same diagnostic the no-run path ([`report_input_failure`]) would have
+/// `failure` is the same diagnostic the no-run path ([`report_input_failure`]) would have
 /// written, and it is passed in rather than rebuilt here so both paths describe one outage in one
 /// wording. The readiness overlay is set before the branch because it is true of every outcome
 /// below: whether the run is held, adopted or given up, the plan cannot read what it should be
@@ -4132,9 +4195,9 @@ async fn handle_unlaunched_input_error(
     unlaunched: &UnlaunchedRun,
     resource_status: &mut PlaybookPlanStatus,
     error: &ReconcileError,
-    summary: &str,
+    failure: &InputFailure,
 ) -> Result<(), ReconcileError> {
-    status::set_inputs_unavailable_condition(resource_status, summary);
+    status::set_inputs_unavailable_condition(resource_status, &failure.detail);
 
     if !input_error_supersedes_unlaunched(error) {
         preserve_unlaunched_run_after_error(
@@ -4143,7 +4206,7 @@ async fn handle_unlaunched_input_error(
             api,
             unlaunched,
             resource_status,
-            error,
+            &failure.summary,
         )
         .await;
         return Ok(());
@@ -4162,7 +4225,7 @@ async fn handle_unlaunched_input_error(
     // give up on, only the previous run's verdict. The outage is already decided and true at this
     // point, so it is safe to publish ahead of what is done about it; the specific outcome replaces
     // the summary below on success.
-    resource_status.summary = Some(summary.to_string());
+    resource_status.summary = Some(failure.summary.clone());
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
         warn!("Could not report unreadable desired inputs on {namespace}/{name}: {patch_error}");
     }
@@ -10250,6 +10313,94 @@ spec:
         assert_eq!(idle.retry_count_slot, None);
     }
 
+    /// The commonest inventory failure there is: an inventory whose controller has not caught up
+    /// with a spec edit yet.
+    fn unsynced_inventory() -> ReconcileError {
+        ReconcileError::InventoryNotSynced {
+            name: "workers-ci".into(),
+            generation: 5,
+            observed: "4".into(),
+        }
+    }
+
+    /// The `Summary` column is one line beside a dozen others in `kubectl get`, so it says which
+    /// inventory and what kind of failure this is, and nothing more. The condition is what carries
+    /// the generations, the kind and the phrasing the troubleshooting docs quote.
+    /// The held-run path is where the not-in-sync wait arrives, since it is the input failure that
+    /// does not give an unlaunched run up, so it states the outage as briefly as the no-run path.
+    #[test]
+    fn a_held_run_states_an_inventory_wait_briefly() {
+        let active_run = ActiveRun {
+            execution_hash: "1".into(),
+            run_id: "run-1".into(),
+            job_name: "apply-plan-1-4".into(),
+            play_uid: "play-uid".into(),
+            hosts: vec!["worker-1".into()],
+            run_number: 4,
+            attempt: 4,
+            triggered_slot: None,
+        };
+        let error = unsynced_inventory();
+        assert!(!input_error_supersedes_unlaunched(&error));
+
+        let mut status = PlaybookPlanStatus::default();
+        adopt_recovered_run(&mut status, &active_run);
+        claim_paused_recovery_summary(
+            &mut status,
+            &active_run,
+            &inventory_input_failure(&error).summary,
+        );
+
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("run recovery paused: inventory \"workers-ci\" not in sync")
+        );
+    }
+
+    #[test]
+    fn an_inventory_failure_is_short_in_the_column_and_complete_in_the_condition() {
+        let waiting = inventory_input_failure(&unsynced_inventory());
+        assert_eq!(waiting.summary, "inventory \"workers-ci\" not in sync");
+        assert_eq!(
+            waiting.detail,
+            "cannot resolve the plan's inventories: Referenced ClusterInventory \"workers-ci\" \
+             has not published its resolved hosts for generation 5 yet (observed: 4)"
+        );
+
+        assert_eq!(
+            inventory_input_failure(&ReconcileError::InventoryNotFound {
+                kind: "ClusterInventory",
+                name: "workers-ci".into(),
+            })
+            .summary,
+            "ClusterInventory \"workers-ci\" not found"
+        );
+        assert_eq!(
+            inventory_input_failure(&ReconcileError::InventoryNotFound {
+                kind: "StaticInventory",
+                name: "workers-ci".into(),
+            })
+            .summary,
+            "StaticInventory \"workers-ci\" not found",
+            "a plan may reference both kinds under one name, so the column says which is missing"
+        );
+        assert_eq!(
+            inventory_input_failure(&ReconcileError::ReservedInventoryVariable {
+                group: "workers".into(),
+                key: "ansible_user".into(),
+            })
+            .summary,
+            "inventory group \"workers\" sets managed variable \"ansible_user\""
+        );
+
+        // An API error carries no inventory to name, and its own text belongs in the condition
+        // rather than in a column it would overrun.
+        assert_eq!(
+            inventory_input_failure(&ReconcileError::PreconditionFailed("nope")).summary,
+            "cannot read the plan's inventories"
+        );
+    }
+
     /// A plan that cannot read its own inputs reports the outage without erasing what its last run
     /// did. The summary and `Ready` condition carry the current failure; `nextRun` is cleared because
     /// that slot cannot fire, while a terminal verdict remains true.
@@ -10279,7 +10430,10 @@ spec:
             )])),
             ..Default::default()
         };
-        record_input_failure(&mut idle, "cannot read referenced Secrets: nope".into());
+        record_input_failure(
+            &mut idle,
+            InputFailure::same("cannot read referenced Secrets: nope".into()),
+        );
         assert_eq!(idle.phase, Phase::Succeeded);
         assert_eq!(idle.next_run, None);
         assert_eq!(
@@ -10305,10 +10459,7 @@ spec:
             next_run: Some(slot),
             ..Default::default()
         };
-        record_input_failure(
-            &mut waiting,
-            "cannot resolve the plan's inventories: nope".into(),
-        );
+        record_input_failure(&mut waiting, inventory_input_failure(&unsynced_inventory()));
         assert_eq!(waiting.phase, Phase::Pending);
         assert_eq!(waiting.next_run, None);
 
@@ -10328,7 +10479,7 @@ spec:
         };
         record_input_failure(
             &mut applying,
-            "cannot resolve the plan's inventories: nope".into(),
+            inventory_input_failure(&unsynced_inventory()),
         );
         assert_eq!(applying.phase, Phase::Applying);
     }
@@ -10346,10 +10497,7 @@ spec:
             &mut held,
             Some(status::WaitingForNodes::NodesNotReady(&nodes)),
         );
-        record_input_failure(
-            &mut held,
-            "cannot resolve the plan's inventories: nope".into(),
-        );
+        record_input_failure(&mut held, inventory_input_failure(&unsynced_inventory()));
         assert!(
             !status::held_for_unready_nodes(&held),
             "the hold ended when the inventory that named its hosts stopped resolving"
@@ -10377,7 +10525,7 @@ spec:
         );
         record_input_failure(
             &mut waiting_on_proxies,
-            "cannot resolve the plan's inventories: nope".into(),
+            inventory_input_failure(&unsynced_inventory()),
         );
         let waiting = waiting_on_proxies
             .conditions
@@ -10419,7 +10567,7 @@ spec:
         };
         record_input_failure(
             &mut succeeded,
-            "cannot read referenced Secrets: temporary failure".into(),
+            InputFailure::same("cannot read referenced Secrets: temporary failure".into()),
         );
         assert_eq!(succeeded.phase, Phase::Succeeded);
         assert_eq!(succeeded.next_run, None);
@@ -10446,10 +10594,7 @@ spec:
             )])),
             ..Default::default()
         };
-        record_input_failure(
-            &mut failed,
-            "cannot resolve the plan's inventories: temporary failure".into(),
-        );
+        record_input_failure(&mut failed, inventory_input_failure(&unsynced_inventory()));
         assert_eq!(failed.phase, Phase::Failed);
         assert_eq!(failed.next_run, None);
 

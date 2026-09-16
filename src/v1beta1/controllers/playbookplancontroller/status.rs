@@ -544,7 +544,7 @@ pub fn set_run_record_lost_condition(status: &mut PlaybookPlanStatus, job_name: 
 }
 
 /// Marks the plan as not ready because one of its desired inputs could not be read. The message is
-/// the same diagnostic shown in the plan summary.
+/// the full diagnostic, of which the plan summary may show only a short form.
 pub fn set_inputs_unavailable_condition(status: &mut PlaybookPlanStatus, message: &str) {
     set_ready_overlay(status, "InputsUnavailable", message);
 }
@@ -1657,7 +1657,7 @@ mod tests {
     }
 
     /// A second, *different* outage under the same reason has to replace the message. The summary is
-    /// written from the same diagnostic, so a condition that kept the first one would sit next to a
+    /// written from the same failure, so a condition that kept the first one would sit next to a
     /// summary naming a different failure — and the reader has no way to tell which is current.
     /// `lastTransitionTime` must not move for it: the status never changed, and it is what a reader
     /// ages a stuck condition by.
