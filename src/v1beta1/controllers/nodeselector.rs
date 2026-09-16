@@ -43,7 +43,18 @@ fn node_matches_match_labels(node: &PartialObjectMeta<Node>, labels: &v1beta1::L
 
     labels
         .iter()
-        .all(|(key, value)| actual_labels.get(key).is_some_and(|v| v == value))
+        .all(|(key, value)| eval_match_label(actual_labels, key, value))
+}
+
+/// Evaluates a single `matchLabels` entry against a raw label map — equality, and an absent label
+/// never satisfies one.
+///
+/// Its own function so that the dependency diagnostics can ask about one entry at a time
+/// (`clusterinventorycontroller::dependencies`) and get exactly the answer the matching gives. Two
+/// implementations of "does this Node satisfy this entry" would let a group's reported waits
+/// disagree with the hosts it actually resolves to.
+pub(crate) fn eval_match_label(labels: &BTreeMap<String, String>, key: &str, value: &str) -> bool {
+    labels.get(key).is_some_and(|actual| actual == value)
 }
 
 fn node_matches_match_expressions(
@@ -57,7 +68,14 @@ fn node_matches_match_expressions(
 }
 
 /// Evaluates a single `matchExpressions` term against a raw label map.
-fn eval_expression(labels: &BTreeMap<String, String>, expr: &SelectorExpression) -> bool {
+///
+/// Visible to the crate for the same reason as [`eval_match_label`]: the dependency diagnostics
+/// evaluate a selector one term at a time, and must reach the same verdict term for term as the
+/// matching they explain.
+pub(crate) fn eval_expression(
+    labels: &BTreeMap<String, String>,
+    expr: &SelectorExpression,
+) -> bool {
     match expr.operator {
         SelectorOperator::In => {
             matches_expression_in(labels, &expr.key, expr.values.as_deref().unwrap_or(&[]))
@@ -84,10 +102,7 @@ pub fn selector_matches(
     let matches_labels = selector
         .match_labels
         .as_ref()
-        .map(|ml| {
-            ml.iter()
-                .all(|(k, v)| labels.get(k).is_some_and(|actual| actual == v))
-        })
+        .map(|ml| ml.iter().all(|(k, v)| eval_match_label(labels, k, v)))
         .unwrap_or(true);
 
     let matches_expressions = selector

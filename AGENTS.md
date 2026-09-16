@@ -79,6 +79,7 @@ src/v1beta1/
   controllers/
     playbookplancontroller/          the big one — see below
     clusterinventorycontroller/      resolves Node → hosts, watches Nodes, writes ClusterInventoryStatus
+      dependencies.rs                pure: splits a group's selector into its terms and counts, per positive requirement on an operator-owned key (`dependency_keys`), how many of the group's Nodes it is holding back. "The group's Nodes" are the ones passing every term that is *not* a dependency — that is what separates "not ready yet" from "not this group's Node", which is the whole diagnostic. Judges every term with `nodeselector`'s own evaluator; a second implementation would let the reported waits disagree with the hosts the inventory resolves to
     nodeaccesspolicycontroller/      writes NodeAccessPolicyStatus (matched namespaces / allowed nodes) for observability; watches ns + nodes
     selector_trigger.rs              label_changes: the set-valued controllers' watch trigger — ticks only on a label change, an appearance or a disappearance; must stay in lockstep with what nodeselector.rs reads
     ansible_inventory.rs             ResolvedInventoryGroup (ManagedSsh | Ssh) + ResolvedHosts; AnsibleInventory trait (get_hosts); distinct_hosts/_count (every host-population count, in both controllers)

@@ -893,6 +893,32 @@ Note that `localhost` here is Ansible's *implicit* localhost, which `all` never 
 targets `all`. A `StaticInventory` host that happens to be named `localhost` is an ordinary host of
 the plan and is reported like any other.
 
+### A dependency never becomes satisfied
+
+A [dependency](./cluster-nodes.md#depending-on-another-plan) that is simply not finished yet shows a
+`waiting` count that falls as the provider works through its hosts. One that never moves is usually
+one of three things, and the `ClusterInventory`'s `.status.dependencies` entry flags each of them:
+
+- **`invalidValue: true`** — the term's own value is not a version, under an operator that orders
+  versions (`Ge`, `Gt`, `Lt`, `Le`). `values: ["latest"]` is the common case. Such a term matches
+  **nothing**, so `waiting` beside it is the whole group. Fix the selector.
+- **`malformedTerm: true`** — an ordered operator listing zero or several values. Each of them takes
+  exactly one, and a range is [two terms](./cluster-nodes.md#comparing-versions). This one also
+  matches nothing, and it is not rejected when you apply the inventory, so the flag is the only
+  warning you get.
+- **`unparseableHosts: N`** — `N` of the waiting Nodes *do* carry the label, with a value no
+  comparison can order (again, `latest`). Here the selector is fine and the **provider** is the
+  problem: it declared a `spec.provides.version` that is not a version, so no ordered term will ever
+  match its Nodes. Either give the provider a real version, or depend on it with `Exists` or `In`,
+  which compare strings and need no ordering.
+
+If nothing is flagged and `waiting` still does not move, the provider is not converging those hosts.
+Look at the provider plan named in `providerNamespace`/`providerName`: its `ProvidesLabels`
+condition ([above](#conditions)) says whether it is publishing at all, and its own per-host outcomes
+say whether it has succeeded there. Remember that a `OneShot` provider whose
+[attempt budget](./scheduling-and-modes.md#retries) is spent will not pick up newly eligible hosts
+until its inputs change.
+
 ### A change is not being picked up
 
 Only inputs that feed the [execution hash](./scheduling-and-modes.md#drift-detection) — the playbook
