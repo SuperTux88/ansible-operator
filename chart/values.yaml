@@ -82,6 +82,34 @@ securityContext:
   # itself, only the ephemeral managed-ssh proxy pods it creates do.
   allowPrivilegeEscalation: false
 
+# Node labels a PlaybookPlan publishes for other plans to depend on.
+#
+# A plan that sets `spec.provides` labels every Node it converged with
+# `<namespace>.plan.ansible.cloudbending.dev/<plan-name>: <version>`, and another plan's
+# ClusterInventory can select on that label so its own runs only reach hosts the first plan has
+# finished with. Ordinary workloads can use the same label in nodeAffinity.
+nodeLabels:
+  # Grants the operator `patch` on Nodes and turns the feature on. Set to false if the operator must
+  # not write to Node objects at all: plans with `spec.provides` still run, and report in their
+  # status that node labels are disabled on this cluster, so a plan waiting on one of them says why.
+  #
+  # Turning it off also takes away the permission to REMOVE labels already written, so the operator
+  # logs the leftovers it finds at startup instead of cleaning them up. Remove them with
+  # `kubectl label nodes --all <key>-`.
+  enabled: true
+  # Renders a ValidatingAdmissionPolicy that holds the operator's `patch` on Nodes to exactly those
+  # labels — every other label, and everything outside metadata.labels, must be unchanged. It
+  # applies only to requests from the operator's own ServiceAccount, so it never constrains an
+  # administrator.
+  #
+  # ValidatingAdmissionPolicy is generally available from Kubernetes 1.30, while this chart supports
+  # 1.25 and up. On an older cluster set this to false: the feature keeps working and the permission
+  # is simply unguarded. The install fails loudly ("no matches for kind ValidatingAdmissionPolicy")
+  # rather than the guard being dropped silently, which is why this is an explicit choice and not a
+  # `.Capabilities.APIVersions.Has` check — `helm template` without `--api-versions` reports the API
+  # as missing, so a rendering pipeline would quietly ship the permission without its guard.
+  admissionPolicy: true
+
 # Optional egress NetworkPolicies. Rules use the native networking.k8s.io/v1 NetworkPolicy egress
 # schema. Disabled by default so an upgrade never broadens or changes existing network controls.
 #

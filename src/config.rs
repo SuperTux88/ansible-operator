@@ -56,6 +56,18 @@ pub struct OperatorConfig {
     #[serde(default)]
     pub managed_ssh: ManagedSshConfig,
 
+    /// Whether the operator may write the dependency labels of plans that set `spec.provides` onto
+    /// Nodes. Rendered by the Helm chart from `nodeLabels.enabled` into the `[node_labels]` table;
+    /// absent ⇒ the feature is on, which matches the chart default.
+    ///
+    /// The same chart value decides whether the ClusterRole grants `nodes: patch`, and the two have
+    /// to agree: without the grant the operator would retry writes the API server refuses, and
+    /// without the flag it would hold a cluster-wide write permission it never uses. The flag is
+    /// what makes the *absence* visible — a plan with `provides` says in its status that node
+    /// labels are disabled here, rather than a dependent waiting forever with no stated cause.
+    #[serde(default)]
+    pub node_labels: NodeLabelsConfig,
+
     /// Egress rules applied to generated Ansible Job pods.
     #[serde(default, deserialize_with = "deserialize_network_policy_egress")]
     pub playbook_network_policy_egress: Option<Vec<NetworkPolicyEgressRule>>,
@@ -89,6 +101,23 @@ where
             Ok(Some(parsed))
         }
         None => Ok(None),
+    }
+}
+
+/// The `[node_labels]` config table: whether the operator may publish a plan's `spec.provides`
+/// version onto the Nodes it converged. See [`OperatorConfig::node_labels`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct NodeLabelsConfig {
+    pub enabled: bool,
+}
+
+impl Default for NodeLabelsConfig {
+    /// On, like the chart value it is rendered from. A config written before this table existed
+    /// belongs to a release whose ClusterRole has no `nodes: patch` either, so the feature cannot
+    /// act on the default until an upgrade grants it.
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 

@@ -26,6 +26,19 @@ proxy policy defaults to an empty array (`[]`), NetworkPolicy's deny-all-egress,
 only needs inbound SSH. Do not use `[]` for the operator or playbook unless deliberately blocking
 their outbound connections.
 
+### Node labels
+
+`nodeLabels.enabled` (default `true`) grants the operator `patch` on Nodes, which is what lets a
+`PlaybookPlan` with `spec.provides` publish `<namespace>.plan.ansible.cloudbending.dev/<plan-name>`
+onto the Nodes it converged, for other plans to depend on. `nodeLabels.admissionPolicy` (default
+`true`) renders a `ValidatingAdmissionPolicy` that holds that grant to exactly those keys.
+
+`ValidatingAdmissionPolicy` is generally available from Kubernetes **1.30**, while this chart's
+`kubeVersion` allows 1.25. On an older cluster the install fails with `no matches for kind
+"ValidatingAdmissionPolicy"`; set `nodeLabels.admissionPolicy=false` to keep the feature with an
+unguarded permission, or `nodeLabels.enabled=false` to give up the feature and the permission
+together. There is deliberately no capability auto-detection — see the comments in `values.yaml`.
+
 ### Pod Security Admission
 
 Managed-ssh proxy pods (created dynamically by the operator at runtime, not by this chart) run
