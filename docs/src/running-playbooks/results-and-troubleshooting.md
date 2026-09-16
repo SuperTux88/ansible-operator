@@ -359,15 +359,18 @@ reconcile.
 Three summaries report that the operator could not read or build what the plan says it should be
 running, and so could not decide anything this tick:
 
-- **"cannot resolve the plan's inventories: …"** — a referenced `ClusterInventory` or
-  `StaticInventory` could not be read, or one of them is not usable. Two forms need an edit rather
-  than a retry: `Referenced ClusterInventory "…" does not exist` (the reference is wrong or the
-  inventory was deleted) and `Inventory group "…" sets variable "…"` (a group sets one of the
-  connection variables the operator owns). One form needs nothing at all: `Referenced
-  ClusterInventory "…" has not published its resolved hosts for generation N yet` means that
-  inventory's own controller has not caught up with a spec edit, so the plan is holding rather than
-  running against the hosts the previous spec resolved to — its next status write wakes the plan,
-  normally within seconds. Anything else is an API error to retry.
+- **"inventory … not in sync" / "ClusterInventory … not found" / "StaticInventory … not found" / "inventory group … sets managed variable
+  …" / "cannot read the plan's inventories"** — a referenced `ClusterInventory` or `StaticInventory`
+  could not be read, or one of them is not usable. The summary is kept short enough for the
+  `Summary` column; the `Ready` condition carries the full diagnostic, prefixed with `cannot resolve
+  the plan's inventories:`. Two forms need an edit rather than a retry: `ClusterInventory "…" not found` or
+  `StaticInventory "…" not found` (the reference of that kind is wrong or the inventory was deleted) and `inventory group "…" sets managed
+  variable "…"` (a group sets one of the connection variables the operator owns). One form needs
+  nothing at all: `inventory "…" not in sync` means that inventory's own controller has not caught
+  up with a spec edit, so the plan is holding rather than running against the hosts the previous
+  spec resolved to — its next status write wakes the plan, normally within seconds; the condition
+  names the generation it is waiting for and the one the inventory last observed. Anything else is
+  an API error to retry, summarized as `cannot read the plan's inventories`.
 - **"cannot read referenced Secrets: …"** — a Secret named by `spec.template.variables` or
   `spec.template.files` could not be read. `Referenced Secret "…" does not exist` means the reference
   is wrong or the Secret was deleted; anything else is an API error to retry.
@@ -559,7 +562,8 @@ instead, and `.status.activeRun` names the run it is waiting on:
   run is deliberately *held*, not dropped: its host locks keep being renewed so no other plan can
   start on those hosts while the question is open, and the operator retries every tick. Unlike the
   messages above, this one can persist indefinitely if the underlying read never succeeds — the rest
-  of the message is the error to fix. A read that fails because the resource is simply *gone* is not
+  of the message says what to fix, briefly for an inventory (the `InputsUnavailable` condition has
+  the full error). A read that fails because the resource is simply *gone* is not
   this case; see the next message.
 - **"aborted the run because its desired inputs cannot be resolved: …"** — the same lookup failed in
   a way that cannot be transient: a referenced `ClusterInventory`/`StaticInventory` or a referenced
