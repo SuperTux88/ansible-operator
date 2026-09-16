@@ -322,6 +322,21 @@ manifests are generated from the operator binary itself (`ansible-operator crds`
 the subchart's `templates/` directory.
 The regeneration procedure lives in `chart/README.md`.
 
+### Schema changes are part of an upgrade
+
+A release using `crds.install: false` owns this step itself: apply the definitions shipped with the
+new chart version *before* the operator that expects them. A field or a selector operator a plan
+author writes is rejected by the API server while an older schema is installed, and the rejection
+names the CRD rather than the chart, so it reads like an authoring mistake.
+
+**Rolling back** the operator is only as safe as the resources tenants have written in the meantime,
+because a downgrade does not undo those. A `ClusterInventory` whose group selects with `Gt`, `Ge`,
+`Lt` or `Le` cannot be *deserialized* by an operator from before those operators existed, and its
+Node-to-host resolution reads inventories a page at a time — so one such object stalls the inventory
+controller for **every** inventory, not only that one, and plans keep running against the hosts last
+published. Change those selectors back to `In`/`Exists` before rolling back, or roll forward
+instead.
+
 The chart declares `kubeVersion: ">=1.25.0-0"` because two CRDs use **CRD validation rules**
 (`x-kubernetes-validations`):
 
