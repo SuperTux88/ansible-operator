@@ -3,8 +3,8 @@ use k8s_openapi::api::batch;
 use crate::{
     utils::upsert_condition,
     v1beta1::{
-        HostOutcome, Phase, PlayPhase, PlayStatus, PlaybookPlanCondition, PlaybookPlanStatus,
-        distinct_host_count,
+        DependencyStatus, HostOutcome, Phase, PlayPhase, PlayStatus, PlaybookPlanCondition,
+        PlaybookPlanStatus, distinct_host_count,
     },
 };
 
@@ -30,8 +30,13 @@ pub fn job_finished(job: &batch::v1::Job) -> bool {
 /// A non-terminal `Play` is a no-op rather than a partial application: the phase is decided *before*
 /// anything is written, so a caller that ever passes one leaves the plan untouched instead of
 /// half-updated.
+///
+/// `provides_version` is the version *that run's* record declared, not the plan's current one, and
+/// is `None` for a plan that provides nothing or a run whose record is gone. It is stamped beside
+/// the hash under exactly the same condition, so a host can never carry one without the other.
 pub fn apply_terminal_play_status(
     execution_hash: &ExecutionHash,
+    provides_version: Option<&str>,
     play_status: &PlayStatus,
     status: &mut PlaybookPlanStatus,
 ) {
@@ -79,6 +84,16 @@ pub fn apply_terminal_play_status(
         let entry = hosts_status.entry(host.clone()).or_default();
         if result.outcome == HostOutcome::Succeeded {
             entry.last_applied_hash = execution_hash.to_string();
+            // Stamped with the hash and only with the hash: it dates the *claim*, so that a Node
+            // registered after it can be recognised as a different machine (`node_recreation`).
+            // Same source as `lastTransitionTime` below, so a replayed recovery dates the claim when
+            // the run finished rather than when it was noticed.
+            entry.applied_at = play_status.finished_at.or(Some(now));
+            // From the run, so the three halves of one claim — the revision, when it was made and
+            // what it provides — are always the same run's. A plan edited while this run was in
+            // flight already advertises the next version, and stamping that here would label the
+            // host for a revision it never received.
+            entry.applied_version = provides_version.map(str::to_string);
         }
         entry.last_outcome = result.outcome.clone();
         // The run's own finish time when the record carries one, so replaying a recovered result
@@ -98,6 +113,243 @@ pub fn apply_terminal_play_status(
         },
     );
     upsert_condition(&mut status.conditions, ready);
+}
+
+/// What a providing plan publishes, and how far it currently reaches.
+pub struct ProvidedLabel<'a> {
+    /// The key derived from the plan's own namespace and name.
+    pub key: &'a str,
+    /// The version the plan's spec declares — what a converged host's label becomes.
+    pub version: &'a str,
+    /// How many Nodes in the cluster carry the key, at whatever version.
+    ///
+    /// The plan's *reach*, not a claim about any dependent's inventory: a `NodeAccessPolicy` may
+    /// narrow what a given dependent can actually use.
+    pub nodes: usize,
+}
+
+/// Reports whether this plan's `spec.provides` claim is actually reaching the Nodes, and how far.
+///
+/// Only present on a plan that provides something — for every other plan the question is meaningless
+/// and a condition answering it would be noise, so dropping `provides` drops the condition too.
+///
+/// It names the key and the count so that both ends of a dependency are readable on their own
+/// objects. A dependent says it is waiting for `platform/containerd-config`; the provider says what
+/// it publishes and on how many Nodes, and the two numbers together are the rollout. Without it,
+/// answering "is the provider actually doing anything?" means going to the Nodes.
+///
+/// The `False` case is the one this exists for. With the chart's `nodeLabels.enabled` turned off the
+/// operator has no `nodes: patch`, so a plan with `provides` runs perfectly well and publishes
+/// nothing — and every plan depending on it waits forever, looking exactly like a typo in a
+/// selector. Saying so on the provider is what turns that into a five-second diagnosis. Its count
+/// means something different there: labels left over from before the feature was switched off, which
+/// still steer inventories and which only an admin can now remove.
+pub fn set_provides_labels_condition(
+    status: &mut PlaybookPlanStatus,
+    provided: Option<ProvidedLabel>,
+    labels_enabled: bool,
+) {
+    let Some(provided) = provided else {
+        status
+            .conditions
+            .retain(|condition| condition.type_ != "ProvidesLabels");
+        return;
+    };
+
+    let ProvidedLabel {
+        key,
+        version,
+        nodes,
+    } = provided;
+    let now = chrono::Local::now().fixed_offset();
+    let condition = if labels_enabled {
+        PlaybookPlanCondition {
+            type_: "ProvidesLabels".into(),
+            status: "True".into(),
+            reason: Some("PublishingNodeLabels".into()),
+            message: Some(format!(
+                "publishing {key}={version} on {nodes} Node(s) for other plans to depend on"
+            )),
+            last_transition_time: Some(now),
+        }
+    } else {
+        PlaybookPlanCondition {
+            type_: "ProvidesLabels".into(),
+            status: "False".into(),
+            reason: Some("NodeLabelsDisabled".into()),
+            message: Some(format!(
+                "node labels are disabled on this cluster (chart nodeLabels.enabled=false), so this plan does not publish {key} and plans depending on it will not see its hosts; {nodes} Node(s) still carry it from before"
+            )),
+            last_transition_time: Some(now),
+        }
+    };
+
+    upsert_condition(&mut status.conditions, condition);
+}
+
+/// One dependency a plan inherits from an inventory it references.
+///
+/// The inventory's name travels with it because the plan references several and the fix is in one of
+/// them: "3 hosts waiting" is a fact, "3 hosts waiting, in `workers-with-containerd`" is something a
+/// reader can act on.
+#[derive(Clone, Debug)]
+pub struct InventoryDependency {
+    pub inventory: String,
+    pub dependency: DependencyStatus,
+}
+
+/// How many dependencies a condition message names before it gives up and counts the rest.
+///
+/// A condition message is read, not parsed. A plan referencing a handful of inventories that each
+/// gate on a handful of providers would otherwise produce a paragraph nobody finishes.
+const NAMED_DEPENDENCIES: usize = 3;
+
+/// Reports the hosts this plan would run on if another plan had finished with them.
+///
+/// Absent on a plan that references no dependency at all, for the same reason as `ProvidesLabels`:
+/// a condition answering a question the plan does not pose is noise on every object that does not
+/// have the problem.
+///
+/// The counts are the inventories' own, copied rather than recomputed. Two controllers deriving the
+/// same number by different routes would eventually disagree, and a plan contradicting the inventory
+/// it names is worse than either number on its own.
+///
+/// Note what the numbers are *not*: they are the inventory's view, taken before the
+/// `NodeAccessPolicy` clamp this plan is subject to. A Node counted as satisfied may still be out of
+/// this plan's reach — `eligibleHosts` is what says which hosts it actually has.
+pub fn set_dependencies_waiting_condition(
+    status: &mut PlaybookPlanStatus,
+    dependencies: &[InventoryDependency],
+) {
+    if dependencies.is_empty() {
+        status
+            .conditions
+            .retain(|condition| condition.type_ != "DependenciesWaiting");
+        return;
+    }
+
+    let now = chrono::Local::now().fixed_offset();
+    let waiting: Vec<&InventoryDependency> = dependencies
+        .iter()
+        .filter(|entry| entry.dependency.waiting > 0)
+        .collect();
+
+    let condition = if waiting.is_empty() {
+        PlaybookPlanCondition {
+            type_: "DependenciesWaiting".into(),
+            status: "False".into(),
+            reason: Some("DependenciesMet".into()),
+            message: Some(
+                "every host the plan's inventories resolve to has the dependencies they require"
+                    .into(),
+            ),
+            last_transition_time: Some(now),
+        }
+    } else {
+        let named: Vec<String> = waiting
+            .iter()
+            .take(NAMED_DEPENDENCIES)
+            .map(|entry| {
+                let dependency = &entry.dependency;
+                format!(
+                    "{} host(s) in group '{}' of ClusterInventory '{}' waiting for {}/{} ({})",
+                    dependency.waiting,
+                    dependency.group,
+                    entry.inventory,
+                    dependency.provider_namespace,
+                    dependency.provider_name,
+                    dependency.requirement
+                )
+            })
+            .collect();
+        let mut message = named.join("; ");
+        if let Some(rest) = waiting
+            .len()
+            .checked_sub(NAMED_DEPENDENCIES)
+            .filter(|rest| *rest > 0)
+        {
+            message.push_str(&format!("; and {rest} more"));
+        }
+
+        PlaybookPlanCondition {
+            type_: "DependenciesWaiting".into(),
+            status: "True".into(),
+            reason: Some("HostsWaiting".into()),
+            message: Some(message),
+            last_transition_time: Some(now),
+        }
+    };
+
+    upsert_condition(&mut status.conditions, condition);
+}
+
+/// How every dependency clause ends, and the only thing that identifies one already on a summary.
+///
+/// The clause is always the last thing appended — `apply_run_diagnostic`'s runs earlier in the tick
+/// — so matching the end of the string is enough to find it.
+const WAITING_CLAUSE_TAIL: &str = " host(s) waiting for dependencies)";
+
+/// Restates the one clause the summary column has room for: how many hosts a dependency is keeping
+/// out.
+///
+/// **A qualifier, never a substitute.** The summary's job is to say what the plan is doing, and a
+/// wait for another plan does not replace that. `5/5 up-to-date` beside an inventory holding eight
+/// more machines back is true and misleading in exactly the way this fixes.
+///
+/// **Idempotent, and that is load-bearing.** An idle tick does not rewrite `summary` at all — it
+/// carries the stored one forward — so the clause a previous tick added is still on it. Appending
+/// to that would grow the summary by a clause per reconcile, and because every changed status is a
+/// write, every write is a watch event and every event is the next reconcile, it would never settle:
+/// a printer column growing until the object hits the size limit and no status can be written at
+/// all. So the previous clause is stripped first and the result is a fixed point, which makes the
+/// merge patch a no-op as soon as the count stops moving. Stripping is also what *removes* the
+/// clause when the last dependency is satisfied, since nothing else would.
+///
+/// The clause is only *added* while the plan is idle. A plan mid-run has a summary about that run,
+/// which is what someone watching it wants; the dependencies are still on the condition, and the
+/// clause comes back when the run ends.
+///
+/// The **strip runs either way**, so no clause can outlive the tick that wrote it. Every path that
+/// starts or adopts a run replaces the summary with the run's own, which would carry the stale
+/// clause off with it — but that is an invariant spread across several call sites, and being wrong
+/// about it once would leave a stale count on a running plan and break the exact-match in
+/// `summary_unclaimed_since_adoption`. Stripping unconditionally costs one comparison and does not
+/// depend on being right.
+///
+/// Counted over distinct requirements' waiting hosts, which may name the same Node twice if two
+/// dependencies hold it — the condition is where the breakdown is, and the largest single wait is
+/// the honest headline for one clause.
+pub fn append_dependency_summary_clause(
+    status: &mut PlaybookPlanStatus,
+    dependencies: &[InventoryDependency],
+) {
+    if let Some(summary) = status.summary.as_mut() {
+        // A loop rather than one strip, so a status already carrying several from before this was
+        // idempotent is healed on the first tick instead of shedding one clause per reconcile.
+        while summary.ends_with(WAITING_CLAUSE_TAIL) {
+            let Some(clause_start) = summary.rfind(" (") else {
+                break;
+            };
+            summary.truncate(clause_start);
+        }
+    }
+
+    if status.active_run.is_some() {
+        return;
+    }
+
+    let Some(waiting) = dependencies
+        .iter()
+        .map(|entry| entry.dependency.waiting)
+        .max()
+        .filter(|waiting| *waiting > 0)
+    else {
+        return;
+    };
+
+    if let Some(summary) = status.summary.as_mut() {
+        summary.push_str(&format!(" ({waiting}{WAITING_CLAUSE_TAIL}"));
+    }
 }
 
 /// Sets the plan-level `Blocked` condition, which reports whether this run is currently waiting on
@@ -430,6 +682,467 @@ mod tests {
         )
     }
 
+    fn provided(nodes: usize) -> ProvidedLabel<'static> {
+        ProvidedLabel {
+            key: "platform.plan.ansible.cloudbending.dev/containerd",
+            version: "1.4.2",
+            nodes,
+        }
+    }
+
+    /// The `False` case is the whole point: with node labels switched off, a plan with `provides`
+    /// runs perfectly and publishes nothing, so every dependent waits and looks like it has a typo
+    /// in its selector. The condition is what makes that a stated cause rather than a mystery.
+    ///
+    /// Both cases name the key, so that the two ends of a dependency can be read against each other
+    /// without going to the Nodes — and the count says how far the provider has actually got.
+    #[test]
+    fn a_providing_plan_says_whether_its_labels_are_reaching_nodes() {
+        let mut status = PlaybookPlanStatus::default();
+
+        set_provides_labels_condition(&mut status, Some(provided(5)), true);
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "ProvidesLabels")
+            .expect("a providing plan carries the condition");
+        assert_eq!(condition.status, "True");
+        let message = condition.message.as_deref().unwrap();
+        assert!(
+            message.contains("platform.plan.ansible.cloudbending.dev/containerd=1.4.2"),
+            "{message}"
+        );
+        assert!(message.contains("5 Node(s)"), "{message}");
+
+        set_provides_labels_condition(&mut status, Some(provided(5)), false);
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "ProvidesLabels")
+            .unwrap();
+        assert_eq!(condition.status, "False");
+        assert_eq!(condition.reason.as_deref(), Some("NodeLabelsDisabled"));
+        let message = condition.message.as_deref().unwrap();
+        assert!(
+            message.contains("platform.plan.ansible.cloudbending.dev/containerd"),
+            "the key an admin has to clean up by hand: {message}"
+        );
+        assert!(message.contains("5 Node(s) still carry it"), "{message}");
+    }
+
+    /// A plan that provides nothing is not answering this question, so it must not carry a stale
+    /// answer to it either — dropping `spec.provides` has to drop the condition with it.
+    #[test]
+    fn a_plan_that_stops_providing_drops_the_condition() {
+        let mut status = PlaybookPlanStatus::default();
+        set_provides_labels_condition(&mut status, Some(provided(5)), true);
+        set_running_condition(&mut status);
+
+        set_provides_labels_condition(&mut status, None, true);
+
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|condition| condition.type_ == "ProvidesLabels")
+        );
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.type_ == "Running"),
+            "and nothing else is disturbed"
+        );
+    }
+
+    fn dependency(inventory: &str, provider: &str, waiting: usize) -> InventoryDependency {
+        InventoryDependency {
+            inventory: inventory.to_string(),
+            dependency: DependencyStatus {
+                group: "workers".into(),
+                key: format!("platform.plan.ansible.cloudbending.dev/{provider}"),
+                provider_namespace: "platform".into(),
+                provider_name: provider.to_string(),
+                requirement: "Ge 1.4.0".into(),
+                waiting,
+                satisfied: 1,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The condition a dependent's author reads to tell "not yet" from "never": which inventory,
+    /// which group, which provider, and how many machines are still to come.
+    #[test]
+    fn a_waiting_dependency_is_named_on_the_plan() {
+        let mut status = PlaybookPlanStatus::default();
+
+        set_dependencies_waiting_condition(
+            &mut status,
+            &[dependency("workers-ci", "containerd", 3)],
+        );
+
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "DependenciesWaiting")
+            .expect("a plan with a dependency carries the condition");
+        assert_eq!(condition.status, "True");
+        assert_eq!(condition.reason.as_deref(), Some("HostsWaiting"));
+        let message = condition.message.as_deref().unwrap();
+        for expected in [
+            "3 host(s)",
+            "workers",
+            "workers-ci",
+            "platform/containerd",
+            "Ge 1.4.0",
+        ] {
+            assert!(
+                message.contains(expected),
+                "{message} should name {expected}"
+            );
+        }
+    }
+
+    /// A satisfied dependency is still a dependency: the plan says so rather than going quiet, so a
+    /// reader can tell "this plan depends on nothing" from "everything it depends on is done".
+    #[test]
+    fn a_satisfied_dependency_reports_false_rather_than_nothing() {
+        let mut status = PlaybookPlanStatus::default();
+
+        set_dependencies_waiting_condition(
+            &mut status,
+            &[dependency("workers-ci", "containerd", 0)],
+        );
+
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "DependenciesWaiting")
+            .unwrap();
+        assert_eq!(condition.status, "False");
+        assert_eq!(condition.reason.as_deref(), Some("DependenciesMet"));
+    }
+
+    /// A condition answering a question the plan does not pose is noise on every object that does
+    /// not have the problem — which is most of them.
+    #[test]
+    fn a_plan_without_dependencies_carries_no_condition() {
+        let mut status = PlaybookPlanStatus::default();
+        set_dependencies_waiting_condition(
+            &mut status,
+            &[dependency("workers-ci", "containerd", 3)],
+        );
+        set_running_condition(&mut status);
+
+        set_dependencies_waiting_condition(&mut status, &[]);
+
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|condition| condition.type_ == "DependenciesWaiting")
+        );
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.type_ == "Running"),
+            "and nothing else is disturbed"
+        );
+    }
+
+    /// A condition message is read, not parsed, so a plan gated on a dozen providers has to stop
+    /// somewhere and say how much it left out.
+    #[test]
+    fn the_message_names_three_dependencies_and_counts_the_rest() {
+        let mut status = PlaybookPlanStatus::default();
+        let dependencies: Vec<InventoryDependency> = (0..5)
+            .map(|index| dependency("workers-ci", &format!("provider-{index}"), 1))
+            .collect();
+
+        set_dependencies_waiting_condition(&mut status, &dependencies);
+
+        let message = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "DependenciesWaiting")
+            .and_then(|condition| condition.message.clone())
+            .unwrap();
+        assert!(message.contains("provider-2"));
+        assert!(!message.contains("provider-3"), "{message} stops at three");
+        assert!(message.ends_with("; and 2 more"), "{message}");
+    }
+
+    /// The summary says what the plan is doing; the wait qualifies it rather than replacing it. A
+    /// converged plan reading `5/5 up-to-date` beside an inventory holding eight machines back is
+    /// true and misleading in exactly the way this fixes.
+    #[test]
+    fn the_summary_clause_is_appended_to_an_idle_plan() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("5/5 up-to-date".into()),
+            ..Default::default()
+        };
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 3)]);
+
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("5/5 up-to-date (3 host(s) waiting for dependencies)")
+        );
+    }
+
+    /// **The property, not the single application.** No idle path rewrites `summary` — the stored
+    /// one is carried forward — so this runs against its own previous output on every tick. A clause
+    /// that stacked would grow the summary by forty bytes a reconcile, and since a changed status is
+    /// a write, a write is a watch event and an event is the next reconcile, it would never settle:
+    /// a printer column growing until the object hits its size limit and no status can be written at
+    /// all.
+    #[test]
+    fn restating_the_clause_every_tick_is_a_fixed_point() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("5/5 up-to-date".into()),
+            ..Default::default()
+        };
+        let waiting = [dependency("workers-ci", "containerd", 3)];
+
+        for _ in 0..3 {
+            append_dependency_summary_clause(&mut status, &waiting);
+            assert_eq!(
+                status.summary.as_deref(),
+                Some("5/5 up-to-date (3 host(s) waiting for dependencies)")
+            );
+        }
+    }
+
+    /// A rollout is the count moving, tick after tick, against a summary that still carries the last
+    /// one. Each has to replace its predecessor rather than queue behind it.
+    #[test]
+    fn a_moving_count_replaces_the_clause_rather_than_stacking() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("5/5 up-to-date".into()),
+            ..Default::default()
+        };
+
+        for remaining in [3, 2, 1] {
+            append_dependency_summary_clause(
+                &mut status,
+                &[dependency("workers-ci", "containerd", remaining)],
+            );
+        }
+
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("5/5 up-to-date (1 host(s) waiting for dependencies)")
+        );
+    }
+
+    /// The provider finishes, and the clause has to go with the wait. Stripping is the only thing
+    /// that removes it: an idle tick never rewrites the summary it was appended to.
+    #[test]
+    fn the_clause_disappears_when_the_last_wait_clears() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("5/5 up-to-date".into()),
+            ..Default::default()
+        };
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 3)]);
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 0)]);
+
+        assert_eq!(status.summary.as_deref(), Some("5/5 up-to-date"));
+    }
+
+    /// A status written by a version that stacked them is healed on the first tick, not one clause
+    /// per reconcile — an operator upgrade must not leave a plan reporting nonsense for as long as
+    /// it takes to unwind.
+    #[test]
+    fn a_summary_that_already_stacked_clauses_is_healed_at_once() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some(
+                "5/5 up-to-date (3 host(s) waiting for dependencies) \
+                 (3 host(s) waiting for dependencies) (3 host(s) waiting for dependencies)"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 3)]);
+
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("5/5 up-to-date (3 host(s) waiting for dependencies)")
+        );
+    }
+
+    /// The clause is appended after `apply_run_diagnostic`'s, so stripping must stop at the
+    /// dependency clause and leave a diagnostic that happens to sit in front of it alone.
+    #[test]
+    fn stripping_leaves_a_run_diagnostics_clause_in_place() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("1/5 up-to-date (the playbook ran no task on 2 of 5 hosts)".into()),
+            ..Default::default()
+        };
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 3)]);
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 3)]);
+
+        assert_eq!(
+            status.summary.as_deref(),
+            Some(
+                "1/5 up-to-date (the playbook ran no task on 2 of 5 hosts) \
+                 (3 host(s) waiting for dependencies)"
+            )
+        );
+    }
+
+    /// Nothing to qualify: a plan whose dependencies are all met is simply doing what its summary
+    /// says.
+    #[test]
+    fn a_satisfied_dependency_leaves_the_summary_alone() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("5/5 up-to-date".into()),
+            ..Default::default()
+        };
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 0)]);
+
+        assert_eq!(status.summary.as_deref(), Some("5/5 up-to-date"));
+    }
+
+    /// A plan mid-run has a summary about that run, which is what someone watching it wants. The
+    /// wait is still on the condition, and the clause comes back when the run ends.
+    #[test]
+    fn a_running_plan_keeps_its_summary_about_the_run() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("applying to 3 hosts".into()),
+            active_run: Some(crate::v1beta1::ActiveRun {
+                execution_hash: "abc".into(),
+                run_id: "run".into(),
+                job_name: "plan-1".into(),
+                play_uid: "uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: None,
+            }),
+            ..Default::default()
+        };
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 3)]);
+
+        assert_eq!(status.summary.as_deref(), Some("applying to 3 hosts"));
+    }
+
+    /// No clause outlives the tick that wrote it, not even onto a summary this function will not add
+    /// one to. Every path that starts a run replaces the summary with the run's own and would carry
+    /// the clause off with it — but that is an invariant across several call sites, and a stale
+    /// count on a running plan would also break the exact match in
+    /// `summary_unclaimed_since_adoption`. So the strip does not depend on that invariant holding.
+    #[test]
+    fn a_run_starting_does_not_inherit_the_idle_plans_clause() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("5/5 up-to-date (3 host(s) waiting for dependencies)".into()),
+            active_run: Some(crate::v1beta1::ActiveRun {
+                execution_hash: "abc".into(),
+                run_id: "run".into(),
+                job_name: "plan-1".into(),
+                play_uid: "uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: None,
+            }),
+            ..Default::default()
+        };
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 3)]);
+
+        assert_eq!(status.summary.as_deref(), Some("5/5 up-to-date"));
+    }
+
+    /// The version travels with the hash and the timestamp, under one condition, so the three can
+    /// never describe different runs. A host that did not succeed keeps whatever it had: the label
+    /// derived from it still says "this version was applied here at some point", which a later
+    /// failure does not undo.
+    #[test]
+    fn only_a_succeeding_host_is_given_the_runs_version() {
+        let mut status = PlaybookPlanStatus::default();
+        let play_status = |outcome: HostOutcome| PlayStatus {
+            phase: PlayPhase::Failed,
+            host_count: 2,
+            hosts: BTreeMap::from([
+                (
+                    "worker-1".into(),
+                    crate::v1beta1::PlayHostResult {
+                        outcome: HostOutcome::Succeeded,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "worker-2".into(),
+                    crate::v1beta1::PlayHostResult {
+                        outcome,
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        apply_terminal_play_status(
+            &hash(),
+            Some("1.4.2"),
+            &play_status(HostOutcome::Succeeded),
+            &mut status,
+        );
+        let hosts = status.hosts_status.clone().unwrap();
+        assert_eq!(hosts["worker-1"].applied_version.as_deref(), Some("1.4.2"));
+        assert_eq!(hosts["worker-2"].applied_version.as_deref(), Some("1.4.2"));
+
+        // The next revision succeeds on worker-1 only.
+        apply_terminal_play_status(
+            &hash(),
+            Some("1.5.0"),
+            &play_status(HostOutcome::Failed),
+            &mut status,
+        );
+        let hosts = status.hosts_status.unwrap();
+        assert_eq!(hosts["worker-1"].applied_version.as_deref(), Some("1.5.0"));
+        assert_eq!(
+            hosts["worker-2"].applied_version.as_deref(),
+            Some("1.4.2"),
+            "a failed host keeps the version it did apply, like its hash"
+        );
+    }
+
+    /// A plan that declares nothing must leave the field absent rather than blank it to something —
+    /// `node_labels` reads "no version" as "label nothing", and that is the fail-closed answer.
+    #[test]
+    fn a_run_that_provides_nothing_records_no_version() {
+        let mut status = PlaybookPlanStatus::default();
+        let play_status = PlayStatus {
+            phase: PlayPhase::Succeeded,
+            host_count: 1,
+            hosts: BTreeMap::from([(
+                "worker-1".into(),
+                crate::v1beta1::PlayHostResult {
+                    outcome: HostOutcome::Succeeded,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        apply_terminal_play_status(&hash(), None, &play_status, &mut status);
+
+        let hosts = status.hosts_status.unwrap();
+        assert_eq!(hosts["worker-1"].applied_version, None);
+        assert_ne!(
+            hosts["worker-1"].last_applied_hash, "",
+            "the host is still converged; it just provides nothing"
+        );
+    }
+
     #[test]
     fn recovered_terminal_play_replaces_running_conditions() {
         let h = hash();
@@ -448,7 +1161,7 @@ mod tests {
             ..Default::default()
         };
 
-        apply_terminal_play_status(&h, &play_status, &mut status);
+        apply_terminal_play_status(&h, None, &play_status, &mut status);
 
         let running = status
             .conditions
@@ -504,7 +1217,7 @@ mod tests {
             ..Default::default()
         };
 
-        apply_terminal_play_status(&h, &play_status, &mut status);
+        apply_terminal_play_status(&h, None, &play_status, &mut status);
 
         let hosts = status.hosts_status.unwrap();
         assert_eq!(hosts["succeeded"].last_applied_hash, h.to_string());
@@ -527,6 +1240,67 @@ mod tests {
             );
             assert!(hosts[host].last_transition_time.is_some(), "{host}");
         }
+    }
+
+    /// `appliedAt` dates the *claim*, so it moves with `lastAppliedHash` and with nothing else: a
+    /// host that failed keeps the date of the revision it really applied, and one that has never
+    /// succeeded has none at all. The pairing is what lets a replaced machine be told apart from the
+    /// one the record describes (`node_recreation`) — a date that moved on a failure would make a
+    /// rebuilt Node look like it had applied something.
+    #[test]
+    fn applied_at_is_stamped_with_the_revision_and_only_with_it() {
+        let h = hash();
+        let earlier = "2026-01-01T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::FixedOffset>>()
+            .unwrap();
+        let finished = "2026-03-04T05:06:07Z"
+            .parse::<chrono::DateTime<chrono::FixedOffset>>()
+            .unwrap();
+        let mut status = PlaybookPlanStatus {
+            hosts_status: Some(BTreeMap::from([(
+                "failed".into(),
+                crate::v1beta1::HostStatus {
+                    last_applied_hash: "previous-revision".into(),
+                    last_outcome: HostOutcome::Succeeded,
+                    applied_at: Some(earlier),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        let result = |outcome: HostOutcome| crate::v1beta1::PlayHostResult {
+            outcome,
+            ..Default::default()
+        };
+        let play_status = PlayStatus {
+            phase: PlayPhase::Failed,
+            host_count: 3,
+            finished_at: Some(finished),
+            hosts: BTreeMap::from([
+                ("succeeded".into(), result(HostOutcome::Succeeded)),
+                ("failed".into(), result(HostOutcome::Failed)),
+                ("not-reached".into(), result(HostOutcome::NotReached)),
+            ]),
+            ..Default::default()
+        };
+
+        apply_terminal_play_status(&h, None, &play_status, &mut status);
+
+        let hosts = status.hosts_status.unwrap();
+        assert_eq!(
+            hosts["succeeded"].applied_at,
+            Some(finished),
+            "the run's own finish time, so a replayed recovery dates the claim when it happened"
+        );
+        assert_eq!(
+            hosts["failed"].applied_at,
+            Some(earlier),
+            "a failure leaves the date of the revision the host really applied"
+        );
+        assert_eq!(
+            hosts["not-reached"].applied_at, None,
+            "a host that never succeeded has no claim to date"
+        );
     }
 
     #[test]
@@ -715,7 +1489,7 @@ mod tests {
             ..Default::default()
         };
 
-        apply_terminal_play_status(&hash(), &play_status, &mut status);
+        apply_terminal_play_status(&hash(), None, &play_status, &mut status);
 
         let ready = status
             .conditions
@@ -736,6 +1510,7 @@ mod tests {
         let mut status = PlaybookPlanStatus::default();
         apply_terminal_play_status(
             &hash(),
+            None,
             &PlayStatus {
                 phase: PlayPhase::Succeeded,
                 host_count: 1,
@@ -857,6 +1632,7 @@ mod tests {
 
         apply_terminal_play_status(
             &hash(),
+            None,
             &PlayStatus {
                 phase: PlayPhase::Unknown,
                 host_count: 1,
@@ -1001,6 +1777,7 @@ mod tests {
         );
         apply_terminal_play_status(
             &hash(),
+            None,
             &PlayStatus {
                 phase: PlayPhase::Failed,
                 host_count: 2,
@@ -1118,7 +1895,7 @@ mod tests {
             )]),
             ..Default::default()
         };
-        apply_terminal_play_status(&hash(), &play_status, &mut status);
+        apply_terminal_play_status(&hash(), None, &play_status, &mut status);
 
         assert!(!clear_inputs_unavailable_condition(&mut status, 0));
 

@@ -19,6 +19,7 @@ validation rules, the operator refuses the plan instead and says so in `.status.
 | `securityContext` | no | Container security context applied to the playbook and collection-installer containers. |
 | `serviceAccountName` | no | ServiceAccount the run's pod uses, so tasks can reach the Kubernetes API. Unset means no API token is mounted — see [Managing Kubernetes resources](#managing-kubernetes-resources). |
 | `inventoryRefs` | yes | Which inventories to target — one entry per referenced `ClusterInventory` or `StaticInventory`. |
+| `provides` | no | Declares what this plan makes true on the hosts it converges, so other plans can depend on it — see [Declaring what a plan provides](#declaring-what-a-plan-provides). |
 | `template.playbook` | yes | The playbook text itself (see below). |
 | `mode` | no (`OneShot`) | `OneShot` or `Recurring` — see [Scheduling and execution modes](./scheduling-and-modes.md). |
 | `maxAttempts` | no (`3` / `1`) | How many times a failed run may be tried again, counting the first run. Defaults to `3` for `OneShot` and `1` for `Recurring` — see [Retries](./scheduling-and-modes.md#retries). |
@@ -122,6 +123,100 @@ inventoryRefs:
 Inventories are resolved from the **same namespace** as the plan. The groups they define become
 Ansible groups in the rendered inventory, so a playbook can target `hosts: workers` or
 `hosts: edge-appliances` as well as `hosts: all`.
+
+## Declaring what a plan provides
+
+Some plans only make sense after another one has finished on the same host: a container runtime has
+to be configured before something that uses it is deployed, a driver installed before a workload
+that needs it lands. `spec.provides` is how the first plan says so.
+
+```yaml
+spec:
+  provides:
+    version: "1.4.2"
+```
+
+Every cluster Node this plan applies to **successfully** is then labelled
+
+```
+<namespace>.plan.ansible.cloudbending.dev/<plan-name>: <version>
+```
+
+so a plan in namespace `platform` named `containerd-config` writes
+`platform.plan.ansible.cloudbending.dev/containerd-config: "1.4.2"`. You do not choose the key: it
+is derived from the plan's own namespace and name, which is what keeps one plan from claiming
+another's label or labelling its way into Nodes it was never granted. A plan without `provides` is
+labelled nowhere.
+
+Dependent plans select on that label in their own `ClusterInventory` — see
+[Cluster nodes](./cluster-nodes.md#depending-on-another-plan). Ordinary workloads can use it too, in
+an ordinary `nodeAffinity`: "schedule this only where the driver playbook succeeded".
+
+### The version is part of the execution hash
+
+Changing `version` changes the plan's revision, so the playbook **re-runs on every host** before any
+label moves. That is deliberate, and it is what makes the label worth trusting: a Node carrying
+`1.4.2` has had a run of the revision that declared `1.4.2` succeed on it. Adding `provides` to an
+existing plan re-runs it once, and so does removing it.
+
+Two consequences worth planning for:
+
+- A version that follows your chart version re-runs the playbook on every release. If that is not
+  what you want, give the plan a version of its own that you bump when the thing it installs
+  actually changes.
+- It is the only way to force a re-run when the playbook text has not changed — for instance when
+  the tool it installs lives in the plan's `image`, which is not part of the hash.
+
+SemVer build metadata cannot be expressed, because `+` is not a legal label value character. Follow
+Helm's own `helm.sh/chart` convention and write it as `_`, e.g. by piping a chart version through
+`replace "+" "_"`.
+
+### What the label means
+
+It means **"this version was applied here at some point"** — not that the last run was green, and
+not that the host is currently healthy. Specifically:
+
+- A later run that *fails* on a host leaves the previous label standing. The software is still
+  there; a failure does not undo it.
+- A host that leaves this plan's inventory keeps its label, for the same reason.
+- A Node that is deleted and re-registered under the same name is **not** labelled until the plan
+  has run on the new machine. A fresh Node inherits the name and nothing else.
+- Only cluster Nodes take part. `StaticInventory` hosts cannot — there is no Kubernetes object to
+  label. See [External hosts](./external-hosts.md).
+
+### When the labels are removed
+
+A label is never withdrawn because a run went badly — only when the plan stops claiming it:
+
+- **You remove `provides` from the spec.** The labels go on the next tick. (Because the version is
+  part of the hash, this also re-runs the playbook once; harmless for an idempotent playbook.)
+- **You delete the plan.** Its labels are removed within seconds, and deleting is never blocked
+  waiting for that — if the operator is down at the time, it cleans them up when it next starts.
+- **Your namespace is un-enrolled** by an administrator. The operator refuses to run the plan at
+  all, so its claim is withdrawn too and dependents elsewhere lose those hosts. Re-enrolling
+  restores the labels from the recorded results on the first tick, **without** re-running anything.
+
+### Seeing how far the label has reached
+
+A providing plan carries a `ProvidesLabels` condition saying what it publishes and on how many
+Nodes:
+
+```text
+publishing platform.plan.ansible.cloudbending.dev/containerd=1.4.2 on 5 Node(s) for other plans to
+depend on
+```
+
+That count is this plan's **reach**, and nothing more. It is not a claim about what any dependent
+can use: a [`NodeAccessPolicy`](../cluster-operators/node-access-policies.md) may leave a dependent
+in another namespace with fewer of those Nodes than the number here. What each dependent is actually
+waiting for is on its own inventory — see
+[Seeing what an inventory is waiting for](./cluster-nodes.md#seeing-what-an-inventory-is-waiting-for).
+
+If your cluster administrator has disabled node labels (`nodeLabels.enabled=false` in the chart),
+plans with `provides` still run but publish nothing, and the condition is `False` with reason
+`NodeLabelsDisabled`. Its count then means the opposite: Nodes still carrying the label from before
+the feature was switched off. They keep steering inventories, and removing them is now an
+administrator's job.
 
 ## Managing Kubernetes resources
 

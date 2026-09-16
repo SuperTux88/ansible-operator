@@ -52,6 +52,18 @@ The drift count is genuinely `5/5` there, so the failure is named separately rat
 inferred from a column that reads like good news. The `Ready` condition says how that run went
 per-host.
 
+An idle plan whose inventories are [waiting on another plan](./cluster-nodes.md#depending-on-another-plan)
+adds one more clause:
+
+```text
+5/5 up-to-date (3 host(s) waiting for dependencies)
+```
+
+It qualifies the line rather than replacing it, because both halves are true: the five hosts the
+plan *has* are up to date, and three more are not its hosts yet. The clause reports the largest
+single wait and does not appear while a run is in progress, where the summary is about that run —
+the `DependenciesWaiting` condition has the full breakdown either way.
+
 ## Conditions
 
 `.status.conditions` carries `True`/`False` conditions. `Ready` and `Running` are also surfaced as
@@ -68,6 +80,28 @@ printer columns:
   [held for `NotReady` Nodes](./cluster-nodes.md#holding-instead-of-starting), `Ready` is `False`
   with reason `NodesNotReady` even if the phase still shows the last run's `Succeeded`: the phase is
   what the plan last did, and `Ready` says it has hosts it has not yet applied to.
+- **`ProvidesLabels`** — only on a plan that declares
+  [`spec.provides`](./playbook-plans.md#declaring-what-a-plan-provides), saying whether its claim is
+  actually reaching Nodes and how far. `True`/`PublishingNodeLabels` is the normal state, and its
+  message names the key, the version and the number of Nodes carrying it —
+  `publishing platform.plan.ansible.cloudbending.dev/containerd=1.4.2 on 5 Node(s) …`. That count is
+  the plan's own **reach**, not a claim about any dependent's inventory, which a
+  [`NodeAccessPolicy`](../cluster-operators/node-access-policies.md) may narrow further.
+  `False`/`NodeLabelsDisabled` means the cluster administrator turned node labels off
+  (`nodeLabels.enabled=false`); the plan still runs, but it publishes nothing and every plan
+  depending on it will wait without ever seeing its hosts. That is the condition to check first when
+  a dependent plan resolves to fewer hosts than you expect and the provider looks healthy. Its count
+  means something different: Nodes still carrying the label from before the feature was switched
+  off, which still steer inventories and which only an administrator can remove now.
+- **`DependenciesWaiting`** — only on a plan whose inventories express a
+  [dependency](./cluster-nodes.md#depending-on-another-plan), saying whether any of them is still
+  holding Nodes back. `True`/`HostsWaiting` names up to three of them — the inventory, the group,
+  the provider and the requirement, with the count — and says "and N more" for the rest;
+  `False`/`DependenciesMet` means every host the plan's inventories resolve to has what it requires.
+  A plan that depends on nothing carries no such condition at all. The counts are the inventories'
+  own, copied rather than recomputed, so the plan and the `ClusterInventory` it names never
+  disagree — and they are therefore taken *before* the `NodeAccessPolicy` clamp this plan is subject
+  to: `.status.eligibleHosts` is what says which hosts it actually has.
 - **`Running`** — the operator has identified this run's own Job in a non-terminal state
   (`JobRunning`). It is set in the same reconcile that creates the Job (a run adopted during recovery
   picks it up on the next tick), and re-asserted on every tick that observes it unfinished, so it
@@ -123,7 +157,34 @@ prevents an old Job and a new revision from targeting the same host concurrently
 | `Unknown` | The operator could not read a recap for this host — its **own instrumentation** failed, not Ansible. Distinct from `NotReached`. Worth investigating (see below). |
 
 Each host also records `lastAppliedHash` (the hash it last *succeeded* on — this is what drift
-detection compares against) and `lastTransitionTime`.
+detection compares against), `appliedAt` (when that hash was stamped), `appliedVersion` (the
+[`spec.provides`](./playbook-plans.md#declaring-what-a-plan-provides) version of the revision that
+stamped it, for plans that declare one — this is the value published as that Node's dependency
+label) and `lastTransitionTime` (when the host last recorded any outcome, successful or not).
+
+The three claim fields move together, under exactly the outcome that stamps the hash. So a host
+whose `appliedVersion` lags another's is genuinely still on the older revision, and a host with no
+`appliedVersion` has not succeeded under a revision that declared one — which is why it carries no
+label.
+
+`appliedAt` is what tells a **replaced machine** from the one the record was written about.
+`.status.hostsStatus` is keyed by host name, and the name is all a rebuilt machine inherits — so a
+Node deleted and re-registered under the same name would otherwise keep its predecessor's
+`lastAppliedHash` and never be applied to again. A Node whose `creationTimestamp` is later than
+`appliedAt` has applied nothing: the operator drops the recorded hash, and the next run targets it.
+Its `lastOutcome` is left standing, because what happened to the previous machine is still history.
+
+Records written before this field existed carry no `appliedAt` and are deliberately left alone until
+their next success, so upgrading the operator does not re-run every plan in the cluster.
+
+A host's record is removed once it has **both** left the plan's inventory and ceased to exist as a
+Node — a machine that has left the cluster for good. Both halves are required, so a host that leaves
+the inventory while its Node is still there keeps its record: a narrowed
+[`NodeAccessPolicy`](../cluster-operators/node-access-policies.md), an edited Node label or a
+rewritten selector all remove hosts from a plan without saying anything about the machines, and
+widening the policy again must not re-apply the playbook to every one of them. A `StaticInventory`
+host has no Node at all and so is never removed for want of one; its record goes when it leaves the
+inventory and the host is gone. Pruning waits for a tick with no run in flight.
 
 ## Run history
 
@@ -302,7 +363,11 @@ running, and so could not decide anything this tick:
   `StaticInventory` could not be read, or one of them is not usable. Two forms need an edit rather
   than a retry: `Referenced ClusterInventory "…" does not exist` (the reference is wrong or the
   inventory was deleted) and `Inventory group "…" sets variable "…"` (a group sets one of the
-  connection variables the operator owns). Anything else is an API error to retry.
+  connection variables the operator owns). One form needs nothing at all: `Referenced
+  ClusterInventory "…" has not published its resolved hosts for generation N yet` means that
+  inventory's own controller has not caught up with a spec edit, so the plan is holding rather than
+  running against the hosts the previous spec resolved to — its next status write wakes the plan,
+  normally within seconds. Anything else is an API error to retry.
 - **"cannot read referenced Secrets: …"** — a Secret named by `spec.template.variables` or
   `spec.template.files` could not be read. `Referenced Secret "…" does not exist` means the reference
   is wrong or the Secret was deleted; anything else is an API error to retry.
@@ -854,6 +919,37 @@ Note that `localhost` here is Ansible's *implicit* localhost, which `all` never 
 `hosts: all` play does not pick it up, and neither does the operator's completion-marker play, which
 targets `all`. A `StaticInventory` host that happens to be named `localhost` is an ordinary host of
 the plan and is reported like any other.
+
+### A dependency never becomes satisfied
+
+A [dependency](./cluster-nodes.md#depending-on-another-plan) that is simply not finished yet shows a
+`waiting` count that falls as the provider works through its hosts. One that never moves is usually
+one of three things, and the `ClusterInventory`'s `.status.dependencies` entry flags each of them:
+
+- **`invalidValue: true`** — the term's own value is not a version, under an operator that orders
+  versions (`Ge`, `Gt`, `Lt`, `Le`). `values: ["latest"]` is the common case. Such a term matches
+  **nothing**, so `waiting` beside it is the whole group. Fix the selector.
+- **`malformedTerm: true`** — an ordered operator listing zero or several values. Each of them takes
+  exactly one, and a range is [two terms](./cluster-nodes.md#comparing-versions). This one also
+  matches nothing, and it is not rejected when you apply the inventory, so the flag is the only
+  warning you get.
+- **`unparseableHosts: N`** — `N` of the waiting Nodes *do* carry the label, with a value no
+  comparison can order (again, `latest`). Here the selector is fine and the **provider** is the
+  problem: it declared a `spec.provides.version` that is not a version, so no ordered term will ever
+  match its Nodes. Either give the provider a real version, or depend on it with `Exists` or `In`,
+  which compare strings and need no ordering.
+
+A wait, a mistyped key and a provider that has been deleted all read the same way — as waiting for
+the plan the key names — and that is deliberate. The operator does not look the provider up, so it
+never claims one exists or does not; it prints the name it decoded, and `nosuch/typo` sitting in
+`providerName` is the mistake staring back at you.
+
+If nothing is flagged and `waiting` still does not move, the provider is not converging those hosts.
+Look at the provider plan named in `providerNamespace`/`providerName`: its `ProvidesLabels`
+condition ([above](#conditions)) says whether it is publishing at all, and its own per-host outcomes
+say whether it has succeeded there. Remember that a `OneShot` provider whose
+[attempt budget](./scheduling-and-modes.md#retries) is spent will not pick up newly eligible hosts
+until its inputs change.
 
 ### A change is not being picked up
 

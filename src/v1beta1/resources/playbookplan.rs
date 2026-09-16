@@ -132,6 +132,18 @@ pub struct PlaybookPlanSpec {
     /// These host groups will be available in our playbook
     pub inventory_refs: Vec<InventoryRef>,
 
+    /// What this plan makes true on the hosts it converges, for other plans to depend on.
+    ///
+    /// Setting it opts the plan into Node labelling: every cluster Node this plan applied to
+    /// successfully is labelled `<namespace>.plan.ansible.cloudbending.dev/<plan-name>` with the
+    /// declared `version`, and another plan's `ClusterInventory` can select on that label to keep
+    /// its own runs off hosts that are not ready yet. A plan without `provides` is labelled
+    /// nowhere, so nothing unrelated appears on a Node.
+    ///
+    /// Left an object rather than a bare version string so it can grow a field without a breaking
+    /// change.
+    pub provides: Option<Provides>,
+
     /// How long a finished run's Job (and its pod) is kept before Kubernetes' TTL controller
     /// reaps it. Reaping a finished run is left entirely to that controller, so this governs the
     /// ansible pod's lifetime. The one Job the operator deletes itself is the Job of a run still in
@@ -155,6 +167,34 @@ pub struct PlaybookPlanSpec {
 
     /// The playbook will be built from this, some fields will be set automatically (vars, hosts)
     pub template: PlaybookTemplate,
+}
+
+/// The dependency claim a plan publishes onto the Nodes it converged — see
+/// [`PlaybookPlanSpec::provides`].
+#[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Provides {
+    /// What this plan is providing right now, and the value the Node label carries.
+    ///
+    /// **Part of the execution hash**, which is what makes the label trustworthy: a Node carrying
+    /// version X has to have had a run of the revision that *declared* X succeed on it, so bumping
+    /// this re-applies the playbook everywhere before any label moves. Adding or removing
+    /// `provides` re-runs the plan once for the same reason. It is also the only way to roll out a
+    /// new binary that ships inside the plan's `image`, since the image is not hashed.
+    ///
+    /// A plan whose playbook must not re-run on every release therefore wants a version of its own
+    /// rather than the chart's.
+    ///
+    /// Any valid Kubernetes label value is accepted, but `Gt`/`Ge`/`Lt`/`Le` selectors read it as a
+    /// SemVer version, so a value that is not one only ever matches `Exists`, `In` and `NotIn`.
+    /// SemVer build metadata cannot be expressed — `+` is not a legal label value character — so
+    /// follow Helm's own `helm.sh/chart` convention and write it as `_`, piping the chart version
+    /// through `replace "+" "_"` where a chart renders this field.
+    #[schemars(
+        length(max = 63),
+        pattern(r"^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
+    )]
+    pub version: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
@@ -489,6 +529,36 @@ pub struct HostStatus {
     /// The execution hash last SUCCESSFULLY applied to this host. Only bumped on `HostOutcome::Succeeded`.
     pub last_applied_hash: String,
     pub last_outcome: HostOutcome,
+    /// When `lastAppliedHash` was stamped — moved by exactly the outcome that moves that field, and
+    /// by no other. This is what separates it from `lastTransitionTime`, which records every
+    /// outcome, successful or not.
+    ///
+    /// It exists because `hostsStatus` is keyed by host *name*, and the name is all a replacement
+    /// machine inherits: without it, a Node deleted and re-registered under the same name would keep
+    /// the claim its predecessor earned, and a `OneShot` plan would never run on the fresh machine.
+    /// A Node whose `creationTimestamp` is later than this is a different machine, and its recorded
+    /// application is dropped — see `node_recreation`.
+    ///
+    /// Absent on a record written before this field existed. Such a record is deliberately left
+    /// alone rather than treated as a replacement, or the upgrade that introduced the field would
+    /// re-run every plan across the fleet; the next success fills it in. See the
+    /// `#[serde(default, ...)]` note on `PlaybookPlanStatus::next_run`.
+    #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
+    #[schemars(with = "Option<String>")]
+    pub applied_at: Option<DateTime<FixedOffset>>,
+    /// The `spec.provides` version of the revision that stamped `lastAppliedHash` — moved by exactly
+    /// the same outcome, and taken from that run's own `Play` rather than from the plan as it reads
+    /// now.
+    ///
+    /// This is what a Node label is derived from, which is why it is recorded per host instead of
+    /// read from the spec: the plan converges one host at a time, so at any moment some hosts carry
+    /// the new revision and some still carry the old one, and each must be labelled with what it
+    /// actually has.
+    ///
+    /// Absent for a plan that provides nothing, and absent on a record stamped before this field
+    /// existed. A host with no version here is never labelled — see `node_labels`.
+    #[serde(default)]
+    pub applied_version: Option<String>,
     // See the `#[serde(default, ...)]` note on `PlaybookPlanStatus::next_run`.
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
@@ -579,6 +649,19 @@ impl Condition for PlaybookPlanCondition {
 }
 
 impl PlaybookPlan {
+    /// The version this plan declares in `spec.provides`, if it declares one.
+    ///
+    /// One accessor rather than the field read spelled out at each site: the version is read by the
+    /// execution hash, by the run record that a host's claim is later dated against, and by the Node
+    /// label diff. Those three answering differently is the one disagreement this design has no room
+    /// for — the label would then claim a revision that never ran.
+    pub fn provides_version(&self) -> Option<&str> {
+        self.spec
+            .provides
+            .as_ref()
+            .map(|provides| provides.version.as_str())
+    }
+
     pub fn timezone(&self) -> Result<Tz, chrono_tz::ParseError> {
         self.spec
             .time_zone
@@ -672,6 +755,54 @@ mod tests {
         assert!(!required.contains(&serde_json::json!("timeZone")));
     }
 
+    /// `provides.version` is written verbatim into a Node label value, so admission is where a value
+    /// that cannot be one has to be refused. Letting it through would leave the plan running happily
+    /// and only failing at the label patch, on a Node, with an error about a field the user would
+    /// have to work backwards to.
+    #[test]
+    fn crd_only_accepts_a_version_that_can_be_a_label_value() {
+        use kube::CustomResourceExt as _;
+
+        let crd = serde_json::to_value(PlaybookPlan::crd()).unwrap();
+        let spec = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        let provides = &spec["properties"]["provides"];
+
+        assert_eq!(provides["properties"]["version"]["maxLength"], 63);
+        let pattern = provides["properties"]["version"]["pattern"]
+            .as_str()
+            .expect("the version carries a label-value pattern");
+
+        let pattern = regex::Regex::new(pattern).unwrap();
+        let accepts = |value: &str| pattern.is_match(value);
+        assert!(accepts("1.4.2"));
+        assert!(accepts("1"));
+        assert!(accepts("v1.4.0-rc.1"));
+        assert!(
+            accepts("1.4.2_a1b2c3"),
+            "the Helm build-metadata convention"
+        );
+        assert!(!accepts(""), "an empty version tells a dependent nothing");
+        assert!(
+            !accepts("1.4.2+a1b2c3"),
+            "'+' is not a label value character"
+        );
+        assert!(!accepts(".1.4.2"), "a label value starts alphanumeric");
+        assert!(!accepts("1.4.2-"), "and ends alphanumeric");
+
+        assert!(
+            !spec["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("provides")),
+            "a plan that provides nothing is the normal case"
+        );
+        assert_eq!(
+            provides["required"],
+            serde_json::json!(["version"]),
+            "provides without a version would label a Node with nothing"
+        );
+    }
+
     #[test]
     fn test_serialization() {
         let playbookplan = PlaybookPlan::new(
@@ -691,6 +822,7 @@ mod tests {
                     cluster_inventory: Some("controlplanes".into()),
                     static_inventory: Some("others".into()),
                 }],
+                provides: None,
                 ttl_seconds_after_finished: None,
                 successful_plays_history_limit: None,
                 failed_plays_history_limit: None,

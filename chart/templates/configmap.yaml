@@ -28,6 +28,13 @@ data:
     # `repository` with an empty `tag` (the production path the release workflow's PR converges onto).
     proxy_image = {{ printf "%s%s" .repository (ternary (printf ":%s" (.tag | toString)) "" (ne (.tag | toString) "")) | quote }}
     {{- end }}{{ end }}{{ end }}
+
+    # Whether the operator may label Nodes for plans that set `spec.provides`. Rendered from
+    # `nodeLabels.enabled`, which also decides whether the ClusterRole grants `nodes: patch` — the
+    # flag and the permission must move together, or the operator would keep trying writes it is
+    # refused (or hold a grant it never uses).
+    [node_labels]
+    enabled = {{ .Values.nodeLabels.enabled }}
     {{- with (.Values.managedSsh).readiness }}
 
     # Adaptive readiness grace for managed-ssh proxy pods on NotReady nodes: wait `grace_seconds`,

@@ -44,6 +44,12 @@ whole point of the design. If a change would weaken one, stop and surface it; do
 - **INV-7 — Proxy pods carry both `PLAYBOOKPLAN_HASH` and `PLAYBOOKPLAN_HOST`** so
   cleanup's label-scoped `delete_collection` cannot sweep the ansible Job pod (which lacks
   `_HOST`).
+- **INV-8 — The operator writes only its own Node labels.** Every Node write is confined to
+  `<namespace>.plan.ansible.cloudbending.dev/<plan>` keys built by `node_labels::label_key` from the
+  plan's own namespace and name — never a tenant-supplied key, never a Node's spec or annotations.
+  A tenant-chosen key would let a plan label its way past a `NodeAccessPolicy` ceiling (T-ESC-3).
+  The chart's `ValidatingAdmissionPolicy` enforces the same bound at the API server, and a test pins
+  its CEL matcher to `node_labels::KEY_DOMAIN`.
 
 Two recent load-bearing fixes that look like "cleanups" but MUST NOT be reverted:
 - **`StrictModes no` in `render_sshd_config`** — required so sshd will read the
@@ -73,16 +79,22 @@ src/v1beta1/
   controllers/
     playbookplancontroller/          the big one — see below
     clusterinventorycontroller/      resolves Node → hosts, watches Nodes, writes ClusterInventoryStatus
+      dependencies.rs                pure: splits a group's selector into its terms and counts, per positive requirement on an operator-owned key (`dependency_keys`), how many of the group's Nodes it is holding back. "The group's Nodes" are the ones passing every term that is *not* a dependency — that is what separates "not ready yet" from "not this group's Node", which is the whole diagnostic. Judges every term with `nodeselector`'s own evaluator; a second implementation would let the reported waits disagree with the hosts the inventory resolves to
     nodeaccesspolicycontroller/      writes NodeAccessPolicyStatus (matched namespaces / allowed nodes) for observability; watches ns + nodes
-    selector_trigger.rs              label_changes: the set-valued controllers' watch trigger — ticks only on a label change, an appearance or a disappearance; must stay in lockstep with what nodeselector.rs reads
+    selector_trigger.rs              label_changes: the set-valued controllers' watch trigger — ticks only on a label change, an appearance or a disappearance; must stay in lockstep with what nodeselector.rs reads. Also owns RECOMPUTE_DEBOUNCE, which both controllers pass to `Controller::with_config`: every tick fans out through `reconcile_all_on` to *every* object, each listing the whole Node set, so a plan labelling a fleet one Node at a time (`node_labels.rs`) would otherwise buy `writes × objects` full recomputes. Keep it short — it delays every trigger of those controllers, and an inventory slow to publish `observedGeneration` holds the plans that reference it
     ansible_inventory.rs             ResolvedInventoryGroup (ManagedSsh | Ssh) + ResolvedHosts; AnsibleInventory trait (get_hosts); distinct_hosts/_count (every host-population count, in both controllers)
     nodeselector.rs                  node_matches / selector_matches / selector_matches_fail_closed (INV-1)
+    dependency_keys.rs               the `<namespace>.plan.ansible.cloudbending.dev/<plan>` Node label key, and its inverse. Shared vocabulary, not a detail of either side: the plan controller writes the key (`node_labels.rs`), the inventory controller recognises it in a tenant's selector to tell a dependency on another plan from an ordinary label term. One end recognising a key the other would not produce is a dependency nobody is told about (INV-8)
+    version.rs                       parses a label or selector value as a version for the ordered operators (`Gt`/`Ge`/`Lt`/`Le`), which Kubernetes' own integer-only `Gt`/`Lt` cannot express. Lenient on the way in (optional `v`, one to three components, `_` build metadata as Helm writes it), SemVer on the way out, and `None` for anything else — an unanswerable comparison is a non-match, so a dependency selector waits instead of running
     reconcile_error.rs               shared ReconcileError (thiserror)
   controllers/playbookplancontroller/
     reconciler.rs                    the reconcile pipeline (below); patch_status via JSON merge patch
     mappers.rs                       maps Secret, NodeAccessPolicy, ClusterInventory and StaticInventory changes to affected plans; the Secret watch asks two rules (named in `variables`/`files`, or holding a StaticInventory's SSH key)
     node_access.rs                   NodeAccessPolicy enforcement: fail-closed intersection clamp (INV-2/3/5)
+    node_labels.rs                   publishes a plan's `spec.provides` version onto the Nodes it converged, as `<ns>.plan.ansible.cloudbending.dev/<plan>`, so other plans can gate their own inventories on it. Three load-bearing rules: **status first, labels after** (a label may lag the record, never lead it — a crash between the two must not leave a claim with no evidence); the diff reads the **resolved managed-ssh groups**, never `hostsStatus` alone (which is keyed by name, so a StaticInventory host would otherwise label a same-named Node); and it writes **only on a real change of value**, since every Node label change is broadcast to every Node watcher in the cluster. The key is derived from the plan's namespace and name, never from tenant input (INV-8)
     node_readiness.rs                Node Ready-condition predicates + the OneShot "hold instead of starting" gate; readiness only, never authorization
+    node_recreation.rs               drops a host's recorded application when its Node was registered after `appliedAt` — a rebuilt machine inherits the name, never the claim. Level-triggered on purpose: a deletion the operator was down for leaves no event to react to
+    departed_hosts.rs                prunes `hostsStatus` rows for hosts that left the inventory **and** no longer exist as Nodes (housekeeping; `hostsStatus` otherwise only ever grows). Requiring both is what stops a narrowed NodeAccessPolicy from dropping live machines' records and re-running them when it widens again. Deletion needs an explicit `null` per key — a merge patch cannot delete by omission
     managed_ssh.rs                   proxy pods (hostPID + nsenter = NODE ROOT), per-run sshd config/certs/principals, NetworkPolicy, cleanup (INV-4/7)
     locking.rs                       per-host Leases (operator ns) for run mutual-exclusion
     play_history.rs                  writes/prunes the immutable Play run records; its module doc is the authoritative PlayPhase state machine
@@ -141,6 +153,11 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    group came from) and then `node_access::enforce`, which clamps managed-ssh nodes to the
    fail-closed intersection of the plan namespace's allowed nodes. One step on purpose: nothing may
    observe the unclamped result. `warn!`s excluded nodes; sets `status.eligible_hosts`.
+   A `ClusterInventory` whose `status.observedGeneration` is behind its `metadata.generation` is
+   refused here (`InventoryNotSynced`, classified transient so it *holds* an unlaunched run rather
+   than superseding it): its published `resolvedHosts` still answer for the spec before the edit, and
+   one `helm upgrade` that changes an inventory and a plan together would otherwise launch against
+   the host set the edit replaced.
 5. **Execution hash.** `ExecutionHash` over the playbook text + contents of every referenced
    Secret (variables + files), order-insensitive; deliberately **excludes** the workspace
    Secret (its content — proxy IPs — legitimately changes each run). Hash change ⇒
@@ -412,19 +429,43 @@ costs exactly as much as one it can: a suspended plan, a `OneShot` plan out of a
 runs — the readiness gate it would be released by is `OneShot`-only — and it is the one mode with no
 budget to bound the wakes, so one stuck host would otherwise wake it per heartbeat forever.
 
-`reconciler::new` is `async` for one reason: it waits for that reflector's initial LIST before
-handing back a controller. An unsynced Node cache reports every node `Ready`, which is precisely the
-answer that starts the runs the readiness gate exists to hold back — so after a restart every held
-plan would launch one, take its hosts' Leases for the full proxy grace window and report everything
-unreachable. `main` drives this controller as a future of its own so that wait does not delay the
-other two.
+The plan reflector's own task is driven **after** that wait, because it carries the two things
+`reconcile` never sees. A **deletion**: `Controller::new` decodes its primary watch with
+`applied_objects()`, which drops `Event::Delete`, and the object has left the store by then — so a
+deleted plan never reconciles, and the run-cleanup finalizer is no help either since an idle plan
+does not hold one. That is the path that withdraws a deleted provider's Node labels. And
+**`InitDone`**, the one moment "no such plan exists" is safe to ask: the reflector applies the event
+to the store *before* yielding it (`reflector/mod.rs`), so the store then holds a complete LIST.
+`node_labels::orphaned_labels` judged against a half-synced store would strip every dependency label
+in the cluster, which is why it is gated there and nowhere else — and why it runs on every resync,
+not only the first: a deletion during a watch disconnection produces no `Delete` event at all.
 
-The wait is bounded (`NODE_CACHE_SYNC_TIMEOUT`, 2 min) and **fatal**: `await_node_cache` panics
-rather than carrying on, because `Store::wait_until_ready` resolves only on a populated cache or a
-dropped writer, and a `watcher` retries a failing watch forever — so an unbounded wait would leave
-the controller pending for the life of the process while the other two kept the operator looking
-healthy. `join!` in `main` is what turns that panic into a process exit; spawning the controllers
-instead would park it in a `JoinHandle` nobody reads and restore exactly the silent half-alive state.
+**Neither is awaited on that stream.** The reflector applies events to the store as the stream is
+polled, so work done inline stops the plan cache updating for its whole duration — and both of these
+remove a label per Node, one PATCH at a time. Every mapper that decides which plans to wake reads
+that cache. So each spawns a task, unserialized: both only ever *remove* labels, removing an absent
+one is a no-op, and a late-starting sweep still reads a complete store because `Writer` buffers a
+re-LIST and only swaps it in on `InitDone`.
+
+`reconciler::new` is `async` because it waits for two initial LISTs before handing back a
+controller, and both waits exist because an unsynced `Store` does not fail — it answers wrongly.
+An unsynced **Node** cache reports every node `Ready`, which is precisely the answer that starts the
+runs the readiness gate exists to hold back: after a restart every held plan would launch one, take
+its hosts' Leases for the full proxy grace window and report everything unreachable. An unsynced
+**plan** cache reports every plan *deleted*, so `plan_still_exists` would withhold the Node labels
+the first tick after a restart is there to republish — the crash-between-status-and-labels case
+deriving them every tick exists for — and not retry until the plan's next requeue, an hour for an
+idle `OneShot`. The plan wait comes second because the task that drives that reflector is spawned
+between them. `main` drives this controller as a future of its own so neither wait delays the other
+two.
+
+Both waits are bounded (`CACHE_SYNC_TIMEOUT`, 2 min) and **fatal**: `await_node_cache` and
+`await_plan_cache` panic rather than carrying on, because `Store::wait_until_ready` resolves only on
+a populated cache or a dropped writer, and a `watcher` retries a failing watch forever — so an
+unbounded wait would leave the controller pending for the life of the process while the other two
+kept the operator looking healthy. `join!` in `main` is what turns that panic into a process exit;
+spawning the controllers instead would park it in a `JoinHandle` nobody reads and restore exactly
+the silent half-alive state.
 
 **It bounds the first sync only.** A watch that breaks after the cache is populated leaves the
 `Store` serving its last contents for the life of the process, so the gate keeps answering from a
@@ -544,6 +585,12 @@ eyeball new cross-page links (or run the `mdbook-linkcheck` backend if installed
   `Justfile` for recipes.
 - `./ansible-operator crds` dumps all **five** CRDs (PlaybookPlan, Play, ClusterInventory,
   StaticInventory, NodeAccessPolicy) — check this path after changing any `CustomResource` type.
+  **A doc comment on a CRD type becomes Helm template text.** `just generate-crds` copies the dump
+  into `chart/charts/crds/templates/` verbatim, escaping nothing, so a `{{ … }}` in a doc comment is
+  a live Helm action: an example of Helm syntax renders as its *result* in the shipped CRD (a
+  `{{ .Chart.Version | replace … }}` sample became `0.1.0`), and an expression Helm cannot evaluate
+  fails the install outright. Describe such syntax in prose, and check with
+  `helm template ./chart | grep` after regenerating.
 - The chart renders `managedSsh.proxyImage` and `watchNamespaces` into the operator ConfigMap;
   `helm template ./chart -s templates/configmap.yaml` (and `templates/role.yaml`) is the quick
   way to sanity-check chart wiring.

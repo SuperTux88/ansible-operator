@@ -46,6 +46,12 @@ spec:
 To cover several namespaces in one policy, use `matchExpressions` on the `namespaceSelector`, e.g.
 `{ key: team, operator: In, values: [business, payments] }`.
 
+Both selectors take the same operators a `ClusterInventory` group does — `In`, `NotIn`, `Exists`,
+`DoesNotExist`, and the ordered `Gt`, `Ge`, `Lt`, `Le`, which compare a label value against one
+value as a version (see [Comparing versions](../running-playbooks/cluster-nodes.md#comparing-versions)).
+A ceiling written with an ordered operator is worth reading twice, because the label it orders is
+usually one a plan publishes — see below.
+
 ## Matching every Node
 
 An **empty** selector (`{}`) matches **nothing**, not everything — the opposite of Kubernetes' usual
@@ -71,6 +77,35 @@ A namespace's effective allow-set is the **union** of the `nodeSelector`s of **e
 `namespaceSelector` matches it. That union is then intersected with each `ClusterInventory`'s resolved
 Nodes at run time. So you can layer policies — a broad baseline plus narrower grants — and a namespace
 gets the sum of what any matching policy allows, never more than the Nodes that actually exist.
+
+## Selecting on a plan's dependency label delegates part of the ceiling
+
+A policy's `nodeSelector` may name one of the labels a plan publishes through `spec.provides`
+(`<namespace>.plan.ansible.cloudbending.dev/<plan-name>`) — for example, to say that a namespace may
+only reach Nodes a hardening plan has finished with, optionally at a minimum version:
+
+```yaml
+  nodeSelector:
+    matchExpressions:
+      - { key: platform.plan.ansible.cloudbending.dev/hardening, operator: Ge, values: ["2.0.0"] }
+```
+
+That is a legitimate and useful thing to express, but be clear about what it means.
+
+No plan can grant *itself* access this way. The label only ever appears on Nodes where the providing
+plan ran successfully, and that plan's runs were already bounded by its own namespace's ceiling — so
+a label can never point past where its author could already reach.
+
+What such a policy does is **delegate**. The selected namespace's ceiling then follows:
+
+- what the providing plan's tenant does, up to that plan's own ceiling; and
+- anyone with root on a Node, who can forge the label for *that* Node through the kubelet (the
+  operator's keys are not under a `NodeRestriction`-reserved prefix). Every managed-SSH playbook has
+  exactly that root.
+
+So treat it as handing part of the decision to the providing plan's owner. For a fixed ceiling,
+keep using labels only an administrator can set — `kubernetes.io/metadata.name` for namespaces,
+admin-managed node pool labels for Nodes.
 
 ## Observing a policy
 

@@ -143,6 +143,26 @@ such an inventory fails to reconcile until the variable is removed. Everything e
 data the playbook they already control would receive anyway, so this adds no reach beyond authoring
 the playbook itself.
 
+## Writing labels on Nodes
+
+With `nodeLabels.enabled` (default on) the operator holds `patch` on every Node in the cluster, so a
+plan that sets `spec.provides` can publish what it has finished as a label other plans depend on.
+RBAC cannot narrow a verb to one field, so that grant would also permit editing taints,
+`spec.unschedulable` or any other label — none of which the operator ever writes.
+
+Two things bound it. The operator derives the key from the plan's **own namespace and name**, never
+from anything a tenant supplies, so no plan can label its way past a `NodeAccessPolicy` ceiling or
+overwrite another plan's claim. And `nodeLabels.admissionPolicy` (default on) has the API server
+enforce the same bound, holding the operator's ServiceAccount to keys containing
+`.plan.ansible.cloudbending.dev/` and requiring everything else about the Node to be unchanged.
+
+It is a smaller step than it looks: the operator is already root on every Node it can reach, through
+the managed-SSH proxy pods. What the grant adds is a write on the *API* that needs no run behind it,
+which is exactly what the policy takes back. Clusters below Kubernetes 1.30 have no
+`ValidatingAdmissionPolicy` and must run the grant unguarded or turn the feature off — see
+[Deployment](./deployment.md#node-labels-for-plan-dependencies). `T-ESC-9` in the threat model is
+the full analysis, including what anyone with root on a Node can forge through the kubelet.
+
 ## Blast radius
 
 What a compromise of the operator (or of a tenant allowed to author a `ClusterInventory`) can and
@@ -166,5 +186,6 @@ remove hosts (INV-2); it runs before any proxy infra, every reconcile (INV-3), a
 resumed run re-authorizes the exact set before creating proxies (INV-3b); cross-run isolation is
 per-run cert principals (INV-4); the Node allow-set is a live read (INV-5); the CA private key
 never leaves the process (INV-6); proxy pods are labelled so cleanup can never sweep the ansible Job
-pod (INV-7). If you are modifying the operator, do not regress these without an explicit, deliberate
-decision.
+pod (INV-7); and the operator writes only its own dependency label keys on a Node, never a Node's
+spec, annotations or anybody else's labels (INV-8). If you are modifying the operator, do not
+regress these without an explicit, deliberate decision.

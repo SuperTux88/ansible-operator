@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use futures::Stream;
 use k8s_openapi::api::core::v1::Node;
@@ -18,6 +18,8 @@ use crate::v1beta1::{
     controllers::{nodeselector::node_matches, reconcile_error::ReconcileError, selector_trigger},
     distinct_host_count,
 };
+
+use super::dependencies;
 
 struct ReconciliationContext {
     client: kube::Client,
@@ -45,6 +47,10 @@ pub fn new(
     // select over actually move. `Controller::reconcile_all_on` reads the controller's own store,
     // so the hand-rolled reflector the mapper needed is gone with it.
     Controller::new(inventories_api, watcher::Config::default())
+        // Every tick recomputes every inventory against the whole Node set, so a fleet being
+        // labelled by a providing plan would otherwise buy one full recompute per Node —
+        // see `selector_trigger::RECOMPUTE_DEBOUNCE`.
+        .with_config(controller::Config::default().debounce(selector_trigger::RECOMPUTE_DEBOUNCE))
         .reconcile_all_on(selector_trigger::label_changes(node_metadata_api))
         .run(
             reconcile,
@@ -79,14 +85,35 @@ async fn reconcile(
         })
         .collect();
 
+    // The same Nodes, asked the complementary question: which of them this group would have taken
+    // if another plan had finished with them. Computed in the pass that resolves the hosts and
+    // published in the same write, so a plan reading both reads one observation — and the
+    // `observedGeneration` below answers for the diagnostics exactly as it answers for the hosts.
+    let mut dependencies = Vec::new();
+    let mut waiting: BTreeSet<String> = BTreeSet::new();
+    for group in to_resolve {
+        let group_waits =
+            dependencies::waits(&group.name, group.match_labels.as_ref(), &all_nodes.items);
+        dependencies.extend(group_waits.dependencies);
+        waiting.extend(group_waits.waiting_hosts);
+    }
+
     // Over the distinct Nodes, not the group memberships: a Node matched by two groups is listed
     // in both, and this column sits directly above the plan's `n/m hosts` summaries, which have
     // always counted it once.
     let host_count = distinct_host_count(&resolved_hosts);
 
+    // Published with the hosts it was computed from, in the same write: it is what tells a plan that
+    // `resolvedHosts` answers for the spec the apiserver holds now, and not for the one before the
+    // edit it has yet to see.
     let next_status = ClusterInventoryStatus {
+        observed_generation: object.metadata.generation,
         host_count,
         resolved_hosts,
+        // Counted over distinct Nodes for the same reason `hostCount` is: the two sit side by side
+        // in the printer columns, and a Node waiting in two groups is one machine not joining.
+        waiting_hosts: waiting.len(),
+        dependencies,
     };
 
     let api: Api<ClusterInventory> = Api::namespaced(context.client.clone(), &namespace);

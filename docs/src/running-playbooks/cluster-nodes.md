@@ -19,7 +19,8 @@ group may use either selector form, following Kubernetes' label-selector semanti
 
 - **`matchLabels`** — an exact-match map; a Node must carry every listed label and value.
 - **`matchExpressions`** — a list of `{ key, operator, values }` terms with operators `In`, `NotIn`,
-  `Exists`, `DoesNotExist`.
+  `Exists`, `DoesNotExist`, and the ordered `Gt`, `Ge`, `Lt`, `Le` described under
+  [Comparing versions](#comparing-versions).
 
 ```yaml
 apiVersion: ansible.cloudbending.dev/v1beta1
@@ -44,6 +45,156 @@ currently match. `hostCount` counts each Node once even when several of the inve
 it — the same way a plan's `n/m hosts` summary does, since one Node is one host to a run whatever it
 is grouped under. `resolvedHosts` still lists it under every group it belongs to; that is what makes
 the group names usable in a playbook's `hosts:`.
+
+`.status.observedGeneration` records the `metadata.generation` those hosts were resolved from. A plan
+reads the published `resolvedHosts` rather than evaluating the selectors itself, so until the
+controller has caught up with an edit they still describe the *previous* spec — and a plan that
+started a run in that window would target the Nodes the edit replaced. Plans therefore start no new
+run from an inventory whose `observedGeneration` is behind its `metadata.generation`, and say so in
+their summary; the catching-up status write wakes them, normally within seconds. This matters most
+for a single `helm upgrade` that changes an inventory and a plan together, since Helm applies both in
+one pass and waits for no status.
+
+## Comparing versions
+
+`Gt`, `Ge`, `Lt` and `Le` order a Node's label value against the term's **single** value as a
+version — "at least 1.4.0", rather than one exact string you have to edit at every bump:
+
+```yaml
+matchExpressions:
+  - { key: platform.plan.ansible.cloudbending.dev/containerd-config, operator: Ge, values: ["1.4.0"] }
+```
+
+Both sides are read leniently and then ordered by [SemVer](https://semver.org): a leading `v` is
+optional, missing components count as zero (`1.4` is `1.4.0`), and build metadata after `+` or `_` is
+ignored. Two consequences to keep in mind:
+
+- **A pre-release sorts *before* its release.** `Ge 1.4.0` does not match `1.4.0-rc.1`, which is
+  usually what you want from a release candidate.
+- **A short value is filled up with zeros, including yours.** `Ge 2` is `Ge 2.0.0`, so it matches
+  `2.1.1` and every other 2.x — you do not have to spell out `2.0.0`. It only reads as "the 2.x
+  series" in that direction, though: `Le 2` is `Le 2.0.0` and therefore *excludes* `2.1.1`. To cap a
+  series, say `Lt 3`.
+- **A range is two terms.** Each term takes one value, and all terms in a group must hold, so
+  `Ge 1.4.0` plus `Lt 2.0.0` is how you express "1.x from 1.4 on".
+
+This is not the same as Kubernetes' own `Gt`/`Lt`, which exist only for node affinity and parse
+**both** sides as integers — a dotted version never matches one. Comparing as plain strings would be
+worse than useless here, since it sorts `1.10.0` before `1.9.0`. An integer is simply a
+one-component version to these operators, so anything Kubernetes' versions of them accept compares
+exactly as it would there.
+
+Anything the comparison cannot answer **does not match**: a Node without that label, a label value
+or term value that is not a version (`latest`, say), or a term listing zero or several values. A
+selector you expected to match nothing but Nodes that are ready therefore errs towards *not*
+running, never towards running somewhere it should not.
+
+## Depending on another plan
+
+A plan that declares [`spec.provides`](./playbook-plans.md#declaring-what-a-plan-provides) labels
+every Node it has converged. Select on that label and your inventory resolves to "the Nodes where
+that plan has finished", growing by itself as the other plan works through its hosts:
+
+```yaml
+kind: ClusterInventory
+metadata:
+  name: workers-with-containerd
+spec:
+  hosts:
+    - name: workers
+      matchLabels:
+        node-role.kubernetes.io/worker: ""
+      matchExpressions:
+        - key: platform.plan.ansible.cloudbending.dev/containerd-config
+          operator: Exists
+```
+
+`Exists` accepts whatever version the providing plan has applied. To require a particular one, use
+`In` for an exact value or `Ge` for "this version or newer" — see
+[Comparing versions](#comparing-versions):
+
+```yaml
+      matchExpressions:
+        - key: platform.plan.ansible.cloudbending.dev/containerd-config
+          operator: Ge
+          values: ["1.4.0"]
+```
+
+A host that is not ready yet is simply **not in the run** — it costs no attempt, holds no Lease and
+starts no proxy pod, which is exactly why this is expressed as a host set rather than as a wait
+inside the playbook. When the providing plan succeeds on another Node, that Node's label reaches
+this inventory's `resolvedHosts` within seconds and the dependent plan is woken.
+
+The label is cluster-wide, so the providing plan may live in **another namespace** — the key names
+it, which is also why every key is visible to anyone who can read Nodes.
+
+Two things to get right when you copy an existing inventory to add a dependency:
+
+- **Keep the group `name`.** It becomes the Ansible group, so a copy that keeps `workers` lets the
+  same playbook (`hosts: workers`) run unchanged.
+- **Copy the group `variables` exactly.** They are part of the execution hash, so a copy that
+  differs puts the dependent plan on a different revision than the original inventory would have.
+
+Remember what the label means: *this version was applied here at some point*. It is not a freshness
+or health signal, and a dependent is **not** re-run when the provider changes — see
+[Scheduling and execution modes](./scheduling-and-modes.md#dependencies-do-not-re-trigger-a-plan).
+
+### Seeing what an inventory is waiting for
+
+An inventory gated on a dependency resolves fewer hosts than you wrote it for, which on its own
+looks exactly like a typo in the key. The inventory says which it is: `.status.waitingHosts` (the
+`Waiting` column) counts the Nodes kept out by a dependency alone, and `.status.dependencies` says
+what each group is waiting on.
+
+```console
+$ kubectl get clusterinventory workers-with-containerd
+NAME                      HOSTS   WAITING
+workers-with-containerd   3       5
+
+$ kubectl get clusterinventory workers-with-containerd -o jsonpath='{.status.dependencies}' | jq
+[
+  {
+    "group": "workers",
+    "key": "platform.plan.ansible.cloudbending.dev/containerd-config",
+    "providerNamespace": "platform",
+    "providerName": "containerd-config",
+    "requirement": "Ge 1.4.0",
+    "waiting": 5,
+    "satisfied": 3
+  }
+]
+```
+
+Read it as "3 of 8 of this group's Nodes have got past `containerd-config`". A Node counts towards
+those numbers when it satisfies everything *else* the group asks for, so a Node your `node-role`
+selector excludes is not reported as waiting — it is simply not this group's Node. A Node held back
+by two dependencies is counted under both, since neither provider finishing releases it on its own.
+
+The provider is named by **decoding the key**, not by looking the plan up. A dependency on a plan
+nobody has therefore reads as waiting for it for ever — which is what a mistyped key looks like, and
+why the name is printed: `nosuch/typo` in `providerName` is the typo staring back at you.
+
+Which Nodes they are is a label query away, since the numbers count exactly the Nodes that lack the
+label:
+
+```console
+$ kubectl get nodes -l 'platform.plan.ansible.cloudbending.dev/containerd-config'
+```
+
+Two limits worth knowing. These counts are the **inventory's**, so they are taken before any
+[`NodeAccessPolicy`](../cluster-operators/node-access-policies.md) clamp a plan using this inventory
+is subject to: a Node reported as satisfied may still be out of a given plan's reach. And a group
+with `Waiting: 0` whose host count is still lower than you expect is telling you the missing Nodes
+fail something other than a dependency — the selector, or the policy.
+
+Three things are flagged rather than counted, when a dependency can never be satisfied as written:
+`invalidValue`, `malformedTerm` and `unparseableHosts`. See
+[A dependency never becomes satisfied](./results-and-troubleshooting.md#a-dependency-never-becomes-satisfied).
+
+Every plan referencing this inventory repeats the wait on itself, as the `DependenciesWaiting`
+condition and a clause in its summary, so you do not have to go looking for the inventory to find
+out why a plan is quiet. See
+[Conditions](./results-and-troubleshooting.md#conditions).
 
 ## Group variables
 

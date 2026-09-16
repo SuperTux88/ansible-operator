@@ -41,9 +41,10 @@ use crate::{
             watch_backoff::WatchBackoff,
         },
         playbookplancontroller::{
-            callback_output,
+            callback_output, departed_hosts,
             execution_evaluator::{self, find_outdated_hosts},
-            job_builder, mappers, node_access, node_readiness, play_history, status,
+            job_builder, mappers, node_access, node_labels, node_readiness, node_recreation,
+            play_history, status,
         },
     },
 };
@@ -59,12 +60,12 @@ const DEFAULT_RECURRING_ATTEMPTS: u32 = 1;
 /// How long a plan waits before making a try it still owes. Short because a scheduled retry has only
 /// the remainder of its tick's `startingDeadlineSeconds` window to start in.
 const RETRY_REQUEUE: std::time::Duration = std::time::Duration::from_secs(1);
-/// How long [`new`] waits for the Node cache's initial LIST before taking the process down with it.
+/// How long [`new`] waits for a reflector's initial LIST before taking the process down with it.
 ///
 /// Deliberately generous, because the two ways of getting it wrong are not symmetric: too short
 /// crash-loops an operator that would have synced a moment later, taking down a working install,
 /// while too long only prolongs a state that is already broken. It has to sit comfortably above a
-/// *healthy* sync and nothing more — that is one unpaginated Node LIST at roughly 10 KB per Node, so
+/// *healthy* sync and nothing more — that is one unpaginated LIST at roughly 10 KB per object, so
 /// single-digit seconds even at a thousand of them.
 ///
 /// Two minutes is the value controller-runtime uses for the same question (its `CacheSyncTimeout`),
@@ -73,7 +74,7 @@ const RETRY_REQUEUE: std::time::Duration = std::time::Duration::from_secs(1);
 /// later restart with nobody involved, while a permanent one shows as `CrashLoopBackOff` within a
 /// couple of minutes with the reason in the log. A knob here would only invite tuning a number whose
 /// single job is to be far above any healthy sync.
-const NODE_CACHE_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const CACHE_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How many consecutive Node watch failures stop looking like a blip, after which the log says what
 /// the failure *costs* rather than only that it happened.
@@ -95,6 +96,23 @@ const NODE_WATCH_ESCALATION_INTERVAL: std::time::Duration = std::time::Duration:
 pub struct WorkloadEgressPolicies {
     pub playbook: Option<Vec<NetworkPolicyEgressRule>>,
     pub managed_ssh: Option<Vec<NetworkPolicyEgressRule>>,
+}
+
+/// The admin's chart-derived knobs, as one value.
+///
+/// Grouped because they travel together and always will: every one of them comes from `values.yaml`
+/// by way of the operator ConfigMap, is read once at startup, and is then only ever read. The
+/// operator's own identity — its namespace, its enrolled set, its CA — is deliberately *not* in
+/// here; that is who the operator is, not how an admin tuned it.
+pub struct OperatorSettings {
+    /// Image for the managed-ssh proxy pods. No built-in default; see
+    /// [`ReconciliationContext::proxy_image`].
+    pub proxy_image: String,
+    /// How long a `NotReady` node's proxy pod is waited for, scaled by heartbeat age.
+    pub proxy_grace: managed_ssh::ProxyGracePolicy,
+    /// Whether a plan's `spec.provides` version may be published onto its Nodes.
+    pub node_labels_enabled: bool,
+    pub workload_egress_policies: WorkloadEgressPolicies,
 }
 
 struct ReconciliationContext {
@@ -122,11 +140,22 @@ struct ReconciliationContext {
     /// own live read, because the allow-set is a security gate and must not be served from a cache
     /// (INV-5).
     nodes: Arc<Store<Node>>,
+    /// Reflector-backed cache of every `PlaybookPlan` in the cluster, read for one question: is the
+    /// plan this tick is reconciling still there, asked immediately before its Node labels are
+    /// published (`plan_still_exists`). It is a *different* store from the one the `Controller`
+    /// handed this reconcile its object out of, and it is the one the delete handler's stream keeps
+    /// current — which is what makes it the freshest answer available without a request.
+    plans: Arc<Store<PlaybookPlan>>,
     /// Image for the managed-ssh proxy pods (the node-root primitive — THREAT_MODEL T-ESC-5). Set by
     /// the admin via the chart's `managedSsh.proxyImage` (rendered to `proxy_image`); there is **no
     /// built-in default** — the operator refuses to start without it (see `config::require_proxy_image`
     /// / `main.rs`), so by the time a reconcile runs this is always a real, admin-chosen image.
     proxy_image: String,
+    /// Whether this cluster lets the operator publish a plan's `spec.provides` version onto the
+    /// Nodes it converged. From the chart's `nodeLabels.enabled`, which moves this flag and the
+    /// ClusterRole's `nodes: patch` together — so a `false` here means the permission is absent too,
+    /// and the only correct thing to do is say so on the plan rather than attempt a write.
+    node_labels_enabled: bool,
     /// How long to wait for a `NotReady` node's proxy pod to become Ready before treating the node as
     /// unreachable, scaled by the node's heartbeat age. From the chart's `managedSsh.readiness`.
     proxy_grace: managed_ssh::ProxyGracePolicy,
@@ -170,9 +199,7 @@ pub async fn new(
     operator_namespace: String,
     enrolled_namespaces: std::collections::BTreeSet<String>,
     ca: Arc<CertificateAuthority>,
-    proxy_image: String,
-    proxy_grace: managed_ssh::ProxyGracePolicy,
-    workload_egress_policies: WorkloadEgressPolicies,
+    settings: OperatorSettings,
 ) -> impl Stream<
     Item = Result<
         (ObjectRef<v1beta1::PlaybookPlan>, Action),
@@ -196,7 +223,9 @@ pub async fn new(
 
     let enrolled_namespaces = Arc::new(enrolled_namespaces);
 
-    let playbookplan_reflector_reader = {
+    // Built here but **driven** further down, once the Node cache exists: its task is also where a
+    // plan deletion and a cache resync are noticed, and both of those have to read Nodes.
+    let (playbookplan_reflector, playbookplan_reflector_reader) = {
         let playbookplan_reflector_writer = Writer::<v1beta1::PlaybookPlan>::default();
         let playbookplan_reflector_reader = Arc::new(playbookplan_reflector_writer.as_reader());
 
@@ -211,18 +240,7 @@ pub async fn new(
                 .backoff(WatchBackoff::default()),
         );
 
-        tokio::spawn(async move {
-            playbookplan_reflector
-                .for_each(|event| async {
-                    match event {
-                        Ok(_) => {}
-                        Err(e) => error!("Reflector error: {e:?}"),
-                    }
-                })
-                .await;
-        });
-
-        playbookplan_reflector_reader
+        (playbookplan_reflector, playbookplan_reflector_reader)
     };
 
     let node_access_policy_reflector_reader = {
@@ -320,8 +338,79 @@ pub async fn new(
         reader
     };
 
-    // The only thing this constructor waits for.
+    // The first of the two things this constructor waits for; the plan cache is the other, and has
+    // to come after the task that drives it is spawned below.
     await_node_cache(&node_reflector_reader).await;
+
+    // Now that the Node cache is populated, drive the plan reflector — the stream that carries the
+    // two things about a plan the reconciler never sees.
+    //
+    // **A deletion.** `Controller::new` decodes its primary watch with `applied_objects()`, which
+    // drops `Event::Delete` outright, and the object has left the store by then anyway, so a
+    // deleted plan never reconciles. The run-cleanup finalizer is no help either: it is held only
+    // while a run owns resources, so a converged provider — exactly the plan whose labels matter —
+    // carries none. This stream still sees the deletion, with the whole object.
+    //
+    // **A completed LIST.** `InitDone` means the store now holds every plan in the cluster, which
+    // is the one moment "this label's plan does not exist" can be asked safely. Asked on every
+    // resync rather than only the first, because a deletion during a watch disconnection produces
+    // no `Delete` event at all — the re-LIST simply drops the object.
+    //
+    // Both answers are acted on in **tasks of their own**, never inline. The reflector applies each
+    // event to the store as this stream is polled, so anything awaited here stops the plan cache
+    // from updating for as long as it runs — and both of these remove a label per Node, one PATCH
+    // at a time, over as many Nodes as a provider converged. Every mapper that decides which plans
+    // a Secret, an inventory or a policy should wake reads that cache, so a large withdrawal would
+    // have them computing wake sets from a plan set minutes out of date.
+    //
+    // Nothing serializes the tasks, because there is nothing for them to corrupt: each one only
+    // ever removes labels, and removing an absent label is a no-op. Two overlapping sweeps agree on
+    // the same orphans and the loser's patches change nothing. A sweep that starts late still reads
+    // a complete store, since `Writer` accumulates a re-LIST into a buffer and only swaps it in on
+    // `InitDone` — the store never empties underneath it.
+    {
+        let client = client.clone();
+        let plans = Arc::clone(&playbookplan_reflector_reader);
+        let nodes = Arc::clone(&node_reflector_reader);
+        let labels_enabled = settings.node_labels_enabled;
+        tokio::spawn(async move {
+            playbookplan_reflector
+                .for_each(|event| {
+                    let client = client.clone();
+                    let plans = Arc::clone(&plans);
+                    let nodes = Arc::clone(&nodes);
+                    async move {
+                        match event {
+                            Ok(watcher::Event::Delete(plan)) if labels_enabled => {
+                                tokio::spawn(async move {
+                                    withdraw_deleted_plans_labels(&client, &plan).await;
+                                });
+                            }
+                            Ok(watcher::Event::InitDone) => {
+                                tokio::spawn(async move {
+                                    sweep_orphaned_node_labels(
+                                        &client,
+                                        &nodes,
+                                        &plans,
+                                        labels_enabled,
+                                    )
+                                    .await;
+                                });
+                            }
+                            Ok(_) => {}
+                            Err(e) => error!("Reflector error: {e:?}"),
+                        }
+                    }
+                })
+                .await;
+        });
+    }
+
+    // The second and last thing this constructor waits for, and only now that the task above is
+    // driving the stream that fills it. Reconciles must not start against a store that has not
+    // synced: every plan reads as deleted there, and `plan_still_exists` would withhold labels the
+    // first tick after a restart is meant to republish.
+    await_plan_cache(&playbookplan_reflector_reader).await;
 
     let context = Arc::new(ReconciliationContext {
         client: client.clone(),
@@ -330,9 +419,11 @@ pub async fn new(
         ca,
         node_access_policies: Arc::clone(&node_access_policy_reflector_reader),
         nodes: Arc::clone(&node_reflector_reader),
-        proxy_image,
-        proxy_grace,
-        workload_egress_policies,
+        plans: Arc::clone(&playbookplan_reflector_reader),
+        proxy_image: settings.proxy_image,
+        proxy_grace: settings.proxy_grace,
+        node_labels_enabled: settings.node_labels_enabled,
+        workload_egress_policies: settings.workload_egress_policies,
     });
 
     // The inventory watches close the gap between what a tick *reads* and what starts one:
@@ -432,7 +523,7 @@ pub async fn new(
 /// making the state loud, which is the half that was missing, without picking a trade on a
 /// cluster's behalf.
 async fn await_node_cache(nodes: &Store<Node>) {
-    match tokio::time::timeout(NODE_CACHE_SYNC_TIMEOUT, nodes.wait_until_ready()).await {
+    match tokio::time::timeout(CACHE_SYNC_TIMEOUT, nodes.wait_until_ready()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => panic!(
             "the Node reflector stopped before its initial sync ({error}); the PlaybookPlan \
@@ -442,7 +533,42 @@ async fn await_node_cache(nodes: &Store<Node>) {
             "timed out after {}s waiting for the initial Node list; the PlaybookPlan controller \
              cannot judge node readiness without it. Check that the operator's ClusterRole still \
              grants list/watch on nodes, and that the apiserver is reachable",
-            NODE_CACHE_SYNC_TIMEOUT.as_secs()
+            CACHE_SYNC_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+/// Blocks until the `PlaybookPlan` reflector has served its initial LIST, and **panics** if it never
+/// does — the same contract as [`await_node_cache`], and for the same shape of reason: an unsynced
+/// store here does not fail, it answers wrongly.
+///
+/// [`plan_still_exists`] asks this store whether the plan a tick is about to label is still in the
+/// cluster. Against a store that has not synced, *every* plan reads as deleted — so the labels of a
+/// plan recovering from a crash between its status write and its label write, which is the case
+/// deriving labels on every tick exists for, would be withheld and not tried again until the plan's
+/// next requeue: an hour for an idle `OneShot`. The same is true of the first tick after a namespace
+/// is re-enrolled, which restores a provider's labels from its recorded results with no run behind
+/// them.
+///
+/// The mappers read it too, where an empty store means a Secret or inventory change wakes no plan at
+/// all. That was always so and was survivable, because the next requeue recovers it; it is the label
+/// publish that has no second chance worth waiting for.
+///
+/// The orphan sweep is deliberately *not* among the readers this protects: it is gated on the
+/// `InitDone` event itself, which is strictly stronger than this.
+async fn await_plan_cache(plans: &Store<PlaybookPlan>) {
+    match tokio::time::timeout(CACHE_SYNC_TIMEOUT, plans.wait_until_ready()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!(
+            "the PlaybookPlan reflector stopped before its initial sync ({error}); the controller \
+             cannot tell a deleted plan from an unread one without it"
+        ),
+        Err(_elapsed) => panic!(
+            "timed out after {}s waiting for the initial PlaybookPlan list; the controller cannot \
+             tell a deleted plan from an unread one without it. Check that the operator's \
+             ClusterRole still grants list/watch on playbookplans, and that the apiserver is \
+             reachable",
+            CACHE_SYNC_TIMEOUT.as_secs()
         ),
     }
 }
@@ -548,6 +674,25 @@ async fn reconcile(
         warn!(
             "PlaybookPlan {namespace}/{name} is in a namespace not enrolled for ansible-operator; refusing to run (add it to the chart's watchNamespaces)"
         );
+        // A plan the operator refuses to run must not go on steering other plans' inventories, so
+        // its claim is withdrawn here rather than left standing for as long as the namespace is
+        // out. Dependents elsewhere lose those hosts, which is the intended fail-closed direction.
+        //
+        // Nodes are cluster-scoped, so this is covered by the ClusterRole even though the operator
+        // holds no Role in this namespace. Idempotent, so running it on every pass through the
+        // guard costs nothing once the labels are gone — and on re-enrolment the labels come back
+        // on the first tick from the recorded results, without a new run.
+        if context.node_labels_enabled {
+            let key = node_labels::label_key(namespace, name);
+            withdraw_node_labels(
+                &context.client,
+                &key,
+                &node_labels::nodes_carrying(&key, &context.nodes),
+                &format!("{namespace}/{name}"),
+                "its namespace is not enrolled",
+            )
+            .await;
+        }
         if object.status.as_ref().map(|s| &s.phase) != Some(&Phase::UnauthorizedNamespace) {
             let mut status = object.status.clone().unwrap_or_default();
             status.phase = Phase::UnauthorizedNamespace;
@@ -648,6 +793,7 @@ async fn reconcile(
             RecoveredRun::Finished {
                 finished,
                 status,
+                provides_version,
                 surviving,
             } => {
                 // A recovered result has only its `Play` to speak from, so the overflow half of
@@ -658,6 +804,7 @@ async fn reconcile(
                 diagnostic.warn(namespace, name, &finished.mirror.job_name);
                 status::apply_terminal_play_status(
                     &finished.execution_hash,
+                    provides_version.as_deref(),
                     &status,
                     &mut resource_status,
                 );
@@ -819,9 +966,15 @@ async fn reconcile(
                 // the normal hash-aware terminal path classify it. A lost receipt has nothing to
                 // replay and was classified above from its recorded run identity.
                 &[],
-                handover,
-                retry_prune,
-                requeue_after,
+                TickConclusion {
+                    handover,
+                    retry_prune,
+                    requeue_after,
+                    // This exit is ahead of inventory resolution, so there is no host set to derive
+                    // a label from. The next tick that resolves one publishes what this recorded.
+                    target_groups: None,
+                    dependencies: &[],
+                },
             )
             .await;
         }
@@ -852,23 +1005,26 @@ async fn reconcile(
     // this namespace. One fallible step with one error site, because they fail the same way — the
     // desired inputs could not be read — and a recovered run's fate depends on which kind of
     // failure it was, not on which of the two calls produced it.
-    let (target_groups, excluded_nodes) =
-        match resolve_authorized_inventory(&context, &object).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                report_desired_input_error(
-                    &context,
-                    &object,
-                    &api,
-                    unlaunched_run.as_ref(),
-                    &mut resource_status,
-                    &error,
-                    format!("cannot resolve the plan's inventories: {error}"),
-                )
-                .await?;
-                return Err(error);
-            }
-        };
+    let AuthorizedInventory {
+        groups: target_groups,
+        excluded_nodes,
+        dependencies,
+    } = match resolve_authorized_inventory(&context, &object).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            report_desired_input_error(
+                &context,
+                &object,
+                &api,
+                unlaunched_run.as_ref(),
+                &mut resource_status,
+                &error,
+                format!("cannot resolve the plan's inventories: {error}"),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
     if !excluded_nodes.is_empty() {
         warn!(
             "NodeAccessPolicy excluded nodes {excluded_nodes:?} from {namespace}/{name} \
@@ -877,6 +1033,49 @@ async fn reconcile(
     }
 
     resource_status.eligible_hosts = flatten_hosts(&target_groups);
+
+    // A host whose Node has been replaced since the claim was stamped has applied nothing: the
+    // record is keyed by name, and the name is all the fresh machine inherits. Dropped here, before
+    // the hash and the outdated check read it, so that every consumer of `hostsStatus` — this tick's
+    // run selection, the restated `Ready`, and the Node watch's wake set on the next tick — works
+    // from one corrected record instead of each re-deciding the question for itself.
+    let replaced_nodes = node_recreation::drop_records_for_recreated_nodes(
+        &context.nodes,
+        &target_groups,
+        &mut resource_status,
+    );
+    if !replaced_nodes.is_empty() {
+        info!(
+            "PlaybookPlan {namespace}/{name}: {replaced_nodes:?} registered after the playbook was \
+             last applied to them, so they are outdated again"
+        );
+    }
+
+    // Housekeeping on the same record, and the only thing that ever removes from it: rows for hosts
+    // that have both left the inventory and stopped existing as Nodes. It needs a write of its own —
+    // see `departed_hosts::hosts_status_deletion_patch` for why the tick's ordinary status write
+    // cannot express a deletion. Best effort: the rows are already gone from this tick's copy, and
+    // the final write leaves the server's untouched rather than restoring them, so a failure here
+    // only leaves them for the next idle tick to find again.
+    let departed = departed_hosts::prune_departed_hosts(&context.nodes, &mut resource_status);
+    if !departed.is_empty() {
+        match api
+            .patch_status(
+                name,
+                &PatchParams::default(),
+                &Patch::Merge(departed_hosts::hosts_status_deletion_patch(&departed)),
+            )
+            .await
+        {
+            Ok(_) => info!(
+                "PlaybookPlan {namespace}/{name}: dropped the records of {departed:?}, which left \
+                 the inventory and no longer exist as Nodes"
+            ),
+            Err(error) => warn!(
+                "PlaybookPlan {namespace}/{name}: could not drop the records of {departed:?}: {error}"
+            ),
+        }
+    }
 
     // Inventory-author group variables are part of the execution hash (a change re-applies the
     // playbook to otherwise-current hosts). Keyed by group name; groups without variables
@@ -896,6 +1095,7 @@ async fn reconcile(
         &related_secrets,
         &secrets_api,
         &inventory_variables,
+        object.provides_version(),
     )
     .await
     {
@@ -997,9 +1197,15 @@ async fn reconcile(
             &object,
             &mut resource_status,
             &[],
-            handover,
-            retry_prune,
-            requeue_after,
+            TickConclusion {
+                handover,
+                retry_prune,
+                requeue_after,
+                // A schedule with no future occurrence stops new runs; it does not make what earlier
+                // runs already applied any less true, so the record is still worth publishing.
+                target_groups: Some(&target_groups),
+                dependencies: &dependencies,
+            },
         )
         .await;
     };
@@ -1385,15 +1591,227 @@ async fn reconcile(
         &finished_records,
         // This exit acknowledges every terminal record it was given, so a run recovered by this tick
         // is one the next will not find again.
-        if recovered_a_run {
-            RunHandover::Retired
-        } else {
-            RunHandover::NothingHeld
+        TickConclusion {
+            handover: if recovered_a_run {
+                RunHandover::Retired
+            } else {
+                RunHandover::NothingHeld
+            },
+            retry_prune,
+            requeue_after: Some(requeue_after),
+            target_groups: Some(&target_groups),
+            dependencies: &dependencies,
         },
-        retry_prune,
-        Some(requeue_after),
     )
     .await
+}
+
+/// What a tick concluded, for the one exit that writes it all down.
+///
+/// Answers that are only ever produced together and only ever consumed together, so they travel as
+/// one value rather than as a widening tail of positional arguments where a `bool` and an `Option`
+/// next to each other are easy to swap by accident.
+struct TickConclusion<'a> {
+    handover: RunHandover,
+    /// Whether history pruning has work left that this tick could not finish.
+    retry_prune: bool,
+    requeue_after: Option<std::time::Duration>,
+    /// The plan's resolved, policy-clamped groups, when this tick got far enough to have them. They
+    /// are what the Node labels are derived from (never `hostsStatus` alone), so an exit that never
+    /// resolved an inventory publishes nothing rather than guessing at a host set.
+    target_groups: Option<&'a [ResolvedInventoryGroup]>,
+    /// What the plan's `ClusterInventory`s report waiting on other plans for. Empty on an exit that
+    /// never resolved them, which reports no wait rather than the absence of one: a tick that could
+    /// not read an inventory has nothing to say about what that inventory is waiting for.
+    dependencies: &'a [status::InventoryDependency],
+}
+
+/// Brings this plan's Node labels in line with what its record says, after the status write.
+///
+/// Runs on every tick rather than when a run finishes, and writes only where a Node's current value
+/// differs — see `node_labels` for why each of those matters.
+///
+/// Both directions live here because they are one question asked of the same key. A plan that
+/// declares `spec.provides` publishes what each of its hosts has applied; a plan that declares
+/// nothing must own no labels at all, so dropping the field from the spec takes its labels with it.
+/// That second case is why this runs for every plan and not only for providers.
+///
+/// Silent and free in the two common cases: a converged provider produces an empty diff, and a plan
+/// that never provided anything finds no Nodes carrying its key. Nothing is attempted at all when
+/// the chart disabled the feature, because the same value withheld the `nodes: patch` grant — every
+/// write would be a 403, and the plan already says so through its `ProvidesLabels` condition.
+async fn reconcile_node_labels(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    resource_status: &PlaybookPlanStatus,
+    target_groups: &[ResolvedInventoryGroup],
+) {
+    if !context.node_labels_enabled {
+        return;
+    }
+    let Ok((namespace, name)) = namespace_and_name(object) else {
+        return;
+    };
+    let key = node_labels::label_key(namespace, name);
+    let plan = format!("{namespace}/{name}");
+
+    if object.provides_version().is_some() {
+        let writes =
+            node_labels::desired_labels(&key, target_groups, resource_status, &context.nodes);
+        if !writes.is_empty() && plan_still_exists(&context.plans, namespace, name) {
+            node_labels::write_labels(&context.client, &key, &writes, &plan).await;
+        }
+        return;
+    }
+
+    // No `provides`: this plan claims nothing, so nothing may still be carrying its key. Because
+    // the version is part of the execution hash, removing the field is itself a new revision — the
+    // playbook re-runs once — but the labels go now rather than waiting for that run.
+    let stale = node_labels::nodes_carrying(&key, &context.nodes);
+    if !stale.is_empty() {
+        info!("PlaybookPlan {plan} no longer provides anything; removing {key} from {stale:?}");
+        node_labels::remove_labels(&context.client, &key, &stale, &plan).await;
+    }
+}
+
+/// Whether the plan this tick is reconciling is still in the cluster, asked immediately before its
+/// labels are published.
+///
+/// A tick holds the object it was handed at the start, so a plan deleted while it runs still looks
+/// present to it — and a label written after `withdraw_deleted_plans_labels` has already taken it
+/// off stands as a claim for a plan nobody has, with every dependent's inventory admitting that Node
+/// as ready. The plan reflector's store is the freshest answer available without a request: it is
+/// updated by the very stream that delivers `Event::Delete`, and is a different store from the one
+/// the `Controller` handed this reconcile its object out of.
+///
+/// This narrows the window to the write loop rather than closing it — a plan deleted just after the
+/// check still slips through, which is inherent in this design having no finalizer to hold (a plan
+/// must stay deletable while the operator is down). What is left is caught by
+/// [`sweep_orphaned_node_labels`] at the operator's next startup.
+///
+/// Only consulted when there is something to write. A converged provider produces an empty diff, so
+/// the common case never asks.
+fn plan_still_exists(plans: &Store<PlaybookPlan>, namespace: &str, name: &str) -> bool {
+    let present = plans.get(&ObjectRef::new(name).within(namespace)).is_some();
+
+    if !present {
+        info!(
+            "PlaybookPlan {namespace}/{name} was deleted while this tick ran; not publishing its Node labels"
+        );
+    }
+
+    present
+}
+
+/// Removes every operator-owned Node label whose plan no longer exists.
+///
+/// The backstop for deletions nothing reacted to — the operator was down, or the plan watch was
+/// disconnected and its re-LIST announced no deletion. Without it those labels stand for ever and
+/// dependents keep treating their Nodes as ready, which is the one way this design can fail open.
+///
+/// Both caches are populated before this can run: the Node store because `await_node_cache` gates
+/// the whole constructor on it, and the plan store because this is only ever called on an
+/// `InitDone`, which the reflector emits after swapping a complete LIST in. That ordering is the
+/// safety property — judged against an empty plan store, every dependency label in the cluster
+/// looks orphaned.
+///
+/// With the feature disabled the operator still reads Nodes but cannot patch them, so the leftovers
+/// are reported rather than removed. Saying nothing would leave an admin who turned the feature off
+/// with stale labels still steering inventories and no indication of it.
+async fn sweep_orphaned_node_labels(
+    client: &kube::Client,
+    nodes: &Store<Node>,
+    plans: &Store<PlaybookPlan>,
+    labels_enabled: bool,
+) {
+    let orphans = node_labels::orphaned_labels(nodes, plans);
+    if orphans.is_empty() {
+        return;
+    }
+
+    if !labels_enabled {
+        // Once per process. With the feature off nothing removes these, so every sweep finds the
+        // same set and would restate the same long line — and the sweep runs on every `InitDone`,
+        // which is a fresh LIST after a watch expiry as well as the startup one. It is a standing
+        // condition for an admin to act on, not news.
+        if !DISABLED_SWEEP_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            warn!(
+                "{} Node labels belong to PlaybookPlans that no longer exist ({orphans:?}), and node labels are disabled (chart nodeLabels.enabled=false) so the operator cannot remove them. Plans selecting on these labels still treat those Nodes as ready. Remove them with `kubectl label nodes --all <key>-`",
+                orphans.len()
+            );
+        }
+        return;
+    }
+
+    info!(
+        "removing {} Node labels left behind by PlaybookPlans that no longer exist",
+        orphans.len()
+    );
+    for orphan in &orphans {
+        node_labels::remove_labels(
+            client,
+            &orphan.key,
+            std::slice::from_ref(&orphan.node),
+            "<deleted>",
+        )
+        .await;
+    }
+}
+
+/// Whether the "node labels are disabled and these leftovers cannot be removed" warning has already
+/// been said. See its use in [`sweep_orphaned_node_labels`].
+static DISABLED_SWEEP_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Withdraws a deleted plan's claim from the Nodes still carrying it.
+///
+/// Reached from the plan watch rather than from a reconcile — see the delete handler in [`new`] for
+/// why there is no reconcile and no finalizer to hang this on.
+///
+/// The Nodes are read live. The plan is already gone, so there is no host set to consult and no
+/// reason to trust a cache that may not have caught up with the machines either; a label selector
+/// asks the API server for exactly the Nodes to clean. A plan that provided nothing is skipped
+/// before that call, so an ordinary deletion costs nothing.
+async fn withdraw_deleted_plans_labels(client: &kube::Client, object: &PlaybookPlan) {
+    if object.provides_version().is_none() {
+        return;
+    }
+    let Ok((namespace, name)) = namespace_and_name(object) else {
+        return;
+    };
+    let key = node_labels::label_key(namespace, name);
+    let plan = format!("{namespace}/{name}");
+
+    match node_labels::nodes_carrying_live(client, &key).await {
+        Ok(nodes) => {
+            withdraw_node_labels(client, &key, &nodes, &plan, "the plan was deleted").await;
+        }
+        Err(error) => warn!(
+            "PlaybookPlan {plan} was deleted, but the Nodes carrying {key} could not be listed: {error}. They keep the label until the operator's next startup sweep"
+        ),
+    }
+}
+
+/// Removes every Node label a plan owns, for the paths that end a plan's claim outright.
+///
+/// Used where there is no host set to diff against and no status worth consulting: the plan's
+/// namespace has been un-enrolled, or the plan is gone. Both are fail-closed on purpose — a plan
+/// the operator may no longer run must not keep steering other plans' inventories.
+///
+/// The Nodes come from the cache when there is one worth trusting and from the API server when
+/// there is not, which is why the caller supplies them.
+async fn withdraw_node_labels(
+    client: &kube::Client,
+    key: &str,
+    nodes: &[String],
+    plan: &str,
+    reason: &str,
+) {
+    if nodes.is_empty() {
+        return;
+    }
+    info!("PlaybookPlan {plan}: {reason}; removing {key} from {nodes:?}");
+    node_labels::remove_labels(client, key, nodes, plan).await;
 }
 
 async fn finish_reconcile_tick(
@@ -1401,12 +1819,38 @@ async fn finish_reconcile_tick(
     object: &PlaybookPlan,
     resource_status: &mut PlaybookPlanStatus,
     finished_records: &[FinishedRecord],
-    handover: RunHandover,
-    mut retry_prune: bool,
-    requeue_after: Option<std::time::Duration>,
+    conclusion: TickConclusion<'_>,
 ) -> Result<Action, ReconcileError> {
+    let TickConclusion {
+        handover,
+        mut retry_prune,
+        requeue_after,
+        target_groups,
+        dependencies,
+    } = conclusion;
     let (namespace, name) = namespace_and_name(object)?;
     let api = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace);
+
+    // The scan is per providing plan per tick, in memory and with no API call — the same cost the
+    // removal path already pays, and the same answer if it ever matters: measure it against the
+    // fleet target before adding state to avoid it.
+    let key = object
+        .provides_version()
+        .is_some()
+        .then(|| node_labels::label_key(namespace, name));
+    status::set_provides_labels_condition(
+        resource_status,
+        key.as_deref()
+            .zip(object.provides_version())
+            .map(|(key, version)| status::ProvidedLabel {
+                version,
+                nodes: node_labels::nodes_carrying(key, &context.nodes).len(),
+                key,
+            }),
+        context.node_labels_enabled,
+    );
+    status::set_dependencies_waiting_condition(resource_status, dependencies);
+    status::append_dependency_summary_clause(resource_status, dependencies);
 
     let release_finalizer =
         handover == RunHandover::NothingHeld && resource_status.active_run.is_none();
@@ -1417,6 +1861,13 @@ async fn finish_reconcile_tick(
     // starting read, so its finalizer list predates anything another controller added since —
     // the live copy answers both questions from the same observation the write is conditioned on.
     let patched = patch_status(&api, object, resource_status.clone()).await?;
+
+    // Status first, labels after, and never the other way round: a label is a claim about what a
+    // host carries, and the record it is derived from is the thing that survives a crash. A label
+    // that got ahead of the record would outlive the only evidence for it.
+    if let Some(target_groups) = target_groups {
+        reconcile_node_labels(context, object, resource_status, target_groups).await;
+    }
 
     for finished in finished_records {
         if finished.record == TerminalRecord::Present
@@ -3040,7 +3491,12 @@ async fn advance_active_run(
             |hosts| RunDiagnostic::RecapOverflowed { hosts },
         );
     diagnostic.warn(namespace, name, &run.mirror.job_name);
-    status::apply_terminal_play_status(&run.execution_hash, finished_status, resource_status);
+    status::apply_terminal_play_status(
+        &run.execution_hash,
+        finished_play.spec.provides_version.as_deref(),
+        finished_status,
+        resource_status,
+    );
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
@@ -3114,7 +3570,10 @@ async fn finalize_lost_run(
     let lost_status = play_history::lost_run_status(&run.mirror.job_name, &run.mirror.hosts);
     let verdict = phase_for_finished_run(&lost_status);
     let failure = classify_run_failure(&lost_status);
-    status::apply_terminal_play_status(&run.execution_hash, &lost_status, resource_status);
+    // No version: the record that would have carried it is gone, which is the whole reason this
+    // run is being finalized as lost. Nothing is stamped from it either — `lost_run_status` records
+    // every host `Unknown`, and only a `Succeeded` host is ever given a version.
+    status::apply_terminal_play_status(&run.execution_hash, None, &lost_status, resource_status);
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
@@ -3759,6 +4218,11 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         | ReconcileError::InventoryNotFound { .. }
         | ReconcileError::SecretNotFound { .. } => true,
         ReconcileError::KubeError(_) => false,
+        // Transient by construction, and the shortest-lived of them all: the inventory's own
+        // controller is on its way to publishing the hosts for this generation, and the status
+        // write that does it wakes this plan. Giving up a prepared run over a wait measured in
+        // seconds would abandon it for nothing.
+        ReconcileError::InventoryNotSynced { .. } => false,
         // A spec the user has to edit, exactly like the three above: no tick clears it, and holding
         // a run open against it would hold host Leases for as long as the plan stays wrong.
         ReconcileError::InvalidFileEntry { .. }
@@ -4842,6 +5306,7 @@ async fn recover_active_run(
             return Ok(Some(RecoveredRun::Finished {
                 finished: recorded_run_from_play(play)?,
                 status: play_status.clone(),
+                provides_version: play.spec.provides_version.clone(),
                 surviving: surviving.map(surviving_run_from_play).transpose()?,
             }));
         }
@@ -4940,6 +5405,10 @@ enum RecoveredRun {
     Finished {
         finished: RecordedRun,
         status: v1beta1::PlayStatus,
+        /// The `spec.provides` version the finished run's record declared, carried beside its
+        /// status because that is the only copy that still describes the revision which ran. The
+        /// live plan may already advertise the next one.
+        provides_version: Option<String>,
         /// The run still in flight behind the drained result, if any. A terminal result is
         /// handed over ahead of anything live, so the plan is *not* finished when this is set, and
         /// the tick must not classify it as such — nor let the finished run's schedule window
@@ -5463,6 +5932,15 @@ impl RunDiagnostic {
     }
 }
 
+/// Appends the run's diagnostic to the summary, and is safe to append blindly **only because every
+/// caller has just written a fresh one**: a diagnostic exists only for a run that finished this
+/// tick, and that is a path which always sets the summary from the run's verdict.
+///
+/// That precondition is the whole reason this may push onto a string it did not build. An idle tick
+/// carries the *stored* summary forward untouched, so anything appending there has to restate rather
+/// than add, or it grows the summary by a clause per reconcile until the object cannot be written —
+/// see `status::append_dependency_summary_clause`, which runs later in the tick and does exactly
+/// that.
 fn apply_run_diagnostic(status: &mut PlaybookPlanStatus, diagnostic: RunDiagnostic) {
     let Some(clause) = diagnostic.summary_clause() else {
         return;
@@ -5885,6 +6363,7 @@ async fn hash_playbook_inputs(
     secret_names: &[&String],
     secrets_api: &Api<Secret>,
     inventory_variables: &[(&str, &serde_json::Value)],
+    provides_version: Option<&str>,
 ) -> Result<ExecutionHash, ReconcileError> {
     let secret_reads = futures::future::join_all(
         secret_names
@@ -5896,7 +6375,8 @@ async fn hash_playbook_inputs(
 
     Ok(
         execution_evaluator::calculate_execution_hash(playbook, variables_secrets.iter())
-            .fold_inventory_variables(inventory_variables.iter().copied()),
+            .fold_inventory_variables(inventory_variables.iter().copied())
+            .fold_provides_version(provides_version),
     )
 }
 
@@ -5935,9 +6415,23 @@ fn collect_secret_data(
     Ok(data)
 }
 
+/// The plan's host set as the rest of the tick is allowed to see it, and what is being kept out of
+/// it.
+struct AuthorizedInventory {
+    /// The resolved, policy-clamped groups.
+    groups: Vec<ResolvedInventoryGroup>,
+    /// The managed-ssh nodes `NodeAccessPolicy` enforcement removed.
+    excluded_nodes: Vec<String>,
+    /// What the referenced `ClusterInventory`s report waiting on another plan for, copied from their
+    /// statuses rather than recomputed. Two controllers arriving at the same number by different
+    /// routes would eventually differ, and a plan saying one thing while the inventory it names says
+    /// another is worse than either number alone.
+    dependencies: Vec<status::InventoryDependency>,
+}
+
 /// Steps 0 and 0b — the plan's desired host set, as the rest of the tick is allowed to see it:
 /// every referenced inventory resolved, then clamped by `NodeAccessPolicy` to the managed-ssh nodes
-/// this namespace may target (INV-2/3/5). Returns the groups plus the nodes enforcement removed.
+/// this namespace may target (INV-2/3/5).
 ///
 /// The two are one step because nothing may ever observe the unclamped result: `eligible_hosts`, the
 /// execution hash, the run's groups and every proxy pod derive from what this returns. Fail-closed —
@@ -5945,14 +6439,14 @@ fn collect_secret_data(
 async fn resolve_authorized_inventory(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
-) -> Result<(Vec<ResolvedInventoryGroup>, Vec<String>), ReconcileError> {
+) -> Result<AuthorizedInventory, ReconcileError> {
     let namespace = object
         .metadata
         .namespace
         .as_deref()
         .ok_or(ReconcileError::PreconditionFailed("namespace not set"))?;
 
-    let mut groups = resolve_inventory(context, object).await?;
+    let (mut groups, dependencies) = resolve_inventory(context, object).await?;
     let excluded_nodes = node_access::enforce(
         &context.client,
         &context.node_access_policies,
@@ -5961,7 +6455,11 @@ async fn resolve_authorized_inventory(
     )
     .await?;
 
-    Ok((groups, excluded_nodes))
+    Ok(AuthorizedInventory {
+        groups,
+        excluded_nodes,
+        dependencies,
+    })
 }
 
 /// Resolves every inventory this PlaybookPlan references into `ResolvedInventoryGroup`s,
@@ -5970,10 +6468,21 @@ async fn resolve_authorized_inventory(
 /// implies its own embedded SSH config. Not flattened into a single list, since downstream steps
 /// (locking, proxy pods, inventory rendering, job building) need to know which mechanism applies
 /// to which group.
+///
+/// Also returns what those `ClusterInventory`s say they are waiting on other plans for. It rides
+/// along on the objects this already fetched, so it costs no second read — and the refusal below of
+/// an inventory whose controller has not caught up covers it too, so a plan never reports a wait
+/// computed from a spec the apiserver no longer holds.
 async fn resolve_inventory(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
-) -> Result<Vec<ResolvedInventoryGroup>, ReconcileError> {
+) -> Result<
+    (
+        Vec<ResolvedInventoryGroup>,
+        Vec<status::InventoryDependency>,
+    ),
+    ReconcileError,
+> {
     use kube::ResourceExt;
 
     let namespace = object
@@ -6041,9 +6550,42 @@ async fn resolve_inventory(
         }
     }
 
+    // An inventory whose controller has not caught up with its spec still publishes the previous
+    // spec's hosts, and `get_hosts` below reads exactly that. Refused here, before any of it reaches
+    // `eligible_hosts`, the execution hash or a run's groups: this is what keeps one `helm upgrade`
+    // that edits an inventory and its plan together from launching against the host set the edit
+    // replaced. The wait is the inventory controller's next reconcile, and the status write that
+    // ends it wakes this plan through the `ClusterInventory` watch.
+    for inventory in &cluster_inventories {
+        if inventory.status_is_current() {
+            continue;
+        }
+
+        return Err(ReconcileError::InventoryNotSynced {
+            name: inventory.name_any(),
+            generation: inventory.metadata.generation.unwrap_or_default(),
+            observed: inventory
+                .status
+                .as_ref()
+                .and_then(|status| status.observed_generation)
+                .map_or_else(|| "none".to_string(), |observed| observed.to_string()),
+        });
+    }
+
     let mut groups = Vec::new();
+    let mut dependencies = Vec::new();
 
     for ci in cluster_inventories {
+        let inventory_name = ci.name_any();
+        dependencies.extend(
+            ci.status
+                .iter()
+                .flat_map(|status| status.dependencies.iter())
+                .map(|dependency| status::InventoryDependency {
+                    inventory: inventory_name.clone(),
+                    dependency: dependency.clone(),
+                }),
+        );
         let tolerations = ci.spec.tolerations.clone();
         // Group variables live on the spec's InventoryHosts, but get_hosts() returns the resolved
         // node lists from status; re-join them by group name.
@@ -6084,7 +6626,7 @@ async fn resolve_inventory(
         }
     }
 
-    Ok(groups)
+    Ok((groups, dependencies))
 }
 
 /// Fails the reconcile if an inventory group sets a variable the operator manages for
@@ -6564,6 +7106,46 @@ mod tests {
         drop(writer);
 
         await_node_cache(&reader).await;
+    }
+
+    /// The same contract for the plan cache, and pinned for the same reason: an unsynced store here
+    /// does not fail, it answers "deleted" for every plan — so the first tick after a restart would
+    /// withhold exactly the labels that restart is meant to republish, and nothing would say why.
+    #[tokio::test]
+    #[should_panic(expected = "stopped before its initial sync")]
+    async fn a_plan_cache_that_can_never_sync_takes_the_operator_down() {
+        let writer = Writer::<PlaybookPlan>::default();
+        let reader = writer.as_reader();
+        drop(writer);
+
+        await_plan_cache(&reader).await;
+    }
+
+    /// A tick keeps the object it was handed, so a plan deleted while it runs still looks present to
+    /// it — and the labels it would then publish outlive the withdrawal the delete handler already
+    /// did, leaving a claim for a plan nobody has on every dependent's inventory. The reflector store
+    /// is asked instead, because the stream that keeps it current is the one that carries the
+    /// deletion.
+    #[test]
+    fn a_plan_deleted_while_its_tick_ran_does_not_publish_labels() {
+        let mut plan = PlaybookPlan::new("containerd", PlaybookPlanSpec::default());
+        plan.metadata.namespace = Some("platform".into());
+
+        let mut writer = Writer::<PlaybookPlan>::default();
+        let plans = writer.as_reader();
+        writer.apply_watcher_event(&watcher::Event::Init);
+        writer.apply_watcher_event(&watcher::Event::InitApply(plan.clone()));
+        writer.apply_watcher_event(&watcher::Event::InitDone);
+
+        assert!(plan_still_exists(&plans, "platform", "containerd"));
+        assert!(
+            !plan_still_exists(&plans, "other", "containerd"),
+            "the key is namespaced, so a same-named plan elsewhere is not this one"
+        );
+
+        writer.apply_watcher_event(&watcher::Event::Delete(plan));
+
+        assert!(!plan_still_exists(&plans, "platform", "containerd"));
     }
 
     fn node_watch_failed(
@@ -7785,6 +8367,7 @@ mod tests {
                         name: "workers".into(),
                         hosts: vec!["worker-1".into()],
                     }],
+                    provides_version: None,
                     triggered_slot: None,
                 },
             );
@@ -8031,6 +8614,7 @@ mod tests {
                     run_number: 1,
                     attempt: 1,
                     inventory: Vec::new(),
+                    provides_version: None,
                     triggered_slot,
                 },
             );
@@ -8142,6 +8726,7 @@ mod tests {
                     run_number: 1,
                     attempt: 1,
                     inventory: Vec::new(),
+                    provides_version: None,
                     triggered_slot: Some(slot),
                 },
             );
@@ -8217,6 +8802,7 @@ mod tests {
                     run_number: 1,
                     attempt: 1,
                     inventory: Vec::new(),
+                    provides_version: None,
                     triggered_slot: Some(slot),
                 },
             );
@@ -9577,6 +10163,17 @@ spec:
                 key: "ansible_host".into(),
             }
         ));
+        // The one inventory failure nobody has to fix, and the shortest-lived: the inventory's
+        // controller has yet to publish the hosts for the current generation, and its status write
+        // is seconds away and wakes this plan. Superseding here would throw a prepared run away over
+        // an ordinary `helm upgrade` race.
+        assert!(!input_error_supersedes_unlaunched(
+            &ReconcileError::InventoryNotSynced {
+                name: "workers".into(),
+                generation: 5,
+                observed: "4".into(),
+            }
+        ));
     }
 
     #[test]
@@ -10306,6 +10903,7 @@ spec:
                         name: "workers".into(),
                         hosts: vec!["worker-1".into()],
                     }],
+                    provides_version: None,
                     triggered_slot: None,
                 },
             );
@@ -10427,6 +11025,7 @@ spec:
                     name: "workers".into(),
                     hosts: vec!["worker-1".into(), "worker-2".into()],
                 }],
+                provides_version: None,
                 triggered_slot: None,
             },
         );

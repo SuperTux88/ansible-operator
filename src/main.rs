@@ -101,6 +101,20 @@ async fn run(args: RunArgs) {
         enrolled_namespaces
     );
 
+    // Whether a plan's `spec.provides` version may be published onto the Nodes it converged. Said
+    // out loud at startup either way: with it off, a plan that provides something still runs but
+    // publishes nothing, so a dependent waiting on it looks like a broken selector unless an admin
+    // can see this was a deliberate choice. The chart moves this flag and the ClusterRole's
+    // `nodes: patch` together (`nodeLabels.enabled`).
+    let node_labels_enabled = operator_config.node_labels.enabled;
+    if node_labels_enabled {
+        tracing::info!("node labels are enabled: plans with spec.provides will label their Nodes");
+    } else {
+        tracing::warn!(
+            "node labels are disabled (chart nodeLabels.enabled=false): plans with spec.provides will run but label nothing, and any labels already on Nodes stay there — the operator has no permission to remove them. Clean up with `kubectl label nodes --all <key>-`"
+        );
+    }
+
     // Managed-ssh proxy image (T-ESC-5): set via the chart's `managedSsh.proxyImage`, surfaced here
     // through the config file. There is NO built-in default for this node-root image — it must be an
     // explicit admin choice — so a missing/empty value is a fatal startup error. Pin to a trusted
@@ -144,11 +158,15 @@ async fn run(args: RunArgs) {
             operator_namespace,
             enrolled_namespaces,
             ca,
-            proxy_image,
-            proxy_grace,
-            v1beta1::playbookplancontroller::reconciler::WorkloadEgressPolicies {
-                playbook: operator_config.playbook_network_policy_egress,
-                managed_ssh: operator_config.managed_ssh_network_policy_egress,
+            v1beta1::playbookplancontroller::reconciler::OperatorSettings {
+                proxy_image,
+                proxy_grace,
+                node_labels_enabled,
+                workload_egress_policies:
+                    v1beta1::playbookplancontroller::reconciler::WorkloadEgressPolicies {
+                        playbook: operator_config.playbook_network_policy_egress,
+                        managed_ssh: operator_config.managed_ssh_network_policy_egress,
+                    },
             },
         )
         .await

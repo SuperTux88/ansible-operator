@@ -1,11 +1,14 @@
 mod callback_output;
+mod departed_hosts;
 mod execution_evaluator;
 mod job_builder;
 mod locking;
 mod managed_ssh;
 mod mappers;
 mod node_access;
+mod node_labels;
 mod node_readiness;
+mod node_recreation;
 mod paths;
 mod play_history;
 pub mod reconciler;

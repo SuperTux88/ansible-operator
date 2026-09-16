@@ -73,6 +73,7 @@ dependencies = [
  "lazy_static",
  "regex",
  "schemars 1.2.2",
+ "semver",
  "serde",
  "serde_derive",
  "serde_ignored",

@@ -99,6 +99,44 @@ spec:
                 - OneShot
                 - Recurring
                 type: string
+              provides:
+                description: |-
+                  What this plan makes true on the hosts it converges, for other plans to depend on.
+
+                  Setting it opts the plan into Node labelling: every cluster Node this plan applied to
+                  successfully is labelled `<namespace>.plan.ansible.cloudbending.dev/<plan-name>` with the
+                  declared `version`, and another plan's `ClusterInventory` can select on that label to keep
+                  its own runs off hosts that are not ready yet. A plan without `provides` is labelled
+                  nowhere, so nothing unrelated appears on a Node.
+
+                  Left an object rather than a bare version string so it can grow a field without a breaking
+                  change.
+                nullable: true
+                properties:
+                  version:
+                    description: |-
+                      What this plan is providing right now, and the value the Node label carries.
+
+                      **Part of the execution hash**, which is what makes the label trustworthy: a Node carrying
+                      version X has to have had a run of the revision that *declared* X succeed on it, so bumping
+                      this re-applies the playbook everywhere before any label moves. Adding or removing
+                      `provides` re-runs the plan once for the same reason. It is also the only way to roll out a
+                      new binary that ships inside the plan's `image`, since the image is not hashed.
+
+                      A plan whose playbook must not re-run on every release therefore wants a version of its own
+                      rather than the chart's.
+
+                      Any valid Kubernetes label value is accepted, but `Gt`/`Ge`/`Lt`/`Le` selectors read it as a
+                      SemVer version, so a value that is not one only ever matches `Exists`, `In` and `NotIn`.
+                      SemVer build metadata cannot be expressed — `+` is not a legal label value character — so
+                      follow Helm's own `helm.sh/chart` convention and write it as `_`, piping the chart version
+                      through `replace "+" "_"` where a chart renders this field.
+                    maxLength: 63
+                    pattern: ^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$
+                    type: string
+                required:
+                - version
+                type: object
               schedule:
                 description: |-
                   5-field cron expression (`minute hour day-of-month month day-of-week`) that tells at which
@@ -1004,6 +1042,39 @@ spec:
               hostsStatus:
                 additionalProperties:
                   properties:
+                    appliedAt:
+                      description: |-
+                        When `lastAppliedHash` was stamped — moved by exactly the outcome that moves that field, and
+                        by no other. This is what separates it from `lastTransitionTime`, which records every
+                        outcome, successful or not.
+
+                        It exists because `hostsStatus` is keyed by host *name*, and the name is all a replacement
+                        machine inherits: without it, a Node deleted and re-registered under the same name would keep
+                        the claim its predecessor earned, and a `OneShot` plan would never run on the fresh machine.
+                        A Node whose `creationTimestamp` is later than this is a different machine, and its recorded
+                        application is dropped — see `node_recreation`.
+
+                        Absent on a record written before this field existed. Such a record is deliberately left
+                        alone rather than treated as a replacement, or the upgrade that introduced the field would
+                        re-run every plan across the fleet; the next success fills it in. See the
+                        `#[serde(default, ...)]` note on `PlaybookPlanStatus::next_run`.
+                      nullable: true
+                      type: string
+                    appliedVersion:
+                      description: |-
+                        The `spec.provides` version of the revision that stamped `lastAppliedHash` — moved by exactly
+                        the same outcome, and taken from that run's own `Play` rather than from the plan as it reads
+                        now.
+
+                        This is what a Node label is derived from, which is why it is recorded per host instead of
+                        read from the spec: the plan converges one host at a time, so at any moment some hosts carry
+                        the new revision and some still carry the old one, and each must be labelled with what it
+                        actually has.
+
+                        Absent for a plan that provides nothing, and absent on a record stamped before this field
+                        existed. A host with no version here is never labelled — see `node_labels`.
+                      nullable: true
+                      type: string
                     lastAppliedHash:
                       description: The execution hash last SUCCESSFULLY applied to this host. Only bumped on `HostOutcome::Succeeded`.
                       type: string

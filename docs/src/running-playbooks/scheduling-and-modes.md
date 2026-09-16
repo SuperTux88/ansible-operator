@@ -105,9 +105,11 @@ repeating work: nightly package upgrades, drift correction, health tasks. A `Rec
 ## Drift detection
 
 To decide which hosts are out of date, the operator computes an **execution hash** over the playbook
-text, **the contents of every referenced Secret** (variables and files), and the group variables set
+text, **the contents of every referenced Secret** (variables and files), the group variables set
 by the inventories the plan references
-([cluster nodes](./cluster-nodes.md#group-variables), [external hosts](./external-hosts.md#group-variables)).
+([cluster nodes](./cluster-nodes.md#group-variables), [external hosts](./external-hosts.md#group-variables)),
+and the version in [`spec.provides`](./playbook-plans.md#declaring-what-a-plan-provides) if the plan
+declares one.
 The hash is order-insensitive, so reordering inputs does not count as a change, and it excludes the
 internally rendered workspace, whose content (e.g. proxy pod IPs) legitimately changes every run.
 
@@ -120,9 +122,17 @@ out of date because it has no recorded hash of its own.
 - Each host records the hash it **last succeeded on** (`.status.hostsStatus.<host>.lastAppliedHash`).
 - A host whose last-applied hash equals the current hash is **current** and is skipped (in
   `OneShot`).
+- A host whose Node was **replaced** — deleted and re-registered under the same name, e.g. a
+  re-imaged machine or a rolled node pool — is outdated again, whatever it last applied. The record
+  is keyed by the host's name, which is all the fresh machine inherits, so the operator compares the
+  Node's `creationTimestamp` against the host's
+  [`appliedAt`](./results-and-troubleshooting.md#per-host-outcomes) to tell the two apart.
 - When you edit the playbook or change a referenced variables/files Secret, the hash changes **at
   once**: the operator watches the plan and the Secrets it names, so the desired hash, run numbering
   and [consumed schedule slot](#one-tick-one-run-per-revision) update on the spot.
+- Changing `spec.provides.version` changes the hash, so the playbook re-runs on **every** host of
+  the plan. That is what lets a Node's dependency label be trusted, and it is also the only way to
+  re-run a plan whose playbook text has not changed. Adding or removing `provides` re-runs it once.
 - Changing an inventory's group variables changes the hash at once too, and for the same reason —
   the operator watches the `ClusterInventory` and `StaticInventory` resources a plan names. The same
   goes for the hosts a group resolves to: a Node joining, leaving or being relabelled updates the
@@ -306,6 +316,21 @@ its window, or lost a host lock — is not a failed try, but it does consume a r
 scheduled execution can still start, as after a host-lock takeover clears within its grace window,
 the unspent attempt remains available. Giving up a retry restores the preceding `Failed` verdict;
 giving up an execution's first attempt leaves the plan `Pending` because it has no verdict yet.
+
+## Dependencies do not re-trigger a plan
+
+A dependency label says "this plan **may** run here", never "this plan **must** run again because
+the provider changed". When a plan you depend on publishes a new version, your plan is not re-run:
+its hosts are still on its own current revision, so nothing about it is out of date. If you need the
+provider's new behaviour, give your own plan a new revision — edit it, or narrow its inventory's
+selector to the new version, which changes what it targets.
+
+One consequence to watch for with `OneShot`: a plan whose attempt budget is already spent starts
+nothing at all, **including for hosts that become eligible later**. So if your plan burned through
+`maxAttempts` while its provider was still working through the fleet, it will not pick up the Nodes
+that were labelled afterwards. That is deliberate — a playbook that is failing should be fixed
+before it reaches more hosts — but it means the fix is to correct the plan (which hands it a fresh
+budget), not to wait.
 
 ## Host locks
 

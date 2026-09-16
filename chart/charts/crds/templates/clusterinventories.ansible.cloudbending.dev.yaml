@@ -18,6 +18,9 @@ spec:
     - jsonPath: .status.hostCount
       name: Hosts
       type: string
+    - jsonPath: .status.waitingHosts
+      name: Waiting
+      type: string
     name: v1beta1
     schema:
       openAPIV3Schema:
@@ -34,11 +37,28 @@ spec:
                           key:
                             type: string
                           operator:
+                            description: |-
+                              How a `matchExpressions` term compares a label against the values it lists.
+
+                              `In`, `NotIn`, `Exists` and `DoesNotExist` behave exactly as Kubernetes' own label selectors do.
+
+                              `Gt`, `Ge`, `Lt` and `Le` order the label value against the term's single value **as a version**,
+                              which Kubernetes itself cannot do: its own `Gt`/`Lt` parse both sides as integers, so a dotted
+                              version never matches, and plain string ordering would sort 1.10.0 before 1.9.0. An optional
+                              leading `v` is accepted, missing components are read as `0` (so `1.4` is `1.4.0` and an integer
+                              is a one-component version, comparing exactly as Kubernetes would compare it), a pre-release
+                              sorts before its release (`Ge 1.4.0` excludes `1.4.0-rc.1`), and build metadata after `+` or `_`
+                              is ignored. A comparison that cannot be answered matches nothing: no such label on the object,
+                              anything other than exactly one value listed, or either side not a version.
                             enum:
                             - In
                             - NotIn
                             - Exists
                             - DoesNotExist
+                            - Gt
+                            - Ge
+                            - Lt
+                            - Le
                             type: string
                           values:
                             items:
@@ -103,6 +123,109 @@ spec:
           status:
             nullable: true
             properties:
+              dependencies:
+                default: []
+                description: |-
+                  What each group is waiting on another plan for, one entry per dependency requirement.
+
+                  Empty on an inventory whose selectors name no operator-owned key, which is every inventory
+                  that does not express a dependency.
+
+                  Written without `skip_serializing_if` on purpose. The status goes out as a JSON **merge**
+                  patch, which leaves a field it does not mention alone, so a list that has become empty has to
+                  be sent as `[]` to actually empty. Omitting it would leave a satisfied dependency reported as
+                  waiting for ever.
+                items:
+                  description: |-
+                    One positive requirement on another plan's label, and how far the fleet has got with it.
+
+                    A *dependency* is a requirement on a key this operator publishes
+                    (`<namespace>.plan.ansible.cloudbending.dev/<plan>`), which only ever appears on a Node where
+                    that plan converged. So a Node failing one is not misconfigured, it is *not ready yet* — and
+                    telling those two apart from the outside is impossible without this, since both simply show up
+                    as an inventory resolving fewer hosts than its author expected.
+
+                    Exclusions (`NotIn`, `DoesNotExist`) are deliberately not dependencies: a Node fails them by
+                    *carrying* something, which no amount of waiting fixes.
+                  properties:
+                    group:
+                      description: The inventory group whose selector carries this requirement.
+                      type: string
+                    invalidValue:
+                      default: false
+                      description: |-
+                        The requirement's own value is not a version, under an operator that orders versions.
+
+                        It therefore matches **nothing**, whatever the Nodes carry, and `waiting` beside it is the
+                        whole group. The selector is what needs fixing.
+                      type: boolean
+                    key:
+                      description: The label key the requirement is on.
+                      type: string
+                    malformedTerm:
+                      default: false
+                      description: |-
+                        An ordered operator (`Gt`/`Ge`/`Lt`/`Le`) listing anything other than exactly one value.
+
+                        Like `invalidValue` it matches nothing. Reported here rather than rejected at admission,
+                        because the selector type is shared with `NodeAccessPolicy` and sits inside a
+                        preserve-unknown-fields item where a CEL rule cannot see it.
+                      type: boolean
+                    providerName:
+                      description: The name of the `PlaybookPlan` that publishes `key`, decoded from the key itself.
+                      type: string
+                    providerNamespace:
+                      description: |-
+                        The namespace of the `PlaybookPlan` that publishes `key`, decoded from the key itself.
+
+                        Not looked up: the operator does not check that this plan exists. A dependency on a plan
+                        nobody has therefore reads as waiting for it, which is exactly what a typo in the key looks
+                        like — and naming it is what lets a human spot the typo.
+                      type: string
+                    requirement:
+                      description: 'The requirement as written, rendered back for a reader: `Ge 1.4.0`, `Exists`, `= 1.4.2`.'
+                      type: string
+                    satisfied:
+                      description: |-
+                        How many of the group's Nodes have got past this requirement.
+
+                        `satisfied + waiting` is the denominator a reader needs — "3 of 8" — which is why both are
+                        published rather than one number or a percentage.
+                      format: uint
+                      minimum: 0.0
+                      type: integer
+                    unparseableHosts:
+                      default: 0
+                      description: |-
+                        How many of the waiting Nodes carry the key with a value that is not a version.
+
+                        The one failure the label's *author* caused rather than the selector's: the provider
+                        published something like `latest`, so no ordered comparison against it can be answered and
+                        the Node waits for ever. A subset of `waiting`.
+                      format: uint
+                      minimum: 0.0
+                      type: integer
+                    waiting:
+                      description: |-
+                        How many of the group's Nodes this requirement is holding back.
+
+                        "The group's Nodes" are the ones that satisfy every term the author wrote for reasons other
+                        than a dependency, so a Node excluded by the wrong `node-role` is not waiting for anything.
+                        A Node held back by two dependencies is counted under both: there is no ordering between
+                        them, and neither one finishing releases it.
+                      format: uint
+                      minimum: 0.0
+                      type: integer
+                  required:
+                  - group
+                  - key
+                  - providerName
+                  - providerNamespace
+                  - requirement
+                  - satisfied
+                  - waiting
+                  type: object
+                type: array
               hostCount:
                 description: |-
                   How many distinct Nodes this inventory resolves to — the `Hosts` column. A Node matched by
@@ -111,6 +234,22 @@ spec:
                   summaries and a `Play`'s `Hosts` column count the same way, and they are read side by side.
                 format: uint
                 minimum: 0.0
+                type: integer
+              observedGeneration:
+                description: |-
+                  The `metadata.generation` this status was computed from.
+
+                  `resolvedHosts` is a *published* answer rather than a live one — a plan reads it instead of
+                  evaluating the selectors itself — so between a spec edit and this controller's next reconcile
+                  the published hosts still describe the previous spec. A plan that started a run in that
+                  window would target the old host set, which one `helm upgrade` changing an inventory and a
+                  plan together makes routine: Helm applies both in a single pass and waits for no status.
+
+                  A plan therefore prepares no new run from an inventory whose `observedGeneration` is not its
+                  `metadata.generation`, and the status write that catches it up wakes every plan that names
+                  it. Absent until this controller has written a status at all.
+                format: int64
+                nullable: true
                 type: integer
               resolvedHosts:
                 description: |-
@@ -130,6 +269,19 @@ spec:
                   - name
                   type: object
                 type: array
+              waitingHosts:
+                default: 0
+                description: |-
+                  How many distinct Nodes are kept out of this inventory by a dependency alone — the `Waiting`
+                  column. Counted over distinct Nodes like `hostCount`, so a Node waiting on two dependencies,
+                  or on the same one in two groups, is one waiting host.
+
+                  Read it beside `hostCount`: `2` hosts and `6` waiting is a rollout in progress, and `0`
+                  waiting on an inventory that resolves fewer hosts than expected means the missing Nodes fail
+                  something other than a dependency.
+                format: uint
+                minimum: 0.0
+                type: integer
             required:
             - hostCount
             - resolvedHosts
