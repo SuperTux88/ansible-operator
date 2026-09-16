@@ -902,6 +902,7 @@ async fn reconcile(
                     // This exit is ahead of inventory resolution, so there is no host set to derive
                     // a label from. The next tick that resolves one publishes what this recorded.
                     target_groups: None,
+                    dependencies: &[],
                 },
             )
             .await;
@@ -933,23 +934,26 @@ async fn reconcile(
     // this namespace. One fallible step with one error site, because they fail the same way — the
     // desired inputs could not be read — and a recovered run's fate depends on which kind of
     // failure it was, not on which of the two calls produced it.
-    let (target_groups, excluded_nodes) =
-        match resolve_authorized_inventory(&context, &object).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                report_desired_input_error(
-                    &context,
-                    &object,
-                    &api,
-                    unlaunched_run.as_ref(),
-                    &mut resource_status,
-                    &error,
-                    format!("cannot resolve the plan's inventories: {error}"),
-                )
-                .await?;
-                return Err(error);
-            }
-        };
+    let AuthorizedInventory {
+        groups: target_groups,
+        excluded_nodes,
+        dependencies,
+    } = match resolve_authorized_inventory(&context, &object).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            report_desired_input_error(
+                &context,
+                &object,
+                &api,
+                unlaunched_run.as_ref(),
+                &mut resource_status,
+                &error,
+                format!("cannot resolve the plan's inventories: {error}"),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
     if !excluded_nodes.is_empty() {
         warn!(
             "NodeAccessPolicy excluded nodes {excluded_nodes:?} from {namespace}/{name} \
@@ -1129,6 +1133,7 @@ async fn reconcile(
                 // A schedule with no future occurrence stops new runs; it does not make what earlier
                 // runs already applied any less true, so the record is still worth publishing.
                 target_groups: Some(&target_groups),
+                dependencies: &dependencies,
             },
         )
         .await;
@@ -1524,6 +1529,7 @@ async fn reconcile(
             retry_prune,
             requeue_after: Some(requeue_after),
             target_groups: Some(&target_groups),
+            dependencies: &dependencies,
         },
     )
     .await
@@ -1531,9 +1537,9 @@ async fn reconcile(
 
 /// What a tick concluded, for the one exit that writes it all down.
 ///
-/// Four answers that are only ever produced together and only ever consumed together, so they
-/// travel as one value rather than as a widening tail of positional arguments where a `bool` and an
-/// `Option` next to each other are easy to swap by accident.
+/// Answers that are only ever produced together and only ever consumed together, so they travel as
+/// one value rather than as a widening tail of positional arguments where a `bool` and an `Option`
+/// next to each other are easy to swap by accident.
 struct TickConclusion<'a> {
     handover: RunHandover,
     /// Whether history pruning has work left that this tick could not finish.
@@ -1544,6 +1550,10 @@ struct TickConclusion<'a> {
     /// never resolved an inventory publishes nothing rather than guessing at a host set. Withdrawing
     /// labels needs no host set and happens either way — see [`reconcile_node_labels`].
     target_groups: Option<&'a [ResolvedInventoryGroup]>,
+    /// What the plan's `ClusterInventory`s report waiting on other plans for. Empty on an exit that
+    /// never resolved them, which reports no wait rather than the absence of one: a tick that could
+    /// not read an inventory has nothing to say about what that inventory is waiting for.
+    dependencies: &'a [status::InventoryDependency],
 }
 
 /// Brings this plan's Node labels in line with what its record says, after the status write.
@@ -1715,6 +1725,7 @@ async fn finish_reconcile_tick(
         mut retry_prune,
         requeue_after,
         target_groups,
+        dependencies,
     } = conclusion;
     let (namespace, name) = namespace_and_name(object)?;
     let api = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace);
@@ -1724,6 +1735,8 @@ async fn finish_reconcile_tick(
         object.provides_version().is_some(),
         context.node_labels_enabled,
     );
+    status::set_dependencies_waiting_condition(resource_status, dependencies);
+    status::append_dependency_summary_clause(resource_status, dependencies);
 
     let release_finalizer =
         handover == RunHandover::NothingHeld && resource_status.active_run.is_none();
@@ -6277,9 +6290,23 @@ fn collect_secret_data(
     Ok(data)
 }
 
+/// The plan's host set as the rest of the tick is allowed to see it, and what is being kept out of
+/// it.
+struct AuthorizedInventory {
+    /// The resolved, policy-clamped groups.
+    groups: Vec<ResolvedInventoryGroup>,
+    /// The managed-ssh nodes `NodeAccessPolicy` enforcement removed.
+    excluded_nodes: Vec<String>,
+    /// What the referenced `ClusterInventory`s report waiting on another plan for, copied from their
+    /// statuses rather than recomputed. Two controllers arriving at the same number by different
+    /// routes would eventually differ, and a plan saying one thing while the inventory it names says
+    /// another is worse than either number alone.
+    dependencies: Vec<status::InventoryDependency>,
+}
+
 /// Steps 0 and 0b — the plan's desired host set, as the rest of the tick is allowed to see it:
 /// every referenced inventory resolved, then clamped by `NodeAccessPolicy` to the managed-ssh nodes
-/// this namespace may target (INV-2/3/5). Returns the groups plus the nodes enforcement removed.
+/// this namespace may target (INV-2/3/5).
 ///
 /// The two are one step because nothing may ever observe the unclamped result: `eligible_hosts`, the
 /// execution hash, the run's groups and every proxy pod derive from what this returns. Fail-closed —
@@ -6287,14 +6314,14 @@ fn collect_secret_data(
 async fn resolve_authorized_inventory(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
-) -> Result<(Vec<ResolvedInventoryGroup>, Vec<String>), ReconcileError> {
+) -> Result<AuthorizedInventory, ReconcileError> {
     let namespace = object
         .metadata
         .namespace
         .as_deref()
         .ok_or(ReconcileError::PreconditionFailed("namespace not set"))?;
 
-    let mut groups = resolve_inventory(context, object).await?;
+    let (mut groups, dependencies) = resolve_inventory(context, object).await?;
     let excluded_nodes = node_access::enforce(
         &context.client,
         &context.node_access_policies,
@@ -6303,7 +6330,11 @@ async fn resolve_authorized_inventory(
     )
     .await?;
 
-    Ok((groups, excluded_nodes))
+    Ok(AuthorizedInventory {
+        groups,
+        excluded_nodes,
+        dependencies,
+    })
 }
 
 /// Resolves every inventory this PlaybookPlan references into `ResolvedInventoryGroup`s,
@@ -6312,10 +6343,21 @@ async fn resolve_authorized_inventory(
 /// implies its own embedded SSH config. Not flattened into a single list, since downstream steps
 /// (locking, proxy pods, inventory rendering, job building) need to know which mechanism applies
 /// to which group.
+///
+/// Also returns what those `ClusterInventory`s say they are waiting on other plans for. It rides
+/// along on the objects this already fetched, so it costs no second read — and the refusal below of
+/// an inventory whose controller has not caught up covers it too, so a plan never reports a wait
+/// computed from a spec the apiserver no longer holds.
 async fn resolve_inventory(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
-) -> Result<Vec<ResolvedInventoryGroup>, ReconcileError> {
+) -> Result<
+    (
+        Vec<ResolvedInventoryGroup>,
+        Vec<status::InventoryDependency>,
+    ),
+    ReconcileError,
+> {
     use kube::ResourceExt;
 
     let namespace = object
@@ -6406,8 +6448,19 @@ async fn resolve_inventory(
     }
 
     let mut groups = Vec::new();
+    let mut dependencies = Vec::new();
 
     for ci in cluster_inventories {
+        let inventory_name = ci.name_any();
+        dependencies.extend(
+            ci.status
+                .iter()
+                .flat_map(|status| status.dependencies.iter())
+                .map(|dependency| status::InventoryDependency {
+                    inventory: inventory_name.clone(),
+                    dependency: dependency.clone(),
+                }),
+        );
         let tolerations = ci.spec.tolerations.clone();
         // Group variables live on the spec's InventoryHosts, but get_hosts() returns the resolved
         // node lists from status; re-join them by group name.
@@ -6448,7 +6501,7 @@ async fn resolve_inventory(
         }
     }
 
-    Ok(groups)
+    Ok((groups, dependencies))
 }
 
 /// Fails the reconcile if an inventory group sets a variable the operator manages for
