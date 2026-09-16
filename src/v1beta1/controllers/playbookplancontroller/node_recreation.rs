@@ -44,9 +44,11 @@ pub fn node_replaced_since(applied_at: Option<DateTime<FixedOffset>>, node: &Nod
 /// Drops the recorded application of every managed-ssh host whose Node is newer than the record,
 /// returning the hosts that lost theirs.
 ///
-/// Only the *claim* is dropped — `lastAppliedHash` and `appliedAt` — and never the outcome or the
-/// time it was recorded: what happened to the previous machine is history worth keeping, while the
-/// claim that this host carries the current revision is the half that is now false.
+/// Only the *claim* is dropped — `lastAppliedHash`, `appliedAt` and `appliedVersion` — and never the
+/// outcome or the time it was recorded: what happened to the previous machine is history worth
+/// keeping, while the claim that this host carries the current revision is the half that is now
+/// false. The version goes with the other two because it is what a Node label is derived from, and a
+/// fresh machine that kept it would be labelled for software it has never been given.
 ///
 /// Three things are deliberately left alone:
 ///
@@ -90,6 +92,7 @@ pub fn drop_records_for_recreated_nodes(
         if let Some(record) = hosts_status.get_mut(host) {
             record.last_applied_hash = String::new();
             record.applied_at = None;
+            record.applied_version = None;
         }
     }
 
@@ -163,6 +166,7 @@ mod tests {
             last_applied_hash: hash.into(),
             last_outcome: HostOutcome::Succeeded,
             applied_at: applied_at.map(at),
+            applied_version: Some("1.4.2".into()),
             last_transition_time: Some(at("2026-01-01T00:00:00Z")),
         }
     }
@@ -249,6 +253,10 @@ mod tests {
             "the fresh machine has applied nothing"
         );
         assert_eq!(hosts["node-a"].applied_at, None);
+        assert_eq!(
+            hosts["node-a"].applied_version, None,
+            "the version a Node label would be derived from goes with the claim"
+        );
         assert_eq!(
             hosts["node-a"].last_outcome,
             HostOutcome::Succeeded,

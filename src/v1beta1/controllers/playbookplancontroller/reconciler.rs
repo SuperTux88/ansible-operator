@@ -649,6 +649,7 @@ async fn reconcile(
             RecoveredRun::Finished {
                 finished,
                 status,
+                provides_version,
                 surviving,
             } => {
                 // A recovered result has only its `Play` to speak from, so the overflow half of
@@ -659,6 +660,7 @@ async fn reconcile(
                 diagnostic.warn(namespace, name, &finished.mirror.job_name);
                 status::apply_terminal_play_status(
                     &finished.execution_hash,
+                    provides_version.as_deref(),
                     &status,
                     &mut resource_status,
                 );
@@ -940,7 +942,7 @@ async fn reconcile(
         &related_secrets,
         &secrets_api,
         &inventory_variables,
-        provides_version(&object),
+        object.provides_version(),
     )
     .await
     {
@@ -3085,7 +3087,12 @@ async fn advance_active_run(
             |hosts| RunDiagnostic::RecapOverflowed { hosts },
         );
     diagnostic.warn(namespace, name, &run.mirror.job_name);
-    status::apply_terminal_play_status(&run.execution_hash, finished_status, resource_status);
+    status::apply_terminal_play_status(
+        &run.execution_hash,
+        finished_play.spec.provides_version.as_deref(),
+        finished_status,
+        resource_status,
+    );
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
@@ -3159,7 +3166,10 @@ async fn finalize_lost_run(
     let lost_status = play_history::lost_run_status(&run.mirror.job_name, &run.mirror.hosts);
     let verdict = phase_for_finished_run(&lost_status);
     let failure = classify_run_failure(&lost_status);
-    status::apply_terminal_play_status(&run.execution_hash, &lost_status, resource_status);
+    // No version: the record that would have carried it is gone, which is the whole reason this
+    // run is being finalized as lost. Nothing is stamped from it either — `lost_run_status` records
+    // every host `Unknown`, and only a `Succeeded` host is ever given a version.
+    status::apply_terminal_play_status(&run.execution_hash, None, &lost_status, resource_status);
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
@@ -4892,6 +4902,7 @@ async fn recover_active_run(
             return Ok(Some(RecoveredRun::Finished {
                 finished: recorded_run_from_play(play)?,
                 status: play_status.clone(),
+                provides_version: play.spec.provides_version.clone(),
                 surviving: surviving.map(surviving_run_from_play).transpose()?,
             }));
         }
@@ -4990,6 +5001,10 @@ enum RecoveredRun {
     Finished {
         finished: RecordedRun,
         status: v1beta1::PlayStatus,
+        /// The `spec.provides` version the finished run's record declared, carried beside its
+        /// status because that is the only copy that still describes the revision which ran. The
+        /// live plan may already advertise the next one.
+        provides_version: Option<String>,
         /// The run still in flight behind the drained result, if any. A terminal result is
         /// handed over ahead of anything live, so the plan is *not* finished when this is set, and
         /// the tick must not classify it as such — nor let the finished run's schedule window
@@ -5950,19 +5965,6 @@ async fn hash_playbook_inputs(
             .fold_inventory_variables(inventory_variables.iter().copied())
             .fold_provides_version(provides_version),
     )
-}
-
-/// The version this plan declares in `spec.provides`, if it declares one.
-///
-/// One accessor rather than the field read spelled out at each site: the version is read by the
-/// hash, by the run record that dates a host's claim to it, and by the Node label diff, and those
-/// three answering differently is exactly the disagreement the design has no room for.
-fn provides_version(object: &PlaybookPlan) -> Option<&str> {
-    object
-        .spec
-        .provides
-        .as_ref()
-        .map(|provides| provides.version.as_str())
 }
 
 /// Collects the data of every referenced Secret, refusing the whole read if any of them failed —
@@ -7872,6 +7874,7 @@ mod tests {
                         name: "workers".into(),
                         hosts: vec!["worker-1".into()],
                     }],
+                    provides_version: None,
                     triggered_slot: None,
                 },
             );
@@ -8118,6 +8121,7 @@ mod tests {
                     run_number: 1,
                     attempt: 1,
                     inventory: Vec::new(),
+                    provides_version: None,
                     triggered_slot,
                 },
             );
@@ -8229,6 +8233,7 @@ mod tests {
                     run_number: 1,
                     attempt: 1,
                     inventory: Vec::new(),
+                    provides_version: None,
                     triggered_slot: Some(slot),
                 },
             );
@@ -8304,6 +8309,7 @@ mod tests {
                     run_number: 1,
                     attempt: 1,
                     inventory: Vec::new(),
+                    provides_version: None,
                     triggered_slot: Some(slot),
                 },
             );
@@ -10404,6 +10410,7 @@ spec:
                         name: "workers".into(),
                         hosts: vec!["worker-1".into()],
                     }],
+                    provides_version: None,
                     triggered_slot: None,
                 },
             );
@@ -10525,6 +10532,7 @@ spec:
                     name: "workers".into(),
                     hosts: vec!["worker-1".into(), "worker-2".into()],
                 }],
+                provides_version: None,
                 triggered_slot: None,
             },
         );
