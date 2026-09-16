@@ -45,6 +45,15 @@ it — the same way a plan's `n/m hosts` summary does, since one Node is one hos
 is grouped under. `resolvedHosts` still lists it under every group it belongs to; that is what makes
 the group names usable in a playbook's `hosts:`.
 
+`.status.observedGeneration` records the `metadata.generation` those hosts were resolved from. A plan
+reads the published `resolvedHosts` rather than evaluating the selectors itself, so until the
+controller has caught up with an edit they still describe the *previous* spec — and a plan that
+started a run in that window would target the Nodes the edit replaced. Plans therefore start no new
+run from an inventory whose `observedGeneration` is behind its `metadata.generation`, and say so in
+their summary; the catching-up status write wakes them, normally within seconds. This matters most
+for a single `helm upgrade` that changes an inventory and a plan together, since Helm applies both in
+one pass and waits for no status.
+
 ## Group variables
 
 Each group may carry a `variables` map, rendered as Ansible **group vars** for every Node the group

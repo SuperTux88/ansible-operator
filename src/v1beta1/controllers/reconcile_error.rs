@@ -14,6 +14,15 @@ pub enum ReconcileError {
     #[error("Referenced {kind} {name:?} does not exist")]
     InventoryNotFound { kind: &'static str, name: String },
 
+    #[error(
+        "Referenced ClusterInventory {name:?} has not published its resolved hosts for generation {generation} yet (observed: {observed})"
+    )]
+    InventoryNotSynced {
+        name: String,
+        generation: i64,
+        observed: String,
+    },
+
     #[error("Referenced Secret {name:?} does not exist")]
     SecretNotFound { name: String },
 

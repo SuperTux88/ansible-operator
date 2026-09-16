@@ -313,7 +313,11 @@ running, and so could not decide anything this tick:
   `StaticInventory` could not be read, or one of them is not usable. Two forms need an edit rather
   than a retry: `Referenced ClusterInventory "…" does not exist` (the reference is wrong or the
   inventory was deleted) and `Inventory group "…" sets variable "…"` (a group sets one of the
-  connection variables the operator owns). Anything else is an API error to retry.
+  connection variables the operator owns). One form needs nothing at all: `Referenced
+  ClusterInventory "…" has not published its resolved hosts for generation N yet` means that
+  inventory's own controller has not caught up with a spec edit, so the plan is holding rather than
+  running against the hosts the previous spec resolved to — its next status write wakes the plan,
+  normally within seconds. Anything else is an API error to retry.
 - **"cannot read referenced Secrets: …"** — a Secret named by `spec.template.variables` or
   `spec.template.files` could not be read. `Referenced Secret "…" does not exist` means the reference
   is wrong or the Secret was deleted; anything else is an API error to retry.
