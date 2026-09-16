@@ -348,6 +348,19 @@ pub async fn new(
     // is the one moment "this label's plan does not exist" can be asked safely. Asked on every
     // resync rather than only the first, because a deletion during a watch disconnection produces
     // no `Delete` event at all — the re-LIST simply drops the object.
+    //
+    // Both answers are acted on in **tasks of their own**, never inline. The reflector applies each
+    // event to the store as this stream is polled, so anything awaited here stops the plan cache
+    // from updating for as long as it runs — and both of these remove a label per Node, one PATCH
+    // at a time, over as many Nodes as a provider converged. Every mapper that decides which plans
+    // a Secret, an inventory or a policy should wake reads that cache, so a large withdrawal would
+    // have them computing wake sets from a plan set minutes out of date.
+    //
+    // Nothing serializes the tasks, because there is nothing for them to corrupt: each one only
+    // ever removes labels, and removing an absent label is a no-op. Two overlapping sweeps agree on
+    // the same orphans and the loser's patches change nothing. A sweep that starts late still reads
+    // a complete store, since `Writer` accumulates a re-LIST into a buffer and only swaps it in on
+    // `InitDone` — the store never empties underneath it.
     {
         let client = client.clone();
         let plans = Arc::clone(&playbookplan_reflector_reader);
@@ -362,11 +375,20 @@ pub async fn new(
                     async move {
                         match event {
                             Ok(watcher::Event::Delete(plan)) if labels_enabled => {
-                                withdraw_deleted_plans_labels(&client, &plan).await;
+                                tokio::spawn(async move {
+                                    withdraw_deleted_plans_labels(&client, &plan).await;
+                                });
                             }
                             Ok(watcher::Event::InitDone) => {
-                                sweep_orphaned_node_labels(&client, &nodes, &plans, labels_enabled)
+                                tokio::spawn(async move {
+                                    sweep_orphaned_node_labels(
+                                        &client,
+                                        &nodes,
+                                        &plans,
+                                        labels_enabled,
+                                    )
                                     .await;
+                                });
                             }
                             Ok(_) => {}
                             Err(e) => error!("Reflector error: {e:?}"),
