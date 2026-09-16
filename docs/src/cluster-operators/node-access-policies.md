@@ -46,6 +46,12 @@ spec:
 To cover several namespaces in one policy, use `matchExpressions` on the `namespaceSelector`, e.g.
 `{ key: team, operator: In, values: [business, payments] }`.
 
+Both selectors take the same operators a `ClusterInventory` group does — `In`, `NotIn`, `Exists`,
+`DoesNotExist`, and the ordered `Gt`, `Ge`, `Lt`, `Le`, which compare a label value against one
+value as a version (see [Comparing versions](../running-playbooks/cluster-nodes.md#comparing-versions)).
+A ceiling written with an ordered operator is worth reading twice, because the label it orders is
+usually one a plan publishes — see below.
+
 ## Matching every Node
 
 An **empty** selector (`{}`) matches **nothing**, not everything — the opposite of Kubernetes' usual
@@ -76,8 +82,15 @@ gets the sum of what any matching policy allows, never more than the Nodes that 
 
 A policy's `nodeSelector` may name one of the labels a plan publishes through `spec.provides`
 (`<namespace>.plan.ansible.cloudbending.dev/<plan-name>`) — for example, to say that a namespace may
-only reach Nodes a hardening plan has finished with. That is a legitimate and useful thing to
-express, but be clear about what it means.
+only reach Nodes a hardening plan has finished with, optionally at a minimum version:
+
+```yaml
+  nodeSelector:
+    matchExpressions:
+      - { key: platform.plan.ansible.cloudbending.dev/hardening, operator: Ge, values: ["2.0.0"] }
+```
+
+That is a legitimate and useful thing to express, but be clear about what it means.
 
 No plan can grant *itself* access this way. The label only ever appears on Nodes where the providing
 plan ran successfully, and that plan's runs were already bounded by its own namespace's ceiling — so
