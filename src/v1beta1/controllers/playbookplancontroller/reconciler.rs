@@ -5863,6 +5863,15 @@ impl RunDiagnostic {
     }
 }
 
+/// Appends the run's diagnostic to the summary, and is safe to append blindly **only because every
+/// caller has just written a fresh one**: a diagnostic exists only for a run that finished this
+/// tick, and that is a path which always sets the summary from the run's verdict.
+///
+/// That precondition is the whole reason this may push onto a string it did not build. An idle tick
+/// carries the *stored* summary forward untouched, so anything appending there has to restate rather
+/// than add, or it grows the summary by a clause per reconcile until the object cannot be written —
+/// see `status::append_dependency_summary_clause`, which runs later in the tick and does exactly
+/// that.
 fn apply_run_diagnostic(status: &mut PlaybookPlanStatus, diagnostic: RunDiagnostic) {
     let Some(clause) = diagnostic.summary_clause() else {
         return;
