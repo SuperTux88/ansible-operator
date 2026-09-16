@@ -1,0 +1,94 @@
+{{- if and .Values.nodeLabels.enabled .Values.nodeLabels.admissionPolicy }}
+# Holds the operator's `nodes: patch` (clusterrole.yaml) to the labels it owns.
+#
+# RBAC cannot express "this verb, but only this field", so the grant that lets a plan publish
+# `<namespace>.plan.ansible.cloudbending.dev/<plan-name>` also lets the operator change taints,
+# spec.unschedulable, node-role labels or anything else on any Node in the cluster. This policy is
+# what narrows it back down. It is defense in depth, not the primary control: the operator is
+# already root on every Node it manages through managed-ssh proxy pods, so what this bounds is what
+# a compromised operator can do to the API *without* a run.
+#
+# Scoped to the operator's own ServiceAccount by matchConditions, so an administrator editing a Node
+# is never in scope — including the labels this policy protects, which a cluster admin must still be
+# able to clean up by hand.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "chart.fullname" . }}-node-labels
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      # UPDATE only, and deliberately not `nodes/status`: the operator's ClusterRole grants neither
+      # create nor delete on Nodes, and a status write goes to a subresource this rule does not
+      # select. A subresource named here would be a second surface to reason about for no gain.
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["nodes"]
+  matchConditions:
+    - name: only-the-operator
+      expression: >-
+        request.userInfo.username ==
+        "system:serviceaccount:{{ .Release.Namespace }}:{{ include "chart.serviceAccountName" . }}"
+  variables:
+    - name: oldLabels
+      expression: "has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}"
+    - name: newLabels
+      expression: "has(object.metadata.labels) ? object.metadata.labels : {}"
+    - name: oldAnnotations
+      expression: "has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
+    - name: newAnnotations
+      expression: "has(object.metadata.annotations) ? object.metadata.annotations : {}"
+  validations:
+    # A label key holds at most one "/", separating the optional DNS-subdomain prefix from the name,
+    # and the name may not contain one. So a key containing ".plan.ansible.cloudbending.dev/" has a
+    # prefix ending in that domain — which is exactly the operator's key format, whatever namespace
+    # and plan name it encodes.
+    - expression: >-
+        variables.newLabels.all(key,
+          (key in variables.oldLabels && variables.oldLabels[key] == variables.newLabels[key])
+          || key.contains(".plan.ansible.cloudbending.dev/"))
+      message: >-
+        the ansible-operator may only add or change Node labels under its own
+        <namespace>.plan.ansible.cloudbending.dev/<plan> keys
+      reason: Forbidden
+    - expression: >-
+        variables.oldLabels.all(key,
+          key in variables.newLabels || key.contains(".plan.ansible.cloudbending.dev/"))
+      message: >-
+        the ansible-operator may only remove Node labels under its own
+        <namespace>.plan.ansible.cloudbending.dev/<plan> keys
+      reason: Forbidden
+    - expression: "object.spec == oldObject.spec"
+      message: the ansible-operator may not change a Node's spec (taints, unschedulable, podCIDR)
+      reason: Forbidden
+    - expression: "variables.newAnnotations == variables.oldAnnotations"
+      message: the ansible-operator may not change a Node's annotations
+      reason: Forbidden
+    - expression: >-
+        (has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) ==
+        (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : [])
+      message: the ansible-operator may not change a Node's ownerReferences
+      reason: Forbidden
+    - expression: >-
+        (has(object.metadata.finalizers) ? object.metadata.finalizers : []) ==
+        (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : [])
+      message: the ansible-operator may not change a Node's finalizers
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "chart.fullname" . }}-node-labels
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "chart.fullname" . }}-node-labels
+  # No matchResources: the policy's own matchConstraints and matchConditions already select exactly
+  # the requests this is meant to judge, and Nodes are cluster-scoped so there is no namespace to
+  # narrow by.
+  validationActions: ["Deny"]
+{{- end }}

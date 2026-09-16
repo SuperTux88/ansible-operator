@@ -343,6 +343,48 @@ deleting a CRD deletes every custom resource of that kind cluster-wide. `crds.ke
 chart leaves both the definitions and your `PlaybookPlan`s in place; set it to `false` if you
 would rather have an uninstall clean everything up.
 
+## Node labels for plan dependencies
+
+A `PlaybookPlan` that sets `spec.provides` publishes what it has finished onto the Nodes it
+converged, as a label `<namespace>.plan.ansible.cloudbending.dev/<plan-name>` carrying the declared
+version. Another plan's `ClusterInventory` selects on that label, so its runs only ever reach hosts
+the first plan is done with; ordinary workloads can use the same label in `nodeAffinity`.
+
+This needs `patch` on Nodes, which is **cluster-wide** — RBAC cannot narrow a verb to one field, so
+the same grant would permit editing taints, `spec.unschedulable` or any other label. The chart
+therefore ships the permission with a guard, and both halves are values you control:
+
+```yaml
+# values.yaml
+nodeLabels:
+  enabled: true          # grants nodes: patch and turns the feature on
+  admissionPolicy: true  # holds that grant to the operator's own label keys
+```
+
+`nodeLabels.admissionPolicy` renders a `ValidatingAdmissionPolicy` and binding that allow the
+operator's ServiceAccount to add, change and remove only keys containing
+`.plan.ansible.cloudbending.dev/`, and require everything else about the Node — spec, annotations,
+every other label — to be unchanged. It is scoped to that ServiceAccount, so it never gets in the
+way of an administrator editing a Node, including cleaning these labels up by hand.
+
+**On Kubernetes below 1.30** the policy API is not generally available, and the install fails with
+`no matches for kind "ValidatingAdmissionPolicy" in version "admissionregistration.k8s.io/v1"`. Set
+`nodeLabels.admissionPolicy=false`: the feature keeps working and the `patch` grant is simply
+unguarded. The chart does not detect this for you on purpose — `helm template` without
+`--api-versions` reports the API as missing, so a capability check would quietly drop the guard
+while keeping the permission, and a security control that disappears without a word is worse than
+one you turned off knowingly.
+
+**To keep the operator off Node objects entirely**, set `nodeLabels.enabled=false`. Plans with
+`spec.provides` still run; they report in their status that node labels are disabled on this
+cluster, so a plan waiting on one of them says why instead of waiting silently. Note that this also
+removes the permission to *remove* labels already written: the operator logs the leftovers it finds
+at startup rather than cleaning them up, and you remove them with
+`kubectl label nodes --all <namespace>.plan.ansible.cloudbending.dev/<plan-name>-`.
+
+See [Playbook plans](../running-playbooks/playbook-plans.md) for authoring `spec.provides`, and
+[Cluster nodes](../running-playbooks/cluster-nodes.md) for selecting on the labels.
+
 ## Grant node access
 
 Installing the operator and enrolling a namespace is **not** enough for cluster-node playbooks: node
