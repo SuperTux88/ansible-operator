@@ -426,6 +426,17 @@ costs exactly as much as one it can: a suspended plan, a `OneShot` plan out of a
 runs — the readiness gate it would be released by is `OneShot`-only — and it is the one mode with no
 budget to bound the wakes, so one stuck host would otherwise wake it per heartbeat forever.
 
+The plan reflector's own task is driven **after** that wait, because it carries the two things
+`reconcile` never sees. A **deletion**: `Controller::new` decodes its primary watch with
+`applied_objects()`, which drops `Event::Delete`, and the object has left the store by then — so a
+deleted plan never reconciles, and the run-cleanup finalizer is no help either since an idle plan
+does not hold one. That is the path that withdraws a deleted provider's Node labels. And
+**`InitDone`**, the one moment "no such plan exists" is safe to ask: the reflector applies the event
+to the store *before* yielding it (`reflector/mod.rs`), so the store then holds a complete LIST.
+`node_labels::orphaned_labels` judged against a half-synced store would strip every dependency label
+in the cluster, which is why it is gated there and nowhere else — and why it runs on every resync,
+not only the first: a deletion during a watch disconnection produces no `Delete` event at all.
+
 `reconciler::new` is `async` for one reason: it waits for that reflector's initial LIST before
 handing back a controller. An unsynced Node cache reports every node `Ready`, which is precisely the
 answer that starts the runs the readiness gate exists to hold back — so after a restart every held
