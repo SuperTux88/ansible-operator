@@ -232,10 +232,27 @@ pub async fn new(
                 .backoff(WatchBackoff::default()),
         );
 
+        // The deletion path for a plan's Node labels, and the reason it is here rather than in
+        // `reconcile`. A deleted plan never reaches the reconciler: `Controller::new` decodes its
+        // primary watch with `applied_objects()`, which drops `Event::Delete` outright, and the
+        // object is gone from the store by then anyway. The run-cleanup finalizer is no help
+        // either — it is held only while a run owns resources, so a converged provider, which is
+        // exactly the plan whose labels matter, carries none.
+        //
+        // This stream still sees the deletion, with the whole object, which is all a withdrawal
+        // needs. Best effort on purpose: no finalizer means a plan is never held open waiting for
+        // the operator, and the two cases this misses — the operator being down, and a deletion
+        // during a watch disconnection, where the re-LIST announces nothing and simply drops the
+        // object — are what the startup sweep exists to catch.
+        let delete_handler_client = client.clone();
+        let labels_enabled = settings.node_labels_enabled;
         tokio::spawn(async move {
             playbookplan_reflector
                 .for_each(|event| async {
                     match event {
+                        Ok(watcher::Event::Delete(plan)) if labels_enabled => {
+                            withdraw_deleted_plans_labels(&delete_handler_client, &plan).await;
+                        }
                         Ok(_) => {}
                         Err(e) => error!("Reflector error: {e:?}"),
                     }
@@ -570,6 +587,25 @@ async fn reconcile(
         warn!(
             "PlaybookPlan {namespace}/{name} is in a namespace not enrolled for ansible-operator; refusing to run (add it to the chart's watchNamespaces)"
         );
+        // A plan the operator refuses to run must not go on steering other plans' inventories, so
+        // its claim is withdrawn here rather than left standing for as long as the namespace is
+        // out. Dependents elsewhere lose those hosts, which is the intended fail-closed direction.
+        //
+        // Nodes are cluster-scoped, so this is covered by the ClusterRole even though the operator
+        // holds no Role in this namespace. Idempotent, so running it on every pass through the
+        // guard costs nothing once the labels are gone — and on re-enrolment the labels come back
+        // on the first tick from the recorded results, without a new run.
+        if context.node_labels_enabled {
+            let key = node_labels::label_key(namespace, name);
+            withdraw_node_labels(
+                &context.client,
+                &key,
+                &node_labels::nodes_carrying(&key, &context.nodes),
+                &format!("{namespace}/{name}"),
+                "its namespace is not enrolled",
+            )
+            .await;
+        }
         if object.status.as_ref().map(|s| &s.phase) != Some(&Phase::UnauthorizedNamespace) {
             let mut status = object.status.clone().unwrap_or_default();
             status.phase = Phase::UnauthorizedNamespace;
@@ -1493,44 +1529,103 @@ struct TickConclusion<'a> {
     target_groups: Option<&'a [ResolvedInventoryGroup]>,
 }
 
-/// Publishes this plan's `spec.provides` version onto the Nodes its record says it converged.
+/// Brings this plan's Node labels in line with what its record says, after the status write.
 ///
-/// Runs after the status write, on every tick rather than when a run finishes, and writes only
-/// where a Node's current value differs — see `node_labels` for why each of those three matters.
+/// Runs on every tick rather than when a run finishes, and writes only where a Node's current value
+/// differs — see `node_labels` for why each of those matters.
 ///
-/// Silent and immediate for the two common cases: a plan that provides nothing has no key to write,
-/// and a converged plan produces an empty diff. Nothing is attempted when the chart disabled the
-/// feature, because the same value withheld the `nodes: patch` grant — every write would be a 403,
-/// and the plan already says so through its `ProvidesLabels` condition.
-async fn publish_node_labels(
+/// Both directions live here because they are one question asked of the same key. A plan that
+/// declares `spec.provides` publishes what each of its hosts has applied; a plan that declares
+/// nothing must own no labels at all, so dropping the field from the spec takes its labels with it.
+/// That second case is why this runs for every plan and not only for providers.
+///
+/// Silent and free in the two common cases: a converged provider produces an empty diff, and a plan
+/// that never provided anything finds no Nodes carrying its key. Nothing is attempted at all when
+/// the chart disabled the feature, because the same value withheld the `nodes: patch` grant — every
+/// write would be a 403, and the plan already says so through its `ProvidesLabels` condition.
+async fn reconcile_node_labels(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
     resource_status: &PlaybookPlanStatus,
     target_groups: &[ResolvedInventoryGroup],
 ) {
-    let Some(_version) = object.provides_version() else {
-        return;
-    };
     if !context.node_labels_enabled {
         return;
     }
     let Ok((namespace, name)) = namespace_and_name(object) else {
         return;
     };
-
     let key = node_labels::label_key(namespace, name);
-    let writes = node_labels::desired_labels(&key, target_groups, resource_status, &context.nodes);
-    if writes.is_empty() {
+    let plan = format!("{namespace}/{name}");
+
+    if object.provides_version().is_some() {
+        let writes =
+            node_labels::desired_labels(&key, target_groups, resource_status, &context.nodes);
+        if !writes.is_empty() {
+            node_labels::write_labels(&context.client, &key, &writes, &plan).await;
+        }
         return;
     }
 
-    node_labels::write_labels(
-        &context.client,
-        &key,
-        &writes,
-        &format!("{namespace}/{name}"),
-    )
-    .await;
+    // No `provides`: this plan claims nothing, so nothing may still be carrying its key. Because
+    // the version is part of the execution hash, removing the field is itself a new revision — the
+    // playbook re-runs once — but the labels go now rather than waiting for that run.
+    let stale = node_labels::nodes_carrying(&key, &context.nodes);
+    if !stale.is_empty() {
+        info!("PlaybookPlan {plan} no longer provides anything; removing {key} from {stale:?}");
+        node_labels::remove_labels(&context.client, &key, &stale, &plan).await;
+    }
+}
+
+/// Withdraws a deleted plan's claim from the Nodes still carrying it.
+///
+/// Reached from the plan watch rather than from a reconcile — see the delete handler in [`new`] for
+/// why there is no reconcile and no finalizer to hang this on.
+///
+/// The Nodes are read live. The plan is already gone, so there is no host set to consult and no
+/// reason to trust a cache that may not have caught up with the machines either; a label selector
+/// asks the API server for exactly the Nodes to clean. A plan that provided nothing is skipped
+/// before that call, so an ordinary deletion costs nothing.
+async fn withdraw_deleted_plans_labels(client: &kube::Client, object: &PlaybookPlan) {
+    if object.provides_version().is_none() {
+        return;
+    }
+    let Ok((namespace, name)) = namespace_and_name(object) else {
+        return;
+    };
+    let key = node_labels::label_key(namespace, name);
+    let plan = format!("{namespace}/{name}");
+
+    match node_labels::nodes_carrying_live(client, &key).await {
+        Ok(nodes) => {
+            withdraw_node_labels(client, &key, &nodes, &plan, "the plan was deleted").await;
+        }
+        Err(error) => warn!(
+            "PlaybookPlan {plan} was deleted, but the Nodes carrying {key} could not be listed: {error}. They keep the label until the operator's next startup sweep"
+        ),
+    }
+}
+
+/// Removes every Node label a plan owns, for the paths that end a plan's claim outright.
+///
+/// Used where there is no host set to diff against and no status worth consulting: the plan's
+/// namespace has been un-enrolled, or the plan is gone. Both are fail-closed on purpose — a plan
+/// the operator may no longer run must not keep steering other plans' inventories.
+///
+/// The Nodes come from the cache when there is one worth trusting and from the API server when
+/// there is not, which is why the caller supplies them.
+async fn withdraw_node_labels(
+    client: &kube::Client,
+    key: &str,
+    nodes: &[String],
+    plan: &str,
+    reason: &str,
+) {
+    if nodes.is_empty() {
+        return;
+    }
+    info!("PlaybookPlan {plan}: {reason}; removing {key} from {nodes:?}");
+    node_labels::remove_labels(client, key, nodes, plan).await;
 }
 
 async fn finish_reconcile_tick(
@@ -1569,7 +1664,7 @@ async fn finish_reconcile_tick(
     // host carries, and the record it is derived from is the thing that survives a crash. A label
     // that got ahead of the record would outlive the only evidence for it.
     if let Some(target_groups) = target_groups {
-        publish_node_labels(context, object, resource_status, target_groups).await;
+        reconcile_node_labels(context, object, resource_status, target_groups).await;
     }
 
     for finished in finished_records {
