@@ -191,6 +191,11 @@ Three things are flagged rather than counted, when a dependency can never be sat
 `invalidValue`, `malformedTerm` and `unparseableHosts`. See
 [A dependency never becomes satisfied](./results-and-troubleshooting.md#a-dependency-never-becomes-satisfied).
 
+Every plan referencing this inventory repeats the wait on itself, as the `DependenciesWaiting`
+condition and a clause in its summary, so you do not have to go looking for the inventory to find
+out why a plan is quiet. See
+[Conditions](./results-and-troubleshooting.md#conditions).
+
 ## Group variables
 
 Each group may carry a `variables` map, rendered as Ansible **group vars** for every Node the group
