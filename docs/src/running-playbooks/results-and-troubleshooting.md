@@ -136,6 +136,15 @@ Its `lastOutcome` is left standing, because what happened to the previous machin
 Records written before this field existed carry no `appliedAt` and are deliberately left alone until
 their next success, so upgrading the operator does not re-run every plan in the cluster.
 
+A host's record is removed once it has **both** left the plan's inventory and ceased to exist as a
+Node — a machine that has left the cluster for good. Both halves are required, so a host that leaves
+the inventory while its Node is still there keeps its record: a narrowed
+[`NodeAccessPolicy`](../cluster-operators/node-access-policies.md), an edited Node label or a
+rewritten selector all remove hosts from a plan without saying anything about the machines, and
+widening the policy again must not re-apply the playbook to every one of them. A `StaticInventory`
+host has no Node at all and so is never removed for want of one; its record goes when it leaves the
+inventory and the host is gone. Pruning waits for a tick with no run in flight.
+
 ## Run history
 
 The plan's `.status` only reflects the **current** run. For a durable, per-run history, the

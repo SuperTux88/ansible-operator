@@ -41,7 +41,7 @@ use crate::{
             watch_backoff::WatchBackoff,
         },
         playbookplancontroller::{
-            callback_output,
+            callback_output, departed_hosts,
             execution_evaluator::{self, find_outdated_hosts},
             job_builder, mappers, node_access, node_readiness, node_recreation, play_history,
             status,
@@ -894,6 +894,32 @@ async fn reconcile(
             "PlaybookPlan {namespace}/{name}: {replaced_nodes:?} registered after the playbook was \
              last applied to them, so they are outdated again"
         );
+    }
+
+    // Housekeeping on the same record, and the only thing that ever removes from it: rows for hosts
+    // that have both left the inventory and stopped existing as Nodes. It needs a write of its own —
+    // see `departed_hosts::hosts_status_deletion_patch` for why the tick's ordinary status write
+    // cannot express a deletion. Best effort: the rows are already gone from this tick's copy, and
+    // the final write leaves the server's untouched rather than restoring them, so a failure here
+    // only leaves them for the next idle tick to find again.
+    let departed = departed_hosts::prune_departed_hosts(&context.nodes, &mut resource_status);
+    if !departed.is_empty() {
+        match api
+            .patch_status(
+                name,
+                &PatchParams::default(),
+                &Patch::Merge(departed_hosts::hosts_status_deletion_patch(&departed)),
+            )
+            .await
+        {
+            Ok(_) => info!(
+                "PlaybookPlan {namespace}/{name}: dropped the records of {departed:?}, which left \
+                 the inventory and no longer exist as Nodes"
+            ),
+            Err(error) => warn!(
+                "PlaybookPlan {namespace}/{name}: could not drop the records of {departed:?}: {error}"
+            ),
+        }
     }
 
     // Inventory-author group variables are part of the execution hash (a change re-applies the
