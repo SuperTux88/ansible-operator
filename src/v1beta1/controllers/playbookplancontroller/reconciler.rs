@@ -43,8 +43,8 @@ use crate::{
         playbookplancontroller::{
             callback_output, departed_hosts,
             execution_evaluator::{self, find_outdated_hosts},
-            job_builder, mappers, node_access, node_readiness, node_recreation, play_history,
-            status,
+            job_builder, mappers, node_access, node_labels, node_readiness, node_recreation,
+            play_history, status,
         },
     },
 };
@@ -98,6 +98,23 @@ pub struct WorkloadEgressPolicies {
     pub managed_ssh: Option<Vec<NetworkPolicyEgressRule>>,
 }
 
+/// The admin's chart-derived knobs, as one value.
+///
+/// Grouped because they travel together and always will: every one of them comes from `values.yaml`
+/// by way of the operator ConfigMap, is read once at startup, and is then only ever read. The
+/// operator's own identity — its namespace, its enrolled set, its CA — is deliberately *not* in
+/// here; that is who the operator is, not how an admin tuned it.
+pub struct OperatorSettings {
+    /// Image for the managed-ssh proxy pods. No built-in default; see
+    /// [`ReconciliationContext::proxy_image`].
+    pub proxy_image: String,
+    /// How long a `NotReady` node's proxy pod is waited for, scaled by heartbeat age.
+    pub proxy_grace: managed_ssh::ProxyGracePolicy,
+    /// Whether a plan's `spec.provides` version may be published onto its Nodes.
+    pub node_labels_enabled: bool,
+    pub workload_egress_policies: WorkloadEgressPolicies,
+}
+
 struct ReconciliationContext {
     client: kube::Client,
     /// Namespace the operator itself runs in — where per-run Leases and managed-ssh proxy pods
@@ -128,6 +145,11 @@ struct ReconciliationContext {
     /// built-in default** — the operator refuses to start without it (see `config::require_proxy_image`
     /// / `main.rs`), so by the time a reconcile runs this is always a real, admin-chosen image.
     proxy_image: String,
+    /// Whether this cluster lets the operator publish a plan's `spec.provides` version onto the
+    /// Nodes it converged. From the chart's `nodeLabels.enabled`, which moves this flag and the
+    /// ClusterRole's `nodes: patch` together — so a `false` here means the permission is absent too,
+    /// and the only correct thing to do is say so on the plan rather than attempt a write.
+    node_labels_enabled: bool,
     /// How long to wait for a `NotReady` node's proxy pod to become Ready before treating the node as
     /// unreachable, scaled by the node's heartbeat age. From the chart's `managedSsh.readiness`.
     proxy_grace: managed_ssh::ProxyGracePolicy,
@@ -171,9 +193,7 @@ pub async fn new(
     operator_namespace: String,
     enrolled_namespaces: std::collections::BTreeSet<String>,
     ca: Arc<CertificateAuthority>,
-    proxy_image: String,
-    proxy_grace: managed_ssh::ProxyGracePolicy,
-    workload_egress_policies: WorkloadEgressPolicies,
+    settings: OperatorSettings,
 ) -> impl Stream<
     Item = Result<
         (ObjectRef<v1beta1::PlaybookPlan>, Action),
@@ -331,9 +351,10 @@ pub async fn new(
         ca,
         node_access_policies: Arc::clone(&node_access_policy_reflector_reader),
         nodes: Arc::clone(&node_reflector_reader),
-        proxy_image,
-        proxy_grace,
-        workload_egress_policies,
+        proxy_image: settings.proxy_image,
+        proxy_grace: settings.proxy_grace,
+        node_labels_enabled: settings.node_labels_enabled,
+        workload_egress_policies: settings.workload_egress_policies,
     });
 
     // The inventory watches close the gap between what a tick *reads* and what starts one:
@@ -822,9 +843,14 @@ async fn reconcile(
                 // the normal hash-aware terminal path classify it. A lost receipt has nothing to
                 // replay and was classified above from its recorded run identity.
                 &[],
-                handover,
-                retry_prune,
-                requeue_after,
+                TickConclusion {
+                    handover,
+                    retry_prune,
+                    requeue_after,
+                    // This exit is ahead of inventory resolution, so there is no host set to derive
+                    // a label from. The next tick that resolves one publishes what this recorded.
+                    target_groups: None,
+                },
             )
             .await;
         }
@@ -1044,9 +1070,14 @@ async fn reconcile(
             &object,
             &mut resource_status,
             &[],
-            handover,
-            retry_prune,
-            requeue_after,
+            TickConclusion {
+                handover,
+                retry_prune,
+                requeue_after,
+                // A schedule with no future occurrence stops new runs; it does not make what earlier
+                // runs already applied any less true, so the record is still worth publishing.
+                target_groups: Some(&target_groups),
+            },
         )
         .await;
     };
@@ -1432,15 +1463,74 @@ async fn reconcile(
         &finished_records,
         // This exit acknowledges every terminal record it was given, so a run recovered by this tick
         // is one the next will not find again.
-        if recovered_a_run {
-            RunHandover::Retired
-        } else {
-            RunHandover::NothingHeld
+        TickConclusion {
+            handover: if recovered_a_run {
+                RunHandover::Retired
+            } else {
+                RunHandover::NothingHeld
+            },
+            retry_prune,
+            requeue_after: Some(requeue_after),
+            target_groups: Some(&target_groups),
         },
-        retry_prune,
-        Some(requeue_after),
     )
     .await
+}
+
+/// What a tick concluded, for the one exit that writes it all down.
+///
+/// Four answers that are only ever produced together and only ever consumed together, so they
+/// travel as one value rather than as a widening tail of positional arguments where a `bool` and an
+/// `Option` next to each other are easy to swap by accident.
+struct TickConclusion<'a> {
+    handover: RunHandover,
+    /// Whether history pruning has work left that this tick could not finish.
+    retry_prune: bool,
+    requeue_after: Option<std::time::Duration>,
+    /// The plan's resolved, policy-clamped groups, when this tick got far enough to have them. They
+    /// are what the Node labels are derived from (never `hostsStatus` alone), so an exit that never
+    /// resolved an inventory publishes nothing rather than guessing at a host set.
+    target_groups: Option<&'a [ResolvedInventoryGroup]>,
+}
+
+/// Publishes this plan's `spec.provides` version onto the Nodes its record says it converged.
+///
+/// Runs after the status write, on every tick rather than when a run finishes, and writes only
+/// where a Node's current value differs — see `node_labels` for why each of those three matters.
+///
+/// Silent and immediate for the two common cases: a plan that provides nothing has no key to write,
+/// and a converged plan produces an empty diff. Nothing is attempted when the chart disabled the
+/// feature, because the same value withheld the `nodes: patch` grant — every write would be a 403,
+/// and the plan already says so through its `ProvidesLabels` condition.
+async fn publish_node_labels(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    resource_status: &PlaybookPlanStatus,
+    target_groups: &[ResolvedInventoryGroup],
+) {
+    let Some(_version) = object.provides_version() else {
+        return;
+    };
+    if !context.node_labels_enabled {
+        return;
+    }
+    let Ok((namespace, name)) = namespace_and_name(object) else {
+        return;
+    };
+
+    let key = node_labels::label_key(namespace, name);
+    let writes = node_labels::desired_labels(&key, target_groups, resource_status, &context.nodes);
+    if writes.is_empty() {
+        return;
+    }
+
+    node_labels::write_labels(
+        &context.client,
+        &key,
+        &writes,
+        &format!("{namespace}/{name}"),
+    )
+    .await;
 }
 
 async fn finish_reconcile_tick(
@@ -1448,12 +1538,22 @@ async fn finish_reconcile_tick(
     object: &PlaybookPlan,
     resource_status: &mut PlaybookPlanStatus,
     finished_records: &[FinishedRecord],
-    handover: RunHandover,
-    mut retry_prune: bool,
-    requeue_after: Option<std::time::Duration>,
+    conclusion: TickConclusion<'_>,
 ) -> Result<Action, ReconcileError> {
+    let TickConclusion {
+        handover,
+        mut retry_prune,
+        requeue_after,
+        target_groups,
+    } = conclusion;
     let (namespace, name) = namespace_and_name(object)?;
     let api = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace);
+
+    status::set_provides_labels_condition(
+        resource_status,
+        object.provides_version().is_some(),
+        context.node_labels_enabled,
+    );
 
     let release_finalizer =
         handover == RunHandover::NothingHeld && resource_status.active_run.is_none();
@@ -1464,6 +1564,13 @@ async fn finish_reconcile_tick(
     // starting read, so its finalizer list predates anything another controller added since —
     // the live copy answers both questions from the same observation the write is conditioned on.
     let patched = patch_status(&api, object, resource_status.clone()).await?;
+
+    // Status first, labels after, and never the other way round: a label is a claim about what a
+    // host carries, and the record it is derived from is the thing that survives a crash. A label
+    // that got ahead of the record would outlive the only evidence for it.
+    if let Some(target_groups) = target_groups {
+        publish_node_labels(context, object, resource_status, target_groups).await;
+    }
 
     for finished in finished_records {
         if finished.record == TerminalRecord::Present

@@ -106,7 +106,8 @@ async fn run(args: RunArgs) {
     // publishes nothing, so a dependent waiting on it looks like a broken selector unless an admin
     // can see this was a deliberate choice. The chart moves this flag and the ClusterRole's
     // `nodes: patch` together (`nodeLabels.enabled`).
-    if operator_config.node_labels.enabled {
+    let node_labels_enabled = operator_config.node_labels.enabled;
+    if node_labels_enabled {
         tracing::info!("node labels are enabled: plans with spec.provides will label their Nodes");
     } else {
         tracing::warn!(
@@ -157,11 +158,15 @@ async fn run(args: RunArgs) {
             operator_namespace,
             enrolled_namespaces,
             ca,
-            proxy_image,
-            proxy_grace,
-            v1beta1::playbookplancontroller::reconciler::WorkloadEgressPolicies {
-                playbook: operator_config.playbook_network_policy_egress,
-                managed_ssh: operator_config.managed_ssh_network_policy_egress,
+            v1beta1::playbookplancontroller::reconciler::OperatorSettings {
+                proxy_image,
+                proxy_grace,
+                node_labels_enabled,
+                workload_egress_policies:
+                    v1beta1::playbookplancontroller::reconciler::WorkloadEgressPolicies {
+                        playbook: operator_config.playbook_network_policy_egress,
+                        managed_ssh: operator_config.managed_ssh_network_policy_egress,
+                    },
             },
         )
         .await
