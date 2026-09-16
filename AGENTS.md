@@ -440,6 +440,13 @@ to the store *before* yielding it (`reflector/mod.rs`), so the store then holds 
 in the cluster, which is why it is gated there and nowhere else — and why it runs on every resync,
 not only the first: a deletion during a watch disconnection produces no `Delete` event at all.
 
+**Neither is awaited on that stream.** The reflector applies events to the store as the stream is
+polled, so work done inline stops the plan cache updating for its whole duration — and both of these
+remove a label per Node, one PATCH at a time. Every mapper that decides which plans to wake reads
+that cache. So each spawns a task, unserialized: both only ever *remove* labels, removing an absent
+one is a no-op, and a late-starting sweep still reads a complete store because `Writer` buffers a
+re-LIST and only swaps it in on `InitDone`.
+
 `reconciler::new` is `async` for one reason: it waits for that reflector's initial LIST before
 handing back a controller. An unsynced Node cache reports every node `Ready`, which is precisely the
 answer that starts the runs the readiness gate exists to hold back — so after a restart every held
