@@ -115,36 +115,61 @@ pub fn apply_terminal_play_status(
     upsert_condition(&mut status.conditions, ready);
 }
 
-/// Reports whether this plan's `spec.provides` claim is actually reaching the Nodes.
+/// What a providing plan publishes, and how far it currently reaches.
+pub struct ProvidedLabel<'a> {
+    /// The key derived from the plan's own namespace and name.
+    pub key: &'a str,
+    /// The version the plan's spec declares — what a converged host's label becomes.
+    pub version: &'a str,
+    /// How many Nodes in the cluster carry the key, at whatever version.
+    ///
+    /// The plan's *reach*, not a claim about any dependent's inventory: a `NodeAccessPolicy` may
+    /// narrow what a given dependent can actually use.
+    pub nodes: usize,
+}
+
+/// Reports whether this plan's `spec.provides` claim is actually reaching the Nodes, and how far.
 ///
 /// Only present on a plan that provides something — for every other plan the question is meaningless
 /// and a condition answering it would be noise, so dropping `provides` drops the condition too.
 ///
+/// It names the key and the count so that both ends of a dependency are readable on their own
+/// objects. A dependent says it is waiting for `platform/containerd-config`; the provider says what
+/// it publishes and on how many Nodes, and the two numbers together are the rollout. Without it,
+/// answering "is the provider actually doing anything?" means going to the Nodes.
+///
 /// The `False` case is the one this exists for. With the chart's `nodeLabels.enabled` turned off the
 /// operator has no `nodes: patch`, so a plan with `provides` runs perfectly well and publishes
 /// nothing — and every plan depending on it waits forever, looking exactly like a typo in a
-/// selector. Saying so on the provider is what turns that into a five-second diagnosis.
+/// selector. Saying so on the provider is what turns that into a five-second diagnosis. Its count
+/// means something different there: labels left over from before the feature was switched off, which
+/// still steer inventories and which only an admin can now remove.
 pub fn set_provides_labels_condition(
     status: &mut PlaybookPlanStatus,
-    provides: bool,
+    provided: Option<ProvidedLabel>,
     labels_enabled: bool,
 ) {
-    if !provides {
+    let Some(provided) = provided else {
         status
             .conditions
             .retain(|condition| condition.type_ != "ProvidesLabels");
         return;
-    }
+    };
 
+    let ProvidedLabel {
+        key,
+        version,
+        nodes,
+    } = provided;
     let now = chrono::Local::now().fixed_offset();
     let condition = if labels_enabled {
         PlaybookPlanCondition {
             type_: "ProvidesLabels".into(),
             status: "True".into(),
             reason: Some("PublishingNodeLabels".into()),
-            message: Some(
-                "hosts this plan has converged are labelled for other plans to depend on".into(),
-            ),
+            message: Some(format!(
+                "publishing {key}={version} on {nodes} Node(s) for other plans to depend on"
+            )),
             last_transition_time: Some(now),
         }
     } else {
@@ -152,9 +177,9 @@ pub fn set_provides_labels_condition(
             type_: "ProvidesLabels".into(),
             status: "False".into(),
             reason: Some("NodeLabelsDisabled".into()),
-            message: Some(
-                "node labels are disabled on this cluster (chart nodeLabels.enabled=false), so this plan publishes nothing and plans depending on it will not see its hosts".into(),
-            ),
+            message: Some(format!(
+                "node labels are disabled on this cluster (chart nodeLabels.enabled=false), so this plan does not publish {key} and plans depending on it will not see its hosts; {nodes} Node(s) still carry it from before"
+            )),
             last_transition_time: Some(now),
         }
     };
@@ -623,22 +648,39 @@ mod tests {
         )
     }
 
+    fn provided(nodes: usize) -> ProvidedLabel<'static> {
+        ProvidedLabel {
+            key: "platform.plan.ansible.cloudbending.dev/containerd",
+            version: "1.4.2",
+            nodes,
+        }
+    }
+
     /// The `False` case is the whole point: with node labels switched off, a plan with `provides`
     /// runs perfectly and publishes nothing, so every dependent waits and looks like it has a typo
     /// in its selector. The condition is what makes that a stated cause rather than a mystery.
+    ///
+    /// Both cases name the key, so that the two ends of a dependency can be read against each other
+    /// without going to the Nodes — and the count says how far the provider has actually got.
     #[test]
     fn a_providing_plan_says_whether_its_labels_are_reaching_nodes() {
         let mut status = PlaybookPlanStatus::default();
 
-        set_provides_labels_condition(&mut status, true, true);
+        set_provides_labels_condition(&mut status, Some(provided(5)), true);
         let condition = status
             .conditions
             .iter()
             .find(|condition| condition.type_ == "ProvidesLabels")
             .expect("a providing plan carries the condition");
         assert_eq!(condition.status, "True");
+        let message = condition.message.as_deref().unwrap();
+        assert!(
+            message.contains("platform.plan.ansible.cloudbending.dev/containerd=1.4.2"),
+            "{message}"
+        );
+        assert!(message.contains("5 Node(s)"), "{message}");
 
-        set_provides_labels_condition(&mut status, true, false);
+        set_provides_labels_condition(&mut status, Some(provided(5)), false);
         let condition = status
             .conditions
             .iter()
@@ -646,6 +688,12 @@ mod tests {
             .unwrap();
         assert_eq!(condition.status, "False");
         assert_eq!(condition.reason.as_deref(), Some("NodeLabelsDisabled"));
+        let message = condition.message.as_deref().unwrap();
+        assert!(
+            message.contains("platform.plan.ansible.cloudbending.dev/containerd"),
+            "the key an admin has to clean up by hand: {message}"
+        );
+        assert!(message.contains("5 Node(s) still carry it"), "{message}");
     }
 
     /// A plan that provides nothing is not answering this question, so it must not carry a stale
@@ -653,10 +701,10 @@ mod tests {
     #[test]
     fn a_plan_that_stops_providing_drops_the_condition() {
         let mut status = PlaybookPlanStatus::default();
-        set_provides_labels_condition(&mut status, true, true);
+        set_provides_labels_condition(&mut status, Some(provided(5)), true);
         set_running_condition(&mut status);
 
-        set_provides_labels_condition(&mut status, false, true);
+        set_provides_labels_condition(&mut status, None, true);
 
         assert!(
             !status

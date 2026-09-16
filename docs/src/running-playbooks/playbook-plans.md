@@ -196,9 +196,27 @@ A label is never withdrawn because a run went badly — only when the plan stops
   all, so its claim is withdrawn too and dependents elsewhere lose those hosts. Re-enrolling
   restores the labels from the recorded results on the first tick, **without** re-running anything.
 
+### Seeing how far the label has reached
+
+A providing plan carries a `ProvidesLabels` condition saying what it publishes and on how many
+Nodes:
+
+```text
+publishing platform.plan.ansible.cloudbending.dev/containerd=1.4.2 on 5 Node(s) for other plans to
+depend on
+```
+
+That count is this plan's **reach**, and nothing more. It is not a claim about what any dependent
+can use: a [`NodeAccessPolicy`](../cluster-operators/node-access-policies.md) may leave a dependent
+in another namespace with fewer of those Nodes than the number here. What each dependent is actually
+waiting for is on its own inventory — see
+[Seeing what an inventory is waiting for](./cluster-nodes.md#seeing-what-an-inventory-is-waiting-for).
+
 If your cluster administrator has disabled node labels (`nodeLabels.enabled=false` in the chart),
-plans with `provides` still run but publish nothing, and say so in their status through a
-`ProvidesLabels` condition with reason `NodeLabelsDisabled`.
+plans with `provides` still run but publish nothing, and the condition is `False` with reason
+`NodeLabelsDisabled`. Its count then means the opposite: Nodes still carrying the label from before
+the feature was switched off. They keep steering inventories, and removing them is now an
+administrator's job.
 
 ## Managing Kubernetes resources
 
