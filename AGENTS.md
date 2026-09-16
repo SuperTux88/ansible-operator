@@ -551,6 +551,12 @@ eyeball new cross-page links (or run the `mdbook-linkcheck` backend if installed
   `Justfile` for recipes.
 - `./ansible-operator crds` dumps all **five** CRDs (PlaybookPlan, Play, ClusterInventory,
   StaticInventory, NodeAccessPolicy) — check this path after changing any `CustomResource` type.
+  **A doc comment on a CRD type becomes Helm template text.** `just generate-crds` copies the dump
+  into `chart/charts/crds/templates/` verbatim, escaping nothing, so a `{{ … }}` in a doc comment is
+  a live Helm action: an example of Helm syntax renders as its *result* in the shipped CRD (a
+  `{{ .Chart.Version | replace … }}` sample became `0.1.0`), and an expression Helm cannot evaluate
+  fails the install outright. Describe such syntax in prose, and check with
+  `helm template ./chart | grep` after regenerating.
 - The chart renders `managedSsh.proxyImage` and `watchNamespaces` into the operator ConfigMap;
   `helm template ./chart -s templates/configmap.yaml` (and `templates/role.yaml`) is the quick
   way to sanity-check chart wiring.

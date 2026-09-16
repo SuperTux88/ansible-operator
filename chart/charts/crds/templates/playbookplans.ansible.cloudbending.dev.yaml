@@ -99,6 +99,44 @@ spec:
                 - OneShot
                 - Recurring
                 type: string
+              provides:
+                description: |-
+                  What this plan makes true on the hosts it converges, for other plans to depend on.
+
+                  Setting it opts the plan into Node labelling: every cluster Node this plan applied to
+                  successfully is labelled `<namespace>.plan.ansible.cloudbending.dev/<plan-name>` with the
+                  declared `version`, and another plan's `ClusterInventory` can select on that label to keep
+                  its own runs off hosts that are not ready yet. A plan without `provides` is labelled
+                  nowhere, so nothing unrelated appears on a Node.
+
+                  Left an object rather than a bare version string so it can grow a field without a breaking
+                  change.
+                nullable: true
+                properties:
+                  version:
+                    description: |-
+                      What this plan is providing right now, and the value the Node label carries.
+
+                      **Part of the execution hash**, which is what makes the label trustworthy: a Node carrying
+                      version X has to have had a run of the revision that *declared* X succeed on it, so bumping
+                      this re-applies the playbook everywhere before any label moves. Adding or removing
+                      `provides` re-runs the plan once for the same reason. It is also the only way to roll out a
+                      new binary that ships inside the plan's `image`, since the image is not hashed.
+
+                      A plan whose playbook must not re-run on every release therefore wants a version of its own
+                      rather than the chart's.
+
+                      Any valid Kubernetes label value is accepted, but `Gt`/`Ge`/`Lt`/`Le` selectors read it as a
+                      SemVer version, so a value that is not one only ever matches `Exists`, `In` and `NotIn`.
+                      SemVer build metadata cannot be expressed — `+` is not a legal label value character — so
+                      follow Helm's own `helm.sh/chart` convention and write it as `_`, piping the chart version
+                      through `replace "+" "_"` where a chart renders this field.
+                    maxLength: 63
+                    pattern: ^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$
+                    type: string
+                required:
+                - version
+                type: object
               schedule:
                 description: |-
                   5-field cron expression (`minute hour day-of-month month day-of-week`) that tells at which
