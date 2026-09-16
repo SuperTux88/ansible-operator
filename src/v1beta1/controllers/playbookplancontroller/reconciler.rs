@@ -3777,6 +3777,11 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         | ReconcileError::InventoryNotFound { .. }
         | ReconcileError::SecretNotFound { .. } => true,
         ReconcileError::KubeError(_) => false,
+        // Transient by construction, and the shortest-lived of them all: the inventory's own
+        // controller is on its way to publishing the hosts for this generation, and the status
+        // write that does it wakes this plan. Giving up a prepared run over a wait measured in
+        // seconds would abandon it for nothing.
+        ReconcileError::InventoryNotSynced { .. } => false,
         // A spec the user has to edit, exactly like the three above: no tick clears it, and holding
         // a run open against it would hold host Leases for as long as the plan stays wrong.
         ReconcileError::InvalidFileEntry { .. }
@@ -6057,6 +6062,28 @@ async fn resolve_inventory(
                 });
             }
         }
+    }
+
+    // An inventory whose controller has not caught up with its spec still publishes the previous
+    // spec's hosts, and `get_hosts` below reads exactly that. Refused here, before any of it reaches
+    // `eligible_hosts`, the execution hash or a run's groups: this is what keeps one `helm upgrade`
+    // that edits an inventory and its plan together from launching against the host set the edit
+    // replaced. The wait is the inventory controller's next reconcile, and the status write that
+    // ends it wakes this plan through the `ClusterInventory` watch.
+    for inventory in &cluster_inventories {
+        if inventory.status_is_current() {
+            continue;
+        }
+
+        return Err(ReconcileError::InventoryNotSynced {
+            name: inventory.name_any(),
+            generation: inventory.metadata.generation.unwrap_or_default(),
+            observed: inventory
+                .status
+                .as_ref()
+                .and_then(|status| status.observed_generation)
+                .map_or_else(|| "none".to_string(), |observed| observed.to_string()),
+        });
     }
 
     let mut groups = Vec::new();
@@ -9593,6 +9620,17 @@ spec:
             &ReconcileError::ReservedInventoryVariable {
                 group: "workers".into(),
                 key: "ansible_host".into(),
+            }
+        ));
+        // The one inventory failure nobody has to fix, and the shortest-lived: the inventory's
+        // controller has yet to publish the hosts for the current generation, and its status write
+        // is seconds away and wakes this plan. Superseding here would throw a prepared run away over
+        // an ordinary `helm upgrade` race.
+        assert!(!input_error_supersedes_unlaunched(
+            &ReconcileError::InventoryNotSynced {
+                name: "workers".into(),
+                generation: 5,
+                observed: "4".into(),
             }
         ));
     }

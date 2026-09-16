@@ -142,6 +142,11 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    group came from) and then `node_access::enforce`, which clamps managed-ssh nodes to the
    fail-closed intersection of the plan namespace's allowed nodes. One step on purpose: nothing may
    observe the unclamped result. `warn!`s excluded nodes; sets `status.eligible_hosts`.
+   A `ClusterInventory` whose `status.observedGeneration` is behind its `metadata.generation` is
+   refused here (`InventoryNotSynced`, classified transient so it *holds* an unlaunched run rather
+   than superseding it): its published `resolvedHosts` still answer for the spec before the edit, and
+   one `helm upgrade` that changes an inventory and a plan together would otherwise launch against
+   the host set the edit replaced.
 5. **Execution hash.** `ExecutionHash` over the playbook text + contents of every referenced
    Secret (variables + files), order-insensitive; deliberately **excludes** the workspace
    Secret (its content — proxy IPs — legitimately changes each run). Hash change ⇒
