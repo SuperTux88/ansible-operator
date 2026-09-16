@@ -1640,10 +1640,16 @@ async fn sweep_orphaned_node_labels(
     }
 
     if !labels_enabled {
-        warn!(
-            "{} Node labels belong to PlaybookPlans that no longer exist ({orphans:?}), and node labels are disabled (chart nodeLabels.enabled=false) so the operator cannot remove them. Plans selecting on these labels still treat those Nodes as ready. Remove them with `kubectl label nodes --all <key>-`",
-            orphans.len()
-        );
+        // Once per process. With the feature off nothing removes these, so every sweep finds the
+        // same set and would restate the same long line — and the sweep runs on every `InitDone`,
+        // which is a fresh LIST after a watch expiry as well as the startup one. It is a standing
+        // condition for an admin to act on, not news.
+        if !DISABLED_SWEEP_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            warn!(
+                "{} Node labels belong to PlaybookPlans that no longer exist ({orphans:?}), and node labels are disabled (chart nodeLabels.enabled=false) so the operator cannot remove them. Plans selecting on these labels still treat those Nodes as ready. Remove them with `kubectl label nodes --all <key>-`",
+                orphans.len()
+            );
+        }
         return;
     }
 
@@ -1661,6 +1667,11 @@ async fn sweep_orphaned_node_labels(
         .await;
     }
 }
+
+/// Whether the "node labels are disabled and these leftovers cannot be removed" warning has already
+/// been said. See its use in [`sweep_orphaned_node_labels`].
+static DISABLED_SWEEP_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Withdraws a deleted plan's claim from the Nodes still carrying it.
 ///
