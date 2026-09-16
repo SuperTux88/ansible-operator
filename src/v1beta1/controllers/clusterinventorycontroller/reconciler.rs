@@ -84,7 +84,11 @@ async fn reconcile(
     // always counted it once.
     let host_count = distinct_host_count(&resolved_hosts);
 
+    // Published with the hosts it was computed from, in the same write: it is what tells a plan that
+    // `resolvedHosts` answers for the spec the apiserver holds now, and not for the one before the
+    // edit it has yet to see.
     let next_status = ClusterInventoryStatus {
+        observed_generation: object.metadata.generation,
         host_count,
         resolved_hosts,
     };

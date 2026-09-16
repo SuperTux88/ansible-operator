@@ -60,6 +60,18 @@ impl From<Toleration> for k8s_openapi::api::core::v1::Toleration {
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterInventoryStatus {
+    /// The `metadata.generation` this status was computed from.
+    ///
+    /// `resolvedHosts` is a *published* answer rather than a live one — a plan reads it instead of
+    /// evaluating the selectors itself — so between a spec edit and this controller's next reconcile
+    /// the published hosts still describe the previous spec. A plan that started a run in that
+    /// window would target the old host set, which one `helm upgrade` changing an inventory and a
+    /// plan together makes routine: Helm applies both in a single pass and waits for no status.
+    ///
+    /// A plan therefore prepares no new run from an inventory whose `observedGeneration` is not its
+    /// `metadata.generation`, and the status write that catches it up wakes every plan that names
+    /// it. Absent until this controller has written a status at all.
+    pub observed_generation: Option<i64>,
     /// How many distinct Nodes this inventory resolves to — the `Hosts` column. A Node matched by
     /// two of the inventory's groups is listed in both of `resolvedHosts` and counted here once,
     /// because that is what it is to a run: one host, applied to once. The plan's own `n/m hosts`
@@ -87,6 +99,28 @@ pub struct InventoryHosts {
     pub variables: Option<GenericMap>,
 }
 
+impl ClusterInventory {
+    /// Whether `status.resolvedHosts` describes the spec the apiserver currently holds.
+    ///
+    /// False while this inventory's controller has not caught up with a spec edit — including
+    /// before it has written any status at all, where there are no stale hosts to speak of but
+    /// equally none to run against.
+    ///
+    /// An object carrying no `metadata.generation` reads as current: the apiserver stamps one onto
+    /// every custom resource, so there is nothing to compare against and no evidence of staleness
+    /// to act on. Blocking on the absence would hold every plan on a field that is never missing in
+    /// a real cluster.
+    pub fn status_is_current(&self) -> bool {
+        let Some(generation) = self.metadata.generation else {
+            return true;
+        };
+
+        self.status
+            .as_ref()
+            .is_some_and(|status| status.observed_generation == Some(generation))
+    }
+}
+
 impl AnsibleInventory for ClusterInventory {
     fn get_hosts(&self) -> Vec<ResolvedHosts> {
         self.status
@@ -104,5 +138,49 @@ mod tests {
     fn test_deserialize_example() {
         let inventory_str = include_str!("../../../examples/v1beta1/cluster-inventory.yaml");
         let _: ClusterInventory = serde_yaml::from_str(inventory_str).unwrap();
+    }
+
+    fn example() -> ClusterInventory {
+        serde_yaml::from_str(include_str!(
+            "../../../examples/v1beta1/cluster-inventory.yaml"
+        ))
+        .unwrap()
+    }
+
+    /// The gate a plan asks before it prepares a run. While it answers false, `resolvedHosts`
+    /// describes a spec the apiserver no longer holds, and a run started against it would target the
+    /// host set the edit replaced.
+    #[test]
+    fn a_status_behind_the_spec_is_not_current() {
+        let mut inventory = example();
+        inventory.metadata.generation = Some(5);
+
+        assert!(
+            !inventory.status_is_current(),
+            "an inventory whose controller has never written a status resolves no hosts to run on"
+        );
+
+        inventory.status = Some(ClusterInventoryStatus {
+            observed_generation: Some(4),
+            ..Default::default()
+        });
+        assert!(!inventory.status_is_current());
+
+        inventory.status = Some(ClusterInventoryStatus {
+            observed_generation: Some(5),
+            ..Default::default()
+        });
+        assert!(inventory.status_is_current());
+    }
+
+    /// The apiserver stamps a generation onto every custom resource, so an object without one offers
+    /// nothing to compare and no staleness to act on. Reading it as stale would hold every plan on a
+    /// field that is never actually missing.
+    #[test]
+    fn an_object_without_a_generation_reads_as_current() {
+        let inventory = example();
+
+        assert_eq!(inventory.metadata.generation, None);
+        assert!(inventory.status_is_current());
     }
 }
