@@ -43,7 +43,8 @@ use crate::{
         playbookplancontroller::{
             callback_output,
             execution_evaluator::{self, find_outdated_hosts},
-            job_builder, mappers, node_access, node_readiness, play_history, status,
+            job_builder, mappers, node_access, node_readiness, node_recreation, play_history,
+            status,
         },
     },
 };
@@ -877,6 +878,23 @@ async fn reconcile(
     }
 
     resource_status.eligible_hosts = flatten_hosts(&target_groups);
+
+    // A host whose Node has been replaced since the claim was stamped has applied nothing: the
+    // record is keyed by name, and the name is all the fresh machine inherits. Dropped here, before
+    // the hash and the outdated check read it, so that every consumer of `hostsStatus` — this tick's
+    // run selection, the restated `Ready`, and the Node watch's wake set on the next tick — works
+    // from one corrected record instead of each re-deciding the question for itself.
+    let replaced_nodes = node_recreation::drop_records_for_recreated_nodes(
+        &context.nodes,
+        &target_groups,
+        &mut resource_status,
+    );
+    if !replaced_nodes.is_empty() {
+        info!(
+            "PlaybookPlan {namespace}/{name}: {replaced_nodes:?} registered after the playbook was \
+             last applied to them, so they are outdated again"
+        );
+    }
 
     // Inventory-author group variables are part of the execution hash (a change re-applies the
     // playbook to otherwise-current hosts). Keyed by group name; groups without variables

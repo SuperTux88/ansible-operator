@@ -123,7 +123,18 @@ prevents an old Job and a new revision from targeting the same host concurrently
 | `Unknown` | The operator could not read a recap for this host — its **own instrumentation** failed, not Ansible. Distinct from `NotReached`. Worth investigating (see below). |
 
 Each host also records `lastAppliedHash` (the hash it last *succeeded* on — this is what drift
-detection compares against) and `lastTransitionTime`.
+detection compares against), `appliedAt` (when that hash was stamped) and `lastTransitionTime` (when
+the host last recorded any outcome, successful or not).
+
+`appliedAt` is what tells a **replaced machine** from the one the record was written about.
+`.status.hostsStatus` is keyed by host name, and the name is all a rebuilt machine inherits — so a
+Node deleted and re-registered under the same name would otherwise keep its predecessor's
+`lastAppliedHash` and never be applied to again. A Node whose `creationTimestamp` is later than
+`appliedAt` has applied nothing: the operator drops the recorded hash, and the next run targets it.
+Its `lastOutcome` is left standing, because what happened to the previous machine is still history.
+
+Records written before this field existed carry no `appliedAt` and are deliberately left alone until
+their next success, so upgrading the operator does not re-run every plan in the cluster.
 
 ## Run history
 
