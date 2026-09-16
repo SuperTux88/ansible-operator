@@ -115,6 +115,53 @@ pub fn apply_terminal_play_status(
     upsert_condition(&mut status.conditions, ready);
 }
 
+/// Reports whether this plan's `spec.provides` claim is actually reaching the Nodes.
+///
+/// Only present on a plan that provides something — for every other plan the question is meaningless
+/// and a condition answering it would be noise, so dropping `provides` drops the condition too.
+///
+/// The `False` case is the one this exists for. With the chart's `nodeLabels.enabled` turned off the
+/// operator has no `nodes: patch`, so a plan with `provides` runs perfectly well and publishes
+/// nothing — and every plan depending on it waits forever, looking exactly like a typo in a
+/// selector. Saying so on the provider is what turns that into a five-second diagnosis.
+pub fn set_provides_labels_condition(
+    status: &mut PlaybookPlanStatus,
+    provides: bool,
+    labels_enabled: bool,
+) {
+    if !provides {
+        status
+            .conditions
+            .retain(|condition| condition.type_ != "ProvidesLabels");
+        return;
+    }
+
+    let now = chrono::Local::now().fixed_offset();
+    let condition = if labels_enabled {
+        PlaybookPlanCondition {
+            type_: "ProvidesLabels".into(),
+            status: "True".into(),
+            reason: Some("PublishingNodeLabels".into()),
+            message: Some(
+                "hosts this plan has converged are labelled for other plans to depend on".into(),
+            ),
+            last_transition_time: Some(now),
+        }
+    } else {
+        PlaybookPlanCondition {
+            type_: "ProvidesLabels".into(),
+            status: "False".into(),
+            reason: Some("NodeLabelsDisabled".into()),
+            message: Some(
+                "node labels are disabled on this cluster (chart nodeLabels.enabled=false), so this plan publishes nothing and plans depending on it will not see its hosts".into(),
+            ),
+            last_transition_time: Some(now),
+        }
+    };
+
+    upsert_condition(&mut status.conditions, condition);
+}
+
 /// Sets the plan-level `Blocked` condition, which reports whether this run is currently waiting on
 /// a per-host lock held by another run (locks are global per node — see `locking::ensure_locks`).
 /// `Some(blocked)` sets it `True` with the offending host and, when known, the holding run named in
@@ -443,6 +490,56 @@ mod tests {
             "playbook",
             std::iter::empty(),
         )
+    }
+
+    /// The `False` case is the whole point: with node labels switched off, a plan with `provides`
+    /// runs perfectly and publishes nothing, so every dependent waits and looks like it has a typo
+    /// in its selector. The condition is what makes that a stated cause rather than a mystery.
+    #[test]
+    fn a_providing_plan_says_whether_its_labels_are_reaching_nodes() {
+        let mut status = PlaybookPlanStatus::default();
+
+        set_provides_labels_condition(&mut status, true, true);
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "ProvidesLabels")
+            .expect("a providing plan carries the condition");
+        assert_eq!(condition.status, "True");
+
+        set_provides_labels_condition(&mut status, true, false);
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "ProvidesLabels")
+            .unwrap();
+        assert_eq!(condition.status, "False");
+        assert_eq!(condition.reason.as_deref(), Some("NodeLabelsDisabled"));
+    }
+
+    /// A plan that provides nothing is not answering this question, so it must not carry a stale
+    /// answer to it either — dropping `spec.provides` has to drop the condition with it.
+    #[test]
+    fn a_plan_that_stops_providing_drops_the_condition() {
+        let mut status = PlaybookPlanStatus::default();
+        set_provides_labels_condition(&mut status, true, true);
+        set_running_condition(&mut status);
+
+        set_provides_labels_condition(&mut status, false, true);
+
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|condition| condition.type_ == "ProvidesLabels")
+        );
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.type_ == "Running"),
+            "and nothing else is disturbed"
+        );
     }
 
     /// The version travels with the hash and the timestamp, under one condition, so the three can

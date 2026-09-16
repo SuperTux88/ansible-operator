@@ -54,6 +54,47 @@ their summary; the catching-up status write wakes them, normally within seconds.
 for a single `helm upgrade` that changes an inventory and a plan together, since Helm applies both in
 one pass and waits for no status.
 
+## Depending on another plan
+
+A plan that declares [`spec.provides`](./playbook-plans.md#declaring-what-a-plan-provides) labels
+every Node it has converged. Select on that label and your inventory resolves to "the Nodes where
+that plan has finished", growing by itself as the other plan works through its hosts:
+
+```yaml
+kind: ClusterInventory
+metadata:
+  name: workers-with-containerd
+spec:
+  hosts:
+    - name: workers
+      matchLabels:
+        node-role.kubernetes.io/worker: ""
+      matchExpressions:
+        - key: platform.plan.ansible.cloudbending.dev/containerd-config
+          operator: Exists
+```
+
+Use `In` with `values` to require a particular version rather than any.
+
+A host that is not ready yet is simply **not in the run** — it costs no attempt, holds no Lease and
+starts no proxy pod, which is exactly why this is expressed as a host set rather than as a wait
+inside the playbook. When the providing plan succeeds on another Node, that Node's label reaches
+this inventory's `resolvedHosts` within seconds and the dependent plan is woken.
+
+The label is cluster-wide, so the providing plan may live in **another namespace** — the key names
+it, which is also why every key is visible to anyone who can read Nodes.
+
+Two things to get right when you copy an existing inventory to add a dependency:
+
+- **Keep the group `name`.** It becomes the Ansible group, so a copy that keeps `workers` lets the
+  same playbook (`hosts: workers`) run unchanged.
+- **Copy the group `variables` exactly.** They are part of the execution hash, so a copy that
+  differs puts the dependent plan on a different revision than the original inventory would have.
+
+Remember what the label means: *this version was applied here at some point*. It is not a freshness
+or health signal, and a dependent is **not** re-run when the provider changes — see
+[Scheduling and execution modes](./scheduling-and-modes.md#dependencies-do-not-re-trigger-a-plan).
+
 ## Group variables
 
 Each group may carry a `variables` map, rendered as Ansible **group vars** for every Node the group

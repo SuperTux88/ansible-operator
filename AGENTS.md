@@ -44,6 +44,12 @@ whole point of the design. If a change would weaken one, stop and surface it; do
 - **INV-7 — Proxy pods carry both `PLAYBOOKPLAN_HASH` and `PLAYBOOKPLAN_HOST`** so
   cleanup's label-scoped `delete_collection` cannot sweep the ansible Job pod (which lacks
   `_HOST`).
+- **INV-8 — The operator writes only its own Node labels.** Every Node write is confined to
+  `<namespace>.plan.ansible.cloudbending.dev/<plan>` keys built by `node_labels::label_key` from the
+  plan's own namespace and name — never a tenant-supplied key, never a Node's spec or annotations.
+  A tenant-chosen key would let a plan label its way past a `NodeAccessPolicy` ceiling (T-ESC-3).
+  The chart's `ValidatingAdmissionPolicy` enforces the same bound at the API server, and a test pins
+  its CEL matcher to `node_labels::KEY_DOMAIN`.
 
 Two recent load-bearing fixes that look like "cleanups" but MUST NOT be reverted:
 - **`StrictModes no` in `render_sshd_config`** — required so sshd will read the
@@ -82,6 +88,7 @@ src/v1beta1/
     reconciler.rs                    the reconcile pipeline (below); patch_status via JSON merge patch
     mappers.rs                       maps Secret, NodeAccessPolicy, ClusterInventory and StaticInventory changes to affected plans; the Secret watch asks two rules (named in `variables`/`files`, or holding a StaticInventory's SSH key)
     node_access.rs                   NodeAccessPolicy enforcement: fail-closed intersection clamp (INV-2/3/5)
+    node_labels.rs                   publishes a plan's `spec.provides` version onto the Nodes it converged, as `<ns>.plan.ansible.cloudbending.dev/<plan>`, so other plans can gate their own inventories on it. Three load-bearing rules: **status first, labels after** (a label may lag the record, never lead it — a crash between the two must not leave a claim with no evidence); the diff reads the **resolved managed-ssh groups**, never `hostsStatus` alone (which is keyed by name, so a StaticInventory host would otherwise label a same-named Node); and it writes **only on a real change of value**, since every Node label change is broadcast to every Node watcher in the cluster. The key is derived from the plan's namespace and name, never from tenant input (INV-8)
     node_readiness.rs                Node Ready-condition predicates + the OneShot "hold instead of starting" gate; readiness only, never authorization
     node_recreation.rs               drops a host's recorded application when its Node was registered after `appliedAt` — a rebuilt machine inherits the name, never the claim. Level-triggered on purpose: a deletion the operator was down for leaves no event to react to
     departed_hosts.rs                prunes `hostsStatus` rows for hosts that left the inventory **and** no longer exist as Nodes (housekeeping; `hostsStatus` otherwise only ever grows). Requiring both is what stops a narrowed NodeAccessPolicy from dropping live machines' records and re-running them when it widens again. Deletion needs an explicit `null` per key — a merge patch cannot delete by omission
