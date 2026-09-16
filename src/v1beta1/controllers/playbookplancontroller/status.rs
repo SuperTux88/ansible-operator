@@ -79,6 +79,11 @@ pub fn apply_terminal_play_status(
         let entry = hosts_status.entry(host.clone()).or_default();
         if result.outcome == HostOutcome::Succeeded {
             entry.last_applied_hash = execution_hash.to_string();
+            // Stamped with the hash and only with the hash: it dates the *claim*, so that a Node
+            // registered after it can be recognised as a different machine (`node_recreation`).
+            // Same source as `lastTransitionTime` below, so a replayed recovery dates the claim when
+            // the run finished rather than when it was noticed.
+            entry.applied_at = play_status.finished_at.or(Some(now));
         }
         entry.last_outcome = result.outcome.clone();
         // The run's own finish time when the record carries one, so replaying a recovered result
@@ -527,6 +532,67 @@ mod tests {
             );
             assert!(hosts[host].last_transition_time.is_some(), "{host}");
         }
+    }
+
+    /// `appliedAt` dates the *claim*, so it moves with `lastAppliedHash` and with nothing else: a
+    /// host that failed keeps the date of the revision it really applied, and one that has never
+    /// succeeded has none at all. The pairing is what lets a replaced machine be told apart from the
+    /// one the record describes (`node_recreation`) — a date that moved on a failure would make a
+    /// rebuilt Node look like it had applied something.
+    #[test]
+    fn applied_at_is_stamped_with_the_revision_and_only_with_it() {
+        let h = hash();
+        let earlier = "2026-01-01T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::FixedOffset>>()
+            .unwrap();
+        let finished = "2026-03-04T05:06:07Z"
+            .parse::<chrono::DateTime<chrono::FixedOffset>>()
+            .unwrap();
+        let mut status = PlaybookPlanStatus {
+            hosts_status: Some(BTreeMap::from([(
+                "failed".into(),
+                crate::v1beta1::HostStatus {
+                    last_applied_hash: "previous-revision".into(),
+                    last_outcome: HostOutcome::Succeeded,
+                    applied_at: Some(earlier),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        let result = |outcome: HostOutcome| crate::v1beta1::PlayHostResult {
+            outcome,
+            ..Default::default()
+        };
+        let play_status = PlayStatus {
+            phase: PlayPhase::Failed,
+            host_count: 3,
+            finished_at: Some(finished),
+            hosts: BTreeMap::from([
+                ("succeeded".into(), result(HostOutcome::Succeeded)),
+                ("failed".into(), result(HostOutcome::Failed)),
+                ("not-reached".into(), result(HostOutcome::NotReached)),
+            ]),
+            ..Default::default()
+        };
+
+        apply_terminal_play_status(&h, &play_status, &mut status);
+
+        let hosts = status.hosts_status.unwrap();
+        assert_eq!(
+            hosts["succeeded"].applied_at,
+            Some(finished),
+            "the run's own finish time, so a replayed recovery dates the claim when it happened"
+        );
+        assert_eq!(
+            hosts["failed"].applied_at,
+            Some(earlier),
+            "a failure leaves the date of the revision the host really applied"
+        );
+        assert_eq!(
+            hosts["not-reached"].applied_at, None,
+            "a host that never succeeded has no claim to date"
+        );
     }
 
     #[test]

@@ -489,6 +489,23 @@ pub struct HostStatus {
     /// The execution hash last SUCCESSFULLY applied to this host. Only bumped on `HostOutcome::Succeeded`.
     pub last_applied_hash: String,
     pub last_outcome: HostOutcome,
+    /// When `lastAppliedHash` was stamped — moved by exactly the outcome that moves that field, and
+    /// by no other. This is what separates it from `lastTransitionTime`, which records every
+    /// outcome, successful or not.
+    ///
+    /// It exists because `hostsStatus` is keyed by host *name*, and the name is all a replacement
+    /// machine inherits: without it, a Node deleted and re-registered under the same name would keep
+    /// the claim its predecessor earned, and a `OneShot` plan would never run on the fresh machine.
+    /// A Node whose `creationTimestamp` is later than this is a different machine, and its recorded
+    /// application is dropped — see `node_recreation`.
+    ///
+    /// Absent on a record written before this field existed. Such a record is deliberately left
+    /// alone rather than treated as a replacement, or the upgrade that introduced the field would
+    /// re-run every plan across the fleet; the next success fills it in. See the
+    /// `#[serde(default, ...)]` note on `PlaybookPlanStatus::next_run`.
+    #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
+    #[schemars(with = "Option<String>")]
+    pub applied_at: Option<DateTime<FixedOffset>>,
     // See the `#[serde(default, ...)]` note on `PlaybookPlanStatus::next_run`.
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
