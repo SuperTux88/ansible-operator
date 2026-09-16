@@ -940,6 +940,7 @@ async fn reconcile(
         &related_secrets,
         &secrets_api,
         &inventory_variables,
+        provides_version(&object),
     )
     .await
     {
@@ -5934,6 +5935,7 @@ async fn hash_playbook_inputs(
     secret_names: &[&String],
     secrets_api: &Api<Secret>,
     inventory_variables: &[(&str, &serde_json::Value)],
+    provides_version: Option<&str>,
 ) -> Result<ExecutionHash, ReconcileError> {
     let secret_reads = futures::future::join_all(
         secret_names
@@ -5945,8 +5947,22 @@ async fn hash_playbook_inputs(
 
     Ok(
         execution_evaluator::calculate_execution_hash(playbook, variables_secrets.iter())
-            .fold_inventory_variables(inventory_variables.iter().copied()),
+            .fold_inventory_variables(inventory_variables.iter().copied())
+            .fold_provides_version(provides_version),
     )
+}
+
+/// The version this plan declares in `spec.provides`, if it declares one.
+///
+/// One accessor rather than the field read spelled out at each site: the version is read by the
+/// hash, by the run record that dates a host's claim to it, and by the Node label diff, and those
+/// three answering differently is exactly the disagreement the design has no room for.
+fn provides_version(object: &PlaybookPlan) -> Option<&str> {
+    object
+        .spec
+        .provides
+        .as_ref()
+        .map(|provides| provides.version.as_str())
 }
 
 /// Collects the data of every referenced Secret, refusing the whole read if any of them failed —

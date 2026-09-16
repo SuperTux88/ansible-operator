@@ -61,6 +61,30 @@ impl ExecutionHash {
 
         ExecutionHash(self.0.wrapping_add(extra))
     }
+
+    /// Folds the version a plan declares in `spec.provides` into an existing hash.
+    ///
+    /// This is what makes the Node label that carries the version mean anything: the label says
+    /// "a run of the revision that declared this version succeeded here", and only a hash that
+    /// moves with the version can keep that promise. Without it, bumping the version would relabel
+    /// hosts the new revision was never applied to.
+    ///
+    /// It is also the one input a plan has for re-running a playbook whose *content* did not
+    /// change — the binary a plan installs usually lives in its `image`, which is deliberately not
+    /// hashed.
+    ///
+    /// `None` returns the hash untouched, so a plan without `provides` hashes exactly as it did
+    /// before this field existed and the upgrade that introduces it re-runs nothing. A plan that
+    /// *adds* `provides` re-runs once, which is what earns its first label.
+    pub fn fold_provides_version(self, version: Option<&str>) -> ExecutionHash {
+        let Some(version) = version else {
+            return self;
+        };
+
+        let mut hasher = twox_hash::XxHash3_64::new();
+        version.hash(&mut hasher);
+        ExecutionHash(self.0.wrapping_add(hasher.finish()))
+    }
 }
 
 /// Returns an iterator over hosts where the PlaybookPlan needs to be (re)applied.
@@ -78,14 +102,10 @@ pub fn find_outdated_hosts(
     let hash = execution_hash.to_string();
     // For each host, check if it already has the current execution hash in the PlaybookPlan's status
     let outdated_hosts = hosts.iter().filter(move |host| {
-        let host_status = hosts_status.get(*host);
-
         // We don't have a status for this host yet so we must execute the playbook
-        if host_status.is_none() {
+        let Some(host_status) = hosts_status.get(*host) else {
             return true;
-        }
-
-        let host_status = host_status.unwrap();
+        };
 
         // Otherwise just compare the hashes
         host_status.last_applied_hash != hash
@@ -302,6 +322,52 @@ mod tests {
             with_vars,
             base.fold_inventory_variables([("workers", &changed), ("edge", &edge)])
         );
+    }
+
+    /// The upgrade guard. Every plan in the fleet is a plan without `provides` on the day this
+    /// ships, and a hash that moved for them would re-apply every playbook on every host at once —
+    /// triggered by nothing but installing a new operator.
+    #[test]
+    fn a_plan_without_provides_hashes_as_though_the_field_did_not_exist() {
+        let base = calculate_execution_hash("playbook", std::iter::empty());
+
+        assert_eq!(base, base.fold_provides_version(None));
+    }
+
+    /// The label's whole promise is that a Node carrying version X had a run of the revision
+    /// declaring X succeed on it. That only holds while the version is part of what makes a
+    /// revision, so each of these three edits has to be a new revision.
+    #[test]
+    fn declaring_and_bumping_a_version_are_both_new_revisions() {
+        let base = calculate_execution_hash("playbook", std::iter::empty());
+
+        let declared = base.fold_provides_version(Some("1.4.2"));
+        assert_ne!(base, declared, "adding provides re-runs the plan once");
+
+        let bumped = base.fold_provides_version(Some("1.4.3"));
+        assert_ne!(declared, bumped, "a bump re-runs it everywhere");
+
+        assert_eq!(
+            declared,
+            base.fold_provides_version(Some("1.4.2")),
+            "an unchanged version is not an edit"
+        );
+    }
+
+    /// The two folds are applied one after the other over the same hash, so a version must not be
+    /// able to cancel an inventory variable out (or the reverse): a plan is one revision, and two
+    /// different sets of inputs landing on one hash would leave hosts converged on a playbook they
+    /// never received.
+    #[test]
+    fn the_version_and_the_inventory_variables_fold_independently() {
+        let base = calculate_execution_hash("playbook", std::iter::empty());
+        let workers = serde_json::json!({ "motd": "hello" });
+
+        let with_vars = base.fold_inventory_variables([("workers", &workers)]);
+        let with_both = with_vars.fold_provides_version(Some("1.4.2"));
+
+        assert_ne!(with_both, with_vars);
+        assert_ne!(with_both, base.fold_provides_version(Some("1.4.2")));
     }
 
     /// A group whose `variables` render nothing must hash as though it had none. The renderer emits
