@@ -233,7 +233,7 @@ fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &Node, node_name: &str) 
             .as_ref()
             .and_then(|hosts| hosts.get(node_name))
             .is_none_or(|host| {
-                node_recreation::node_replaced_since(host.applied_at, node)
+                node_recreation::node_replaced_since(host.applied_node_uid.as_deref(), node)
                     || (host.last_applied_hash != status.current_hash
                         && !matches!(
                             host.last_outcome,
@@ -552,7 +552,7 @@ mod tests {
         }]
     }
 
-    /// A Node that cannot be a replacement for anything: with no `creationTimestamp` there is
+    /// A Node that cannot be a replacement for anything: with no `uid` there is
     /// nothing for `node_recreation::node_replaced_since` to read as one. Every case below that is
     /// about the *host's* recorded state uses it, so each keeps asking exactly what it asked before
     /// the predicate learned about rebuilt machines.
@@ -560,15 +560,10 @@ mod tests {
         Node::default()
     }
 
-    fn node_created_at(created: &str) -> Node {
-        let created = created
-            .parse::<chrono::DateTime<chrono::FixedOffset>>()
-            .unwrap();
+    fn node_with_uid(uid: &str) -> Node {
         Node {
             metadata: kube::core::ObjectMeta {
-                creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
-                    k8s_openapi::jiff::Timestamp::from_second(created.timestamp()).unwrap(),
-                )),
+                uid: Some(uid.to_string()),
                 ..Default::default()
             },
             ..Default::default()
@@ -583,11 +578,7 @@ mod tests {
     #[test]
     fn a_plan_awaits_a_host_whose_node_was_replaced_since_it_applied() {
         let mut converged = host("abc", HostOutcome::Succeeded);
-        converged.applied_at = Some(
-            "2026-01-01T00:00:00Z"
-                .parse::<chrono::DateTime<chrono::FixedOffset>>()
-                .unwrap(),
-        );
+        converged.applied_node_uid = Some("uid-1".into());
         let plan = plan_awaiting("node-a", converged);
 
         assert!(
@@ -595,14 +586,10 @@ mod tests {
             "on the machine the record was written about, this plan is converged"
         );
         assert!(
-            !plan_awaits_node(&plan, &node_created_at("2025-12-31T00:00:00Z"), "node-a"),
-            "a Node older than the claim is that same machine"
+            !plan_awaits_node(&plan, &node_with_uid("uid-1"), "node-a"),
+            "a Node with the recorded uid is that same machine"
         );
-        assert!(plan_awaits_node(
-            &plan,
-            &node_created_at("2026-01-02T00:00:00Z"),
-            "node-a"
-        ));
+        assert!(plan_awaits_node(&plan, &node_with_uid("uid-2"), "node-a"));
     }
 
     #[test]

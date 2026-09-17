@@ -806,6 +806,7 @@ async fn reconcile(
                     &finished.execution_hash,
                     provides_version.as_deref(),
                     &status,
+                    &context.nodes,
                     &mut resource_status,
                 );
                 // Adopted *before* the result is persisted, so the plan never goes a tick describing
@@ -3537,6 +3538,7 @@ async fn advance_active_run(
         &run.execution_hash,
         finished_play.spec.provides_version.as_deref(),
         finished_status,
+        &context.nodes,
         resource_status,
     );
     resource_status.active_run = None;
@@ -3615,7 +3617,13 @@ async fn finalize_lost_run(
     // No version: the record that would have carried it is gone, which is the whole reason this
     // run is being finalized as lost. Nothing is stamped from it either — `lost_run_status` records
     // every host `Unknown`, and only a `Succeeded` host is ever given a version.
-    status::apply_terminal_play_status(&run.execution_hash, None, &lost_status, resource_status);
+    status::apply_terminal_play_status(
+        &run.execution_hash,
+        None,
+        &lost_status,
+        &context.nodes,
+        resource_status,
+    );
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
