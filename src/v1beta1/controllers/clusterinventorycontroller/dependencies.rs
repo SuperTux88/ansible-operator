@@ -149,6 +149,17 @@ impl Term<'_> {
         )
     }
 
+    /// A term that can match nothing because of how it is written: an ordered operator not listing
+    /// exactly one value, or an `In` listing none.
+    fn is_malformed(&self) -> bool {
+        match self {
+            Term::Expression(expr) if expr.operator == SelectorOperator::In => {
+                expr.values.as_deref().is_none_or(<[String]>::is_empty)
+            }
+            _ => self.is_ordered() && self.ordered_bound().is_none(),
+        }
+    }
+
     /// The requirement written back for a human, in the shape the selector used.
     fn render(&self) -> String {
         match self {
@@ -285,7 +296,7 @@ pub fn waits(
                     invalid_value: term
                         .ordered_bound()
                         .is_some_and(|bound| version::parse(bound).is_none()),
-                    malformed_term: term.is_ordered() && term.ordered_bound().is_none(),
+                    malformed_term: term.is_malformed(),
                     unparseable_hosts,
                 }
             })
@@ -590,6 +601,38 @@ mod tests {
             bounded(&"a".repeat(MAX_FIELD_CHARS)),
             "a".repeat(MAX_FIELD_CHARS)
         );
+    }
+
+    /// `In` with no values matches nothing, like an ordered term with none, and without the flag
+    /// its `waiting` would read as a provider that is not converging.
+    #[test]
+    fn an_in_listing_no_values_is_flagged() {
+        let key = containerd();
+        for values in [None, Some(Vec::new())] {
+            let result = waits(
+                "workers",
+                Some(&selector(
+                    &[],
+                    vec![SelectorExpression {
+                        operator: SelectorOperator::In,
+                        key: key.clone(),
+                        values,
+                    }],
+                )),
+                &[node("bare", &[])],
+            );
+            assert!(result.dependencies[0].malformed_term);
+        }
+
+        let listed = waits(
+            "workers",
+            Some(&selector(
+                &[],
+                vec![expression(&key, SelectorOperator::In, &["1.4.0"])],
+            )),
+            &[],
+        );
+        assert!(!listed.dependencies[0].malformed_term);
     }
 
     /// A key the substring test accepts but that decodes to no plan is the likeliest typo of all, so
