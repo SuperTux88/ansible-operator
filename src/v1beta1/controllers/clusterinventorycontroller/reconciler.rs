@@ -113,6 +113,24 @@ fn status_for(
         dependencies.extend(group_waits.dependencies);
         waiting.extend(group_waits.waiting_hosts);
     }
+    // Said out loud, because the cut is otherwise invisible: the status would report a subset of the
+    // inventory's waits in exactly the shape of the whole set, and a reader troubleshooting a
+    // dependency that is missing from it has no way to tell it was dropped. The bound is far above
+    // any inventory anyone writes, so this should never be said at all.
+    if dependencies.len() > dependencies::MAX_DEPENDENCIES {
+        tracing::warn!(
+            "ClusterInventory {}/{}: {} dependency requirements is past the {} the status publishes; the rest are not reported (the hosts and the waiting count still cover all of them)",
+            object
+                .metadata
+                .namespace
+                .as_deref()
+                .unwrap_or("<no namespace>"),
+            object.metadata.name.as_deref().unwrap_or("<no name>"),
+            dependencies.len(),
+            dependencies::MAX_DEPENDENCIES
+        );
+        dependencies.truncate(dependencies::MAX_DEPENDENCIES);
+    }
     // A Node one group waits for and another already takes is in the inventory, so it is not kept
     // out of it: counting it would put one machine under both `Hosts` and `Waiting`, and the two
     // columns are read as disjoint. The per-group `dependencies` entries still count it, because
@@ -228,6 +246,33 @@ mod tests {
         assert_eq!(status.dependencies.len(), 1);
         assert_eq!(status.dependencies[0].waiting, 1);
         assert_eq!(status.dependencies[0].satisfied, 1);
+    }
+
+    /// However many requirements the spec writes, the status publishes a bounded number, and the
+    /// hosts and the waiting count are still computed from all of them.
+    #[test]
+    fn the_published_requirements_are_bounded() {
+        let key = label_key("platform", "hardening");
+        let groups = (0..=dependencies::MAX_DEPENDENCIES)
+            .map(|index| {
+                group(
+                    &format!("group-{index}"),
+                    vec![SelectorExpression {
+                        operator: SelectorOperator::Exists,
+                        key: key.clone(),
+                        values: None,
+                    }],
+                )
+            })
+            .collect();
+
+        let status = status_for(
+            &inventory(groups),
+            &[node("plain", &[("node-role", "worker")])],
+        );
+
+        assert_eq!(status.dependencies.len(), dependencies::MAX_DEPENDENCIES);
+        assert_eq!(status.waiting_hosts, 1);
     }
 
     /// Distinct Nodes on both sides: a Node waiting in two groups is one machine not joining, and a
