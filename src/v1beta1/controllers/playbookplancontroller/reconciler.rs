@@ -794,6 +794,8 @@ async fn reconcile(
                 finished,
                 status,
                 provides_version,
+                started_at: run_started_at,
+                inventory: run_inventory,
                 surviving,
             } => {
                 // A recovered result has only its `Play` to speak from, so the overflow half of
@@ -803,8 +805,12 @@ async fn reconcile(
                 let diagnostic = RunDiagnostic::from_play_status(&status);
                 diagnostic.warn(namespace, name, &finished.mirror.job_name);
                 status::apply_terminal_play_status(
-                    &finished.execution_hash,
-                    provides_version.as_deref(),
+                    &status::RunRecord {
+                        execution_hash: &finished.execution_hash,
+                        provides_version: provides_version.as_deref(),
+                        started_at: run_started_at,
+                        inventory: &run_inventory,
+                    },
                     &status,
                     &context.nodes,
                     &mut resource_status,
@@ -3532,8 +3538,12 @@ async fn advance_active_run(
         );
     diagnostic.warn(namespace, name, &run.mirror.job_name);
     status::apply_terminal_play_status(
-        &run.execution_hash,
-        finished_play.spec.provides_version.as_deref(),
+        &status::RunRecord {
+            execution_hash: &run.execution_hash,
+            provides_version: finished_play.spec.provides_version.as_deref(),
+            started_at: play_prepared_at(&finished_play),
+            inventory: &finished_play.spec.inventory,
+        },
         finished_status,
         &context.nodes,
         resource_status,
@@ -3611,12 +3621,16 @@ async fn finalize_lost_run(
     let lost_status = play_history::lost_run_status(&run.mirror.job_name, &run.mirror.hosts);
     let verdict = phase_for_finished_run(&lost_status);
     let failure = classify_run_failure(&lost_status);
-    // No version: the record that would have carried it is gone, which is the whole reason this
-    // run is being finalized as lost. Nothing is stamped from it either — `lost_run_status` records
-    // every host `Unknown`, and only a `Succeeded` host is ever given a version.
+    // Nothing from the record, because the record is gone — which is the whole reason this run is
+    // being finalized as lost. Nothing is stamped from it either: `lost_run_status` records every
+    // host `Unknown`, and only a `Succeeded` host is ever given a claim.
     status::apply_terminal_play_status(
-        &run.execution_hash,
-        None,
+        &status::RunRecord {
+            execution_hash: &run.execution_hash,
+            provides_version: None,
+            started_at: None,
+            inventory: &[],
+        },
         &lost_status,
         &context.nodes,
         resource_status,
@@ -5421,6 +5435,8 @@ async fn recover_active_run(
                 finished: recorded_run_from_play(play)?,
                 status: play_status.clone(),
                 provides_version: play.spec.provides_version.clone(),
+                started_at: play_prepared_at(play),
+                inventory: play.spec.inventory.clone(),
                 surviving: surviving.map(surviving_run_from_play).transpose()?,
             }));
         }
@@ -5460,6 +5476,19 @@ async fn recover_active_run(
         )),
         v1beta1::PlayPhase::Aborted => Ok(Some(RecoveredRun::Aborted(run))),
     }
+}
+
+/// When a run was prepared, from its `Play`'s own `metadata.creationTimestamp`.
+///
+/// The apiserver stamps it at `record_prepared`, immediately before the run's Job is created, so it
+/// dates the run against the same clock a Node's `creationTimestamp` is dated against. That is the
+/// whole point of using it: [`status::RunRecord::started_at`] is compared with Node creation times,
+/// and any operator-stamped time on either side would make the comparison measure clock skew.
+///
+/// `None` only for an object that never reached the apiserver, which no recovery path holds.
+fn play_prepared_at(play: &Play) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let created = play.metadata.creation_timestamp.as_ref()?;
+    chrono::DateTime::from_timestamp(created.0.as_second(), 0).map(|time| time.fixed_offset())
 }
 
 /// The distinct hosts a run's recorded inventory targets, in first-seen order.
@@ -5524,6 +5553,16 @@ enum RecoveredRun {
         /// status because that is the only copy that still describes the revision which ran. The
         /// live plan may already advertise the next one.
         provides_version: Option<String>,
+        /// When the finished run was prepared — its `Play`'s own `metadata.creationTimestamp`,
+        /// stamped by the apiserver. Carried for the same reason as the version, and it matters
+        /// more here: this record may have been written by a process that is long gone, so the
+        /// machine standing under a host's name now need not be the one the run reached
+        /// (`status::RunRecord::started_at`).
+        started_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+        /// The groups the finished run targeted, which is what says whether a host is a cluster
+        /// Node. Read from the record because this tick has not resolved an inventory yet — and
+        /// must not, since the run's host set is the one it launched with.
+        inventory: Vec<v1beta1::ResolvedHosts>,
         /// The run still in flight behind the drained result, if any. A terminal result is
         /// handed over ahead of anything live, so the plan is *not* finished when this is set, and
         /// the tick must not classify it as such — nor let the finished run's schedule window

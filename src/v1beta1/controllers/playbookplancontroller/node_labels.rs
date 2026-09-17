@@ -232,7 +232,7 @@ pub struct LabelWrite {
 ///   `lastAppliedHash`. A host that failed, was unreachable, or received only part of a playbook
 ///   has none, and a record written before that field existed has none either.
 /// - its Node is in the cache. The Node's current labels are needed to tell a change from a no-op,
-///   and its `uid` is needed for the next point.
+///   and its `creationTimestamp` is needed for the next point.
 /// - its Node is the machine the claim was recorded for. A machine rebuilt under its predecessor's
 ///   name inherits the name and nothing else, so labelling it would advertise software it has
 ///   never been given. `node_recreation` has already dropped such a claim earlier in the tick; this
@@ -264,15 +264,15 @@ pub fn desired_labels(
         .filter_map(|host| {
             let record = hosts_status.get(host.as_str())?;
             let version = record.applied_version.as_deref()?;
-            // A claim that names no machine cannot be shown to belong to the one standing there
-            // now, so it is not published. `node_replaced_since` answers `false` for one, and
-            // rightly so for the question *it* exists for — treating such records as replacements
-            // would re-run every plan in the fleet on the upgrade that introduced the field.
-            // Publishing is the opposite trade: the cost of a wrong label is every dependent in the
-            // cluster acting on it, so an unanswerable question fails closed here.
-            let applied_node_uid = record.applied_node_uid.as_deref()?;
+            // An undated claim cannot be shown to belong to the machine standing there now, so it
+            // is not published. `node_replaced_since` answers `false` for one, and rightly so for
+            // the question *it* exists for — treating undated records as replacements would re-run
+            // every plan in the fleet on the upgrade that introduced the field. Publishing is the
+            // opposite trade: the cost of a wrong label is every dependent in the cluster acting on
+            // it, so an unanswerable question fails closed here.
+            let applied_at = record.applied_at?;
             let node = nodes.get(&ObjectRef::new(host))?;
-            if node_replaced_since(Some(applied_node_uid), &node) {
+            if node_replaced_since(Some(applied_at), &node) {
                 return None;
             }
             let current = node
@@ -353,11 +353,13 @@ mod tests {
         DateTime::parse_from_rfc3339(rfc3339).unwrap()
     }
 
-    fn node(name: &str, uid: &str, labels: &[(&str, &str)]) -> Node {
+    fn node(name: &str, created: &str, labels: &[(&str, &str)]) -> Node {
         Node {
             metadata: kube::core::ObjectMeta {
                 name: Some(name.to_string()),
-                uid: Some(uid.to_string()),
+                creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    k8s_openapi::jiff::Timestamp::from_second(at(created).timestamp()).unwrap(),
+                )),
                 labels: Some(
                     labels
                         .iter()
@@ -409,12 +411,11 @@ mod tests {
         }
     }
 
-    fn applied(version: Option<&str>, node_uid: Option<&str>) -> HostStatus {
+    fn applied(version: Option<&str>, applied_at: Option<&str>) -> HostStatus {
         HostStatus {
             last_applied_hash: "abc".into(),
             last_outcome: HostOutcome::Succeeded,
-            applied_at: Some(at("2026-01-01T00:00:00Z")),
-            applied_node_uid: node_uid.map(str::to_string),
+            applied_at: applied_at.map(at),
             applied_version: version.map(str::to_string),
             last_transition_time: Some(at("2026-01-01T00:00:00Z")),
         }
@@ -457,8 +458,11 @@ mod tests {
         let writes = desired_labels(
             KEY,
             &[managed(&["node-a"])],
-            &status_with(&[("node-a", applied(Some("1.4.2"), Some("uid-1")))]),
-            &store(vec![node("node-a", "uid-1", &[])]),
+            &status_with(&[(
+                "node-a",
+                applied(Some("1.4.2"), Some("2026-01-02T00:00:00Z")),
+            )]),
+            &store(vec![node("node-a", "2026-01-01T00:00:00Z", &[])]),
         );
 
         assert_eq!(
@@ -477,8 +481,15 @@ mod tests {
         let writes = desired_labels(
             KEY,
             &[managed(&["node-a"])],
-            &status_with(&[("node-a", applied(Some("1.4.2"), Some("uid-1")))]),
-            &store(vec![node("node-a", "uid-1", &[(KEY, "1.4.2")])]),
+            &status_with(&[(
+                "node-a",
+                applied(Some("1.4.2"), Some("2026-01-02T00:00:00Z")),
+            )]),
+            &store(vec![node(
+                "node-a",
+                "2026-01-01T00:00:00Z",
+                &[(KEY, "1.4.2")],
+            )]),
         );
 
         assert!(writes.is_empty());
@@ -489,8 +500,15 @@ mod tests {
         let writes = desired_labels(
             KEY,
             &[managed(&["node-a"])],
-            &status_with(&[("node-a", applied(Some("1.5.0"), Some("uid-1")))]),
-            &store(vec![node("node-a", "uid-1", &[(KEY, "1.4.2")])]),
+            &status_with(&[(
+                "node-a",
+                applied(Some("1.5.0"), Some("2026-01-02T00:00:00Z")),
+            )]),
+            &store(vec![node(
+                "node-a",
+                "2026-01-01T00:00:00Z",
+                &[(KEY, "1.4.2")],
+            )]),
         );
 
         assert_eq!(
@@ -507,8 +525,8 @@ mod tests {
         let writes = desired_labels(
             KEY,
             &[managed(&["node-a"])],
-            &status_with(&[("node-a", applied(None, Some("uid-1")))]),
-            &store(vec![node("node-a", "uid-1", &[])]),
+            &status_with(&[("node-a", applied(None, Some("2026-01-02T00:00:00Z")))]),
+            &store(vec![node("node-a", "2026-01-01T00:00:00Z", &[])]),
         );
 
         assert!(writes.is_empty());
@@ -522,23 +540,26 @@ mod tests {
         let writes = desired_labels(
             KEY,
             &[managed(&["node-a"])],
-            &status_with(&[("node-a", applied(Some("1.4.2"), Some("uid-1")))]),
-            &store(vec![node("node-a", "uid-2", &[])]),
+            &status_with(&[(
+                "node-a",
+                applied(Some("1.4.2"), Some("2026-01-02T00:00:00Z")),
+            )]),
+            &store(vec![node("node-a", "2026-01-03T00:00:00Z", &[])]),
         );
 
         assert!(writes.is_empty());
     }
 
-    /// A record that predates `appliedNodeUid` names no machine, so it cannot be told apart from a
+    /// A record that predates `appliedAt` cannot be dated, so it cannot be told apart from a
     /// replacement. It is left unlabelled rather than guessed at; its next success fills the field
     /// in.
     #[test]
-    fn a_claim_that_names_no_machine_is_not_labelled() {
+    fn a_claim_that_cannot_be_dated_is_not_labelled() {
         let writes = desired_labels(
             KEY,
             &[managed(&["node-a"])],
             &status_with(&[("node-a", applied(Some("1.4.2"), None))]),
-            &store(vec![node("node-a", "uid-2", &[])]),
+            &store(vec![node("node-a", "2026-01-03T00:00:00Z", &[])]),
         );
 
         assert!(writes.is_empty());
@@ -551,8 +572,11 @@ mod tests {
         let writes = desired_labels(
             KEY,
             &[external(&["node-a"])],
-            &status_with(&[("node-a", applied(Some("1.4.2"), Some("uid-1")))]),
-            &store(vec![node("node-a", "uid-1", &[])]),
+            &status_with(&[(
+                "node-a",
+                applied(Some("1.4.2"), Some("2026-01-02T00:00:00Z")),
+            )]),
+            &store(vec![node("node-a", "2026-01-01T00:00:00Z", &[])]),
         );
 
         assert!(writes.is_empty());
@@ -565,7 +589,10 @@ mod tests {
         let writes = desired_labels(
             KEY,
             &[managed(&["node-a"])],
-            &status_with(&[("node-a", applied(Some("1.4.2"), Some("uid-1")))]),
+            &status_with(&[(
+                "node-a",
+                applied(Some("1.4.2"), Some("2026-01-02T00:00:00Z")),
+            )]),
             &store(vec![]),
         );
 
@@ -577,12 +604,18 @@ mod tests {
     #[test]
     fn only_hosts_in_the_resolved_groups_are_considered() {
         let status = status_with(&[
-            ("node-a", applied(Some("1.4.2"), Some("uid-1"))),
-            ("node-b", applied(Some("1.4.2"), Some("uid-1"))),
+            (
+                "node-a",
+                applied(Some("1.4.2"), Some("2026-01-02T00:00:00Z")),
+            ),
+            (
+                "node-b",
+                applied(Some("1.4.2"), Some("2026-01-02T00:00:00Z")),
+            ),
         ]);
         let nodes = store(vec![
-            node("node-a", "uid-1", &[]),
-            node("node-b", "uid-1", &[(KEY, "1.4.2")]),
+            node("node-a", "2026-01-01T00:00:00Z", &[]),
+            node("node-b", "2026-01-01T00:00:00Z", &[(KEY, "1.4.2")]),
         ]);
 
         let writes = desired_labels(KEY, &[managed(&["node-a"])], &status, &nodes);
@@ -611,7 +644,7 @@ mod tests {
         let nodes = store(vec![
             node(
                 "node-a",
-                "uid-1",
+                "2026-01-01T00:00:00Z",
                 &[
                     (KEY, "1.4.2"),
                     ("team-a.plan.ansible.cloudbending.dev/gone", "2.0"),
@@ -620,7 +653,7 @@ mod tests {
             ),
             node(
                 "node-b",
-                "uid-1",
+                "2026-01-01T00:00:00Z",
                 &[("team-a.plan.ansible.cloudbending.dev/gone", "2.0")],
             ),
         ]);
@@ -649,7 +682,7 @@ mod tests {
     fn a_plan_is_matched_within_its_own_namespace() {
         let nodes = store(vec![node(
             "node-a",
-            "uid-1",
+            "2026-01-01T00:00:00Z",
             &[(&label_key("platform", "harden"), "1.0")],
         )]);
 
@@ -666,7 +699,11 @@ mod tests {
     /// that, which is why it is documented as a precondition and gated at the call site.
     #[test]
     fn an_empty_plan_store_would_condemn_every_label() {
-        let nodes = store(vec![node("node-a", "uid-1", &[(KEY, "1.4.2")])]);
+        let nodes = store(vec![node(
+            "node-a",
+            "2026-01-01T00:00:00Z",
+            &[(KEY, "1.4.2")],
+        )]);
 
         assert_eq!(orphaned_labels(&nodes, &plan_store(&[])).len(), 1);
     }
@@ -677,10 +714,10 @@ mod tests {
     #[test]
     fn nodes_carrying_the_key_are_found_whatever_their_value() {
         let nodes = store(vec![
-            node("node-a", "uid-1", &[(KEY, "1.4.2")]),
-            node("node-b", "uid-1", &[(KEY, "1.5.0")]),
-            node("node-c", "uid-1", &[("other", "x")]),
-            node("node-d", "uid-1", &[]),
+            node("node-a", "2026-01-01T00:00:00Z", &[(KEY, "1.4.2")]),
+            node("node-b", "2026-01-01T00:00:00Z", &[(KEY, "1.5.0")]),
+            node("node-c", "2026-01-01T00:00:00Z", &[("other", "x")]),
+            node("node-d", "2026-01-01T00:00:00Z", &[]),
         ]);
 
         assert_eq!(nodes_carrying(KEY, &nodes), vec!["node-a", "node-b"]);
@@ -695,11 +732,11 @@ mod tests {
     #[test]
     fn only_nodes_carrying_the_exact_version_count_as_reached() {
         let nodes = store(vec![
-            node("node-a", "uid-1", &[(KEY, "1.4.2")]),
-            node("node-b", "uid-1", &[(KEY, "1.5.0")]),
-            node("node-c", "uid-1", &[(KEY, "1.5.0-rc1")]),
-            node("node-d", "uid-1", &[("other", "1.5.0")]),
-            node("node-e", "uid-1", &[]),
+            node("node-a", "2026-01-01T00:00:00Z", &[(KEY, "1.4.2")]),
+            node("node-b", "2026-01-01T00:00:00Z", &[(KEY, "1.5.0")]),
+            node("node-c", "2026-01-01T00:00:00Z", &[(KEY, "1.5.0-rc1")]),
+            node("node-d", "2026-01-01T00:00:00Z", &[("other", "1.5.0")]),
+            node("node-e", "2026-01-01T00:00:00Z", &[]),
         ]);
 
         for (version, at_version) in [("1.5.0", 1), ("1.4.2", 1), ("2.0.0", 0)] {
@@ -729,7 +766,7 @@ mod tests {
             KEY,
             &[managed(&["node-a"])],
             &PlaybookPlanStatus::default(),
-            &store(vec![node("node-a", "uid-1", &[])]),
+            &store(vec![node("node-a", "2026-01-01T00:00:00Z", &[])]),
         );
 
         assert!(writes.is_empty());
