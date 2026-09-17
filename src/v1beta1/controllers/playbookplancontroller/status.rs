@@ -32,15 +32,34 @@ pub fn job_finished(job: &batch::v1::Job) -> bool {
 /// anything is written, so a caller that ever passes one leaves the plan untouched instead of
 /// half-updated.
 ///
-/// `provides_version` is the version *that run's* record declared, not the plan's current one, and
-/// is `None` for a plan that provides nothing or a run whose record is gone. It is stamped beside
-/// the hash under exactly the same condition, so a host can never carry one without the other.
-///
-/// `nodes` names the machine each succeeded host was: its Node's uid is stamped beside the hash, so
-/// a Node later re-registered under the same name can be told apart (`node_recreation`).
+/// Everything the claim a host makes is taken from the run's own record rather than from the plan
+/// as it reads now — see [`apply_terminal_play_status`], and each field for why it must be the
+/// run's.
+pub struct RunRecord<'a> {
+    /// The revision this run applied.
+    pub execution_hash: &'a ExecutionHash,
+    /// The version *that run's* record declared, not the plan's current one; `None` for a plan that
+    /// provides nothing or a run whose record is gone. A plan edited while this run was in flight
+    /// already advertises the next version, and stamping that would label a host for a revision it
+    /// never received.
+    pub provides_version: Option<&'a str>,
+    /// The `Play`'s own `metadata.creationTimestamp`: when this run was prepared, stamped by the
+    /// apiserver. It dates the claim, and both questions about a host's machine are asked against
+    /// it — see `node_recreation` for why the run's *start*, and why an apiserver timestamp.
+    pub started_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    /// The groups this run targeted, which is what says whether a host is a cluster Node. Taken
+    /// from the run's record because the tick folding a result in has not resolved an inventory yet.
+    pub inventory: &'a [crate::v1beta1::ResolvedHosts],
+}
+
+/// `nodes` is consulted for one thing: whether the Node standing under a succeeded host's name is
+/// newer than the run that reached it. A machine replaced between this run being prepared and its
+/// result being recorded — an operator down while a node pool rolled, or a result replayed from a
+/// `Play` the operator never got to acknowledge — cannot be shown to have received the playbook, so
+/// it makes no claim and is run again. The same comparison, asked every tick afterwards by
+/// `node_recreation::drop_records_for_recreated_nodes`, catches a machine replaced later.
 pub fn apply_terminal_play_status(
-    execution_hash: &ExecutionHash,
-    provides_version: Option<&str>,
+    run: &RunRecord<'_>,
     play_status: &PlayStatus,
     nodes: &Store<Node>,
     status: &mut PlaybookPlanStatus,
@@ -84,25 +103,18 @@ pub fn apply_terminal_play_status(
     };
 
     clear_run_conditions(status);
+    let node_hosts = crate::v1beta1::node_hosts(run.inventory);
     let hosts_status = status.hosts_status.get_or_insert_default();
     for (host, result) in &play_status.hosts {
         let entry = hosts_status.entry(host.clone()).or_default();
-        if result.outcome == HostOutcome::Succeeded {
-            entry.last_applied_hash = execution_hash.to_string();
-            // Stamped with the hash and only with the hash: it dates the *claim*. Same source as
-            // `lastTransitionTime` below, so a replayed recovery dates the claim when the run
-            // finished rather than when it was noticed.
-            entry.applied_at = play_status.finished_at.or(Some(now));
-            // The machine the claim is about, so that a Node re-registered under this name can be
-            // recognised as a different one (`node_recreation`). Read now rather than at launch:
-            // a Node replaced mid-run takes the run's pod on it down, so the host cannot report
-            // `Succeeded` for a machine it was never on.
-            entry.applied_node_uid = node_recreation::current_node_uid(nodes, host);
-            // From the run, so the three halves of one claim — the revision, when it was made and
-            // what it provides — are always the same run's. A plan edited while this run was in
-            // flight already advertises the next version, and stamping that here would label the
-            // host for a revision it never received.
-            entry.applied_version = provides_version.map(str::to_string);
+        if result.outcome == HostOutcome::Succeeded
+            && !machine_replaced_during_run(run, host, nodes, &node_hosts)
+        {
+            // The three halves of one claim — the revision, when it was made and what it provides —
+            // move together and come from the same run, so they can never describe two.
+            entry.last_applied_hash = run.execution_hash.to_string();
+            entry.applied_at = run.started_at;
+            entry.applied_version = run.provides_version.map(str::to_string);
         }
         entry.last_outcome = result.outcome.clone();
         // The run's own finish time when the record carries one, so replaying a recovered result
@@ -122,6 +134,26 @@ pub fn apply_terminal_play_status(
         },
     );
     upsert_condition(&mut status.conditions, ready);
+}
+
+/// Whether the machine that answered for `host` cannot be the one this run was prepared against.
+///
+/// Asked only of hosts the run reached as cluster Nodes: a `StaticInventory` host may share its
+/// name with a Node the plan never targets, and refusing its result because of that Node's age would
+/// leave it outdated on every run, for ever.
+///
+/// A host with no Node in the cache is not refused — a machine that has left the cluster entirely
+/// still applied the playbook while it was there, and a cache miss is not evidence of a replacement.
+fn machine_replaced_during_run(
+    run: &RunRecord<'_>,
+    host: &str,
+    nodes: &Store<Node>,
+    node_hosts: &std::collections::HashSet<&str>,
+) -> bool {
+    node_hosts.contains(host)
+        && nodes
+            .get(&kube::runtime::reflector::ObjectRef::new(host))
+            .is_some_and(|node| node_recreation::node_replaced_since(run.started_at, &node))
 }
 
 /// What a providing plan publishes, and how far it currently reaches.
@@ -737,15 +769,28 @@ mod tests {
     use kube::runtime::{reflector::store::Writer, watcher};
     use std::collections::BTreeMap;
 
-    fn nodes_with_uids(nodes: &[(&str, &str)]) -> Store<Node> {
+    fn at(rfc3339: &str) -> chrono::DateTime<chrono::FixedOffset> {
+        rfc3339.parse().unwrap()
+    }
+
+    fn result(outcome: HostOutcome) -> crate::v1beta1::PlayHostResult {
+        crate::v1beta1::PlayHostResult {
+            outcome,
+            ..Default::default()
+        }
+    }
+
+    fn nodes_created_at(nodes: &[(&str, &str)]) -> Store<Node> {
         let mut writer = Writer::<Node>::default();
         let reader = writer.as_reader();
         writer.apply_watcher_event(&watcher::Event::Init);
-        for (name, uid) in nodes {
+        for (name, created) in nodes {
             writer.apply_watcher_event(&watcher::Event::InitApply(Node {
                 metadata: kube::core::ObjectMeta {
                     name: Some((*name).to_string()),
-                    uid: Some((*uid).to_string()),
+                    creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                        k8s_openapi::jiff::Timestamp::from_second(at(created).timestamp()).unwrap(),
+                    )),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -756,7 +801,7 @@ mod tests {
     }
 
     fn no_nodes() -> Store<Node> {
-        nodes_with_uids(&[])
+        nodes_created_at(&[])
     }
 
     fn hash() -> ExecutionHash {
@@ -1298,8 +1343,12 @@ mod tests {
         };
 
         apply_terminal_play_status(
-            &hash(),
-            Some("1.4.2"),
+            &RunRecord {
+                execution_hash: &hash(),
+                provides_version: Some("1.4.2"),
+                started_at: None,
+                inventory: &[],
+            },
             &play_status(HostOutcome::Succeeded),
             &no_nodes(),
             &mut status,
@@ -1310,8 +1359,12 @@ mod tests {
 
         // The next revision succeeds on worker-1 only.
         apply_terminal_play_status(
-            &hash(),
-            Some("1.5.0"),
+            &RunRecord {
+                execution_hash: &hash(),
+                provides_version: Some("1.5.0"),
+                started_at: None,
+                inventory: &[],
+            },
             &play_status(HostOutcome::Failed),
             &no_nodes(),
             &mut status,
@@ -1343,7 +1396,17 @@ mod tests {
             ..Default::default()
         };
 
-        apply_terminal_play_status(&hash(), None, &play_status, &no_nodes(), &mut status);
+        apply_terminal_play_status(
+            &RunRecord {
+                execution_hash: &hash(),
+                provides_version: None,
+                started_at: None,
+                inventory: &[],
+            },
+            &play_status,
+            &no_nodes(),
+            &mut status,
+        );
 
         let hosts = status.hosts_status.unwrap();
         assert_eq!(hosts["worker-1"].applied_version, None);
@@ -1371,7 +1434,17 @@ mod tests {
             ..Default::default()
         };
 
-        apply_terminal_play_status(&h, None, &play_status, &no_nodes(), &mut status);
+        apply_terminal_play_status(
+            &RunRecord {
+                execution_hash: &h,
+                provides_version: None,
+                started_at: None,
+                inventory: &[],
+            },
+            &play_status,
+            &no_nodes(),
+            &mut status,
+        );
 
         let running = status
             .conditions
@@ -1427,7 +1500,17 @@ mod tests {
             ..Default::default()
         };
 
-        apply_terminal_play_status(&h, None, &play_status, &no_nodes(), &mut status);
+        apply_terminal_play_status(
+            &RunRecord {
+                execution_hash: &h,
+                provides_version: None,
+                started_at: None,
+                inventory: &[],
+            },
+            &play_status,
+            &no_nodes(),
+            &mut status,
+        );
 
         let hosts = status.hosts_status.unwrap();
         assert_eq!(hosts["succeeded"].last_applied_hash, h.to_string());
@@ -1452,20 +1535,19 @@ mod tests {
         }
     }
 
-    /// `appliedAt` and `appliedNodeUid` describe the *claim*, so they move with `lastAppliedHash`
-    /// and with nothing else: a host that failed keeps the date and the machine of the revision it
-    /// really applied, and one that has never succeeded has neither. The pairing is what lets a
-    /// replaced machine be told apart from the one the record describes (`node_recreation`) — a uid
-    /// that moved on a failure would make a rebuilt Node look like it had applied something.
+    /// `appliedAt` describes the *claim*, so it moves with `lastAppliedHash` and with nothing else:
+    /// a host that failed keeps the date of the revision it really applied, and one that has never
+    /// succeeded has none. That pairing is what lets a replaced machine be told apart from the one
+    /// the record describes (`node_recreation`) — a date that moved on a failure would make a
+    /// rebuilt Node look like it had applied something.
+    ///
+    /// It is the run's **start**, not its finish: see `node_recreation` for why an apiserver
+    /// timestamp on both sides of that comparison is the whole point.
     #[test]
-    fn the_claim_is_dated_and_identified_with_the_revision_and_only_with_it() {
+    fn the_claim_is_dated_with_the_run_that_made_it_and_with_nothing_else() {
         let h = hash();
-        let earlier = "2026-01-01T00:00:00Z"
-            .parse::<chrono::DateTime<chrono::FixedOffset>>()
-            .unwrap();
-        let finished = "2026-03-04T05:06:07Z"
-            .parse::<chrono::DateTime<chrono::FixedOffset>>()
-            .unwrap();
+        let earlier = at("2026-01-01T00:00:00Z");
+        let started = at("2026-03-04T05:06:07Z");
         let mut status = PlaybookPlanStatus {
             hosts_status: Some(BTreeMap::from([(
                 "failed".into(),
@@ -1473,49 +1555,40 @@ mod tests {
                     last_applied_hash: "previous-revision".into(),
                     last_outcome: HostOutcome::Succeeded,
                     applied_at: Some(earlier),
-                    applied_node_uid: Some("uid-failed-previous".into()),
                     ..Default::default()
                 },
             )])),
             ..Default::default()
         };
-        let result = |outcome: HostOutcome| crate::v1beta1::PlayHostResult {
-            outcome,
-            ..Default::default()
-        };
         let play_status = PlayStatus {
             phase: PlayPhase::Failed,
-            host_count: 4,
-            finished_at: Some(finished),
+            host_count: 3,
+            finished_at: Some(at("2026-03-04T06:00:00Z")),
             hosts: BTreeMap::from([
                 ("succeeded".into(), result(HostOutcome::Succeeded)),
-                ("no-node".into(), result(HostOutcome::Succeeded)),
                 ("failed".into(), result(HostOutcome::Failed)),
                 ("not-reached".into(), result(HostOutcome::NotReached)),
             ]),
             ..Default::default()
         };
-        let nodes = nodes_with_uids(&[
-            ("succeeded", "uid-succeeded"),
-            ("failed", "uid-failed-now"),
-            ("not-reached", "uid-not-reached"),
-        ]);
 
-        apply_terminal_play_status(&h, None, &play_status, &nodes, &mut status);
+        apply_terminal_play_status(
+            &RunRecord {
+                execution_hash: &h,
+                provides_version: None,
+                started_at: Some(started),
+                inventory: &[],
+            },
+            &play_status,
+            &no_nodes(),
+            &mut status,
+        );
 
         let hosts = status.hosts_status.unwrap();
         assert_eq!(
             hosts["succeeded"].applied_at,
-            Some(finished),
-            "the run's own finish time, so a replayed recovery dates the claim when it happened"
-        );
-        assert_eq!(
-            hosts["succeeded"].applied_node_uid.as_deref(),
-            Some("uid-succeeded")
-        );
-        assert_eq!(
-            hosts["no-node"].applied_node_uid, None,
-            "a host with no Node in the cache records no machine, which is never a replacement"
+            Some(started),
+            "when the run was prepared, not when the operator noticed it finish"
         );
         assert_eq!(
             hosts["failed"].applied_at,
@@ -1523,15 +1596,80 @@ mod tests {
             "a failure leaves the date of the revision the host really applied"
         );
         assert_eq!(
-            hosts["failed"].applied_node_uid.as_deref(),
-            Some("uid-failed-previous"),
-            "and the machine it applied it to"
-        );
-        assert_eq!(
             hosts["not-reached"].applied_at, None,
             "a host that never succeeded has no claim to date"
         );
-        assert_eq!(hosts["not-reached"].applied_node_uid, None);
+    }
+
+    /// The case the claim's date exists to catch on the way in. A machine replaced between this run
+    /// being prepared and its result being recorded — an operator down while a node pool rolled, or
+    /// a `Play` replayed by a later process — cannot be shown to have received the playbook, so it
+    /// makes no claim and is run again. It is asked only of cluster Nodes: an external host sharing
+    /// a name with an unrelated Node would otherwise be refused on every run, for ever.
+    #[test]
+    fn a_machine_replaced_before_its_result_was_recorded_makes_no_claim() {
+        let h = hash();
+        let started = at("2026-03-04T05:06:07Z");
+        let play_status = PlayStatus {
+            phase: PlayPhase::Succeeded,
+            host_count: 3,
+            hosts: BTreeMap::from([
+                ("rebuilt".into(), result(HostOutcome::Succeeded)),
+                ("steady".into(), result(HostOutcome::Succeeded)),
+                ("edge-1".into(), result(HostOutcome::Succeeded)),
+            ]),
+            ..Default::default()
+        };
+        let nodes = nodes_created_at(&[
+            ("rebuilt", "2026-03-04T05:06:30Z"),
+            ("steady", "2026-01-01T00:00:00Z"),
+            // An unrelated Node that happens to share the external host's name.
+            ("edge-1", "2026-03-04T05:06:30Z"),
+        ]);
+        let inventory = vec![
+            crate::v1beta1::ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["rebuilt".into(), "steady".into()],
+                connection: Some(crate::v1beta1::HostConnection::ManagedSsh),
+            },
+            crate::v1beta1::ResolvedHosts {
+                name: "edge".into(),
+                hosts: vec!["edge-1".into()],
+                connection: Some(crate::v1beta1::HostConnection::Ssh),
+            },
+        ];
+        let mut status = PlaybookPlanStatus::default();
+
+        apply_terminal_play_status(
+            &RunRecord {
+                execution_hash: &h,
+                provides_version: Some("1.4.2"),
+                started_at: Some(started),
+                inventory: &inventory,
+            },
+            &play_status,
+            &nodes,
+            &mut status,
+        );
+
+        let hosts = status.hosts_status.unwrap();
+        assert_eq!(
+            hosts["rebuilt"].last_applied_hash, "",
+            "a Node created after the run was prepared is not the machine it ran on"
+        );
+        assert_eq!(hosts["rebuilt"].applied_at, None);
+        assert_eq!(hosts["rebuilt"].applied_version, None);
+        assert_eq!(
+            hosts["rebuilt"].last_outcome,
+            HostOutcome::Succeeded,
+            "the run still reports what it saw; only the claim is withheld"
+        );
+        assert_eq!(hosts["steady"].last_applied_hash, h.to_string());
+        assert_eq!(
+            hosts["edge-1"].last_applied_hash,
+            h.to_string(),
+            "a Node of the same name is a different machine, and says nothing about this host"
+        );
     }
 
     #[test]
@@ -1720,7 +1858,17 @@ mod tests {
             ..Default::default()
         };
 
-        apply_terminal_play_status(&hash(), None, &play_status, &no_nodes(), &mut status);
+        apply_terminal_play_status(
+            &RunRecord {
+                execution_hash: &hash(),
+                provides_version: None,
+                started_at: None,
+                inventory: &[],
+            },
+            &play_status,
+            &no_nodes(),
+            &mut status,
+        );
 
         let ready = status
             .conditions
@@ -1740,8 +1888,12 @@ mod tests {
     fn set_running_condition_marks_the_plan_as_running() {
         let mut status = PlaybookPlanStatus::default();
         apply_terminal_play_status(
-            &hash(),
-            None,
+            &RunRecord {
+                execution_hash: &hash(),
+                provides_version: None,
+                started_at: None,
+                inventory: &[],
+            },
             &PlayStatus {
                 phase: PlayPhase::Succeeded,
                 host_count: 1,
@@ -1863,8 +2015,12 @@ mod tests {
         );
 
         apply_terminal_play_status(
-            &hash(),
-            None,
+            &RunRecord {
+                execution_hash: &hash(),
+                provides_version: None,
+                started_at: None,
+                inventory: &[],
+            },
             &PlayStatus {
                 phase: PlayPhase::Unknown,
                 host_count: 1,
@@ -2010,8 +2166,12 @@ mod tests {
             "1",
         );
         apply_terminal_play_status(
-            &hash(),
-            None,
+            &RunRecord {
+                execution_hash: &hash(),
+                provides_version: None,
+                started_at: None,
+                inventory: &[],
+            },
             &PlayStatus {
                 phase: PlayPhase::Failed,
                 host_count: 2,
@@ -2130,7 +2290,17 @@ mod tests {
             )]),
             ..Default::default()
         };
-        apply_terminal_play_status(&hash(), None, &play_status, &no_nodes(), &mut status);
+        apply_terminal_play_status(
+            &RunRecord {
+                execution_hash: &hash(),
+                provides_version: None,
+                started_at: None,
+                inventory: &[],
+            },
+            &play_status,
+            &no_nodes(),
+            &mut status,
+        );
 
         assert!(!clear_inputs_unavailable_condition(&mut status, 0));
 

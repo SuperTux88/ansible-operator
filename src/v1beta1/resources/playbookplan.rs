@@ -529,37 +529,31 @@ pub struct HostStatus {
     /// The execution hash last SUCCESSFULLY applied to this host. Only bumped on `HostOutcome::Succeeded`.
     pub last_applied_hash: String,
     pub last_outcome: HostOutcome,
-    /// When `lastAppliedHash` was stamped — moved by exactly the outcome that moves that field, and
-    /// by no other. This is what separates it from `lastTransitionTime`, which records every
-    /// outcome, successful or not.
+    /// When the run that stamped `lastAppliedHash` was **prepared** — moved by exactly the outcome
+    /// that moves that field, and by no other. This is what separates it from `lastTransitionTime`,
+    /// which records every outcome, successful or not.
     ///
-    /// Absent on a record written before this field existed. See the `#[serde(default, ...)]` note
-    /// on `PlaybookPlanStatus::next_run`.
+    /// It dates the claim, and it is also what tells a **replaced machine** from the one the record
+    /// describes: `hostsStatus` is keyed by host *name*, and the name is all a rebuilt machine
+    /// inherits, so without this a Node deleted and re-registered under the same name would keep the
+    /// claim its predecessor earned and a `OneShot` plan would never run on the fresh machine. A
+    /// Node whose `creationTimestamp` is later than this cannot be the machine the run was prepared
+    /// against — Node names are unique, so one standing there now that is *older* has been there
+    /// since before the run — and its recorded application is dropped (`node_recreation`).
+    ///
+    /// The run's start rather than its finish, because the finish time is stamped by the operator
+    /// pod while a Node's `creationTimestamp` is stamped by the API server. Comparing those two
+    /// would measure clock skew as much as machine identity, and an operator running behind would
+    /// drop the claim it had just written for a freshly joined Node — a success that re-runs for
+    /// ever. Both sides of the comparison are now the API server's own clock.
+    ///
+    /// Absent on a record written before this field existed. Such a record is never treated as a
+    /// replacement, or the upgrade that introduced the field would re-run every plan across the
+    /// fleet, and it is never published as a Node label either; the next success fills it in. See
+    /// the `#[serde(default, ...)]` note on `PlaybookPlanStatus::next_run`.
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub applied_at: Option<DateTime<FixedOffset>>,
-    /// The `metadata.uid` of the host's Node when `lastAppliedHash` was stamped — moved by exactly
-    /// the outcome that moves that field, and by no other.
-    ///
-    /// It exists because `hostsStatus` is keyed by host *name*, and the name is all a replacement
-    /// machine inherits: without it, a Node deleted and re-registered under the same name would keep
-    /// the claim its predecessor earned, and a `OneShot` plan would never run on the fresh machine.
-    /// A Node with a different uid is a different machine, and its recorded application is dropped
-    /// — see `node_recreation`.
-    ///
-    /// Identity rather than time: comparing the Node's `creationTimestamp` against `appliedAt` would
-    /// weigh the apiserver's clock against the operator's, and an operator running behind would drop
-    /// the claim it had just written for a freshly joined Node — a success that re-runs for ever.
-    ///
-    /// Absent for a host that had no Node in the cache when it succeeded, and on a record written
-    /// before this field existed. Such a record is never treated as a replacement, or the upgrade
-    /// that introduced the field would re-run every plan across the fleet, and it is never labelled
-    /// either; the next success fills it in.
-    ///
-    /// Absent, too, for a host the plan reaches only through a `StaticInventory`: a Node that
-    /// happens to share its name is not that machine.
-    #[serde(default)]
-    pub applied_node_uid: Option<String>,
     /// The `spec.provides` version of the revision that stamped `lastAppliedHash` — moved by exactly
     /// the same outcome, and taken from that run's own `Play` rather than from the plan as it reads
     /// now.
