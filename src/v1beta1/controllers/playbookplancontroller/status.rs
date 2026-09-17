@@ -361,10 +361,17 @@ pub fn append_dependency_summary_clause(
         // A loop rather than one strip, so a status already carrying several from before this was
         // idempotent is healed on the first tick instead of shedding one clause per reconcile.
         while summary.ends_with(WAITING_CLAUSE_TAIL) {
-            let Some(clause_start) = summary.rfind(" (") else {
-                break;
-            };
-            summary.truncate(clause_start);
+            match summary.rfind(" (") {
+                Some(clause_start) => summary.truncate(clause_start),
+                None => {
+                    summary.clear();
+                    break;
+                }
+            }
+        }
+        // All that was there was the clause, written onto a plan that had no summary of its own.
+        if summary.is_empty() {
+            status.summary = None;
         }
     }
 
@@ -381,8 +388,12 @@ pub fn append_dependency_summary_clause(
         return;
     };
 
-    if let Some(summary) = status.summary.as_mut() {
-        summary.push_str(&format!(" ({waiting}{WAITING_CLAUSE_TAIL}"));
+    // A plan that has never run has no summary to qualify, and it is the one most likely to be
+    // waiting: its inventory resolves no host until the provider reaches one. The clause then stands
+    // alone, and the strip above takes the whole string back off.
+    match status.summary.as_mut() {
+        Some(summary) => summary.push_str(&format!(" ({waiting}{WAITING_CLAUSE_TAIL}")),
+        None => status.summary = Some(format!("({waiting}{WAITING_CLAUSE_TAIL}")),
     }
 }
 
@@ -1114,6 +1125,32 @@ mod tests {
                  (3 host(s) waiting for dependencies)"
             )
         );
+    }
+
+    /// The headline case: a dependent that has never run, because its inventory resolves no host
+    /// until the provider reaches one, has no summary of its own. The clause stands alone, stays a
+    /// fixed point, and goes again when the wait clears.
+    #[test]
+    fn a_plan_with_no_summary_gets_the_clause_alone() {
+        let mut status = PlaybookPlanStatus::default();
+        let waiting = [dependency("workers-ci", "containerd", 3)];
+
+        for _ in 0..3 {
+            append_dependency_summary_clause(&mut status, &waiting);
+            assert_eq!(
+                status.summary.as_deref(),
+                Some("(3 host(s) waiting for dependencies)")
+            );
+        }
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 1)]);
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("(1 host(s) waiting for dependencies)")
+        );
+
+        append_dependency_summary_clause(&mut status, &[dependency("workers-ci", "containerd", 0)]);
+        assert_eq!(status.summary, None);
     }
 
     /// Nothing to qualify: a plan whose dependencies are all met is simply doing what its summary
