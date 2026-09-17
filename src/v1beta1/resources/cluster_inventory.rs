@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -156,8 +154,8 @@ pub struct DependencyStatus {
     /// an `In` listing none.
     ///
     /// Like `invalidValue` it matches nothing. Reported here rather than rejected at admission,
-    /// because the selector type is shared with `NodeAccessPolicy` and sits inside a
-    /// preserve-unknown-fields item where a CEL rule cannot see it.
+    /// because the selector type is shared with `NodeAccessPolicy` and has no validation rules of
+    /// its own.
     #[serde(default)]
     pub malformed_term: bool,
     /// How many of the waiting Nodes carry the key with a value that is not a version.
@@ -173,10 +171,14 @@ pub struct DependencyStatus {
 #[serde(rename_all = "camelCase")]
 pub struct InventoryHosts {
     pub name: String,
+    /// The group's `matchLabels` and `matchExpressions`, flattened into the item.
+    ///
+    /// Nothing else may be flattened beside it. A catch-all map here makes the schema preserve
+    /// unknown fields, so a misspelt `matchExpresions` is accepted without a word, dropped, and
+    /// leaves an empty selector that matches every Node in the cluster. Without one, the apiserver
+    /// prunes the misspelt field and warns about it, and `kubectl apply` rejects it by default.
     #[serde(flatten)]
     pub match_labels: Option<NodeSelectorTerm>,
-    #[serde(flatten)]
-    pub match_expressions: Option<BTreeMap<String, serde_json::Value>>, // todo: placeholder
 
     /// Group variables applied to every node this group resolves to, rendered as Ansible group
     /// `vars:`. Use it to set node facts the playbook author should not have to know, e.g.
@@ -219,6 +221,20 @@ impl AnsibleInventory for ClusterInventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kube::CustomResourceExt as _;
+
+    /// See `InventoryHosts::match_labels`: an item that preserves unknown fields swallows a
+    /// misspelt selector, and the group then resolves to every Node.
+    #[test]
+    fn a_host_group_does_not_preserve_unknown_fields() {
+        let crd = serde_json::to_value(ClusterInventory::crd()).unwrap();
+        let item = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+            ["hosts"]["items"];
+
+        assert!(item["properties"]["matchExpressions"].is_object());
+        assert!(item["properties"]["matchLabels"].is_object());
+        assert_eq!(item.get("x-kubernetes-preserve-unknown-fields"), None);
+    }
 
     #[test]
     fn test_deserialize_example() {

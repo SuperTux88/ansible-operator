@@ -203,7 +203,6 @@ mod tests {
                 match_labels: Some([("node-role".to_string(), "worker".to_string())].into()),
                 match_expressions: Some(expressions),
             }),
-            match_expressions: None,
             variables: None,
         }
     }
