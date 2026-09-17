@@ -6,12 +6,25 @@
 //! names the revision the old machine applied, so `find_outdated_hosts` counts the new one as
 //! current and a `OneShot` plan never runs on it again.
 //!
-//! The question is answered by comparing timestamps rather than by reacting to the deletion,
-//! because a deletion is an event and this has to be answerable from state alone. An operator that
-//! was down while the machine was replaced, or one whose plan sat in a namespace that was not
-//! enrolled at the time, never sees a deletion — only a Node that exists under a familiar name.
-//! Comparing `creationTimestamp` against `appliedAt` needs no such history, which is what makes it
-//! agree with the rest of this level-triggered reconciler.
+//! The question is answered from state rather than by reacting to the deletion, because a deletion
+//! is an event and this has to be answerable without one. An operator that was down while the
+//! machine was replaced, or one whose plan sat in a namespace that was not enrolled at the time,
+//! never sees a deletion — only a Node that exists under a familiar name.
+//!
+//! **Both sides of the comparison are stamped by the apiserver.** A Node's `creationTimestamp` is,
+//! and `appliedAt` is the `Play`'s own `metadata.creationTimestamp` — when the run that made the
+//! claim was prepared. That is the whole reason the claim is dated from the run's *start* rather
+//! than its finish: the finish time is written by the operator pod, and comparing an operator clock
+//! against an apiserver clock would measure skew as much as machine identity. An operator running
+//! behind would then read a Node it had just converged as a replacement, drop the claim, run again,
+//! and do it for ever — on a plan reporting itself healthy, since every one of those runs succeeds.
+//!
+//! One comparison answers two questions, which is why there is only one function. A Node created
+//! after the run was prepared cannot be the machine that run was prepared against — Node names are
+//! unique, so a Node standing there now with an *earlier* `creationTimestamp` has been there since
+//! before the run and is that machine. So the same test catches a replacement that happened while
+//! the result was still being recorded (asked once, in `status::apply_terminal_play_status`) and one
+//! that happens any time afterwards (asked every tick, here).
 
 use chrono::{DateTime, FixedOffset};
 use k8s_openapi::api::core::v1::Node;
@@ -19,30 +32,37 @@ use kube::runtime::reflector::{ObjectRef, Store};
 
 use crate::v1beta1::{PlaybookPlanStatus, ResolvedInventoryGroup};
 
-/// Whether `node` is a different machine from the one a record with this `applied_at` describes.
+/// Whether `node` is a different machine from the one a claim made by a run prepared at
+/// `claimed_at` describes.
 ///
 /// Both halves are required, and a missing one answers "no" deliberately:
 ///
-/// - **no `applied_at`** is a record written before that field existed. Treating it as a replacement
-///   would re-run every plan in the fleet on the upgrade that introduced this; the next success
-///   fills the field in, and until then the record stands exactly as it was.
+/// - **no `claimed_at`** is a record written before the claim was dated. Treating it as a
+///   replacement would re-run every plan in the fleet on the upgrade that introduced this; the next
+///   success fills the field in, and until then the record stands exactly as it was.
 /// - **no `creationTimestamp`** is a Node the apiserver has not stamped, which nothing but a
 ///   hand-built object can be.
 ///
-/// The comparison is strict, so a Node created within the same second as the run that applied to it
-/// is not a replacement. Both timestamps are second-precision on the wire, and of the two directions
-/// to round, the one that does not re-run a playbook is the one to prefer.
-pub fn node_replaced_since(applied_at: Option<DateTime<FixedOffset>>, node: &Node) -> bool {
-    let (Some(applied_at), Some(created)) = (applied_at, node.metadata.creation_timestamp.as_ref())
+/// The comparison is **strict**, so a Node created within the same second as the run that applied to
+/// it is not a replacement. Both timestamps are second-precision on the wire, and a Node that joins
+/// and is picked up by an inventory straight away routinely lands in the same second as the run
+/// prepared for it — so of the two directions to round, the one that does not re-run a playbook is
+/// also the one that is right far more often.
+pub fn node_replaced_since(claimed_at: Option<DateTime<FixedOffset>>, node: &Node) -> bool {
+    let (Some(claimed_at), Some(created)) = (claimed_at, node.metadata.creation_timestamp.as_ref())
     else {
         return false;
     };
 
-    created.0.as_second() > applied_at.timestamp()
+    created.0.as_second() > claimed_at.timestamp()
 }
 
-/// Drops the recorded application of every managed-ssh host whose Node is newer than the record,
-/// returning the hosts that lost theirs.
+/// Drops the recorded application of every managed-ssh host whose Node is newer than the run that
+/// claimed it, returning the hosts that lost theirs.
+///
+/// This is the half of [`node_replaced_since`] that runs long after the fact: a machine rebuilt
+/// days or weeks after a plan converged on it, which no check made while the result was being
+/// recorded could have seen.
 ///
 /// Only the *claim* is dropped — `lastAppliedHash`, `appliedAt` and `appliedVersion` — and never the
 /// outcome or the time it was recorded: what happened to the previous machine is history worth
@@ -103,8 +123,6 @@ pub fn drop_records_for_recreated_nodes(
 mod tests {
     use super::*;
     use crate::v1beta1::{HostOutcome, HostStatus, ResolvedHosts, SecretRef, SshConfig};
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
-    use k8s_openapi::jiff::Timestamp;
     use kube::runtime::{reflector::store::Writer, watcher};
     use std::collections::BTreeMap;
 
@@ -116,8 +134,11 @@ mod tests {
         Node {
             metadata: kube::core::ObjectMeta {
                 name: Some(name.to_string()),
-                creation_timestamp: created
-                    .map(|created| Time(Timestamp::from_second(at(created).timestamp()).unwrap())),
+                creation_timestamp: created.map(|created| {
+                    k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                        k8s_openapi::jiff::Timestamp::from_second(at(created).timestamp()).unwrap(),
+                    )
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -140,6 +161,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: "workers".into(),
                 hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+                ..Default::default()
             },
             tolerations: None,
             variables: None,
@@ -151,6 +173,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: "edge".into(),
                 hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+                ..Default::default()
             },
             static_inventory_name: "external".into(),
             config: SshConfig {
@@ -161,11 +184,11 @@ mod tests {
         }
     }
 
-    fn applied(hash: &str, applied_at: Option<&str>) -> HostStatus {
+    fn applied(hash: &str, claimed_at: Option<&str>) -> HostStatus {
         HostStatus {
             last_applied_hash: hash.into(),
             last_outcome: HostOutcome::Succeeded,
-            applied_at: applied_at.map(at),
+            applied_at: claimed_at.map(at),
             applied_version: Some("1.4.2".into()),
             last_transition_time: Some(at("2026-01-01T00:00:00Z")),
         }
@@ -184,31 +207,34 @@ mod tests {
     }
 
     #[test]
-    fn a_node_registered_after_the_claim_is_a_different_machine() {
+    fn a_node_created_after_the_run_that_claimed_it_is_a_different_machine() {
+        let claimed_at = Some(at("2026-01-01T12:00:00Z"));
+
         assert!(node_replaced_since(
-            Some(at("2026-01-01T00:00:00Z")),
+            claimed_at,
             &node("node-a", Some("2026-01-02T00:00:00Z"))
         ));
         assert!(!node_replaced_since(
-            Some(at("2026-01-02T00:00:00Z")),
-            &node("node-a", Some("2026-01-01T00:00:00Z")),
+            claimed_at,
+            &node("node-a", Some("2025-12-31T00:00:00Z"))
         ));
     }
 
-    /// Both timestamps are second-precision on the wire, so a tie is genuinely ambiguous. It reads
-    /// as "the same machine" because the cost of being wrong that way is one skipped re-run, while
-    /// the other way re-applies a playbook to a machine that already has it.
+    /// A Node that joins and is picked up by an inventory straight away is prepared for in the same
+    /// second it was created, so a tie has to read as "the same machine" — the other way round would
+    /// re-run the playbook on every freshly joined Node, for ever, which is the population this is
+    /// most likely to meet.
     #[test]
-    fn a_node_registered_within_the_same_second_is_not_a_replacement() {
+    fn a_node_created_in_the_same_second_as_the_run_is_the_same_machine() {
         assert!(!node_replaced_since(
             Some(at("2026-01-01T12:00:00Z")),
             &node("node-a", Some("2026-01-01T12:00:00Z"))
         ));
     }
 
-    /// The upgrade path. Every record written before `appliedAt` existed has none, and reading that
-    /// as a replacement would mark every host in the fleet outdated at once — a cluster-wide re-run
-    /// triggered by nothing but installing a new operator.
+    /// The upgrade path. Every record written before the claim was dated has no `appliedAt`, and
+    /// reading that as a replacement would mark every host in the fleet outdated at once — a
+    /// cluster-wide re-run triggered by nothing but installing a new operator.
     #[test]
     fn a_record_predating_the_field_is_left_alone() {
         assert!(!node_replaced_since(
@@ -231,16 +257,24 @@ mod tests {
     }
 
     #[test]
+    fn a_node_without_a_creation_timestamp_is_not_a_replacement() {
+        assert!(!node_replaced_since(
+            Some(at("2026-01-01T00:00:00Z")),
+            &node("node-a", None)
+        ));
+    }
+
+    #[test]
     fn a_replaced_node_loses_its_claim_but_keeps_its_history() {
         let mut status = status_with(&[
             ("node-a", applied("abc", Some("2026-01-01T00:00:00Z"))),
-            ("node-b", applied("abc", Some("2026-01-03T00:00:00Z"))),
+            ("node-b", applied("abc", Some("2026-01-01T00:00:00Z"))),
         ]);
 
         let replaced = drop_records_for_recreated_nodes(
             &store(vec![
                 node("node-a", Some("2026-01-02T00:00:00Z")),
-                node("node-b", Some("2026-01-02T00:00:00Z")),
+                node("node-b", Some("2025-12-01T00:00:00Z")),
             ]),
             &[managed(&["node-a", "node-b"])],
             &mut status,
@@ -265,7 +299,7 @@ mod tests {
         assert!(hosts["node-a"].last_transition_time.is_some());
         assert_eq!(
             hosts["node-b"].last_applied_hash, "abc",
-            "a Node older than the claim is the machine the claim was made about"
+            "a Node older than the run that claimed it is the machine it was claimed about"
         );
     }
 
@@ -287,7 +321,8 @@ mod tests {
 
     /// `hostsStatus` is keyed by name alone, so an external host named like a Node would otherwise be
     /// reset because an unrelated cluster Node was replaced. Nothing about a `StaticInventory`
-    /// machine is knowable from a Node object.
+    /// machine is knowable from a Node object — and the wake set agrees, because `eligibleHosts`
+    /// records which hosts are Nodes (`ResolvedHosts::connection`).
     #[test]
     fn an_external_host_sharing_a_node_name_is_untouched() {
         let mut status = status_with(&[("node-a", applied("abc", Some("2026-01-01T00:00:00Z")))]);

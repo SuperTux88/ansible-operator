@@ -794,6 +794,8 @@ async fn reconcile(
                 finished,
                 status,
                 provides_version,
+                started_at: run_started_at,
+                inventory: run_inventory,
                 surviving,
             } => {
                 // A recovered result has only its `Play` to speak from, so the overflow half of
@@ -803,9 +805,14 @@ async fn reconcile(
                 let diagnostic = RunDiagnostic::from_play_status(&status);
                 diagnostic.warn(namespace, name, &finished.mirror.job_name);
                 status::apply_terminal_play_status(
-                    &finished.execution_hash,
-                    provides_version.as_deref(),
+                    &status::RunRecord {
+                        execution_hash: &finished.execution_hash,
+                        provides_version: provides_version.as_deref(),
+                        started_at: run_started_at,
+                        inventory: &run_inventory,
+                    },
                     &status,
+                    &context.nodes,
                     &mut resource_status,
                 );
                 // Adopted *before* the result is persisted, so the plan never goes a tick describing
@@ -853,7 +860,7 @@ async fn reconcile(
                     &api,
                     &unlaunched,
                     &mut resource_status,
-                    &error,
+                    &error.to_string(),
                 )
                 .await;
                 return Err(error);
@@ -973,7 +980,7 @@ async fn reconcile(
                     // This exit is ahead of inventory resolution, so there is no host set to derive
                     // a label from. The next tick that resolves one publishes what this recorded.
                     target_groups: None,
-                    dependencies: &[],
+                    dependencies: None,
                 },
             )
             .await;
@@ -995,7 +1002,7 @@ async fn reconcile(
             unlaunched_run.as_ref(),
             &mut resource_status,
             &error,
-            error.to_string(),
+            InputFailure::same(error.to_string()),
         )
         .await?;
         return Err(error);
@@ -1019,7 +1026,7 @@ async fn reconcile(
                 unlaunched_run.as_ref(),
                 &mut resource_status,
                 &error,
-                format!("cannot resolve the plan's inventories: {error}"),
+                inventory_input_failure(&error),
             )
             .await?;
             return Err(error);
@@ -1112,7 +1119,7 @@ async fn reconcile(
                 unlaunched_run.as_ref(),
                 &mut resource_status,
                 &error,
-                format!("cannot read referenced Secrets: {error}"),
+                InputFailure::same(format!("cannot read referenced Secrets: {error}")),
             )
             .await?;
             return Err(error);
@@ -1204,7 +1211,7 @@ async fn reconcile(
                 // A schedule with no future occurrence stops new runs; it does not make what earlier
                 // runs already applied any less true, so the record is still worth publishing.
                 target_groups: Some(&target_groups),
-                dependencies: &dependencies,
+                dependencies: Some(&dependencies),
             },
         )
         .await;
@@ -1600,7 +1607,7 @@ async fn reconcile(
             retry_prune,
             requeue_after: Some(requeue_after),
             target_groups: Some(&target_groups),
-            dependencies: &dependencies,
+            dependencies: Some(&dependencies),
         },
     )
     .await
@@ -1617,13 +1624,16 @@ struct TickConclusion<'a> {
     retry_prune: bool,
     requeue_after: Option<std::time::Duration>,
     /// The plan's resolved, policy-clamped groups, when this tick got far enough to have them. They
-    /// are what the Node labels are derived from (never `hostsStatus` alone), so an exit that never
-    /// resolved an inventory publishes nothing rather than guessing at a host set.
+    /// are what published Node labels are derived from (never `hostsStatus` alone), so an exit that
+    /// never resolved an inventory publishes nothing rather than guessing at a host set. Withdrawing
+    /// labels needs no host set and happens either way — see [`reconcile_node_labels`].
     target_groups: Option<&'a [ResolvedInventoryGroup]>,
-    /// What the plan's `ClusterInventory`s report waiting on other plans for. Empty on an exit that
-    /// never resolved them, which reports no wait rather than the absence of one: a tick that could
-    /// not read an inventory has nothing to say about what that inventory is waiting for.
-    dependencies: &'a [status::InventoryDependency],
+    /// What the plan's `ClusterInventory`s report waiting on other plans for, or `None` on an exit
+    /// that never resolved them. The two must not be confused: an empty list says the plan depends
+    /// on nothing and removes `DependenciesWaiting`, while a tick that could not read an inventory
+    /// has nothing to say about it, so `None` leaves the condition as the last resolving tick set
+    /// it and only takes the clause off the summary.
+    dependencies: Option<&'a [status::InventoryDependency]>,
 }
 
 /// Brings this plan's Node labels in line with what its record says, after the status write.
@@ -1640,11 +1650,17 @@ struct TickConclusion<'a> {
 /// that never provided anything finds no Nodes carrying its key. Nothing is attempted at all when
 /// the chart disabled the feature, because the same value withheld the `nodes: patch` grant — every
 /// write would be a 403, and the plan already says so through its `ProvidesLabels` condition.
+///
+/// Only *publishing* needs `target_groups`, which is why the withdrawal below runs even on a tick
+/// that resolved none. Withdrawal is decided by the live spec alone — a plan that declares no
+/// `provides` may own no labels, whatever its inventories do — so gating it on a resolved host set
+/// would let a plan that dropped the field keep its labels for as long as its schedule was invalid
+/// or an inventory of its would not resolve, with every dependent still admitting those Nodes.
 async fn reconcile_node_labels(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
     resource_status: &PlaybookPlanStatus,
-    target_groups: &[ResolvedInventoryGroup],
+    target_groups: Option<&[ResolvedInventoryGroup]>,
 ) {
     if !context.node_labels_enabled {
         return;
@@ -1656,6 +1672,9 @@ async fn reconcile_node_labels(
     let plan = format!("{namespace}/{name}");
 
     if object.provides_version().is_some() {
+        let Some(target_groups) = target_groups else {
+            return;
+        };
         let writes =
             node_labels::desired_labels(&key, target_groups, resource_status, &context.nodes);
         if !writes.is_empty() && plan_still_exists(&context.plans, namespace, name) {
@@ -1736,7 +1755,7 @@ async fn sweep_orphaned_node_labels(
         // condition for an admin to act on, not news.
         if !DISABLED_SWEEP_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             warn!(
-                "{} Node labels belong to PlaybookPlans that no longer exist ({orphans:?}), and node labels are disabled (chart nodeLabels.enabled=false) so the operator cannot remove them. Plans selecting on these labels still treat those Nodes as ready. Remove them with `kubectl label nodes --all <key>-`",
+                "{} Node labels belong to PlaybookPlans that no longer exist ({orphans:?}), and node labels are disabled (chart nodeLabels.enabled=false) so the operator cannot remove them. Plans selecting on these labels still treat those Nodes as ready. Remove each with `kubectl label nodes -l '<key>' '<key>-'`",
                 orphans.len()
             );
         }
@@ -1831,7 +1850,7 @@ async fn finish_reconcile_tick(
     let (namespace, name) = namespace_and_name(object)?;
     let api = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace);
 
-    // The scan is per providing plan per tick, in memory and with no API call — the same cost the
+    // The scans are per providing plan per tick, in memory and with no API call — the same cost the
     // removal path already pays, and the same answer if it ever matters: measure it against the
     // fleet target before adding state to avoid it.
     let key = object
@@ -1842,15 +1861,10 @@ async fn finish_reconcile_tick(
         resource_status,
         key.as_deref()
             .zip(object.provides_version())
-            .map(|(key, version)| status::ProvidedLabel {
-                version,
-                nodes: node_labels::nodes_carrying(key, &context.nodes).len(),
-                key,
-            }),
+            .map(|(key, version)| status::ProvidedLabel::from_nodes(key, version, &context.nodes)),
         context.node_labels_enabled,
     );
-    status::set_dependencies_waiting_condition(resource_status, dependencies);
-    status::append_dependency_summary_clause(resource_status, dependencies);
+    status::restate_dependencies(resource_status, dependencies);
 
     let release_finalizer =
         handover == RunHandover::NothingHeld && resource_status.active_run.is_none();
@@ -1865,9 +1879,7 @@ async fn finish_reconcile_tick(
     // Status first, labels after, and never the other way round: a label is a claim about what a
     // host carries, and the record it is derived from is the thing that survives a crash. A label
     // that got ahead of the record would outlive the only evidence for it.
-    if let Some(target_groups) = target_groups {
-        reconcile_node_labels(context, object, resource_status, target_groups).await;
-    }
+    reconcile_node_labels(context, object, resource_status, target_groups).await;
 
     for finished in finished_records {
         if finished.record == TerminalRecord::Present
@@ -3492,9 +3504,14 @@ async fn advance_active_run(
         );
     diagnostic.warn(namespace, name, &run.mirror.job_name);
     status::apply_terminal_play_status(
-        &run.execution_hash,
-        finished_play.spec.provides_version.as_deref(),
+        &status::RunRecord {
+            execution_hash: &run.execution_hash,
+            provides_version: finished_play.spec.provides_version.as_deref(),
+            started_at: play_prepared_at(&finished_play),
+            inventory: &finished_play.spec.inventory,
+        },
         finished_status,
+        &context.nodes,
         resource_status,
     );
     resource_status.active_run = None;
@@ -3570,10 +3587,20 @@ async fn finalize_lost_run(
     let lost_status = play_history::lost_run_status(&run.mirror.job_name, &run.mirror.hosts);
     let verdict = phase_for_finished_run(&lost_status);
     let failure = classify_run_failure(&lost_status);
-    // No version: the record that would have carried it is gone, which is the whole reason this
-    // run is being finalized as lost. Nothing is stamped from it either — `lost_run_status` records
-    // every host `Unknown`, and only a `Succeeded` host is ever given a version.
-    status::apply_terminal_play_status(&run.execution_hash, None, &lost_status, resource_status);
+    // Nothing from the record, because the record is gone — which is the whole reason this run is
+    // being finalized as lost. Nothing is stamped from it either: `lost_run_status` records every
+    // host `Unknown`, and only a `Succeeded` host is ever given a claim.
+    status::apply_terminal_play_status(
+        &status::RunRecord {
+            execution_hash: &run.execution_hash,
+            provides_version: None,
+            started_at: None,
+            inventory: &[],
+        },
+        &lost_status,
+        &context.nodes,
+        resource_status,
+    );
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
@@ -3951,6 +3978,58 @@ fn prune_retry_after(current: std::time::Duration) -> std::time::Duration {
     current.min(std::time::Duration::from_secs(15))
 }
 
+/// What a failed desired-input read says on the plan, in each of the two places it is said.
+///
+/// `summary` lands in the `Summary` print column, which `kubectl get playbookplans` renders on one
+/// line per plan, so it stays short enough to read there. `detail` is the `Ready`/`InputsUnavailable`
+/// message, which only a `describe` or a status read shows and therefore has room for the whole
+/// error. Both are built once at the call site, because only that site knows which error it just
+/// caught.
+struct InputFailure {
+    summary: String,
+    detail: String,
+}
+
+impl InputFailure {
+    /// One wording for both, for a read whose error text already fits a column.
+    fn same(text: String) -> Self {
+        Self {
+            summary: text.clone(),
+            detail: text,
+        }
+    }
+}
+
+/// How an inventory that would not resolve is stated in each place.
+///
+/// The full error goes to the condition, not the column: the column is one line beside a dozen
+/// others, and a name, a kind, a generation and the generation observed push every column after it
+/// off the terminal. What a reader needs there is which inventory, and whether this is a wait or a
+/// mistake; `describe` has the rest.
+///
+/// The wait gets the shortest form of all, because it is the one of these a healthy cluster meets
+/// during normal operation — every edit to an inventory's spec produces it — and it clears itself
+/// within seconds.
+fn inventory_input_failure(error: &ReconcileError) -> InputFailure {
+    let summary = match error {
+        ReconcileError::InventoryNotFound { kind, name } => format!("{kind} {name:?} not found"),
+        ReconcileError::InventoryNotSynced { name, .. } => {
+            format!("inventory {name:?} not in sync")
+        }
+        ReconcileError::ReservedInventoryVariable { group, key } => {
+            format!("inventory group {group:?} sets managed variable {key:?}")
+        }
+        ReconcileError::AmbiguousHost { host, .. } => {
+            format!("host {host:?} is both a Node and an external host")
+        }
+        _ => "cannot read the plan's inventories".to_string(),
+    };
+    InputFailure {
+        summary,
+        detail: format!("cannot resolve the plan's inventories: {error}"),
+    }
+}
+
 /// Reports on the plan that its desired inputs could not be read, for a tick with no run in
 /// flight to hold open.
 ///
@@ -3976,9 +4055,9 @@ async fn report_input_failure(
     api: &Api<PlaybookPlan>,
     object: &PlaybookPlan,
     resource_status: &mut PlaybookPlanStatus,
-    summary: String,
+    failure: InputFailure,
 ) {
-    record_input_failure(resource_status, summary);
+    record_input_failure(resource_status, failure);
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
         warn!(
             "Could not report a desired-input read failure on {:?}/{:?}: {patch_error}",
@@ -3989,9 +4068,9 @@ async fn report_input_failure(
 
 /// The status half of [`report_input_failure`], split from the write so the guard is unit-testable
 /// without a kube client — see that function for why each field is (or is not) touched.
-fn record_input_failure(status: &mut PlaybookPlanStatus, summary: String) {
-    status::set_inputs_unavailable_condition(status, &summary);
-    status.summary = Some(summary);
+fn record_input_failure(status: &mut PlaybookPlanStatus, failure: InputFailure) {
+    status::set_inputs_unavailable_condition(status, &failure.detail);
+    status.summary = Some(failure.summary);
     if status.active_run.is_none() {
         status.phase = phase_under_readiness_overlay(&status.phase);
         status.next_run = None;
@@ -4021,13 +4100,17 @@ fn record_input_failure(status: &mut PlaybookPlanStatus, summary: String) {
 /// node-root proxy pods and host Leases could not be released, and tells the reader which manual
 /// cleanup applies. Writing "run recovery paused" over that would replace a specific, actionable
 /// diagnosis with a vague one, for the same error.
+///
+/// `reason` is what the summary says after "run recovery paused". A desired-input read passes its
+/// [`InputFailure::summary`], so a held run states an inventory outage as briefly as the no-run
+/// path does; the condition beside it carries the whole error.
 async fn preserve_unlaunched_run_after_error(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
     api: &Api<PlaybookPlan>,
     unlaunched: &UnlaunchedRun,
     resource_status: &mut PlaybookPlanStatus,
-    error: &ReconcileError,
+    reason: &str,
 ) {
     let Ok((namespace, name)) = namespace_and_name(object) else {
         return;
@@ -4049,11 +4132,21 @@ async fn preserve_unlaunched_run_after_error(
         }
     }
 
-    if summary_unclaimed_since_adoption(resource_status, &unlaunched.run.mirror) {
-        resource_status.summary = Some(format!("run recovery paused: {error}"));
-    }
+    claim_paused_recovery_summary(resource_status, &unlaunched.run.mirror, reason);
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
         warn!("Could not report paused run recovery on {namespace}/{name}: {patch_error}");
+    }
+}
+
+/// The summary half of [`preserve_unlaunched_run_after_error`], split from the Lease renewal and the
+/// write so it is unit-testable without a kube client.
+fn claim_paused_recovery_summary(
+    status: &mut PlaybookPlanStatus,
+    active_run: &ActiveRun,
+    reason: &str,
+) {
+    if summary_unclaimed_since_adoption(status, active_run) {
+        status.summary = Some(format!("run recovery paused: {reason}"));
     }
 }
 
@@ -4073,7 +4166,7 @@ async fn report_desired_input_error(
     unlaunched: Option<&UnlaunchedRun>,
     resource_status: &mut PlaybookPlanStatus,
     error: &ReconcileError,
-    summary: String,
+    failure: InputFailure,
 ) -> Result<(), ReconcileError> {
     match unlaunched {
         Some(unlaunched) => {
@@ -4084,7 +4177,7 @@ async fn report_desired_input_error(
                 unlaunched,
                 resource_status,
                 error,
-                &summary,
+                &failure,
             )
             .await
         }
@@ -4092,7 +4185,7 @@ async fn report_desired_input_error(
         // deleted inventory or Secret would otherwise leave the last successful run's summary
         // standing while every tick fails in the log only.
         None => {
-            report_input_failure(api, object, resource_status, summary).await;
+            report_input_failure(api, object, resource_status, failure).await;
             Ok(())
         }
     }
@@ -4101,7 +4194,7 @@ async fn report_desired_input_error(
 /// Decides what a failed desired-input read means for a run whose Job does not exist yet, and
 /// reports the outage on the plan either way.
 ///
-/// `summary` is the same diagnostic the no-run path ([`report_input_failure`]) would have
+/// `failure` is the same diagnostic the no-run path ([`report_input_failure`]) would have
 /// written, and it is passed in rather than rebuilt here so both paths describe one outage in one
 /// wording. The readiness overlay is set before the branch because it is true of every outcome
 /// below: whether the run is held, adopted or given up, the plan cannot read what it should be
@@ -4124,9 +4217,9 @@ async fn handle_unlaunched_input_error(
     unlaunched: &UnlaunchedRun,
     resource_status: &mut PlaybookPlanStatus,
     error: &ReconcileError,
-    summary: &str,
+    failure: &InputFailure,
 ) -> Result<(), ReconcileError> {
-    status::set_inputs_unavailable_condition(resource_status, summary);
+    status::set_inputs_unavailable_condition(resource_status, &failure.detail);
 
     if !input_error_supersedes_unlaunched(error) {
         preserve_unlaunched_run_after_error(
@@ -4135,7 +4228,7 @@ async fn handle_unlaunched_input_error(
             api,
             unlaunched,
             resource_status,
-            error,
+            &failure.summary,
         )
         .await;
         return Ok(());
@@ -4154,7 +4247,7 @@ async fn handle_unlaunched_input_error(
     // give up on, only the previous run's verdict. The outage is already decided and true at this
     // point, so it is safe to publish ahead of what is done about it; the specific outcome replaces
     // the summary below on success.
-    resource_status.summary = Some(summary.to_string());
+    resource_status.summary = Some(failure.summary.clone());
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
         warn!("Could not report unreadable desired inputs on {namespace}/{name}: {patch_error}");
     }
@@ -4216,6 +4309,7 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
     match error {
         ReconcileError::ReservedInventoryVariable { .. }
         | ReconcileError::InventoryNotFound { .. }
+        | ReconcileError::AmbiguousHost { .. }
         | ReconcileError::SecretNotFound { .. } => true,
         ReconcileError::KubeError(_) => false,
         // Transient by construction, and the shortest-lived of them all: the inventory's own
@@ -5307,6 +5401,8 @@ async fn recover_active_run(
                 finished: recorded_run_from_play(play)?,
                 status: play_status.clone(),
                 provides_version: play.spec.provides_version.clone(),
+                started_at: play_prepared_at(play),
+                inventory: play.spec.inventory.clone(),
                 surviving: surviving.map(surviving_run_from_play).transpose()?,
             }));
         }
@@ -5348,6 +5444,19 @@ async fn recover_active_run(
     }
 }
 
+/// When a run was prepared, from its `Play`'s own `metadata.creationTimestamp`.
+///
+/// The apiserver stamps it at `record_prepared`, immediately before the run's Job is created, so it
+/// dates the run against the same clock a Node's `creationTimestamp` is dated against. That is the
+/// whole point of using it: [`status::RunRecord::started_at`] is compared with Node creation times,
+/// and any operator-stamped time on either side would make the comparison measure clock skew.
+///
+/// `None` only for an object that never reached the apiserver, which no recovery path holds.
+fn play_prepared_at(play: &Play) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let created = play.metadata.creation_timestamp.as_ref()?;
+    chrono::DateTime::from_timestamp(created.0.as_second(), 0).map(|time| time.fixed_offset())
+}
+
 /// The distinct hosts a run's recorded inventory targets, in first-seen order.
 ///
 /// Deduplicated because a host reachable through two inventory groups is still one host, and this
@@ -5377,6 +5486,7 @@ async fn managed_hosts_still_allowed(
         hosts: ResolvedHosts {
             name: "recovery-authorization".into(),
             hosts: managed_hosts.to_vec(),
+            ..Default::default()
         },
         tolerations: None,
         variables: None,
@@ -5409,6 +5519,16 @@ enum RecoveredRun {
         /// status because that is the only copy that still describes the revision which ran. The
         /// live plan may already advertise the next one.
         provides_version: Option<String>,
+        /// When the finished run was prepared — its `Play`'s own `metadata.creationTimestamp`,
+        /// stamped by the apiserver. Carried for the same reason as the version, and it matters
+        /// more here: this record may have been written by a process that is long gone, so the
+        /// machine standing under a host's name now need not be the one the run reached
+        /// (`status::RunRecord::started_at`).
+        started_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+        /// The groups the finished run targeted, which is what says whether a host is a cluster
+        /// Node. Read from the record because this tick has not resolved an inventory yet — and
+        /// must not, since the run's host set is the one it launched with.
+        inventory: Vec<v1beta1::ResolvedHosts>,
         /// The run still in flight behind the drained result, if any. A terminal result is
         /// handed over ahead of anything live, so the plan is *not* finished when this is set, and
         /// the tick must not classify it as such — nor let the finished run's schedule window
@@ -6618,6 +6738,7 @@ async fn resolve_inventory(
                 hosts: ResolvedHosts {
                     name: group.name.clone(),
                     hosts: group.hosts.clone(),
+                    ..Default::default()
                 },
                 static_inventory_name: static_inventory_name.clone(),
                 config: config.clone(),
@@ -6626,7 +6747,60 @@ async fn resolve_inventory(
         }
     }
 
+    reject_ambiguous_hosts(&groups)?;
+
     Ok((groups, dependencies))
+}
+
+/// Fails the reconcile if one host name is reached both as a cluster Node and as an external
+/// machine.
+///
+/// Everything downstream is keyed by host *name* and assumes that name means one machine. The
+/// rendered inventory puts connection variables on the host entry inside each group
+/// (`ansible::inventory_renderer`), so a name in both kinds is emitted twice — once pointing at a
+/// managed-ssh proxy pod, once at the external machine's own address — and Ansible folds the two
+/// into a single host where one of the connection configs silently wins. The plan then holds one
+/// Lease, writes one `hostsStatus` row and reports one outcome for two machines, with no way for a
+/// reader to tell which was reached.
+///
+/// Refused rather than deduplicated or preferred: both entries are things the author wrote, and any
+/// rule for picking between them would quietly not run the playbook somewhere it was asked to.
+/// Classified like [`ReconcileError::ReservedInventoryVariable`] — a spec only an edit can fix, so a
+/// run waiting behind it is given up rather than held.
+///
+/// Judged before the `NodeAccessPolicy` clamp, so the diagnosis does not depend on a policy that
+/// happens to exclude one of the two today and may stop doing so tomorrow.
+fn reject_ambiguous_hosts(groups: &[ResolvedInventoryGroup]) -> Result<(), ReconcileError> {
+    let node_hosts: BTreeMap<&str, &str> = groups
+        .iter()
+        .filter_map(|group| match group {
+            ResolvedInventoryGroup::ManagedSsh { hosts, .. } => Some(hosts),
+            ResolvedInventoryGroup::Ssh { .. } => None,
+        })
+        .flat_map(|hosts| {
+            hosts
+                .hosts
+                .iter()
+                .map(|host| (host.as_str(), hosts.name.as_str()))
+        })
+        .collect();
+
+    for group in groups {
+        let ResolvedInventoryGroup::Ssh { hosts, .. } = group else {
+            continue;
+        };
+        for host in &hosts.hosts {
+            if let Some(node_group) = node_hosts.get(host.as_str()) {
+                return Err(ReconcileError::AmbiguousHost {
+                    host: host.clone(),
+                    node_group: (*node_group).to_string(),
+                    ssh_group: hosts.name.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Fails the reconcile if an inventory group sets a variable the operator manages for
@@ -7252,6 +7426,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: name.into(),
                 hosts: hosts.iter().map(|h| h.to_string()).collect(),
+                ..Default::default()
             },
             tolerations,
             variables: None,
@@ -7276,6 +7451,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: name.into(),
                 hosts: hosts.iter().map(|h| h.to_string()).collect(),
+                ..Default::default()
             },
             static_inventory_name: static_inventory_name.into(),
             config: SshConfig {
@@ -7286,6 +7462,38 @@ mod tests {
             },
             variables: None,
         }
+    }
+
+    /// One name cannot mean two machines. The rendered inventory would carry the host twice with
+    /// two different connection configs, Ansible would fold them into one, and the plan would hold
+    /// one Lease and write one record for whichever of the two it happened to reach.
+    #[test]
+    fn a_host_reached_as_both_a_node_and_an_external_machine_is_refused() {
+        let ambiguous = reject_ambiguous_hosts(&[
+            managed_ssh_group("workers", &["node-a", "node-b"], None),
+            ssh_group("edge", &["ccu.fritz.box", "node-b"], "ccu"),
+        ]);
+
+        assert!(matches!(
+            ambiguous,
+            Err(ReconcileError::AmbiguousHost { ref host, ref node_group, ref ssh_group })
+                if host == "node-b" && node_group == "workers" && ssh_group == "edge"
+        ));
+    }
+
+    #[test]
+    fn hosts_that_are_only_ever_one_kind_are_accepted() {
+        assert!(
+            reject_ambiguous_hosts(&[
+                managed_ssh_group("workers", &["node-a"], None),
+                managed_ssh_group("storage", &["node-a"], None),
+                ssh_group("edge", &["ccu.fritz.box"], "ccu"),
+                ssh_group("other", &["ccu.fritz.box"], "ccu"),
+            ])
+            .is_ok(),
+            "a host in two groups of the same kind is still one machine"
+        );
+        assert!(reject_ambiguous_hosts(&[]).is_ok());
     }
 
     #[test]
@@ -7592,10 +7800,12 @@ mod tests {
             ResolvedHosts {
                 name: "nodes".into(),
                 hosts: vec!["a".into(), "b".into()],
+                ..Default::default()
             },
             ResolvedHosts {
                 name: "external".into(),
                 hosts: vec!["c".into()],
+                ..Default::default()
             },
         ];
 
@@ -7606,10 +7816,12 @@ mod tests {
             ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["a".into(), "b".into()],
+                ..Default::default()
             },
             ResolvedHosts {
                 name: "database".into(),
                 hosts: vec!["b".into(), "c".into()],
+                ..Default::default()
             },
         ];
 
@@ -7669,6 +7881,7 @@ mod tests {
                 hosts: ResolvedHosts {
                     name: "nodes".into(),
                     hosts: vec!["a".into()],
+                    ..Default::default()
                 },
                 tolerations: None,
                 variables: variables.map(GenericMap),
@@ -8366,6 +8579,7 @@ mod tests {
                     inventory: vec![ResolvedHosts {
                         name: "workers".into(),
                         hosts: vec!["worker-1".into()],
+                        ..Default::default()
                     }],
                     provides_version: None,
                     triggered_slot: None,
@@ -8988,6 +9202,7 @@ mod tests {
             eligible_hosts: vec![ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["worker-1".into()],
+                ..Default::default()
             }],
             hosts_status: Some(BTreeMap::from([(
                 "worker-1".into(),
@@ -9842,6 +10057,7 @@ spec:
             hosts: v1beta1::ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["worker-1".to_string()],
+                ..Default::default()
             },
             tolerations: None,
             variables: None,
@@ -10242,6 +10458,103 @@ spec:
         assert_eq!(idle.retry_count_slot, None);
     }
 
+    /// The commonest inventory failure there is: an inventory whose controller has not caught up
+    /// with a spec edit yet.
+    fn unsynced_inventory() -> ReconcileError {
+        ReconcileError::InventoryNotSynced {
+            name: "workers-ci".into(),
+            generation: 5,
+            observed: "4".into(),
+        }
+    }
+
+    /// The `Summary` column is one line beside a dozen others in `kubectl get`, so it says which
+    /// inventory and what kind of failure this is, and nothing more. The condition is what carries
+    /// the generations, the kind and the phrasing the troubleshooting docs quote.
+    /// The held-run path is where the not-in-sync wait arrives, since it is the input failure that
+    /// does not give an unlaunched run up, so it states the outage as briefly as the no-run path.
+    #[test]
+    fn a_held_run_states_an_inventory_wait_briefly() {
+        let active_run = ActiveRun {
+            execution_hash: "1".into(),
+            run_id: "run-1".into(),
+            job_name: "apply-plan-1-4".into(),
+            play_uid: "play-uid".into(),
+            hosts: vec!["worker-1".into()],
+            run_number: 4,
+            attempt: 4,
+            triggered_slot: None,
+        };
+        let error = unsynced_inventory();
+        assert!(!input_error_supersedes_unlaunched(&error));
+
+        let mut status = PlaybookPlanStatus::default();
+        adopt_recovered_run(&mut status, &active_run);
+        claim_paused_recovery_summary(
+            &mut status,
+            &active_run,
+            &inventory_input_failure(&error).summary,
+        );
+
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("run recovery paused: inventory \"workers-ci\" not in sync")
+        );
+    }
+
+    #[test]
+    fn an_inventory_failure_is_short_in_the_column_and_complete_in_the_condition() {
+        let waiting = inventory_input_failure(&unsynced_inventory());
+        assert_eq!(waiting.summary, "inventory \"workers-ci\" not in sync");
+        assert_eq!(
+            waiting.detail,
+            "cannot resolve the plan's inventories: Referenced ClusterInventory \"workers-ci\" \
+             has not published its resolved hosts for generation 5 yet (observed: 4)"
+        );
+
+        assert_eq!(
+            inventory_input_failure(&ReconcileError::InventoryNotFound {
+                kind: "ClusterInventory",
+                name: "workers-ci".into(),
+            })
+            .summary,
+            "ClusterInventory \"workers-ci\" not found"
+        );
+        assert_eq!(
+            inventory_input_failure(&ReconcileError::InventoryNotFound {
+                kind: "StaticInventory",
+                name: "workers-ci".into(),
+            })
+            .summary,
+            "StaticInventory \"workers-ci\" not found",
+            "a plan may reference both kinds under one name, so the column says which is missing"
+        );
+        assert_eq!(
+            inventory_input_failure(&ReconcileError::ReservedInventoryVariable {
+                group: "workers".into(),
+                key: "ansible_user".into(),
+            })
+            .summary,
+            "inventory group \"workers\" sets managed variable \"ansible_user\""
+        );
+        assert_eq!(
+            inventory_input_failure(&ReconcileError::AmbiguousHost {
+                host: "node-a".into(),
+                node_group: "workers".into(),
+                ssh_group: "edge".into(),
+            })
+            .summary,
+            "host \"node-a\" is both a Node and an external host"
+        );
+
+        // An API error carries no inventory to name, and its own text belongs in the condition
+        // rather than in a column it would overrun.
+        assert_eq!(
+            inventory_input_failure(&ReconcileError::PreconditionFailed("nope")).summary,
+            "cannot read the plan's inventories"
+        );
+    }
+
     /// A plan that cannot read its own inputs reports the outage without erasing what its last run
     /// did. The summary and `Ready` condition carry the current failure; `nextRun` is cleared because
     /// that slot cannot fire, while a terminal verdict remains true.
@@ -10271,7 +10584,10 @@ spec:
             )])),
             ..Default::default()
         };
-        record_input_failure(&mut idle, "cannot read referenced Secrets: nope".into());
+        record_input_failure(
+            &mut idle,
+            InputFailure::same("cannot read referenced Secrets: nope".into()),
+        );
         assert_eq!(idle.phase, Phase::Succeeded);
         assert_eq!(idle.next_run, None);
         assert_eq!(
@@ -10297,10 +10613,7 @@ spec:
             next_run: Some(slot),
             ..Default::default()
         };
-        record_input_failure(
-            &mut waiting,
-            "cannot resolve the plan's inventories: nope".into(),
-        );
+        record_input_failure(&mut waiting, inventory_input_failure(&unsynced_inventory()));
         assert_eq!(waiting.phase, Phase::Pending);
         assert_eq!(waiting.next_run, None);
 
@@ -10320,7 +10633,7 @@ spec:
         };
         record_input_failure(
             &mut applying,
-            "cannot resolve the plan's inventories: nope".into(),
+            inventory_input_failure(&unsynced_inventory()),
         );
         assert_eq!(applying.phase, Phase::Applying);
     }
@@ -10338,10 +10651,7 @@ spec:
             &mut held,
             Some(status::WaitingForNodes::NodesNotReady(&nodes)),
         );
-        record_input_failure(
-            &mut held,
-            "cannot resolve the plan's inventories: nope".into(),
-        );
+        record_input_failure(&mut held, inventory_input_failure(&unsynced_inventory()));
         assert!(
             !status::held_for_unready_nodes(&held),
             "the hold ended when the inventory that named its hosts stopped resolving"
@@ -10369,7 +10679,7 @@ spec:
         );
         record_input_failure(
             &mut waiting_on_proxies,
-            "cannot resolve the plan's inventories: nope".into(),
+            inventory_input_failure(&unsynced_inventory()),
         );
         let waiting = waiting_on_proxies
             .conditions
@@ -10389,6 +10699,7 @@ spec:
         let eligible_hosts = vec![ResolvedHosts {
             name: "workers".into(),
             hosts: vec!["worker-1".into()],
+            ..Default::default()
         }];
         let slot = "2025-08-13T20:00:00Z"
             .parse::<DateTime<FixedOffset>>()
@@ -10411,7 +10722,7 @@ spec:
         };
         record_input_failure(
             &mut succeeded,
-            "cannot read referenced Secrets: temporary failure".into(),
+            InputFailure::same("cannot read referenced Secrets: temporary failure".into()),
         );
         assert_eq!(succeeded.phase, Phase::Succeeded);
         assert_eq!(succeeded.next_run, None);
@@ -10438,10 +10749,7 @@ spec:
             )])),
             ..Default::default()
         };
-        record_input_failure(
-            &mut failed,
-            "cannot resolve the plan's inventories: temporary failure".into(),
-        );
+        record_input_failure(&mut failed, inventory_input_failure(&unsynced_inventory()));
         assert_eq!(failed.phase, Phase::Failed);
         assert_eq!(failed.next_run, None);
 
@@ -10508,6 +10816,7 @@ spec:
             eligible_hosts: vec![ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["worker-1".into()],
+                ..Default::default()
             }],
             hosts_status: Some(BTreeMap::from([(
                 "worker-1".into(),
@@ -10603,6 +10912,7 @@ spec:
             eligible_hosts: vec![ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["worker-1".into(), "worker-2".into()],
+                ..Default::default()
             }],
             hosts_status: Some(BTreeMap::from([(
                 "worker-1".into(),
@@ -10902,6 +11212,7 @@ spec:
                     inventory: vec![ResolvedHosts {
                         name: "workers".into(),
                         hosts: vec!["worker-1".into()],
+                        ..Default::default()
                     }],
                     provides_version: None,
                     triggered_slot: None,
@@ -11024,6 +11335,7 @@ spec:
                 inventory: vec![ResolvedHosts {
                     name: "workers".into(),
                     hosts: vec!["worker-1".into(), "worker-2".into()],
+                    ..Default::default()
                 }],
                 provides_version: None,
                 triggered_slot: None,
@@ -11906,6 +12218,7 @@ spec:
             eligible_hosts: vec![ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["worker-1".into(), "worker-2".into()],
+                ..Default::default()
             }],
             hosts_status: Some(BTreeMap::from([(
                 "worker-1".into(),

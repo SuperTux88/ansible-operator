@@ -126,7 +126,9 @@ out of date because it has no recorded hash of its own.
   re-imaged machine or a rolled node pool — is outdated again, whatever it last applied. The record
   is keyed by the host's name, which is all the fresh machine inherits, so the operator compares the
   Node's `creationTimestamp` against the host's
-  [`appliedAt`](./results-and-troubleshooting.md#per-host-outcomes) to tell the two apart.
+  [`appliedAt`](./results-and-troubleshooting.md#per-host-outcomes) — the time the run that claimed
+  it was prepared — to tell the two apart. On a **scheduled** plan such a host waits for the next
+  slot, because the run it was replaced during consumed this one by succeeding.
 - When you edit the playbook or change a referenced variables/files Secret, the hash changes **at
   once**: the operator watches the plan and the Secrets it names, so the desired hash, run numbering
   and [consumed schedule slot](#one-tick-one-run-per-revision) update on the spot.

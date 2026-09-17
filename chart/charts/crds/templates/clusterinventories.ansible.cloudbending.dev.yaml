@@ -90,7 +90,6 @@ spec:
                   required:
                   - name
                   type: object
-                  x-kubernetes-preserve-unknown-fields: true
                 type: array
               tolerations:
                 description: |-
@@ -131,6 +130,9 @@ spec:
                   Empty on an inventory whose selectors name no operator-owned key, which is every inventory
                   that does not express a dependency.
 
+                  Bounded so the status always fits the object size limit: at most 256 entries, with any
+                  string longer than a label key (317 characters) cut and ending in `…`.
+
                   Written without `skip_serializing_if` on purpose. The status goes out as a JSON **merge**
                   patch, which leaves a field it does not mention alone, so a list that has become empty has to
                   be sent as `[]` to actually empty. Omitting it would leave a satisfied dependency reported as
@@ -165,11 +167,12 @@ spec:
                     malformedTerm:
                       default: false
                       description: |-
-                        An ordered operator (`Gt`/`Ge`/`Lt`/`Le`) listing anything other than exactly one value.
+                        An ordered operator (`Gt`/`Ge`/`Lt`/`Le`) listing anything other than exactly one value, or
+                        an `In` listing none.
 
                         Like `invalidValue` it matches nothing. Reported here rather than rejected at admission,
-                        because the selector type is shared with `NodeAccessPolicy` and sits inside a
-                        preserve-unknown-fields item where a CEL rule cannot see it.
+                        because the selector type is shared with `NodeAccessPolicy` and has no validation rules of
+                        its own.
                       type: boolean
                     providerName:
                       description: The name of the `PlaybookPlan` that publishes `key`, decoded from the key itself.
@@ -258,6 +261,27 @@ spec:
                   something.
                 items:
                   properties:
+                    connection:
+                      description: |-
+                        How a run reaches this group's hosts: `managedSsh` for a cluster Node, through a per-run
+                        managed-ssh proxy pod, and `ssh` for an external machine, through its `StaticInventory`'s own
+                        key. It follows from the kind of inventory the group came from and is never chosen.
+
+                        Recorded because everything about a host — its `hostsStatus` row, its per-host Lease, its entry
+                        in the rendered inventory — is keyed by host *name*, and a name alone cannot say whether a Node
+                        object standing under it describes this host. For a `ClusterInventory` host it does; for a
+                        `StaticInventory` host a Node of the same name is an unrelated machine, whose rebuilding says
+                        nothing about the external one.
+
+                        Absent on a `ClusterInventory`'s own `status.resolvedHosts`, where the kind of the resource
+                        holding it is already the answer, and on a record written before this field existed. Absent
+                        therefore reads as "not known to be a Node", which is the safe way round: every question it
+                        gates is about Node objects.
+                      enum:
+                      - managedSsh
+                      - ssh
+                      nullable: true
+                      type: string
                     hosts:
                       items:
                         type: string

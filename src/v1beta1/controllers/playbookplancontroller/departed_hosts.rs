@@ -19,6 +19,13 @@
 //! Requiring the Node to be gone as well narrows this to the case that actually grows without bound:
 //! a machine that has left the cluster.
 //!
+//! That protection only exists for cluster Nodes. A `StaticInventory` host never has a Node, so the
+//! second condition always holds for it: removing an external host from its inventory drops its
+//! record, and adding it back re-runs the playbook there. Accepted: a `StaticInventory`'s hosts are a
+//! literal list, so one only leaves when an author edits it — nothing like a narrowed policy can drop
+//! many live machines at once — and a host removed and re-added by hand may well have been rebuilt
+//! in between, so running again is the better default anyway.
+//!
 //! This is deliberately **not** how recreated Nodes are handled — see `node_recreation`. That
 //! question is about *identity* and has to be answered from state, because a machine replaced while
 //! the operator was down leaves no deletion to react to. This one is about *housekeeping*, and being
@@ -120,6 +127,7 @@ mod tests {
             eligible_hosts: vec![ResolvedHosts {
                 name: "workers".into(),
                 hosts: eligible.iter().map(|host| (*host).to_string()).collect(),
+                ..Default::default()
             }],
             hosts_status: Some(
                 recorded

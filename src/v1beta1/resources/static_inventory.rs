@@ -56,6 +56,7 @@ impl AnsibleInventory for StaticInventory {
             .map(|group| ResolvedHosts {
                 name: group.name.clone(),
                 hosts: group.hosts.clone(),
+                ..Default::default()
             })
             .collect()
     }

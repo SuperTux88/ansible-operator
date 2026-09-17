@@ -15,6 +15,15 @@ pub enum ReconcileError {
     InventoryNotFound { kind: &'static str, name: String },
 
     #[error(
+        "Host {host:?} is reached both as a cluster Node (group {node_group:?}) and as an external host (group {ssh_group:?}); one name cannot mean two machines"
+    )]
+    AmbiguousHost {
+        host: String,
+        node_group: String,
+        ssh_group: String,
+    },
+
+    #[error(
         "Referenced ClusterInventory {name:?} has not published its resolved hosts for generation {generation} yet (observed: {observed})"
     )]
     InventoryNotSynced {

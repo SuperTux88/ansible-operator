@@ -88,9 +88,42 @@ mod tests {
         let policy = include_str!("../../../chart/templates/validatingadmissionpolicy.yaml");
         let matcher = format!("key.contains(\"{KEY_DOMAIN}/\")");
 
-        assert!(
-            policy.contains(&matcher),
-            "the chart policy must test for {matcher}"
+        assert_eq!(
+            policy.matches(&matcher).count(),
+            2,
+            "both label rules, adding or changing and removing, must test for {matcher}"
         );
+    }
+
+    /// The rest of the policy that INV-8's API-server half rests on. Any of these could be relaxed
+    /// in the chart while the matcher test above stays green.
+    #[test]
+    fn the_admission_policy_keeps_its_guards() {
+        let policy = include_str!("../../../chart/templates/validatingadmissionpolicy.yaml");
+
+        for (guard, why) in [
+            (
+                "failurePolicy: Fail",
+                "a policy that fails open is no guard",
+            ),
+            (
+                "request.userInfo.username ==",
+                "the policy is scoped to the operator's ServiceAccount",
+            ),
+            (
+                "object.spec == oldObject.spec",
+                "the operator may not change taints or unschedulable",
+            ),
+            (
+                "variables.newAnnotations == variables.oldAnnotations",
+                "the operator may not change annotations",
+            ),
+            (
+                "validationActions: [\"Deny\"]",
+                "a binding that only warns or audits enforces nothing",
+            ),
+        ] {
+            assert!(policy.contains(guard), "{why}: expected {guard:?}");
+        }
     }
 }

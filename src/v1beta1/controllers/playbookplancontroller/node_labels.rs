@@ -110,6 +110,48 @@ pub fn nodes_carrying(key: &str, nodes: &Store<Node>) -> Vec<String> {
     carrying
 }
 
+/// How far a plan's key has got: the Nodes carrying it at all, and those carrying `version` exactly.
+///
+/// Two numbers because one cannot answer the question. A version bump leaves every Node on the
+/// previous value until its host runs again, so a count of the key alone reads a rollout that has
+/// not started as one that has finished; a count of the version alone loses the leftovers an admin
+/// has to clean up where the feature is switched off.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LabelReach {
+    /// Nodes carrying the key at exactly the declared version — how far this rollout has got.
+    pub at_version: usize,
+    /// Nodes carrying the key at any version — the plan's whole reach.
+    pub carrying: usize,
+}
+
+/// Counts both halves of [`LabelReach`] in one walk of the Node cache.
+///
+/// One pass rather than two, and no allocation: this runs for every providing plan on every tick,
+/// and the counts are only ever read together.
+pub fn label_reach(key: &str, version: &str, nodes: &Store<Node>) -> LabelReach {
+    let mut reach = LabelReach {
+        at_version: 0,
+        carrying: 0,
+    };
+
+    for node in nodes.state().iter() {
+        let Some(value) = node
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(key))
+        else {
+            continue;
+        };
+        reach.carrying += 1;
+        if value == version {
+            reach.at_version += 1;
+        }
+    }
+
+    reach
+}
+
 /// The Nodes carrying `key` according to the API server rather than the cache.
 ///
 /// For the paths that run where no cache answer can be trusted — chiefly a plan's deletion, which
@@ -191,11 +233,12 @@ pub struct LabelWrite {
 ///   has none, and a record written before that field existed has none either.
 /// - its Node is in the cache. The Node's current labels are needed to tell a change from a no-op,
 ///   and its `creationTimestamp` is needed for the next point.
-/// - its Node is not newer than the claim. A machine rebuilt under its predecessor's name inherits
-///   the name and nothing else, so labelling it would advertise software it has never been given.
-///   `node_recreation` has already dropped such a claim earlier in the tick; this asks the question
-///   again rather than depending on that, because the answer here is published to the whole cluster
-///   and a caller that forgot the earlier pass must not be able to produce a false label.
+/// - its Node is the machine the claim was recorded for. A machine rebuilt under its predecessor's
+///   name inherits the name and nothing else, so labelling it would advertise software it has
+///   never been given. `node_recreation` has already dropped such a claim earlier in the tick; this
+///   asks the question again rather than depending on that, because the answer here is published to
+///   the whole cluster and a caller that forgot the earlier pass must not be able to produce a false
+///   label.
 ///
 /// **Only ever adds and updates.** A label is never lowered or removed because a later run failed —
 /// it says "this version was applied here at some point", which a failure does not undo — nor
@@ -227,9 +270,9 @@ pub fn desired_labels(
             // every plan in the fleet on the upgrade that introduced the field. Publishing is the
             // opposite trade: the cost of a wrong label is every dependent in the cluster acting on
             // it, so an unanswerable question fails closed here.
-            record.applied_at?;
+            let applied_at = record.applied_at?;
             let node = nodes.get(&ObjectRef::new(host))?;
-            if node_replaced_since(record.applied_at, &node) {
+            if node_replaced_since(Some(applied_at), &node) {
                 return None;
             }
             let current = node
@@ -301,8 +344,6 @@ mod tests {
     use super::*;
     use crate::v1beta1::{HostOutcome, HostStatus, ResolvedHosts, SecretRef, SshConfig};
     use chrono::{DateTime, FixedOffset};
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
-    use k8s_openapi::jiff::Timestamp;
     use kube::runtime::{reflector::store::Writer, watcher};
     use std::collections::BTreeMap;
 
@@ -316,8 +357,8 @@ mod tests {
         Node {
             metadata: kube::core::ObjectMeta {
                 name: Some(name.to_string()),
-                creation_timestamp: Some(Time(
-                    Timestamp::from_second(at(created).timestamp()).unwrap(),
+                creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    k8s_openapi::jiff::Timestamp::from_second(at(created).timestamp()).unwrap(),
                 )),
                 labels: Some(
                     labels
@@ -347,6 +388,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: "workers".into(),
                 hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+                ..Default::default()
             },
             tolerations: None,
             variables: None,
@@ -358,6 +400,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: "edge".into(),
                 hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+                ..Default::default()
             },
             static_inventory_name: "external".into(),
             config: SshConfig {
@@ -499,16 +542,16 @@ mod tests {
             &[managed(&["node-a"])],
             &status_with(&[(
                 "node-a",
-                applied(Some("1.4.2"), Some("2026-01-01T00:00:00Z")),
+                applied(Some("1.4.2"), Some("2026-01-02T00:00:00Z")),
             )]),
-            &store(vec![node("node-a", "2026-01-02T00:00:00Z", &[])]),
+            &store(vec![node("node-a", "2026-01-03T00:00:00Z", &[])]),
         );
 
         assert!(writes.is_empty());
     }
 
     /// A record that predates `appliedAt` cannot be dated, so it cannot be told apart from a
-    /// replacement. It is left unlabelled rather than guessed at; its next success fills both fields
+    /// replacement. It is left unlabelled rather than guessed at; its next success fills the field
     /// in.
     #[test]
     fn a_claim_that_cannot_be_dated_is_not_labelled() {
@@ -516,7 +559,7 @@ mod tests {
             KEY,
             &[managed(&["node-a"])],
             &status_with(&[("node-a", applied(Some("1.4.2"), None))]),
-            &store(vec![node("node-a", "2026-01-02T00:00:00Z", &[])]),
+            &store(vec![node("node-a", "2026-01-03T00:00:00Z", &[])]),
         );
 
         assert!(writes.is_empty());
@@ -681,6 +724,39 @@ mod tests {
         assert!(
             nodes_carrying("team-b.plan.ansible.cloudbending.dev/other", &nodes).is_empty(),
             "another plan's key is not this plan's to remove"
+        );
+    }
+
+    /// A version bump leaves every Node carrying the key at the old value until each host has run
+    /// again, so only an exact match counts as reached — while the reach itself does not move.
+    #[test]
+    fn only_nodes_carrying_the_exact_version_count_as_reached() {
+        let nodes = store(vec![
+            node("node-a", "2026-01-01T00:00:00Z", &[(KEY, "1.4.2")]),
+            node("node-b", "2026-01-01T00:00:00Z", &[(KEY, "1.5.0")]),
+            node("node-c", "2026-01-01T00:00:00Z", &[(KEY, "1.5.0-rc1")]),
+            node("node-d", "2026-01-01T00:00:00Z", &[("other", "1.5.0")]),
+            node("node-e", "2026-01-01T00:00:00Z", &[]),
+        ]);
+
+        for (version, at_version) in [("1.5.0", 1), ("1.4.2", 1), ("2.0.0", 0)] {
+            assert_eq!(
+                label_reach(KEY, version, &nodes),
+                LabelReach {
+                    at_version,
+                    carrying: 3
+                },
+                "at {version}"
+            );
+        }
+
+        assert_eq!(
+            label_reach("team-b.plan.ansible.cloudbending.dev/other", "1.0", &nodes),
+            LabelReach {
+                at_version: 0,
+                carrying: 0
+            },
+            "another plan's key is not this plan's reach"
         );
     }
 

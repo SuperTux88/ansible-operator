@@ -1054,6 +1054,7 @@ mod tests {
         let inventory = vec![ResolvedHosts {
             name: "nodes".into(),
             hosts: vec!["a".into()],
+            ..Default::default()
         }];
 
         let mut plan = plan("web", "plan-uid");
@@ -1086,6 +1087,7 @@ mod tests {
         let inventory = vec![ResolvedHosts {
             name: "nodes".into(),
             hosts: vec!["a".into(), "b".into()],
+            ..Default::default()
         }];
         let built = build_play(&play_ref(&plan, &hash, "run-1", "fp-1", 3, &inventory)).unwrap();
 
@@ -1121,6 +1123,7 @@ mod tests {
         let inventory = vec![ResolvedHosts {
             name: "nodes".into(),
             hosts: vec!["a".into()],
+            ..Default::default()
         }];
         let build = |run_id: &str, fp: &str, run_number: u32, uid: &str| {
             let plan = plan("web", uid);
@@ -1192,6 +1195,7 @@ mod tests {
         let inventory = vec![ResolvedHosts {
             name: "nodes".into(),
             hosts: vec!["a".into(), "b".into(), "c".into()],
+            ..Default::default()
         }];
 
         let status = prepared_status(&play_ref(&plan, &hash, "run-1", "fp", 1, &inventory));

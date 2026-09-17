@@ -205,6 +205,14 @@ pub fn node_to_playbookplans(
 /// claim (`node_recreation`). Asking here too is what keeps the wake set and the start gate from
 /// disagreeing about one host: without it a replaced machine is ignored until the plan's next
 /// hourly requeue, having been declared outdated by the very tick that would have run on it.
+///
+/// It is asked **only of hosts `eligibleHosts` records as cluster Nodes**, which is what keeps this
+/// agreeing with the start gate. A `StaticInventory` host may share a name with a Node the plan
+/// never targets, and a Node object says nothing about that machine — so asking would report a
+/// replacement the reconcile rightly refuses to act on (`node_recreation` only touches managed-ssh
+/// hosts), leaving a wake condition that every kubelet heartbeat re-triggers and nothing can ever
+/// clear. A record written before the connection was tracked answers "not a Node" and is simply not
+/// asked, which costs at most one delayed wake-up on the tick after an upgrade.
 fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &Node, node_name: &str) -> bool {
     if plan.spec.suspend || !matches!(plan.spec.mode, ExecutionMode::OneShot) {
         return false;
@@ -233,7 +241,8 @@ fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &Node, node_name: &str) 
             .as_ref()
             .and_then(|hosts| hosts.get(node_name))
             .is_none_or(|host| {
-                node_recreation::node_replaced_since(host.applied_at, node)
+                (node_recreation::node_replaced_since(host.applied_at, node)
+                    && v1beta1::is_node_host(&status.eligible_hosts, node_name))
                     || (host.last_applied_hash != status.current_hash
                         && !matches!(
                             host.last_outcome,
@@ -549,6 +558,15 @@ mod tests {
         vec![crate::v1beta1::ResolvedHosts {
             name: "workers".into(),
             hosts: hosts.iter().map(|host| host.to_string()).collect(),
+            connection: Some(crate::v1beta1::HostConnection::ManagedSsh),
+        }]
+    }
+
+    fn eligible_external(hosts: &[&str]) -> Vec<crate::v1beta1::ResolvedHosts> {
+        vec![crate::v1beta1::ResolvedHosts {
+            name: "edge".into(),
+            hosts: hosts.iter().map(|host| host.to_string()).collect(),
+            connection: Some(crate::v1beta1::HostConnection::Ssh),
         }]
     }
 
@@ -560,10 +578,13 @@ mod tests {
         Node::default()
     }
 
+    /// When the run that made the records below was prepared.
+    fn claimed_at() -> chrono::DateTime<chrono::FixedOffset> {
+        "2026-01-01T00:00:00Z".parse().unwrap()
+    }
+
     fn node_created_at(created: &str) -> Node {
-        let created = created
-            .parse::<chrono::DateTime<chrono::FixedOffset>>()
-            .unwrap();
+        let created: chrono::DateTime<chrono::FixedOffset> = created.parse().unwrap();
         Node {
             metadata: kube::core::ObjectMeta {
                 creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
@@ -583,11 +604,7 @@ mod tests {
     #[test]
     fn a_plan_awaits_a_host_whose_node_was_replaced_since_it_applied() {
         let mut converged = host("abc", HostOutcome::Succeeded);
-        converged.applied_at = Some(
-            "2026-01-01T00:00:00Z"
-                .parse::<chrono::DateTime<chrono::FixedOffset>>()
-                .unwrap(),
-        );
+        converged.applied_at = Some(claimed_at());
         let plan = plan_awaiting("node-a", converged);
 
         assert!(
@@ -596,9 +613,45 @@ mod tests {
         );
         assert!(
             !plan_awaits_node(&plan, &node_created_at("2025-12-31T00:00:00Z"), "node-a"),
-            "a Node older than the claim is that same machine"
+            "a Node older than the run that claimed it is that same machine"
         );
         assert!(plan_awaits_node(
+            &plan,
+            &node_created_at("2026-01-02T00:00:00Z"),
+            "node-a"
+        ));
+    }
+
+    /// The same record, reached as an external machine. A Node of that name is a different machine
+    /// the plan never targets, so its replacement says nothing about this host — and the reconcile
+    /// this would wake refuses to clear the claim (`node_recreation` only touches managed-ssh
+    /// hosts), so every kubelet heartbeat of that Node would buy a full reconcile that can never
+    /// change the answer.
+    #[test]
+    fn an_external_host_is_not_woken_by_a_node_that_shares_its_name() {
+        let mut converged = host("abc", HostOutcome::Succeeded);
+        converged.applied_at = Some(claimed_at());
+        let mut plan = plan_awaiting("edge-1", converged);
+        plan.status.as_mut().unwrap().eligible_hosts = eligible_external(&["edge-1"]);
+
+        assert!(!plan_awaits_node(
+            &plan,
+            &node_created_at("2026-01-02T00:00:00Z"),
+            "edge-1"
+        ));
+    }
+
+    /// A record written before the connection was tracked. Answering "not a Node" costs at most one
+    /// delayed wake-up after an upgrade; answering "Node" for an external host costs a wake nothing
+    /// can ever clear.
+    #[test]
+    fn a_host_whose_connection_was_never_recorded_is_not_treated_as_a_node() {
+        let mut converged = host("abc", HostOutcome::Succeeded);
+        converged.applied_at = Some(claimed_at());
+        let mut plan = plan_awaiting("node-a", converged);
+        plan.status.as_mut().unwrap().eligible_hosts[0].connection = None;
+
+        assert!(!plan_awaits_node(
             &plan,
             &node_created_at("2026-01-02T00:00:00Z"),
             "node-a"

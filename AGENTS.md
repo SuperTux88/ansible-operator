@@ -45,11 +45,12 @@ whole point of the design. If a change would weaken one, stop and surface it; do
   cleanup's label-scoped `delete_collection` cannot sweep the ansible Job pod (which lacks
   `_HOST`).
 - **INV-8 — The operator writes only its own Node labels.** Every Node write is confined to
-  `<namespace>.plan.ansible.cloudbending.dev/<plan>` keys built by `node_labels::label_key` from the
+  `<namespace>.plan.ansible.cloudbending.dev/<plan>` keys built by `dependency_keys::label_key` from the
   plan's own namespace and name — never a tenant-supplied key, never a Node's spec or annotations.
   A tenant-chosen key would let a plan label its way past a `NodeAccessPolicy` ceiling (T-ESC-3).
   The chart's `ValidatingAdmissionPolicy` enforces the same bound at the API server, and a test pins
-  its CEL matcher to `node_labels::KEY_DOMAIN`.
+  its CEL matcher to `dependency_keys::KEY_DOMAIN`
+  (`dependency_keys::tests::the_admission_policy_matches_the_key_this_module_builds`).
 
 Two recent load-bearing fixes that look like "cleanups" but MUST NOT be reverted:
 - **`StrictModes no` in `render_sshd_config`** — required so sshd will read the
@@ -82,7 +83,7 @@ src/v1beta1/
       dependencies.rs                pure: splits a group's selector into its terms and counts, per positive requirement on an operator-owned key (`dependency_keys`), how many of the group's Nodes it is holding back. "The group's Nodes" are the ones passing every term that is *not* a dependency — that is what separates "not ready yet" from "not this group's Node", which is the whole diagnostic. Judges every term with `nodeselector`'s own evaluator; a second implementation would let the reported waits disagree with the hosts the inventory resolves to
     nodeaccesspolicycontroller/      writes NodeAccessPolicyStatus (matched namespaces / allowed nodes) for observability; watches ns + nodes
     selector_trigger.rs              label_changes: the set-valued controllers' watch trigger — ticks only on a label change, an appearance or a disappearance; must stay in lockstep with what nodeselector.rs reads. Also owns RECOMPUTE_DEBOUNCE, which both controllers pass to `Controller::with_config`: every tick fans out through `reconcile_all_on` to *every* object, each listing the whole Node set, so a plan labelling a fleet one Node at a time (`node_labels.rs`) would otherwise buy `writes × objects` full recomputes. Keep it short — it delays every trigger of those controllers, and an inventory slow to publish `observedGeneration` holds the plans that reference it
-    ansible_inventory.rs             ResolvedInventoryGroup (ManagedSsh | Ssh) + ResolvedHosts; AnsibleInventory trait (get_hosts); distinct_hosts/_count (every host-population count, in both controllers)
+    ansible_inventory.rs             ResolvedInventoryGroup (ManagedSsh | Ssh) + ResolvedHosts; AnsibleInventory trait (get_hosts); distinct_hosts/_count (every host-population count, in both controllers); `flatten_hosts` is the **only** writer of `ResolvedHosts.connection`, which carries the group's variant into the records that outlive it (`status.eligibleHosts`, `PlaySpec.inventory`) so a reader can still ask whether a host is a cluster Node — `node_hosts` is that question
     nodeselector.rs                  node_matches / selector_matches / selector_matches_fail_closed (INV-1)
     dependency_keys.rs               the `<namespace>.plan.ansible.cloudbending.dev/<plan>` Node label key, and its inverse. Shared vocabulary, not a detail of either side: the plan controller writes the key (`node_labels.rs`), the inventory controller recognises it in a tenant's selector to tell a dependency on another plan from an ordinary label term. One end recognising a key the other would not produce is a dependency nobody is told about (INV-8)
     version.rs                       parses a label or selector value as a version for the ordered operators (`Gt`/`Ge`/`Lt`/`Le`), which Kubernetes' own integer-only `Gt`/`Lt` cannot express. Lenient on the way in (optional `v`, one to three components, `_` build metadata as Helm writes it), SemVer on the way out, and `None` for anything else — an unanswerable comparison is a non-match, so a dependency selector waits instead of running
@@ -93,7 +94,7 @@ src/v1beta1/
     node_access.rs                   NodeAccessPolicy enforcement: fail-closed intersection clamp (INV-2/3/5)
     node_labels.rs                   publishes a plan's `spec.provides` version onto the Nodes it converged, as `<ns>.plan.ansible.cloudbending.dev/<plan>`, so other plans can gate their own inventories on it. Three load-bearing rules: **status first, labels after** (a label may lag the record, never lead it — a crash between the two must not leave a claim with no evidence); the diff reads the **resolved managed-ssh groups**, never `hostsStatus` alone (which is keyed by name, so a StaticInventory host would otherwise label a same-named Node); and it writes **only on a real change of value**, since every Node label change is broadcast to every Node watcher in the cluster. The key is derived from the plan's namespace and name, never from tenant input (INV-8)
     node_readiness.rs                Node Ready-condition predicates + the OneShot "hold instead of starting" gate; readiness only, never authorization
-    node_recreation.rs               drops a host's recorded application when its Node was registered after `appliedAt` — a rebuilt machine inherits the name, never the claim. Level-triggered on purpose: a deletion the operator was down for leaves no event to react to
+    node_recreation.rs               drops a host's recorded application when its Node is newer than `appliedAt` (the time the run that claimed it was *prepared*) — a rebuilt machine inherits the name, never the claim. Both sides are apiserver-stamped on purpose: the run's finish time comes from the operator pod, and comparing clocks would re-run a freshly joined Node for ever. Level-triggered too: a deletion the operator was down for leaves no event to react to, and `status::apply_terminal_play_status` asks the same question once more before recording a claim at all
     departed_hosts.rs                prunes `hostsStatus` rows for hosts that left the inventory **and** no longer exist as Nodes (housekeeping; `hostsStatus` otherwise only ever grows). Requiring both is what stops a narrowed NodeAccessPolicy from dropping live machines' records and re-running them when it widens again. Deletion needs an explicit `null` per key — a merge patch cannot delete by omission
     managed_ssh.rs                   proxy pods (hostPID + nsenter = NODE ROOT), per-run sshd config/certs/principals, NetworkPolicy, cleanup (INV-4/7)
     locking.rs                       per-host Leases (operator ns) for run mutual-exclusion
@@ -159,7 +160,9 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    one `helm upgrade` that changes an inventory and a plan together would otherwise launch against
    the host set the edit replaced.
 5. **Execution hash.** `ExecutionHash` over the playbook text + contents of every referenced
-   Secret (variables + files), order-insensitive; deliberately **excludes** the workspace
+   Secret (variables + files), order-insensitive, with `spec.provides.version` folded in
+   (`fold_provides_version`) — so bumping a provided version re-runs the plan on every host, and a
+   plan without `provides` hashes as before; deliberately **excludes** the workspace
    Secret (its content — proxy IPs — legitimately changes each run). Hash change ⇒
    `last_run_number` reset to 0, `last_triggered_run` cleared (so an edit can start inside the
    window its predecessor used, and a revert is just another change), and `Phase::Pending`
@@ -427,7 +430,11 @@ fall on the floor. It asks the *plan* as well as the host, because a wake the pl
 costs exactly as much as one it can: a suspended plan, a `OneShot` plan out of attempts, and every
 `Recurring` plan are all refused. `Recurring` is refused outright because only the clock starts its
 runs — the readiness gate it would be released by is `OneShot`-only — and it is the one mode with no
-budget to bound the wakes, so one stuck host would otherwise wake it per heartbeat forever.
+budget to bound the wakes, so one stuck host would otherwise wake it per heartbeat forever. The
+replacement half of that predicate is asked **only of hosts `eligibleHosts` records as cluster
+Nodes** (`ResolvedHosts.connection`): a `StaticInventory` host may share a name with a Node the plan
+never targets, and `node_recreation` rightly refuses to act on it — so asking would leave a wake
+condition every heartbeat re-triggers and no reconcile can clear.
 
 The plan reflector's own task is driven **after** that wait, because it carries the two things
 `reconcile` never sees. A **deletion**: `Controller::new` decodes its primary watch with

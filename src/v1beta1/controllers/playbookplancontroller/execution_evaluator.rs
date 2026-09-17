@@ -102,14 +102,10 @@ pub fn find_outdated_hosts(
     let hash = execution_hash.to_string();
     // For each host, check if it already has the current execution hash in the PlaybookPlan's status
     let outdated_hosts = hosts.iter().filter(move |host| {
-        let host_status = hosts_status.get(*host);
-
         // We don't have a status for this host yet so we must execute the playbook
-        if host_status.is_none() {
+        let Some(host_status) = hosts_status.get(*host) else {
             return true;
-        }
-
-        let host_status = host_status.unwrap();
+        };
 
         // Otherwise just compare the hashes
         host_status.last_applied_hash != hash
@@ -206,6 +202,7 @@ mod tests {
             eligible_hosts: vec![ResolvedHosts {
                 name: "test-inventory".into(),
                 hosts: vec!["host-1".into(), "host-2".into(), "host-3".into()],
+                ..Default::default()
             }],
             hosts_status: None,
             ..Default::default()
@@ -233,6 +230,7 @@ mod tests {
             eligible_hosts: vec![ResolvedHosts {
                 name: "test-inventory".into(),
                 hosts: vec!["host-1".into(), "host-2".into(), "host-3".into()],
+                ..Default::default()
             }],
             hosts_status: Some(BTreeMap::from_iter(vec![
                 (
@@ -424,10 +422,12 @@ mod tests {
             ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["node-a".into(), "node-b".into()],
+                ..Default::default()
             },
             ResolvedHosts {
                 name: "storage".into(),
                 hosts: vec!["node-b".into(), "node-c".into()],
+                ..Default::default()
             },
         ];
         assert_eq!(

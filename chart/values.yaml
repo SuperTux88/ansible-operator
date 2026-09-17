@@ -93,9 +93,10 @@ nodeLabels:
   # not write to Node objects at all: plans with `spec.provides` still run, and report in their
   # status that node labels are disabled on this cluster, so a plan waiting on one of them says why.
   #
-  # Turning it off also takes away the permission to REMOVE labels already written, so the operator
-  # logs the leftovers it finds at startup instead of cleaning them up. Remove them with
-  # `kubectl label nodes --all <key>-`.
+  # Turning it off also takes away the permission to REMOVE labels already written. Nothing removes
+  # them: the operator only logs labels whose plan no longer exists, and a plan that still exists
+  # reports the Nodes still carrying its label in its `ProvidesLabels` condition. Remove a label with
+  # `kubectl label nodes -l '<key>' '<key>-'`.
   enabled: true
   # Renders a ValidatingAdmissionPolicy that holds the operator's `patch` on Nodes to exactly those
   # labels — every other label, and everything outside metadata.labels, must be unchanged. It

@@ -34,7 +34,7 @@ data:
     # flag and the permission must move together, or the operator would keep trying writes it is
     # refused (or hold a grant it never uses).
     [node_labels]
-    enabled = {{ .Values.nodeLabels.enabled }}
+    enabled = {{ if .Values.nodeLabels.enabled }}true{{ else }}false{{ end }}
     {{- with (.Values.managedSsh).readiness }}
 
     # Adaptive readiness grace for managed-ssh proxy pods on NotReady nodes: wait `grace_seconds`,

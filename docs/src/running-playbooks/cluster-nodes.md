@@ -174,18 +174,34 @@ The provider is named by **decoding the key**, not by looking the plan up. A dep
 nobody has therefore reads as waiting for it for ever — which is what a mistyped key looks like, and
 why the name is printed: `nosuch/typo` in `providerName` is the typo staring back at you.
 
-Which Nodes they are is a label query away, since the numbers count exactly the Nodes that lack the
-label:
+Which Nodes they are is a label query away. Select on the group's other terms and show the
+dependency key as a column, which holds each Node's version:
 
 ```console
-$ kubectl get nodes -l 'platform.plan.ansible.cloudbending.dev/containerd-config'
+$ kubectl get nodes -l 'node-role.kubernetes.io/worker' -L 'platform.plan.ansible.cloudbending.dev/containerd-config'
+```
+
+Every Node with an empty column is waiting. So is one showing a version the requirement does not
+accept, such as `1.3.0` against `Ge 1.4.0`, because a label selector cannot compare versions. For an
+`Exists` requirement the empty ones are all of them, and a selector can list just those:
+
+```console
+$ kubectl get nodes -l 'node-role.kubernetes.io/worker,!platform.plan.ansible.cloudbending.dev/containerd-config'
 ```
 
 Two limits worth knowing. These counts are the **inventory's**, so they are taken before any
 [`NodeAccessPolicy`](../cluster-operators/node-access-policies.md) clamp a plan using this inventory
-is subject to: a Node reported as satisfied may still be out of a given plan's reach. And a group
-with `Waiting: 0` whose host count is still lower than you expect is telling you the missing Nodes
-fail something other than a dependency — the selector, or the policy.
+is subject to: a Node reported as satisfied may still be out of a given plan's reach.
+
+And `Waiting` is the whole inventory's, not any one group's: it counts the Nodes **no** group of this
+inventory takes. A Node one group is waiting for while another already resolves it is a host of this
+inventory, so it is counted under `Hosts` and not under `Waiting` — which is what makes the two
+columns add up rather than double-count a machine. An inventory with one broad group and one gated
+group can therefore sit at `Waiting: 0` while `.status.dependencies` still reports a group waiting,
+and that is the honest answer to each question. So read `Waiting: 0` as "nothing is kept out of this
+inventory by a dependency"; if its host count is still lower than you expect, the missing Nodes fail
+something other than a dependency — the selector, or the policy. For what an individual *group* is
+waiting for, read `.status.dependencies`.
 
 Three things are flagged rather than counted, when a dependency can never be satisfied as written:
 `invalidValue`, `malformedTerm` and `unparseableHosts`. See
