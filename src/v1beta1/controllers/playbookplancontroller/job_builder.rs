@@ -1507,6 +1507,7 @@ spec:
             hosts: ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["node-a".into(), "node-b".into()],
+                ..Default::default()
             },
             tolerations: None,
             variables: None,
@@ -1560,6 +1561,7 @@ spec:
             hosts: ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["node-a".into()],
+                ..Default::default()
             },
             tolerations: None,
             variables: None,
@@ -1674,6 +1676,7 @@ spec:
             hosts: ResolvedHosts {
                 name: "external".into(),
                 hosts: vec!["ccu.fritz.box".into()],
+                ..Default::default()
             },
             static_inventory_name: "ccu".into(),
             config: SshConfig {

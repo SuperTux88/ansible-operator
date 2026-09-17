@@ -1051,7 +1051,6 @@ async fn reconcile(
              last applied to them, so they are outdated again"
         );
     }
-    node_recreation::forget_node_uids_of_external_hosts(&target_groups, &mut resource_status);
 
     // Housekeeping on the same record, and the only thing that ever removes from it: rows for hosts
     // that have both left the inventory and stopped existing as Nodes. It needs a write of its own —
@@ -5458,6 +5457,7 @@ async fn managed_hosts_still_allowed(
         hosts: ResolvedHosts {
             name: "recovery-authorization".into(),
             hosts: managed_hosts.to_vec(),
+            ..Default::default()
         },
         tolerations: None,
         variables: None,
@@ -6699,6 +6699,7 @@ async fn resolve_inventory(
                 hosts: ResolvedHosts {
                     name: group.name.clone(),
                     hosts: group.hosts.clone(),
+                    ..Default::default()
                 },
                 static_inventory_name: static_inventory_name.clone(),
                 config: config.clone(),
@@ -7386,6 +7387,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: name.into(),
                 hosts: hosts.iter().map(|h| h.to_string()).collect(),
+                ..Default::default()
             },
             tolerations,
             variables: None,
@@ -7410,6 +7412,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: name.into(),
                 hosts: hosts.iter().map(|h| h.to_string()).collect(),
+                ..Default::default()
             },
             static_inventory_name: static_inventory_name.into(),
             config: SshConfig {
@@ -7758,10 +7761,12 @@ mod tests {
             ResolvedHosts {
                 name: "nodes".into(),
                 hosts: vec!["a".into(), "b".into()],
+                ..Default::default()
             },
             ResolvedHosts {
                 name: "external".into(),
                 hosts: vec!["c".into()],
+                ..Default::default()
             },
         ];
 
@@ -7772,10 +7777,12 @@ mod tests {
             ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["a".into(), "b".into()],
+                ..Default::default()
             },
             ResolvedHosts {
                 name: "database".into(),
                 hosts: vec!["b".into(), "c".into()],
+                ..Default::default()
             },
         ];
 
@@ -7835,6 +7842,7 @@ mod tests {
                 hosts: ResolvedHosts {
                     name: "nodes".into(),
                     hosts: vec!["a".into()],
+                    ..Default::default()
                 },
                 tolerations: None,
                 variables: variables.map(GenericMap),
@@ -8532,6 +8540,7 @@ mod tests {
                     inventory: vec![ResolvedHosts {
                         name: "workers".into(),
                         hosts: vec!["worker-1".into()],
+                        ..Default::default()
                     }],
                     provides_version: None,
                     triggered_slot: None,
@@ -9154,6 +9163,7 @@ mod tests {
             eligible_hosts: vec![ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["worker-1".into()],
+                ..Default::default()
             }],
             hosts_status: Some(BTreeMap::from([(
                 "worker-1".into(),
@@ -10008,6 +10018,7 @@ spec:
             hosts: v1beta1::ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["worker-1".to_string()],
+                ..Default::default()
             },
             tolerations: None,
             variables: None,
@@ -10649,6 +10660,7 @@ spec:
         let eligible_hosts = vec![ResolvedHosts {
             name: "workers".into(),
             hosts: vec!["worker-1".into()],
+            ..Default::default()
         }];
         let slot = "2025-08-13T20:00:00Z"
             .parse::<DateTime<FixedOffset>>()
@@ -10765,6 +10777,7 @@ spec:
             eligible_hosts: vec![ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["worker-1".into()],
+                ..Default::default()
             }],
             hosts_status: Some(BTreeMap::from([(
                 "worker-1".into(),
@@ -10860,6 +10873,7 @@ spec:
             eligible_hosts: vec![ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["worker-1".into(), "worker-2".into()],
+                ..Default::default()
             }],
             hosts_status: Some(BTreeMap::from([(
                 "worker-1".into(),
@@ -11159,6 +11173,7 @@ spec:
                     inventory: vec![ResolvedHosts {
                         name: "workers".into(),
                         hosts: vec!["worker-1".into()],
+                        ..Default::default()
                     }],
                     provides_version: None,
                     triggered_slot: None,
@@ -11281,6 +11296,7 @@ spec:
                 inventory: vec![ResolvedHosts {
                     name: "workers".into(),
                     hosts: vec!["worker-1".into(), "worker-2".into()],
+                    ..Default::default()
                 }],
                 provides_version: None,
                 triggered_slot: None,
@@ -12163,6 +12179,7 @@ spec:
             eligible_hosts: vec![ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["worker-1".into(), "worker-2".into()],
+                ..Default::default()
             }],
             hosts_status: Some(BTreeMap::from([(
                 "worker-1".into(),
