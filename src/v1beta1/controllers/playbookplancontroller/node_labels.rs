@@ -386,6 +386,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: "workers".into(),
                 hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+                ..Default::default()
             },
             tolerations: None,
             variables: None,
@@ -397,6 +398,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: "edge".into(),
                 hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+                ..Default::default()
             },
             static_inventory_name: "external".into(),
             config: SshConfig {

@@ -131,6 +131,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: name.into(),
                 hosts: hosts.iter().map(|h| h.to_string()).collect(),
+                ..Default::default()
             },
             tolerations: None,
             variables: None,
@@ -142,6 +143,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: name.into(),
                 hosts: hosts.iter().map(|h| h.to_string()).collect(),
+                ..Default::default()
             },
             static_inventory_name: "static".into(),
             config: SshConfig {
