@@ -4006,6 +4006,9 @@ fn inventory_input_failure(error: &ReconcileError) -> InputFailure {
         ReconcileError::ReservedInventoryVariable { group, key } => {
             format!("inventory group {group:?} sets managed variable {key:?}")
         }
+        ReconcileError::AmbiguousHost { host, .. } => {
+            format!("host {host:?} is both a Node and an external host")
+        }
         _ => "cannot read the plan's inventories".to_string(),
     };
     InputFailure {
@@ -4293,6 +4296,7 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
     match error {
         ReconcileError::ReservedInventoryVariable { .. }
         | ReconcileError::InventoryNotFound { .. }
+        | ReconcileError::AmbiguousHost { .. }
         | ReconcileError::SecretNotFound { .. } => true,
         ReconcileError::KubeError(_) => false,
         // Transient by construction, and the shortest-lived of them all: the inventory's own
@@ -6703,7 +6707,60 @@ async fn resolve_inventory(
         }
     }
 
+    reject_ambiguous_hosts(&groups)?;
+
     Ok((groups, dependencies))
+}
+
+/// Fails the reconcile if one host name is reached both as a cluster Node and as an external
+/// machine.
+///
+/// Everything downstream is keyed by host *name* and assumes that name means one machine. The
+/// rendered inventory puts connection variables on the host entry inside each group
+/// (`ansible::inventory_renderer`), so a name in both kinds is emitted twice — once pointing at a
+/// managed-ssh proxy pod, once at the external machine's own address — and Ansible folds the two
+/// into a single host where one of the connection configs silently wins. The plan then holds one
+/// Lease, writes one `hostsStatus` row and reports one outcome for two machines, with no way for a
+/// reader to tell which was reached.
+///
+/// Refused rather than deduplicated or preferred: both entries are things the author wrote, and any
+/// rule for picking between them would quietly not run the playbook somewhere it was asked to.
+/// Classified like [`ReconcileError::ReservedInventoryVariable`] — a spec only an edit can fix, so a
+/// run waiting behind it is given up rather than held.
+///
+/// Judged before the `NodeAccessPolicy` clamp, so the diagnosis does not depend on a policy that
+/// happens to exclude one of the two today and may stop doing so tomorrow.
+fn reject_ambiguous_hosts(groups: &[ResolvedInventoryGroup]) -> Result<(), ReconcileError> {
+    let node_hosts: BTreeMap<&str, &str> = groups
+        .iter()
+        .filter_map(|group| match group {
+            ResolvedInventoryGroup::ManagedSsh { hosts, .. } => Some(hosts),
+            ResolvedInventoryGroup::Ssh { .. } => None,
+        })
+        .flat_map(|hosts| {
+            hosts
+                .hosts
+                .iter()
+                .map(|host| (host.as_str(), hosts.name.as_str()))
+        })
+        .collect();
+
+    for group in groups {
+        let ResolvedInventoryGroup::Ssh { hosts, .. } = group else {
+            continue;
+        };
+        for host in &hosts.hosts {
+            if let Some(node_group) = node_hosts.get(host.as_str()) {
+                return Err(ReconcileError::AmbiguousHost {
+                    host: host.clone(),
+                    node_group: (*node_group).to_string(),
+                    ssh_group: hosts.name.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Fails the reconcile if an inventory group sets a variable the operator manages for
@@ -7363,6 +7420,38 @@ mod tests {
             },
             variables: None,
         }
+    }
+
+    /// One name cannot mean two machines. The rendered inventory would carry the host twice with
+    /// two different connection configs, Ansible would fold them into one, and the plan would hold
+    /// one Lease and write one record for whichever of the two it happened to reach.
+    #[test]
+    fn a_host_reached_as_both_a_node_and_an_external_machine_is_refused() {
+        let ambiguous = reject_ambiguous_hosts(&[
+            managed_ssh_group("workers", &["node-a", "node-b"], None),
+            ssh_group("edge", &["ccu.fritz.box", "node-b"], "ccu"),
+        ]);
+
+        assert!(matches!(
+            ambiguous,
+            Err(ReconcileError::AmbiguousHost { ref host, ref node_group, ref ssh_group })
+                if host == "node-b" && node_group == "workers" && ssh_group == "edge"
+        ));
+    }
+
+    #[test]
+    fn hosts_that_are_only_ever_one_kind_are_accepted() {
+        assert!(
+            reject_ambiguous_hosts(&[
+                managed_ssh_group("workers", &["node-a"], None),
+                managed_ssh_group("storage", &["node-a"], None),
+                ssh_group("edge", &["ccu.fritz.box"], "ccu"),
+                ssh_group("other", &["ccu.fritz.box"], "ccu"),
+            ])
+            .is_ok(),
+            "a host in two groups of the same kind is still one machine"
+        );
+        assert!(reject_ambiguous_hosts(&[]).is_ok());
     }
 
     #[test]
@@ -10397,6 +10486,15 @@ spec:
             })
             .summary,
             "inventory group \"workers\" sets managed variable \"ansible_user\""
+        );
+        assert_eq!(
+            inventory_input_failure(&ReconcileError::AmbiguousHost {
+                host: "node-a".into(),
+                node_group: "workers".into(),
+                ssh_group: "edge".into(),
+            })
+            .summary,
+            "host \"node-a\" is both a Node and an external host"
         );
 
         // An API error carries no inventory to name, and its own text belongs in the condition
