@@ -15,6 +15,8 @@
 //! identity and not a timestamp on purpose: `creationTimestamp` comes from the apiserver's clock and
 //! the claim's date from the operator's, so any comparison between them measures clock skew as well.
 
+use std::collections::HashSet;
+
 use k8s_openapi::api::core::v1::Node;
 use kube::runtime::reflector::{ObjectRef, Store};
 
@@ -103,6 +105,46 @@ pub fn drop_records_for_recreated_nodes(
     }
 
     replaced
+}
+
+/// Drops the `appliedNodeUid` of every host the plan reaches only through `Ssh` groups, so that a
+/// record carries a machine identity only while its host is a Node.
+///
+/// A success stamps the uid of whatever Node shares the host's name, and `hostsStatus` is keyed by
+/// name alone, so an external host named like a Node picks up that Node's uid.
+/// [`drop_records_for_recreated_nodes`] rightly never acts on it, but the Node watch's wake set
+/// (`mappers::plan_awaits_node`) cannot tell group kinds apart and asks [`node_replaced_since`] of
+/// every targeted host. Left in place, a replacement of that unrelated Node would wake the plan on
+/// every heartbeat, for a claim no reconcile ever clears. Without the uid both sides answer "not
+/// replaced".
+///
+/// Only the uid goes: the claim itself is true of the external machine, which a Node object says
+/// nothing about. A host also listed in a managed-ssh group is that Node, and keeps it.
+pub fn forget_node_uids_of_external_hosts(
+    groups: &[ResolvedInventoryGroup],
+    status: &mut PlaybookPlanStatus,
+) {
+    let Some(hosts_status) = status.hosts_status.as_mut() else {
+        return;
+    };
+
+    let (managed, external): (Vec<_>, Vec<_>) = groups
+        .iter()
+        .partition(|group| matches!(group, ResolvedInventoryGroup::ManagedSsh { .. }));
+    let managed: HashSet<&str> = managed
+        .iter()
+        .flat_map(|group| group.hosts().hosts.iter().map(String::as_str))
+        .collect();
+
+    for host in external
+        .iter()
+        .flat_map(|group| group.hosts().hosts.iter())
+        .filter(|host| !managed.contains(host.as_str()))
+    {
+        if let Some(record) = hosts_status.get_mut(host) {
+            record.applied_node_uid = None;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -327,6 +369,37 @@ mod tests {
             status.hosts_status.unwrap()["node-a"].last_applied_hash,
             "abc"
         );
+    }
+
+    /// The other half of the case above. The wake set asks [`node_replaced_since`] of every targeted
+    /// host whatever its group kind, so an external host holding a Node's uid would keep a plan
+    /// woken by that Node's every heartbeat once the Node was replaced, with nothing ever clearing
+    /// it. Without the uid, the question has the same answer on both sides.
+    #[test]
+    fn an_external_host_forgets_the_node_uid_its_success_stamped() {
+        let mut status = status_with(&[
+            ("edge-1", applied("abc", Some("uid-1"))),
+            ("both", applied("abc", Some("uid-2"))),
+            ("node-a", applied("abc", Some("uid-3"))),
+        ]);
+
+        forget_node_uids_of_external_hosts(
+            &[external(&["edge-1", "both"]), managed(&["both", "node-a"])],
+            &mut status,
+        );
+
+        let hosts = status.hosts_status.unwrap();
+        assert_eq!(hosts["edge-1"].applied_node_uid, None);
+        assert_eq!(
+            hosts["edge-1"].last_applied_hash, "abc",
+            "the claim is still true of the external machine"
+        );
+        assert_eq!(
+            hosts["both"].applied_node_uid.as_deref(),
+            Some("uid-2"),
+            "a host a managed-ssh group lists is that Node"
+        );
+        assert_eq!(hosts["node-a"].applied_node_uid.as_deref(), Some("uid-3"));
     }
 
     #[test]
