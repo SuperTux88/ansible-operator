@@ -1842,7 +1842,7 @@ async fn finish_reconcile_tick(
     let (namespace, name) = namespace_and_name(object)?;
     let api = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace);
 
-    // The scan is per providing plan per tick, in memory and with no API call — the same cost the
+    // The scans are per providing plan per tick, in memory and with no API call — the same cost the
     // removal path already pays, and the same answer if it ever matters: measure it against the
     // fleet target before adding state to avoid it.
     let key = object
@@ -1853,11 +1853,7 @@ async fn finish_reconcile_tick(
         resource_status,
         key.as_deref()
             .zip(object.provides_version())
-            .map(|(key, version)| status::ProvidedLabel {
-                version,
-                nodes: node_labels::nodes_carrying(key, &context.nodes).len(),
-                key,
-            }),
+            .map(|(key, version)| status::ProvidedLabel::from_nodes(key, version, &context.nodes)),
         context.node_labels_enabled,
     );
     status::set_dependencies_waiting_condition(resource_status, dependencies);

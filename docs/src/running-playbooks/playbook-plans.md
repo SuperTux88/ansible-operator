@@ -198,15 +198,23 @@ A label is never withdrawn because a run went badly — only when the plan stops
 
 ### Seeing how far the label has reached
 
-A providing plan carries a `ProvidesLabels` condition saying what it publishes and on how many
-Nodes:
+A providing plan carries a `ProvidesLabels` condition saying what it publishes and how far it has
+got:
 
 ```text
-publishing platform.plan.ansible.cloudbending.dev/containerd=1.4.2 on 5 Node(s) for other plans to
-depend on
+publishing platform.plan.ansible.cloudbending.dev/containerd=1.5.0 on 3 of 5 Node(s) for other plans
+to depend on
 ```
 
-That count is this plan's **reach**, and nothing more. It is not a claim about what any dependent
+The first number counts Nodes carrying this exact version; the second counts Nodes carrying the key
+at any version. Right after you bump `spec.provides.version` the Nodes still carry the old value, so
+the condition reads `on 0 of 5` and the first number climbs as the plan re-runs on each host. A
+first number that stays short of the second once the plan has stopped running is a rollout that has
+stalled — look at the per-host outcomes of the Nodes still on the old version. The first number can
+also lag briefly: labels are written after the status, so Nodes relabelled in one reconcile are
+counted in the plan's next one.
+
+These counts are this plan's **reach**, and nothing more. It is not a claim about what any dependent
 can use: a [`NodeAccessPolicy`](../cluster-operators/node-access-policies.md) may leave a dependent
 in another namespace with fewer of those Nodes than the number here. What each dependent is actually
 waiting for is on its own inventory — see
@@ -214,8 +222,8 @@ waiting for is on its own inventory — see
 
 If your cluster administrator has disabled node labels (`nodeLabels.enabled=false` in the chart),
 plans with `provides` still run but publish nothing, and the condition is `False` with reason
-`NodeLabelsDisabled`. Its count then means the opposite: Nodes still carrying the label from before
-the feature was switched off. They keep steering inventories, and removing them is now an
+`NodeLabelsDisabled`. It then gives a single count, which means the opposite: Nodes still carrying
+the label, at any version, from before the feature was switched off. They keep steering inventories, and removing them is now an
 administrator's job.
 
 ## Managing Kubernetes resources
