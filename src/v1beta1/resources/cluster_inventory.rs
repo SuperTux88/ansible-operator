@@ -152,7 +152,8 @@ pub struct DependencyStatus {
     /// whole group. The selector is what needs fixing.
     #[serde(default)]
     pub invalid_value: bool,
-    /// An ordered operator (`Gt`/`Ge`/`Lt`/`Le`) listing anything other than exactly one value.
+    /// An ordered operator (`Gt`/`Ge`/`Lt`/`Le`) listing anything other than exactly one value, or
+    /// an `In` listing none.
     ///
     /// Like `invalidValue` it matches nothing. Reported here rather than rejected at admission,
     /// because the selector type is shared with `NodeAccessPolicy` and sits inside a

@@ -938,8 +938,9 @@ one of three things, and the `ClusterInventory`'s `.status.dependencies` entry f
 - **`invalidValue: true`** — the term's own value is not a version, under an operator that orders
   versions (`Ge`, `Gt`, `Lt`, `Le`). `values: ["latest"]` is the common case. Such a term matches
   **nothing**, so `waiting` beside it is the whole group. Fix the selector.
-- **`malformedTerm: true`** — an ordered operator listing zero or several values. Each of them takes
-  exactly one, and a range is [two terms](./cluster-nodes.md#comparing-versions). This one also
+- **`malformedTerm: true`** — an ordered operator listing zero or several values, or an `In` listing
+  none. An ordered operator takes exactly one, and a range is
+  [two terms](./cluster-nodes.md#comparing-versions). This one also
   matches nothing, and it is not rejected when you apply the inventory, so the flag is the only
   warning you get.
 - **`unparseableHosts: N`** — `N` of the waiting Nodes *do* carry the label, with a value no
