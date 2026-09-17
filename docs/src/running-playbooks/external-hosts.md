@@ -84,6 +84,17 @@ and key Secret; they are mounted at distinct paths and do not collide. You can a
 `StaticInventory` and `ClusterInventory` references in one plan; external hosts and cluster Nodes then
 appear in the same rendered inventory and are applied by the same Job.
 
+**One name, one machine.** Within a plan, an external host may not share a name with a cluster Node
+the same plan reaches. Everything about a host is keyed by its name — its lock, its recorded outcome,
+its connection variables — so a name meaning two machines would give one of them an outcome the other
+earned. The operator refuses such a plan before it runs anything and says which host and which two
+groups; see
+[the plan's inputs cannot be read](./results-and-troubleshooting.md#the-plans-inputs-cannot-be-read).
+The names only have to be unique within one plan. Renaming the external host is not a way out on its
+own, though: the operator renders no `ansible_host` for a `StaticInventory` host and the group's
+`variables` may not supply one, so the name is what Ansible dials. Narrow one of the two inventories
+instead, until the plan no longer reaches both.
+
 ## Dependencies between plans are cluster-Nodes only
 
 The [`spec.provides`](./playbook-plans.md#declaring-what-a-plan-provides) mechanism — a plan
