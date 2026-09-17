@@ -170,17 +170,35 @@ pub fn flatten_hosts(groups: &[ResolvedInventoryGroup]) -> Vec<ResolvedHosts> {
         .collect()
 }
 
-/// The hosts of `groups` that are cluster Nodes, as recorded by [`flatten_hosts`].
+/// What counts as a cluster Node in a flattened record, written once for both shapes the question
+/// is asked in. A group whose `connection` was never recorded is left out, so the answer is "known
+/// to be a Node" rather than "not known not to be".
 ///
-/// For the readers that have a flattened record and not the groups: a plan's own
-/// `status.eligibleHosts` and a run's `Play`. A group whose `connection` was never recorded is left
-/// out, so the answer is "known to be a Node" rather than "not known not to be".
-pub fn node_hosts(groups: &[ResolvedHosts]) -> std::collections::HashSet<&str> {
+/// Lazy, so the caller decides whether a set is worth building.
+fn node_host_names(groups: &[ResolvedHosts]) -> impl Iterator<Item = &str> {
     groups
         .iter()
         .filter(|group| group.connection == Some(HostConnection::ManagedSsh))
         .flat_map(|group| group.hosts.iter().map(String::as_str))
-        .collect()
+}
+
+/// The hosts of `groups` that are cluster Nodes, as recorded by [`flatten_hosts`].
+///
+/// For the readers that have a flattened record and not the groups: a plan's own
+/// `status.eligibleHosts` and a run's `Play`.
+pub fn node_hosts(groups: &[ResolvedHosts]) -> std::collections::HashSet<&str> {
+    node_host_names(groups).collect()
+}
+
+/// [`node_hosts`]' question asked about one host, without building the set.
+///
+/// The same rule, in the shape a caller with a single name needs. `mappers::plan_awaits_node` asks
+/// it of every plan in the store on every kubelet heartbeat, where the whole point of that predicate
+/// is that a settled cluster pays nothing for one — so it must not allocate a set of the plan's
+/// every host to answer a question about one of them, and must be reached only after the cheaper
+/// tests have already failed to rule the host out.
+pub fn is_node_host(groups: &[ResolvedHosts], host: &str) -> bool {
+    node_host_names(groups).any(|recorded| recorded == host)
 }
 
 #[cfg(test)]
@@ -274,5 +292,14 @@ mod tests {
             "the external group and the untracked one are both left out"
         );
         assert!(node_hosts(&[]).is_empty());
+
+        for host in ["node-a", "node-b", "ccu.fritz.box", "node-c", "absent"] {
+            assert_eq!(
+                is_node_host(&groups, host),
+                hosts.contains(host),
+                "{host} must be answered the same way whichever shape asks"
+            );
+        }
+        assert!(!is_node_host(&[], "node-a"));
     }
 }
