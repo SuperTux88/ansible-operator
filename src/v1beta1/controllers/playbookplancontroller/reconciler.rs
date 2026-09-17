@@ -974,7 +974,7 @@ async fn reconcile(
                     // This exit is ahead of inventory resolution, so there is no host set to derive
                     // a label from. The next tick that resolves one publishes what this recorded.
                     target_groups: None,
-                    dependencies: &[],
+                    dependencies: None,
                 },
             )
             .await;
@@ -1206,7 +1206,7 @@ async fn reconcile(
                 // A schedule with no future occurrence stops new runs; it does not make what earlier
                 // runs already applied any less true, so the record is still worth publishing.
                 target_groups: Some(&target_groups),
-                dependencies: &dependencies,
+                dependencies: Some(&dependencies),
             },
         )
         .await;
@@ -1602,7 +1602,7 @@ async fn reconcile(
             retry_prune,
             requeue_after: Some(requeue_after),
             target_groups: Some(&target_groups),
-            dependencies: &dependencies,
+            dependencies: Some(&dependencies),
         },
     )
     .await
@@ -1623,10 +1623,12 @@ struct TickConclusion<'a> {
     /// never resolved an inventory publishes nothing rather than guessing at a host set. Withdrawing
     /// labels needs no host set and happens either way — see [`reconcile_node_labels`].
     target_groups: Option<&'a [ResolvedInventoryGroup]>,
-    /// What the plan's `ClusterInventory`s report waiting on other plans for. Empty on an exit that
-    /// never resolved them, which reports no wait rather than the absence of one: a tick that could
-    /// not read an inventory has nothing to say about what that inventory is waiting for.
-    dependencies: &'a [status::InventoryDependency],
+    /// What the plan's `ClusterInventory`s report waiting on other plans for, or `None` on an exit
+    /// that never resolved them. The two must not be confused: an empty list says the plan depends
+    /// on nothing and removes `DependenciesWaiting`, while a tick that could not read an inventory
+    /// has nothing to say about it, so `None` leaves the condition as the last resolving tick set
+    /// it and only takes the clause off the summary.
+    dependencies: Option<&'a [status::InventoryDependency]>,
 }
 
 /// Brings this plan's Node labels in line with what its record says, after the status write.
@@ -1891,8 +1893,7 @@ async fn finish_reconcile_tick(
             .map(|(key, version)| status::ProvidedLabel::from_nodes(key, version, &context.nodes)),
         context.node_labels_enabled,
     );
-    status::set_dependencies_waiting_condition(resource_status, dependencies);
-    status::append_dependency_summary_clause(resource_status, dependencies);
+    status::restate_dependencies(resource_status, dependencies);
 
     let release_finalizer =
         handover == RunHandover::NothingHeld && resource_status.active_run.is_none();
