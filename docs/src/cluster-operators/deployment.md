@@ -392,7 +392,9 @@ exists; a plan that still exists but has stopped providing is handled by its own
 cluster, so a plan waiting on one of them says why instead of waiting silently. Note that this also
 removes the permission to *remove* labels already written: the sweep above still runs, but it can
 only report what it found — a warning naming the orphaned labels — and you remove them with
-`kubectl label nodes --all <namespace>.plan.ansible.cloudbending.dev/<plan-name>-`.
+`kubectl label nodes -l '<key>' '<key>-'`, where `<key>` is
+`<namespace>.plan.ansible.cloudbending.dev/<plan-name>`. A plan that still exists is not in that
+warning; its `ProvidesLabels` condition counts the Nodes still carrying its label.
 
 Watch for that warning after turning the feature off: until those labels are gone, plans selecting
 on them still treat those Nodes as ready.

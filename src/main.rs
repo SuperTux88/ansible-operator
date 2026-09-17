@@ -111,7 +111,7 @@ async fn run(args: RunArgs) {
         tracing::info!("node labels are enabled: plans with spec.provides will label their Nodes");
     } else {
         tracing::warn!(
-            "node labels are disabled (chart nodeLabels.enabled=false): plans with spec.provides will run but label nothing, and any labels already on Nodes stay there — the operator has no permission to remove them. Clean up with `kubectl label nodes --all <key>-`"
+            "node labels are disabled (chart nodeLabels.enabled=false): plans with spec.provides will run but label nothing, and any labels already on Nodes stay there — the operator has no permission to remove them. Labels of deleted plans are logged below; a plan that still exists counts its own in its ProvidesLabels condition. Remove a label with `kubectl label nodes -l '<key>' '<key>-'`"
         );
     }
 

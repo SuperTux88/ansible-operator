@@ -1750,7 +1750,7 @@ async fn sweep_orphaned_node_labels(
         // condition for an admin to act on, not news.
         if !DISABLED_SWEEP_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             warn!(
-                "{} Node labels belong to PlaybookPlans that no longer exist ({orphans:?}), and node labels are disabled (chart nodeLabels.enabled=false) so the operator cannot remove them. Plans selecting on these labels still treat those Nodes as ready. Remove them with `kubectl label nodes --all <key>-`",
+                "{} Node labels belong to PlaybookPlans that no longer exist ({orphans:?}), and node labels are disabled (chart nodeLabels.enabled=false) so the operator cannot remove them. Plans selecting on these labels still treat those Nodes as ready. Remove each with `kubectl label nodes -l '<key>' '<key>-'`",
                 orphans.len()
             );
         }
