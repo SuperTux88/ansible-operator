@@ -234,7 +234,6 @@ fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &Node, node_name: &str) 
         .eligible_hosts
         .iter()
         .any(|group| group.hosts.iter().any(|host| host == node_name));
-    let is_node = v1beta1::node_hosts(&status.eligible_hosts).contains(node_name);
 
     targeted
         && status
@@ -242,7 +241,8 @@ fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &Node, node_name: &str) 
             .as_ref()
             .and_then(|hosts| hosts.get(node_name))
             .is_none_or(|host| {
-                (is_node && node_recreation::node_replaced_since(host.applied_at, node))
+                (node_recreation::node_replaced_since(host.applied_at, node)
+                    && v1beta1::is_node_host(&status.eligible_hosts, node_name))
                     || (host.last_applied_hash != status.current_hash
                         && !matches!(
                             host.last_outcome,
