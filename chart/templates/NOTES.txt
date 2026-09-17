@@ -1,8 +1,8 @@
 ansible-operator has been installed into namespace "{{ .Release.Namespace }}".
 
-This namespace is now load-bearing, not just a deployment target: the operator uses it to store
-its own SSH certificate authority Secret, and creates per-run Leases and ephemeral managed-ssh
-proxy pods/Secrets/NetworkPolicies here at runtime. Do not point PlaybookPlans/ClusterInventories/
+This namespace is now load-bearing, not just a deployment target: the operator creates per-run
+Leases and ephemeral managed-ssh proxy pods/Secrets/NetworkPolicies here at runtime. (Its SSH
+certificate authority is held in memory only and is never stored in a Secret.) Do not point PlaybookPlans/ClusterInventories/
 StaticInventories at this same namespace — those belong in your own tenant namespaces.
 
 Next steps:
