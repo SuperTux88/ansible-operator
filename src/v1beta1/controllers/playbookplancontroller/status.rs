@@ -281,14 +281,18 @@ pub fn set_dependencies_waiting_condition(
             .take(NAMED_DEPENDENCIES)
             .map(|entry| {
                 let dependency = &entry.dependency;
+                // An empty namespace is a key that decodes to no plan, reported by its spelling.
+                let provider = if dependency.provider_namespace.is_empty() {
+                    dependency.provider_name.clone()
+                } else {
+                    format!(
+                        "{}/{}",
+                        dependency.provider_namespace, dependency.provider_name
+                    )
+                };
                 format!(
-                    "{} host(s) in group '{}' of ClusterInventory '{}' waiting for {}/{} ({})",
-                    dependency.waiting,
-                    dependency.group,
-                    entry.inventory,
-                    dependency.provider_namespace,
-                    dependency.provider_name,
-                    dependency.requirement
+                    "{} host(s) in group '{}' of ClusterInventory '{}' waiting for {provider} ({})",
+                    dependency.waiting, dependency.group, entry.inventory, dependency.requirement
                 )
             })
             .collect();
@@ -903,6 +907,22 @@ mod tests {
                 "{message} should name {expected}"
             );
         }
+    }
+
+    #[test]
+    fn a_key_naming_no_plan_is_named_by_its_spelling_on_the_plan() {
+        let mut status = PlaybookPlanStatus::default();
+        let mut malformed = dependency("workers-ci", "x", 3);
+        malformed.dependency.provider_namespace = String::new();
+        malformed.dependency.provider_name = ".plan.ansible.cloudbending.dev/x".into();
+
+        set_dependencies_waiting_condition(&mut status, &[malformed]);
+
+        let message = status.conditions[0].message.as_deref().unwrap();
+        assert!(
+            message.contains("waiting for .plan.ansible.cloudbending.dev/x (Ge 1.4.0)"),
+            "{message}"
+        );
     }
 
     /// A satisfied dependency is still a dependency: the plan says so rather than going quiet, so a

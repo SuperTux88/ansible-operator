@@ -268,7 +268,10 @@ pub fn waits(
             .map(|&index| {
                 let term = &terms[index];
                 let key = term.key();
-                let (namespace, plan) = decode_key(key).unwrap_or_default();
+                // A key only the substring test accepts, such as `.plan.ansible.cloudbending.dev/x`,
+                // names no plan. It is still a wait, and most likely a typo, so the raw key stands
+                // in for the provider rather than an empty name nobody could trace back.
+                let (namespace, plan) = decode_key(key).unwrap_or(("", key));
                 let (waiting, satisfied, unparseable_hosts) = counts[index];
 
                 DependencyStatus {
@@ -587,6 +590,25 @@ mod tests {
             bounded(&"a".repeat(MAX_FIELD_CHARS)),
             "a".repeat(MAX_FIELD_CHARS)
         );
+    }
+
+    /// A key the substring test accepts but that decodes to no plan is the likeliest typo of all, so
+    /// it is reported under its own spelling rather than as a wait for `/`.
+    #[test]
+    fn a_key_naming_no_plan_is_reported_by_its_spelling() {
+        let key = ".plan.ansible.cloudbending.dev/x";
+        let result = waits(
+            "workers",
+            Some(&selector(
+                &[],
+                vec![expression(key, SelectorOperator::Exists, &[])],
+            )),
+            &[],
+        );
+
+        let dependency = &result.dependencies[0];
+        assert_eq!(dependency.provider_namespace, "");
+        assert_eq!(dependency.provider_name, key);
     }
 
     /// A diagnostic where there is nothing to diagnose is noise, and an inventory without
