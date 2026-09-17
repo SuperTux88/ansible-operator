@@ -158,29 +158,46 @@ prevents an old Job and a new revision from targeting the same host concurrently
 | `Unknown` | The operator could not read a recap for this host — its **own instrumentation** failed, not Ansible. Distinct from `NotReached`. Worth investigating (see below). |
 
 Each host also records `lastAppliedHash` (the hash it last *succeeded* on — this is what drift
-detection compares against), `appliedAt` (when that hash was stamped), `appliedNodeUid` (the uid of
-the Node it was stamped for), `appliedVersion` (the
+detection compares against), `appliedAt` (when the run that stamped that hash was **prepared**),
+`appliedVersion` (the
 [`spec.provides`](./playbook-plans.md#declaring-what-a-plan-provides) version of the revision that
 stamped it, for plans that declare one — this is the value published as that Node's dependency
 label) and `lastTransitionTime` (when the host last recorded any outcome, successful or not).
 
-The four claim fields move together, under exactly the outcome that stamps the hash. So a host
+The three claim fields move together, under exactly the outcome that stamps the hash. So a host
 whose `appliedVersion` lags another's is genuinely still on the older revision, and a host with no
 `appliedVersion` has not succeeded under a revision that declared one — which is why it carries no
 label.
 
-`appliedNodeUid` is what tells a **replaced machine** from the one the record was written about.
+`appliedAt` is also what tells a **replaced machine** from the one the record was written about.
 `.status.hostsStatus` is keyed by host name, and the name is all a rebuilt machine inherits — so a
 Node deleted and re-registered under the same name would otherwise keep its predecessor's
-`lastAppliedHash` and never be applied to again. A Node whose `metadata.uid` differs from
-`appliedNodeUid` has applied nothing: the operator drops the recorded hash, and the next run targets
-it. Its `lastOutcome` is left standing, because what happened to the previous machine is still
-history. The comparison is by identity rather than by time, so clock skew between the operator and
-the API server cannot make a machine look replaced.
+`lastAppliedHash` and never be applied to again. A Node whose `creationTimestamp` is later than
+`appliedAt` has applied nothing — Node names are unique, so a Node standing there that is *older*
+than the run has been there since before it — and the operator drops the recorded hash so the next
+run targets it. Its `lastOutcome` is left standing, because what happened to the previous machine is
+still history.
 
-Records written before this field existed carry no `appliedNodeUid` and are deliberately left alone
+This is why `appliedAt` dates the run's **start** and not its finish: a Node's `creationTimestamp` is
+stamped by the API server, so the claim is too, and the comparison cannot be thrown off by the
+operator's clock differing from the cluster's. A Node created in the *same second* as the run counts
+as the same machine, which is the common case for a Node that joins and is picked up straight away.
+
+The same comparison is made once more when a result is recorded, so a machine replaced while the
+operator was down — between a run finishing and its result being written to the plan — makes no
+claim at all and is simply run again.
+
+**On a scheduled plan, "run again" means the next slot.** That run *succeeded* — it is only the one
+host's claim that was withheld — and a successful run
+[consumes its schedule slot](./scheduling-and-modes.md#one-tick-one-run-per-revision) for the
+revision. So the rebuilt machine stays outdated, and carries no dependency label, until the plan's
+next scheduled tick; on a daily schedule that is a day, and any plan depending on this one waits the
+same. An unscheduled `OneShot` picks it up on the following reconcile instead. Editing the plan
+moves the hash, which clears the slot and runs immediately, if you would rather not wait.
+
+Records written before this field existed carry no `appliedAt` and are deliberately left alone
 until their next success, so upgrading the operator does not re-run every plan in the cluster. Until
-then they also publish no dependency label, because nothing says which machine they describe.
+then they also publish no dependency label, because nothing dates what they describe.
 
 A host's record is removed once it has **both** left the plan's inventory and ceased to exist as a
 Node — a machine that has left the cluster for good. Both halves are required, so a host that leaves
