@@ -1,4 +1,5 @@
-use k8s_openapi::api::batch;
+use k8s_openapi::api::{batch, core::v1::Node};
+use kube::runtime::reflector::Store;
 
 use crate::{
     utils::upsert_condition,
@@ -8,7 +9,7 @@ use crate::{
     },
 };
 
-use super::{execution_evaluator::ExecutionHash, locking::BlockedBy};
+use super::{execution_evaluator::ExecutionHash, locking::BlockedBy, node_recreation};
 
 /// Whether this run's single Job has reached a terminal state — `Complete` or `Failed`.
 pub fn job_finished(job: &batch::v1::Job) -> bool {
@@ -34,10 +35,14 @@ pub fn job_finished(job: &batch::v1::Job) -> bool {
 /// `provides_version` is the version *that run's* record declared, not the plan's current one, and
 /// is `None` for a plan that provides nothing or a run whose record is gone. It is stamped beside
 /// the hash under exactly the same condition, so a host can never carry one without the other.
+///
+/// `nodes` names the machine each succeeded host was: its Node's uid is stamped beside the hash, so
+/// a Node later re-registered under the same name can be told apart (`node_recreation`).
 pub fn apply_terminal_play_status(
     execution_hash: &ExecutionHash,
     provides_version: Option<&str>,
     play_status: &PlayStatus,
+    nodes: &Store<Node>,
     status: &mut PlaybookPlanStatus,
 ) {
     let now = chrono::Local::now().fixed_offset();
@@ -84,11 +89,15 @@ pub fn apply_terminal_play_status(
         let entry = hosts_status.entry(host.clone()).or_default();
         if result.outcome == HostOutcome::Succeeded {
             entry.last_applied_hash = execution_hash.to_string();
-            // Stamped with the hash and only with the hash: it dates the *claim*, so that a Node
-            // registered after it can be recognised as a different machine (`node_recreation`).
-            // Same source as `lastTransitionTime` below, so a replayed recovery dates the claim when
-            // the run finished rather than when it was noticed.
+            // Stamped with the hash and only with the hash: it dates the *claim*. Same source as
+            // `lastTransitionTime` below, so a replayed recovery dates the claim when the run
+            // finished rather than when it was noticed.
             entry.applied_at = play_status.finished_at.or(Some(now));
+            // The machine the claim is about, so that a Node re-registered under this name can be
+            // recognised as a different one (`node_recreation`). Read now rather than at launch:
+            // a Node replaced mid-run takes the run's pod on it down, so the host cannot report
+            // `Succeeded` for a machine it was never on.
+            entry.applied_node_uid = node_recreation::current_node_uid(nodes, host);
             // From the run, so the three halves of one claim — the revision, when it was made and
             // what it provides — are always the same run's. A plan edited while this run was in
             // flight already advertises the next version, and stamping that here would label the
@@ -673,7 +682,30 @@ fn clear_ready_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kube::runtime::{reflector::store::Writer, watcher};
     use std::collections::BTreeMap;
+
+    fn nodes_with_uids(nodes: &[(&str, &str)]) -> Store<Node> {
+        let mut writer = Writer::<Node>::default();
+        let reader = writer.as_reader();
+        writer.apply_watcher_event(&watcher::Event::Init);
+        for (name, uid) in nodes {
+            writer.apply_watcher_event(&watcher::Event::InitApply(Node {
+                metadata: kube::core::ObjectMeta {
+                    name: Some((*name).to_string()),
+                    uid: Some((*uid).to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+        }
+        writer.apply_watcher_event(&watcher::Event::InitDone);
+        reader
+    }
+
+    fn no_nodes() -> Store<Node> {
+        nodes_with_uids(&[])
+    }
 
     fn hash() -> ExecutionHash {
         crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash(
@@ -1093,6 +1125,7 @@ mod tests {
             &hash(),
             Some("1.4.2"),
             &play_status(HostOutcome::Succeeded),
+            &no_nodes(),
             &mut status,
         );
         let hosts = status.hosts_status.clone().unwrap();
@@ -1104,6 +1137,7 @@ mod tests {
             &hash(),
             Some("1.5.0"),
             &play_status(HostOutcome::Failed),
+            &no_nodes(),
             &mut status,
         );
         let hosts = status.hosts_status.unwrap();
@@ -1133,7 +1167,7 @@ mod tests {
             ..Default::default()
         };
 
-        apply_terminal_play_status(&hash(), None, &play_status, &mut status);
+        apply_terminal_play_status(&hash(), None, &play_status, &no_nodes(), &mut status);
 
         let hosts = status.hosts_status.unwrap();
         assert_eq!(hosts["worker-1"].applied_version, None);
@@ -1161,7 +1195,7 @@ mod tests {
             ..Default::default()
         };
 
-        apply_terminal_play_status(&h, None, &play_status, &mut status);
+        apply_terminal_play_status(&h, None, &play_status, &no_nodes(), &mut status);
 
         let running = status
             .conditions
@@ -1217,7 +1251,7 @@ mod tests {
             ..Default::default()
         };
 
-        apply_terminal_play_status(&h, None, &play_status, &mut status);
+        apply_terminal_play_status(&h, None, &play_status, &no_nodes(), &mut status);
 
         let hosts = status.hosts_status.unwrap();
         assert_eq!(hosts["succeeded"].last_applied_hash, h.to_string());
@@ -1242,13 +1276,13 @@ mod tests {
         }
     }
 
-    /// `appliedAt` dates the *claim*, so it moves with `lastAppliedHash` and with nothing else: a
-    /// host that failed keeps the date of the revision it really applied, and one that has never
-    /// succeeded has none at all. The pairing is what lets a replaced machine be told apart from the
-    /// one the record describes (`node_recreation`) — a date that moved on a failure would make a
-    /// rebuilt Node look like it had applied something.
+    /// `appliedAt` and `appliedNodeUid` describe the *claim*, so they move with `lastAppliedHash`
+    /// and with nothing else: a host that failed keeps the date and the machine of the revision it
+    /// really applied, and one that has never succeeded has neither. The pairing is what lets a
+    /// replaced machine be told apart from the one the record describes (`node_recreation`) — a uid
+    /// that moved on a failure would make a rebuilt Node look like it had applied something.
     #[test]
-    fn applied_at_is_stamped_with_the_revision_and_only_with_it() {
+    fn the_claim_is_dated_and_identified_with_the_revision_and_only_with_it() {
         let h = hash();
         let earlier = "2026-01-01T00:00:00Z"
             .parse::<chrono::DateTime<chrono::FixedOffset>>()
@@ -1263,6 +1297,7 @@ mod tests {
                     last_applied_hash: "previous-revision".into(),
                     last_outcome: HostOutcome::Succeeded,
                     applied_at: Some(earlier),
+                    applied_node_uid: Some("uid-failed-previous".into()),
                     ..Default::default()
                 },
             )])),
@@ -1274,17 +1309,23 @@ mod tests {
         };
         let play_status = PlayStatus {
             phase: PlayPhase::Failed,
-            host_count: 3,
+            host_count: 4,
             finished_at: Some(finished),
             hosts: BTreeMap::from([
                 ("succeeded".into(), result(HostOutcome::Succeeded)),
+                ("no-node".into(), result(HostOutcome::Succeeded)),
                 ("failed".into(), result(HostOutcome::Failed)),
                 ("not-reached".into(), result(HostOutcome::NotReached)),
             ]),
             ..Default::default()
         };
+        let nodes = nodes_with_uids(&[
+            ("succeeded", "uid-succeeded"),
+            ("failed", "uid-failed-now"),
+            ("not-reached", "uid-not-reached"),
+        ]);
 
-        apply_terminal_play_status(&h, None, &play_status, &mut status);
+        apply_terminal_play_status(&h, None, &play_status, &nodes, &mut status);
 
         let hosts = status.hosts_status.unwrap();
         assert_eq!(
@@ -1293,14 +1334,28 @@ mod tests {
             "the run's own finish time, so a replayed recovery dates the claim when it happened"
         );
         assert_eq!(
+            hosts["succeeded"].applied_node_uid.as_deref(),
+            Some("uid-succeeded")
+        );
+        assert_eq!(
+            hosts["no-node"].applied_node_uid, None,
+            "a host with no Node in the cache records no machine, which is never a replacement"
+        );
+        assert_eq!(
             hosts["failed"].applied_at,
             Some(earlier),
             "a failure leaves the date of the revision the host really applied"
         );
         assert_eq!(
+            hosts["failed"].applied_node_uid.as_deref(),
+            Some("uid-failed-previous"),
+            "and the machine it applied it to"
+        );
+        assert_eq!(
             hosts["not-reached"].applied_at, None,
             "a host that never succeeded has no claim to date"
         );
+        assert_eq!(hosts["not-reached"].applied_node_uid, None);
     }
 
     #[test]
@@ -1489,7 +1544,7 @@ mod tests {
             ..Default::default()
         };
 
-        apply_terminal_play_status(&hash(), None, &play_status, &mut status);
+        apply_terminal_play_status(&hash(), None, &play_status, &no_nodes(), &mut status);
 
         let ready = status
             .conditions
@@ -1523,6 +1578,7 @@ mod tests {
                 )]),
                 ..Default::default()
             },
+            &no_nodes(),
             &mut status,
         );
         let ready_before = status
@@ -1645,6 +1701,7 @@ mod tests {
                 )]),
                 ..Default::default()
             },
+            &no_nodes(),
             &mut status,
         );
         let finalized = status
@@ -1799,6 +1856,7 @@ mod tests {
                 ]),
                 ..Default::default()
             },
+            &no_nodes(),
             &mut status,
         );
         let ran = status
@@ -1895,7 +1953,7 @@ mod tests {
             )]),
             ..Default::default()
         };
-        apply_terminal_play_status(&hash(), None, &play_status, &mut status);
+        apply_terminal_play_status(&hash(), None, &play_status, &no_nodes(), &mut status);
 
         assert!(!clear_inputs_unavailable_condition(&mut status, 0));
 
