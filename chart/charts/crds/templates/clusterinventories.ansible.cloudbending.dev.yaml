@@ -131,6 +131,9 @@ spec:
                   Empty on an inventory whose selectors name no operator-owned key, which is every inventory
                   that does not express a dependency.
 
+                  Bounded so the status always fits the object size limit: at most 256 entries, with any
+                  string longer than a label key (317 characters) cut and ending in `…`.
+
                   Written without `skip_serializing_if` on purpose. The status goes out as a JSON **merge**
                   patch, which leaves a field it does not mention alone, so a list that has become empty has to
                   be sent as `[]` to actually empty. Omitting it would leave a satisfied dependency reported as

@@ -31,6 +31,31 @@ use crate::v1beta1::controllers::nodeselector::{eval_expression, eval_match_labe
 use crate::v1beta1::controllers::version;
 use crate::v1beta1::{DependencyStatus, NodeSelectorTerm, SelectorExpression, SelectorOperator};
 
+/// The most requirements one inventory publishes in `status.dependencies`.
+///
+/// This and [`MAX_FIELD_CHARS`] are what keep the status under the apiserver's object size limit
+/// whatever the spec says. Every entry copies its group name, key and values out of the spec, once
+/// per requirement, so a spec well within the limit could otherwise produce a status past it. That
+/// write would then fail on every tick, `observedGeneration` would never advance, and every plan
+/// naming the inventory would wait on `InventoryNotSynced` for good, renewing the host Leases of
+/// any run it was holding.
+///
+/// Far above any real inventory. Beyond it the entries are dropped rather than the write, so the
+/// hosts are still published and `waitingHosts` stays exact.
+pub const MAX_DEPENDENCIES: usize = 256;
+
+/// The most characters a string in a `status.dependencies` entry keeps — the length of the longest
+/// valid label key, and therefore of any key a Node could actually carry. A longer string is cut
+/// and ends in `…`.
+pub const MAX_FIELD_CHARS: usize = 317;
+
+fn bounded(text: &str) -> String {
+    match text.char_indices().nth(MAX_FIELD_CHARS) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
 /// What one group's selector is waiting on, and which of its Nodes are waiting.
 #[derive(Debug, Default, PartialEq)]
 pub struct GroupDependencies {
@@ -247,11 +272,11 @@ pub fn waits(
                 let (waiting, satisfied, unparseable_hosts) = counts[index];
 
                 DependencyStatus {
-                    group: group.to_string(),
-                    key: key.to_string(),
-                    provider_namespace: namespace.to_string(),
-                    provider_name: plan.to_string(),
-                    requirement: term.render(),
+                    group: bounded(group),
+                    key: bounded(key),
+                    provider_namespace: bounded(namespace),
+                    provider_name: bounded(plan),
+                    requirement: bounded(&term.render()),
                     waiting,
                     satisfied,
                     invalid_value: term
@@ -521,6 +546,46 @@ mod tests {
         assert_eq!(
             dependency.unparseable_hosts, 1,
             "a Node that simply has no label carries no unparseable value"
+        );
+    }
+
+    /// The spec bounds none of these strings, and every requirement copies them, so the status
+    /// cuts them instead of growing past the object size limit (see [`MAX_DEPENDENCIES`]).
+    #[test]
+    fn long_strings_are_cut_in_the_status() {
+        let key = containerd();
+        let many: Vec<String> = (0..200).map(|index| format!("1.{index}.0")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let group = "g".repeat(1000);
+
+        let result = waits(
+            &group,
+            Some(&selector(
+                &[],
+                vec![expression(&key, SelectorOperator::In, &many)],
+            )),
+            &[],
+        );
+
+        let dependency = &result.dependencies[0];
+        assert_eq!(dependency.requirement.chars().count(), MAX_FIELD_CHARS + 1);
+        assert!(dependency.requirement.starts_with("In [1.0.0, 1.1.0, "));
+        assert!(dependency.requirement.ends_with('…'));
+        assert_eq!(dependency.group.chars().count(), MAX_FIELD_CHARS + 1);
+        assert_eq!(
+            dependency.key, key,
+            "a key short enough to be a label is kept whole"
+        );
+    }
+
+    #[test]
+    fn a_string_is_cut_on_a_character_boundary() {
+        let text = "ä".repeat(MAX_FIELD_CHARS + 5);
+        assert_eq!(bounded(&text), format!("{}…", "ä".repeat(MAX_FIELD_CHARS)));
+        assert_eq!(bounded("short"), "short");
+        assert_eq!(
+            bounded(&"a".repeat(MAX_FIELD_CHARS)),
+            "a".repeat(MAX_FIELD_CHARS)
         );
     }
 
