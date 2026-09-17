@@ -110,6 +110,48 @@ pub fn nodes_carrying(key: &str, nodes: &Store<Node>) -> Vec<String> {
     carrying
 }
 
+/// How far a plan's key has got: the Nodes carrying it at all, and those carrying `version` exactly.
+///
+/// Two numbers because one cannot answer the question. A version bump leaves every Node on the
+/// previous value until its host runs again, so a count of the key alone reads a rollout that has
+/// not started as one that has finished; a count of the version alone loses the leftovers an admin
+/// has to clean up where the feature is switched off.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LabelReach {
+    /// Nodes carrying the key at exactly the declared version — how far this rollout has got.
+    pub at_version: usize,
+    /// Nodes carrying the key at any version — the plan's whole reach.
+    pub carrying: usize,
+}
+
+/// Counts both halves of [`LabelReach`] in one walk of the Node cache.
+///
+/// One pass rather than two, and no allocation: this runs for every providing plan on every tick,
+/// and the counts are only ever read together.
+pub fn label_reach(key: &str, version: &str, nodes: &Store<Node>) -> LabelReach {
+    let mut reach = LabelReach {
+        at_version: 0,
+        carrying: 0,
+    };
+
+    for node in nodes.state().iter() {
+        let Some(value) = node
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(key))
+        else {
+            continue;
+        };
+        reach.carrying += 1;
+        if value == version {
+            reach.at_version += 1;
+        }
+    }
+
+    reach
+}
+
 /// The Nodes carrying `key` according to the API server rather than the cache.
 ///
 /// For the paths that run where no cache answer can be trusted — chiefly a plan's deletion, which
@@ -643,6 +685,39 @@ mod tests {
         assert!(
             nodes_carrying("team-b.plan.ansible.cloudbending.dev/other", &nodes).is_empty(),
             "another plan's key is not this plan's to remove"
+        );
+    }
+
+    /// A version bump leaves every Node carrying the key at the old value until each host has run
+    /// again, so only an exact match counts as reached — while the reach itself does not move.
+    #[test]
+    fn only_nodes_carrying_the_exact_version_count_as_reached() {
+        let nodes = store(vec![
+            node("node-a", "uid-1", &[(KEY, "1.4.2")]),
+            node("node-b", "uid-1", &[(KEY, "1.5.0")]),
+            node("node-c", "uid-1", &[(KEY, "1.5.0-rc1")]),
+            node("node-d", "uid-1", &[("other", "1.5.0")]),
+            node("node-e", "uid-1", &[]),
+        ]);
+
+        for (version, at_version) in [("1.5.0", 1), ("1.4.2", 1), ("2.0.0", 0)] {
+            assert_eq!(
+                label_reach(KEY, version, &nodes),
+                LabelReach {
+                    at_version,
+                    carrying: 3
+                },
+                "at {version}"
+            );
+        }
+
+        assert_eq!(
+            label_reach("team-b.plan.ansible.cloudbending.dev/other", "1.0", &nodes),
+            LabelReach {
+                at_version: 0,
+                carrying: 0
+            },
+            "another plan's key is not this plan's reach"
         );
     }
 

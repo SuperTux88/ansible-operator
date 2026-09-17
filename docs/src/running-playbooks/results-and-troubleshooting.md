@@ -83,9 +83,10 @@ printer columns:
 - **`ProvidesLabels`** — only on a plan that declares
   [`spec.provides`](./playbook-plans.md#declaring-what-a-plan-provides), saying whether its claim is
   actually reaching Nodes and how far. `True`/`PublishingNodeLabels` is the normal state, and its
-  message names the key, the version and the number of Nodes carrying it —
-  `publishing platform.plan.ansible.cloudbending.dev/containerd=1.4.2 on 5 Node(s) …`. That count is
-  the plan's own **reach**, not a claim about any dependent's inventory, which a
+  message names the key, the version, how many Nodes carry that exact version and how many carry the
+  key at all — `publishing platform.plan.ansible.cloudbending.dev/containerd=1.5.0 on 3 of 5 Node(s)
+  …`. The gap between the two is the part of a version rollout still to go. Both counts are the
+  plan's own **reach**, not a claim about any dependent's inventory, which a
   [`NodeAccessPolicy`](../cluster-operators/node-access-policies.md) may narrow further.
   `False`/`NodeLabelsDisabled` means the cluster administrator turned node labels off
   (`nodeLabels.enabled=false`); the plan still runs, but it publishes nothing and every plan
@@ -954,7 +955,8 @@ never claims one exists or does not; it prints the name it decoded, and `nosuch/
 
 If nothing is flagged and `waiting` still does not move, the provider is not converging those hosts.
 Look at the provider plan named in `providerNamespace`/`providerName`: its `ProvidesLabels`
-condition ([above](#conditions)) says whether it is publishing at all, and its own per-host outcomes
+condition ([above](#conditions)) says whether it is publishing at all and how many Nodes have the
+version it declares, and its own per-host outcomes
 say whether it has succeeded there. Remember that a `OneShot` provider whose
 [attempt budget](./scheduling-and-modes.md#retries) is spent will not pick up newly eligible hosts
 until its inputs change.

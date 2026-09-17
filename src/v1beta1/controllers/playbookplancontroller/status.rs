@@ -9,7 +9,7 @@ use crate::{
     },
 };
 
-use super::{execution_evaluator::ExecutionHash, locking::BlockedBy, node_recreation};
+use super::{execution_evaluator::ExecutionHash, locking::BlockedBy, node_labels, node_recreation};
 
 /// Whether this run's single Job has reached a terminal state — `Complete` or `Failed`.
 pub fn job_finished(job: &batch::v1::Job) -> bool {
@@ -130,11 +130,29 @@ pub struct ProvidedLabel<'a> {
     pub key: &'a str,
     /// The version the plan's spec declares — what a converged host's label becomes.
     pub version: &'a str,
+    /// How many Nodes in the cluster carry the key at exactly `version` — how far the current
+    /// version's rollout has got.
+    pub at_version: usize,
     /// How many Nodes in the cluster carry the key, at whatever version.
     ///
     /// The plan's *reach*, not a claim about any dependent's inventory: a `NodeAccessPolicy` may
-    /// narrow what a given dependent can actually use.
+    /// narrow what a given dependent can actually use. Kept apart from `at_version` because with
+    /// node labels disabled this is the number that matters: leftovers an admin has to remove,
+    /// whatever version they carry.
     pub nodes: usize,
+}
+
+impl<'a> ProvidedLabel<'a> {
+    /// Reads both counts for `key` off the Node cache, in one pass.
+    pub fn from_nodes(key: &'a str, version: &'a str, nodes: &Store<Node>) -> Self {
+        let reach = node_labels::label_reach(key, version, nodes);
+        Self {
+            key,
+            version,
+            at_version: reach.at_version,
+            nodes: reach.carrying,
+        }
+    }
 }
 
 /// Reports whether this plan's `spec.provides` claim is actually reaching the Nodes, and how far.
@@ -142,9 +160,11 @@ pub struct ProvidedLabel<'a> {
 /// Only present on a plan that provides something — for every other plan the question is meaningless
 /// and a condition answering it would be noise, so dropping `provides` drops the condition too.
 ///
-/// It names the key and the count so that both ends of a dependency are readable on their own
+/// It names the key and the counts so that both ends of a dependency are readable on their own
 /// objects. A dependent says it is waiting for `platform/containerd-config`; the provider says what
-/// it publishes and on how many Nodes, and the two numbers together are the rollout. Without it,
+/// it publishes, on how many Nodes that version has landed, and how many carry the key at all. A
+/// version bump leaves every Node on the old value until its host runs again, so only the first
+/// count moves during a rollout. Without it,
 /// answering "is the provider actually doing anything?" means going to the Nodes.
 ///
 /// The `False` case is the one this exists for. With the chart's `nodeLabels.enabled` turned off the
@@ -168,6 +188,7 @@ pub fn set_provides_labels_condition(
     let ProvidedLabel {
         key,
         version,
+        at_version,
         nodes,
     } = provided;
     let now = chrono::Local::now().fixed_offset();
@@ -177,7 +198,7 @@ pub fn set_provides_labels_condition(
             status: "True".into(),
             reason: Some("PublishingNodeLabels".into()),
             message: Some(format!(
-                "publishing {key}={version} on {nodes} Node(s) for other plans to depend on"
+                "publishing {key}={version} on {at_version} of {nodes} Node(s) for other plans to depend on"
             )),
             last_transition_time: Some(now),
         }
@@ -714,10 +735,11 @@ mod tests {
         )
     }
 
-    fn provided(nodes: usize) -> ProvidedLabel<'static> {
+    fn provided(at_version: usize, nodes: usize) -> ProvidedLabel<'static> {
         ProvidedLabel {
             key: "platform.plan.ansible.cloudbending.dev/containerd",
             version: "1.4.2",
+            at_version,
             nodes,
         }
     }
@@ -732,7 +754,7 @@ mod tests {
     fn a_providing_plan_says_whether_its_labels_are_reaching_nodes() {
         let mut status = PlaybookPlanStatus::default();
 
-        set_provides_labels_condition(&mut status, Some(provided(5)), true);
+        set_provides_labels_condition(&mut status, Some(provided(3, 5)), true);
         let condition = status
             .conditions
             .iter()
@@ -744,9 +766,9 @@ mod tests {
             message.contains("platform.plan.ansible.cloudbending.dev/containerd=1.4.2"),
             "{message}"
         );
-        assert!(message.contains("5 Node(s)"), "{message}");
+        assert!(message.contains("on 3 of 5 Node(s)"), "{message}");
 
-        set_provides_labels_condition(&mut status, Some(provided(5)), false);
+        set_provides_labels_condition(&mut status, Some(provided(3, 5)), false);
         let condition = status
             .conditions
             .iter()
@@ -759,7 +781,54 @@ mod tests {
             message.contains("platform.plan.ansible.cloudbending.dev/containerd"),
             "the key an admin has to clean up by hand: {message}"
         );
-        assert!(message.contains("5 Node(s) still carry it"), "{message}");
+        assert!(
+            message.contains("5 Node(s) still carry it"),
+            "leftovers count whatever version they carry: {message}"
+        );
+    }
+
+    /// A version bump is the normal way to re-drive a provider, and from the moment it is applied
+    /// every Node still carries the key at the old value. The condition must read as a rollout that
+    /// has not started, not as one that has finished.
+    #[test]
+    fn the_rollout_count_only_includes_nodes_on_the_declared_version() {
+        let key = "platform.plan.ansible.cloudbending.dev/containerd";
+        let mut writer = Writer::<Node>::default();
+        let nodes = writer.as_reader();
+        writer.apply_watcher_event(&watcher::Event::Init);
+        for (name, value) in [
+            ("node-a", "1.4.2"),
+            ("node-b", "1.4.2"),
+            ("node-c", "1.5.0"),
+        ] {
+            writer.apply_watcher_event(&watcher::Event::InitApply(Node {
+                metadata: kube::core::ObjectMeta {
+                    name: Some(name.to_string()),
+                    labels: Some(BTreeMap::from([(key.to_string(), value.to_string())])),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+        }
+        writer.apply_watcher_event(&watcher::Event::InitDone);
+        let mut status = PlaybookPlanStatus::default();
+
+        set_provides_labels_condition(
+            &mut status,
+            Some(ProvidedLabel::from_nodes(key, "1.5.0", &nodes)),
+            true,
+        );
+
+        let message = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "ProvidesLabels")
+            .and_then(|condition| condition.message.as_deref())
+            .unwrap();
+        assert!(
+            message.contains(&format!("{key}=1.5.0 on 1 of 3 Node(s)")),
+            "{message}"
+        );
     }
 
     /// A plan that provides nothing is not answering this question, so it must not carry a stale
@@ -767,7 +836,7 @@ mod tests {
     #[test]
     fn a_plan_that_stops_providing_drops_the_condition() {
         let mut status = PlaybookPlanStatus::default();
-        set_provides_labels_condition(&mut status, Some(provided(5)), true);
+        set_provides_labels_condition(&mut status, Some(provided(5, 5)), true);
         set_running_condition(&mut status);
 
         set_provides_labels_condition(&mut status, None, true);
