@@ -45,11 +45,12 @@ whole point of the design. If a change would weaken one, stop and surface it; do
   cleanup's label-scoped `delete_collection` cannot sweep the ansible Job pod (which lacks
   `_HOST`).
 - **INV-8 — The operator writes only its own Node labels.** Every Node write is confined to
-  `<namespace>.plan.ansible.cloudbending.dev/<plan>` keys built by `node_labels::label_key` from the
+  `<namespace>.plan.ansible.cloudbending.dev/<plan>` keys built by `dependency_keys::label_key` from the
   plan's own namespace and name — never a tenant-supplied key, never a Node's spec or annotations.
   A tenant-chosen key would let a plan label its way past a `NodeAccessPolicy` ceiling (T-ESC-3).
   The chart's `ValidatingAdmissionPolicy` enforces the same bound at the API server, and a test pins
-  its CEL matcher to `node_labels::KEY_DOMAIN`.
+  its CEL matcher to `dependency_keys::KEY_DOMAIN`
+  (`dependency_keys::tests::the_admission_policy_matches_the_key_this_module_builds`).
 
 Two recent load-bearing fixes that look like "cleanups" but MUST NOT be reverted:
 - **`StrictModes no` in `render_sshd_config`** — required so sshd will read the
@@ -159,7 +160,9 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    one `helm upgrade` that changes an inventory and a plan together would otherwise launch against
    the host set the edit replaced.
 5. **Execution hash.** `ExecutionHash` over the playbook text + contents of every referenced
-   Secret (variables + files), order-insensitive; deliberately **excludes** the workspace
+   Secret (variables + files), order-insensitive, with `spec.provides.version` folded in
+   (`fold_provides_version`) — so bumping a provided version re-runs the plan on every host, and a
+   plan without `provides` hashes as before; deliberately **excludes** the workspace
    Secret (its content — proxy IPs — legitimately changes each run). Hash change ⇒
    `last_run_number` reset to 0, `last_triggered_run` cleared (so an edit can start inside the
    window its predecessor used, and a revert is just another change), and `Phase::Pending`
