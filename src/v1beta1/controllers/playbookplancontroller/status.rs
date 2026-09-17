@@ -317,6 +317,22 @@ pub fn set_dependencies_waiting_condition(
     upsert_condition(&mut status.conditions, condition);
 }
 
+/// Restates what the plan is waiting on, from `dependencies` as this tick resolved them.
+///
+/// `None` is a tick that never resolved the inventories. It says nothing about them, so the
+/// `DependenciesWaiting` condition keeps what the last resolving tick set: removing it would claim
+/// the plan depends on nothing. The summary clause is still stripped, because the summary it was
+/// appended to may have been rewritten since.
+pub fn restate_dependencies(
+    status: &mut PlaybookPlanStatus,
+    dependencies: Option<&[InventoryDependency]>,
+) {
+    if let Some(dependencies) = dependencies {
+        set_dependencies_waiting_condition(status, dependencies);
+    }
+    append_dependency_summary_clause(status, dependencies.unwrap_or_default());
+}
+
 /// How every dependency clause ends, and the only thing that identifies one already on a summary.
 ///
 /// The clause is always the last thing appended — `apply_run_diagnostic`'s runs earlier in the tick
@@ -933,6 +949,40 @@ mod tests {
         assert!(
             message.contains("waiting for .plan.ansible.cloudbending.dev/x (Ge 1.4.0)"),
             "{message}"
+        );
+    }
+
+    /// A tick that could not resolve the inventories, such as the invalid-schedule exit, must not
+    /// report the plan as depending on nothing.
+    #[test]
+    fn a_tick_without_resolved_dependencies_keeps_the_condition() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("5/5 up-to-date".into()),
+            ..Default::default()
+        };
+        restate_dependencies(
+            &mut status,
+            Some(&[dependency("workers-ci", "containerd", 3)]),
+        );
+
+        status.summary = Some("invalid schedule (3 host(s) waiting for dependencies)".into());
+        restate_dependencies(&mut status, None);
+
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "DependenciesWaiting")
+            .expect("the last resolving tick's condition stands");
+        assert_eq!(condition.status, "True");
+        assert_eq!(status.summary.as_deref(), Some("invalid schedule"));
+
+        restate_dependencies(&mut status, Some(&[]));
+        assert!(
+            status
+                .conditions
+                .iter()
+                .all(|condition| condition.type_ != "DependenciesWaiting"),
+            "a resolved empty list does mean no dependency"
         );
     }
 
