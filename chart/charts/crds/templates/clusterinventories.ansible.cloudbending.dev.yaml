@@ -90,7 +90,6 @@ spec:
                   required:
                   - name
                   type: object
-                  x-kubernetes-preserve-unknown-fields: true
                 type: array
               tolerations:
                 description: |-
@@ -172,8 +171,8 @@ spec:
                         an `In` listing none.
 
                         Like `invalidValue` it matches nothing. Reported here rather than rejected at admission,
-                        because the selector type is shared with `NodeAccessPolicy` and sits inside a
-                        preserve-unknown-fields item where a CEL rule cannot see it.
+                        because the selector type is shared with `NodeAccessPolicy` and has no validation rules of
+                        its own.
                       type: boolean
                     providerName:
                       description: The name of the `PlaybookPlan` that publishes `key`, decoded from the key itself.
