@@ -98,7 +98,11 @@ fn status_for(
                 .map(|node| node.name().expect("name is set").to_string())
                 .collect();
 
-            v1beta1::ResolvedHosts { name, hosts }
+            v1beta1::ResolvedHosts {
+                name,
+                hosts,
+                ..Default::default()
+            }
         })
         .collect();
 

@@ -127,6 +127,7 @@ mod tests {
             eligible_hosts: vec![ResolvedHosts {
                 name: "workers".into(),
                 hosts: eligible.iter().map(|host| (*host).to_string()).collect(),
+                ..Default::default()
             }],
             hosts_status: Some(
                 recorded

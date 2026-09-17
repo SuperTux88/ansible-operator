@@ -171,6 +171,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: "controlplanes".into(),
                 hosts: vec!["worker-1".into()],
+                ..Default::default()
             },
             tolerations: None,
             variables: None,
@@ -214,6 +215,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: "controlplanes".into(),
                 hosts: vec!["worker-1".into(), "worker-9".into()],
+                ..Default::default()
             },
             tolerations: None,
             variables: None,
@@ -252,6 +254,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: "external-devices".into(),
                 hosts: vec!["ccu.fritz.box".into()],
+                ..Default::default()
             },
             static_inventory_name: "ccu".into(),
             config: SshConfig {
@@ -291,6 +294,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: "controlplanes".into(),
                 hosts: vec!["worker-1".into()],
+                ..Default::default()
             },
             tolerations: None,
             variables: None,
@@ -299,6 +303,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: "external-devices".into(),
                 hosts: vec!["ccu.fritz.box".into()],
+                ..Default::default()
             },
             static_inventory_name: "ccu".into(),
             config: SshConfig {
@@ -340,6 +345,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: "controlplanes".into(),
                 hosts: vec!["worker-1".into()],
+                ..Default::default()
             },
             tolerations: None,
             variables: Some(GenericMap(serde_json::json!({
@@ -380,6 +386,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: "controlplanes".into(),
                 hosts: vec!["worker-1".into()],
+                ..Default::default()
             },
             tolerations: None,
             variables,
@@ -419,6 +426,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: "controlplanes".into(),
                 hosts: vec!["worker-9".into()],
+                ..Default::default()
             },
             tolerations: None,
             variables: None,
@@ -427,6 +435,7 @@ mod tests {
             hosts: ResolvedHosts {
                 name: "external-devices".into(),
                 hosts: vec!["ccu.fritz.box".into()],
+                ..Default::default()
             },
             static_inventory_name: "ccu".into(),
             config: SshConfig {

@@ -1947,6 +1947,7 @@ mod tests {
             eligible_hosts: vec![crate::v1beta1::ResolvedHosts {
                 name: "workers".into(),
                 hosts: hosts.iter().map(|(host, _)| (*host).into()).collect(),
+                ..Default::default()
             }],
             hosts_status: Some(
                 hosts

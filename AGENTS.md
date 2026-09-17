@@ -83,7 +83,7 @@ src/v1beta1/
       dependencies.rs                pure: splits a group's selector into its terms and counts, per positive requirement on an operator-owned key (`dependency_keys`), how many of the group's Nodes it is holding back. "The group's Nodes" are the ones passing every term that is *not* a dependency — that is what separates "not ready yet" from "not this group's Node", which is the whole diagnostic. Judges every term with `nodeselector`'s own evaluator; a second implementation would let the reported waits disagree with the hosts the inventory resolves to
     nodeaccesspolicycontroller/      writes NodeAccessPolicyStatus (matched namespaces / allowed nodes) for observability; watches ns + nodes
     selector_trigger.rs              label_changes: the set-valued controllers' watch trigger — ticks only on a label change, an appearance or a disappearance; must stay in lockstep with what nodeselector.rs reads. Also owns RECOMPUTE_DEBOUNCE, which both controllers pass to `Controller::with_config`: every tick fans out through `reconcile_all_on` to *every* object, each listing the whole Node set, so a plan labelling a fleet one Node at a time (`node_labels.rs`) would otherwise buy `writes × objects` full recomputes. Keep it short — it delays every trigger of those controllers, and an inventory slow to publish `observedGeneration` holds the plans that reference it
-    ansible_inventory.rs             ResolvedInventoryGroup (ManagedSsh | Ssh) + ResolvedHosts; AnsibleInventory trait (get_hosts); distinct_hosts/_count (every host-population count, in both controllers)
+    ansible_inventory.rs             ResolvedInventoryGroup (ManagedSsh | Ssh) + ResolvedHosts; AnsibleInventory trait (get_hosts); distinct_hosts/_count (every host-population count, in both controllers); `flatten_hosts` is the **only** writer of `ResolvedHosts.connection`, which carries the group's variant into the records that outlive it (`status.eligibleHosts`, `PlaySpec.inventory`) so a reader can still ask whether a host is a cluster Node — `node_hosts` is that question
     nodeselector.rs                  node_matches / selector_matches / selector_matches_fail_closed (INV-1)
     dependency_keys.rs               the `<namespace>.plan.ansible.cloudbending.dev/<plan>` Node label key, and its inverse. Shared vocabulary, not a detail of either side: the plan controller writes the key (`node_labels.rs`), the inventory controller recognises it in a tenant's selector to tell a dependency on another plan from an ordinary label term. One end recognising a key the other would not produce is a dependency nobody is told about (INV-8)
     version.rs                       parses a label or selector value as a version for the ordered operators (`Gt`/`Ge`/`Lt`/`Le`), which Kubernetes' own integer-only `Gt`/`Lt` cannot express. Lenient on the way in (optional `v`, one to three components, `_` build metadata as Helm writes it), SemVer on the way out, and `None` for anything else — an unanswerable comparison is a non-match, so a dependency selector waits instead of running
@@ -430,7 +430,11 @@ fall on the floor. It asks the *plan* as well as the host, because a wake the pl
 costs exactly as much as one it can: a suspended plan, a `OneShot` plan out of attempts, and every
 `Recurring` plan are all refused. `Recurring` is refused outright because only the clock starts its
 runs — the readiness gate it would be released by is `OneShot`-only — and it is the one mode with no
-budget to bound the wakes, so one stuck host would otherwise wake it per heartbeat forever.
+budget to bound the wakes, so one stuck host would otherwise wake it per heartbeat forever. The
+replacement half of that predicate is asked **only of hosts `eligibleHosts` records as cluster
+Nodes** (`ResolvedHosts.connection`): a `StaticInventory` host may share a name with a Node the plan
+never targets, and `node_recreation` rightly refuses to act on it — so asking would leave a wake
+condition every heartbeat re-triggers and no reconcile can clear.
 
 The plan reflector's own task is driven **after** that wait, because it carries the two things
 `reconcile` never sees. A **deletion**: `Controller::new` decodes its primary watch with

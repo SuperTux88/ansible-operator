@@ -206,9 +206,13 @@ pub fn node_to_playbookplans(
 /// disagreeing about one host: without it a replaced machine is ignored until the plan's next
 /// hourly requeue, having been declared outdated by the very tick that would have run on it.
 ///
-/// `eligibleHosts` does not say which kind of group a host came from, so this asks the question of
-/// external hosts too, where the start gate never would. It agrees anyway because such a record
-/// carries no Node uid to compare (`node_recreation::forget_node_uids_of_external_hosts`).
+/// It is asked **only of hosts `eligibleHosts` records as cluster Nodes**, which is what keeps this
+/// agreeing with the start gate. A `StaticInventory` host may share a name with a Node the plan
+/// never targets, and a Node object says nothing about that machine — so asking would report a
+/// replacement the reconcile rightly refuses to act on (`node_recreation` only touches managed-ssh
+/// hosts), leaving a wake condition that every kubelet heartbeat re-triggers and nothing can ever
+/// clear. A record written before the connection was tracked answers "not a Node" and is simply not
+/// asked, which costs at most one delayed wake-up on the tick after an upgrade.
 fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &Node, node_name: &str) -> bool {
     if plan.spec.suspend || !matches!(plan.spec.mode, ExecutionMode::OneShot) {
         return false;
@@ -230,6 +234,7 @@ fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &Node, node_name: &str) 
         .eligible_hosts
         .iter()
         .any(|group| group.hosts.iter().any(|host| host == node_name));
+    let is_node = v1beta1::node_hosts(&status.eligible_hosts).contains(node_name);
 
     targeted
         && status
@@ -237,7 +242,8 @@ fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &Node, node_name: &str) 
             .as_ref()
             .and_then(|hosts| hosts.get(node_name))
             .is_none_or(|host| {
-                node_recreation::node_replaced_since(host.applied_node_uid.as_deref(), node)
+                (is_node
+                    && node_recreation::node_replaced_since(host.applied_node_uid.as_deref(), node))
                     || (host.last_applied_hash != status.current_hash
                         && !matches!(
                             host.last_outcome,
@@ -553,6 +559,15 @@ mod tests {
         vec![crate::v1beta1::ResolvedHosts {
             name: "workers".into(),
             hosts: hosts.iter().map(|host| host.to_string()).collect(),
+            connection: Some(crate::v1beta1::HostConnection::ManagedSsh),
+        }]
+    }
+
+    fn eligible_external(hosts: &[&str]) -> Vec<crate::v1beta1::ResolvedHosts> {
+        vec![crate::v1beta1::ResolvedHosts {
+            name: "edge".into(),
+            hosts: hosts.iter().map(|host| host.to_string()).collect(),
+            connection: Some(crate::v1beta1::HostConnection::Ssh),
         }]
     }
 
@@ -594,6 +609,34 @@ mod tests {
             "a Node with the recorded uid is that same machine"
         );
         assert!(plan_awaits_node(&plan, &node_with_uid("uid-2"), "node-a"));
+    }
+
+    /// The same record, reached as an external machine. A Node of that name is a different machine
+    /// the plan never targets, so its replacement says nothing about this host — and the reconcile
+    /// this would wake refuses to clear the claim (`node_recreation` only touches managed-ssh
+    /// hosts), so every kubelet heartbeat of that Node would buy a full reconcile that can never
+    /// change the answer.
+    #[test]
+    fn an_external_host_is_not_woken_by_a_node_that_shares_its_name() {
+        let mut converged = host("abc", HostOutcome::Succeeded);
+        converged.applied_node_uid = Some("uid-1".into());
+        let mut plan = plan_awaiting("edge-1", converged);
+        plan.status.as_mut().unwrap().eligible_hosts = eligible_external(&["edge-1"]);
+
+        assert!(!plan_awaits_node(&plan, &node_with_uid("uid-2"), "edge-1"));
+    }
+
+    /// A record written before the connection was tracked. Answering "not a Node" costs at most one
+    /// delayed wake-up after an upgrade; answering "Node" for an external host costs a wake nothing
+    /// can ever clear.
+    #[test]
+    fn a_host_whose_connection_was_never_recorded_is_not_treated_as_a_node() {
+        let mut converged = host("abc", HostOutcome::Succeeded);
+        converged.applied_node_uid = Some("uid-1".into());
+        let mut plan = plan_awaiting("node-a", converged);
+        plan.status.as_mut().unwrap().eligible_hosts[0].connection = None;
+
+        assert!(!plan_awaits_node(&plan, &node_with_uid("uid-2"), "node-a"));
     }
 
     #[test]

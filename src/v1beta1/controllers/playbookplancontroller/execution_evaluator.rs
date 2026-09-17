@@ -202,6 +202,7 @@ mod tests {
             eligible_hosts: vec![ResolvedHosts {
                 name: "test-inventory".into(),
                 hosts: vec!["host-1".into(), "host-2".into(), "host-3".into()],
+                ..Default::default()
             }],
             hosts_status: None,
             ..Default::default()
@@ -229,6 +230,7 @@ mod tests {
             eligible_hosts: vec![ResolvedHosts {
                 name: "test-inventory".into(),
                 hosts: vec!["host-1".into(), "host-2".into(), "host-3".into()],
+                ..Default::default()
             }],
             hosts_status: Some(BTreeMap::from_iter(vec![
                 (
@@ -420,10 +422,12 @@ mod tests {
             ResolvedHosts {
                 name: "workers".into(),
                 hosts: vec!["node-a".into(), "node-b".into()],
+                ..Default::default()
             },
             ResolvedHosts {
                 name: "storage".into(),
                 hosts: vec!["node-b".into(), "node-c".into()],
+                ..Default::default()
             },
         ];
         assert_eq!(
