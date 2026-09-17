@@ -1051,6 +1051,7 @@ async fn reconcile(
              last applied to them, so they are outdated again"
         );
     }
+    node_recreation::forget_node_uids_of_external_hosts(&target_groups, &mut resource_status);
 
     // Housekeeping on the same record, and the only thing that ever removes from it: rows for hosts
     // that have both left the inventory and stopped existing as Nodes. It needs a write of its own —

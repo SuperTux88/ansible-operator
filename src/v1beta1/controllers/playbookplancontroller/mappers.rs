@@ -205,6 +205,10 @@ pub fn node_to_playbookplans(
 /// claim (`node_recreation`). Asking here too is what keeps the wake set and the start gate from
 /// disagreeing about one host: without it a replaced machine is ignored until the plan's next
 /// hourly requeue, having been declared outdated by the very tick that would have run on it.
+///
+/// `eligibleHosts` does not say which kind of group a host came from, so this asks the question of
+/// external hosts too, where the start gate never would. It agrees anyway because such a record
+/// carries no Node uid to compare (`node_recreation::forget_node_uids_of_external_hosts`).
 fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &Node, node_name: &str) -> bool {
     if plan.spec.suspend || !matches!(plan.spec.mode, ExecutionMode::OneShot) {
         return false;

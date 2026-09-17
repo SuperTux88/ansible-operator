@@ -555,6 +555,9 @@ pub struct HostStatus {
     /// before this field existed. Such a record is never treated as a replacement, or the upgrade
     /// that introduced the field would re-run every plan across the fleet, and it is never labelled
     /// either; the next success fills it in.
+    ///
+    /// Absent, too, for a host the plan reaches only through a `StaticInventory`: a Node that
+    /// happens to share its name is not that machine.
     #[serde(default)]
     pub applied_node_uid: Option<String>,
     /// The `spec.provides` version of the revision that stamped `lastAppliedHash` — moved by exactly
