@@ -951,7 +951,9 @@ one of three things, and the `ClusterInventory`'s `.status.dependencies` entry f
 A wait, a mistyped key and a provider that has been deleted all read the same way — as waiting for
 the plan the key names — and that is deliberate. The operator does not look the provider up, so it
 never claims one exists or does not; it prints the name it decoded, and `nosuch/typo` sitting in
-`providerName` is the mistake staring back at you.
+`providerName` is the mistake staring back at you. A key too malformed to name any plan at all,
+such as `.plan.ansible.cloudbending.dev/x`, leaves `providerNamespace` empty and repeats the whole
+key in `providerName`.
 
 If nothing is flagged and `waiting` still does not move, the provider is not converging those hosts.
 Look at the provider plan named in `providerNamespace`/`providerName`: its `ProvidesLabels`
