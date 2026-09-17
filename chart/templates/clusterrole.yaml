@@ -25,6 +25,8 @@ rules:
     resources: ["playbookplans/status", "clusterinventories/status", "nodeaccesspolicies/status"]
     verbs: ["patch"]
   # ClusterInventory resolves node label selectors against real Nodes (cluster-scoped resource).
+  # No `nodes/status`: validatingadmissionpolicy.yaml only guards the main resource, so granting the
+  # subresource would need a matching rule there.
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"{{ if .Values.nodeLabels.enabled }}, "patch"{{ end }}]

@@ -21,9 +21,10 @@ spec:
   failurePolicy: Fail
   matchConstraints:
     resourceRules:
-      # UPDATE only, and deliberately not `nodes/status`: the operator's ClusterRole grants neither
-      # create nor delete on Nodes, and a status write goes to a subresource this rule does not
-      # select. A subresource named here would be a second surface to reason about for no gain.
+      # UPDATE only, because the operator's ClusterRole grants neither create nor delete on Nodes.
+      # `nodes/status` is not selected because it is unreachable: the ClusterRole grants nothing on
+      # that subresource, and status sent through the main resource is discarded by the API server.
+      # If the ClusterRole ever gains `nodes/status`, this needs a second resourceRules entry.
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["UPDATE"]

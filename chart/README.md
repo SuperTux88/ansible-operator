@@ -39,6 +39,10 @@ onto the Nodes it converged, for other plans to depend on. `nodeLabels.admission
 unguarded permission, or `nodeLabels.enabled=false` to give up the feature and the permission
 together. There is deliberately no capability auto-detection — see the comments in `values.yaml`.
 
+The policy applies to the ServiceAccount the operator runs as. With `serviceAccount.create=false`,
+set `serviceAccount.name` too: otherwise that is the namespace's `default` ServiceAccount, and every
+other workload using it in the release namespace is held to the operator's label bound.
+
 ### Pod Security Admission
 
 Managed-ssh proxy pods (created dynamically by the operator at runtime, not by this chart) run
