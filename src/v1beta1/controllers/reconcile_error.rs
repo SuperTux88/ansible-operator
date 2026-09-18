@@ -24,6 +24,15 @@ pub enum ReconcileError {
     },
 
     #[error(
+        "Host {host:?} is reached as an external host by {first} and by {second}, with different SSH credentials; one name cannot be reached two ways"
+    )]
+    AmbiguousHostCredentials {
+        host: String,
+        first: String,
+        second: String,
+    },
+
+    #[error(
         "Referenced ClusterInventory {name:?} has not published its resolved hosts for generation {generation} yet (observed: {observed})"
     )]
     InventoryNotSynced {
