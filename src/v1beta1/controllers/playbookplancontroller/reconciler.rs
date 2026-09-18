@@ -38,7 +38,7 @@ use crate::{
         ca::CertificateAuthority,
         controllers::{
             reconcile_error::{ReconcileError, is_conflict, is_not_found},
-            watch_stream::restarting_watcher,
+            watch_stream::{SharedBackoff, restarting_watcher},
         },
         playbookplancontroller::{
             callback_output, departed_hosts,
@@ -92,6 +92,15 @@ const NODE_WATCH_FAILURES_BEFORE_ESCALATING: u32 = 5;
 /// only once, it scrolls out of whatever window an admin reads with `kubectl logs --since`, leaving
 /// bare watch errors that do not say what they cost.
 const NODE_WATCH_ESCALATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// The trigger streams [`new`] sets up once for the whole cluster: the primary `PlaybookPlan` watch
+/// `Controller::new` adds, and one for each `.watches` chained onto it.
+///
+/// **Raise it when one is added.** `SharedBackoff` divides its ceiling by the total, and it cannot
+/// ask `Controller` how many there are, so a stale count is wrong silently and in both directions —
+/// too low re-throttles a recovery, too high spends the apiserver's budget on streams that do not
+/// exist. The per-namespace streams are counted in the loop that makes them.
+const CLUSTER_WIDE_TRIGGERS: usize = 5;
 
 pub struct WorkloadEgressPolicies {
     pub playbook: Option<Vec<NetworkPolicyEgressRule>>,
@@ -429,6 +438,12 @@ pub async fn new(
     // whenever a reconcile happened — but nothing made one happen. A `ClusterInventory` that gained
     // a Node therefore reached its plans only on their next requeue (an hour for an idle `OneShot`
     // plan, the next slot for a scheduled one), and a `StaticInventory` edit had no path at all.
+    // `Controller::run` polls every trigger stream through one shared delay, and `SharedBackoff`
+    // divides its ceiling by how many there are — see there for why it has to be told rather than
+    // guessing at 30s. **Every `.watches` and `.owns` below is one of them**: the count is what
+    // pays for them, so it is kept next to them and raised where they are made.
+    let mut trigger_streams = CLUSTER_WIDE_TRIGGERS;
+
     let mut controller = Controller::new(playbookplans_api, watcher::Config::default())
         .watches(
             node_access_policies_api,
@@ -474,7 +489,10 @@ pub async fn new(
                     Arc::clone(&static_inventory_reflector_reader),
                 ),
             );
+        trigger_streams += 2;
     }
+
+    controller = controller.trigger_backoff(SharedBackoff::new(trigger_streams));
 
     controller.run(
         reconcile,
