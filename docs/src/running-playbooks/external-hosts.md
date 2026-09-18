@@ -90,9 +90,17 @@ its connection variables — so a name meaning two machines would give one of th
 earned. The operator refuses such a plan before it runs anything and says which host and which two
 groups; see
 [the plan's inputs cannot be read](./results-and-troubleshooting.md#the-plans-inputs-cannot-be-read).
-The names only have to be unique within one plan, and an Ansible host name need not be resolvable —
-if the name was doing the addressing, rename the host and set `ansible_host` in the group's
-`variables`.
+The names only have to be unique within one plan. Renaming the external host is not a way out on its
+own, though: the operator renders no `ansible_host` for a `StaticInventory` host and the group's
+`variables` may not supply one, so the name is what Ansible dials. Narrow one of the two inventories
+instead, until the plan no longer reaches both.
+
+**One name, one set of credentials.** For the same reason, two `StaticInventory`s referenced by one
+plan may not name the same host with a different `ssh.user` or `ssh.secretRef`. That name is one
+machine, so it gets one lock and one outcome, but the rendered inventory would carry two connection
+configurations for it and Ansible would keep whichever its group ordering happens to prefer — so the
+run would connect as somebody the manifests do not agree on. Naming the same host in two
+`StaticInventory`s with the *same* user and Secret is fine, and stays allowed.
 
 ## Dependencies between plans are cluster-Nodes only
 

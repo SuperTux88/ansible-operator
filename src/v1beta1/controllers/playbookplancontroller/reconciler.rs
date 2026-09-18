@@ -22,8 +22,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::v1beta1::{
     ActiveRun, AnsibleInventory, ClusterInventory, ExecutionMode, GenericMap, NodeAccessPolicy,
-    Phase, Play, PlaybookPlanStatus, ResolvedHosts, ResolvedInventoryGroup, StaticInventory,
-    ansible, distinct_host_count, flatten_hosts, labels,
+    Phase, Play, PlaybookPlanStatus, ResolvedHosts, ResolvedInventoryGroup, SshConfig,
+    StaticInventory, ansible, distinct_host_count, flatten_hosts, labels,
     playbookplancontroller::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
         locking, managed_ssh,
@@ -1656,31 +1656,37 @@ struct TickConclusion<'a> {
 /// `provides` may own no labels, whatever its inventories do — so gating it on a resolved host set
 /// would let a plan that dropped the field keep its labels for as long as its schedule was invalid
 /// or an inventory of its would not resolve, with every dependent still admitting those Nodes.
+/// Returns whether this tick left something for a soon-after tick to do, which is what the caller
+/// shortens its requeue on — see [`LABEL_REACH_RESTATE`]. That is either a label **published**,
+/// whose reach the status has yet to state, or one refused in a way another attempt could clear. A
+/// refusal that will simply be repeated does not count, and neither does a withdrawal: a plan that
+/// has stopped providing has no `ProvidesLabels` condition left to restate.
 async fn reconcile_node_labels(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
     resource_status: &PlaybookPlanStatus,
     target_groups: Option<&[ResolvedInventoryGroup]>,
-) {
+) -> bool {
     if !context.node_labels_enabled {
-        return;
+        return false;
     }
     let Ok((namespace, name)) = namespace_and_name(object) else {
-        return;
+        return false;
     };
     let key = node_labels::label_key(namespace, name);
     let plan = format!("{namespace}/{name}");
 
     if object.provides_version().is_some() {
         let Some(target_groups) = target_groups else {
-            return;
+            return false;
         };
         let writes =
             node_labels::desired_labels(&key, target_groups, resource_status, &context.nodes);
         if !writes.is_empty() && plan_still_exists(&context.plans, namespace, name) {
-            node_labels::write_labels(&context.client, &key, &writes, &plan).await;
+            let written = node_labels::write_labels(&context.client, &key, &writes, &plan).await;
+            return written.published > 0 || written.retryable > 0;
         }
-        return;
+        return false;
     }
 
     // No `provides`: this plan claims nothing, so nothing may still be carrying its key. Because
@@ -1691,6 +1697,7 @@ async fn reconcile_node_labels(
         info!("PlaybookPlan {plan} no longer provides anything; removing {key} from {stale:?}");
         node_labels::remove_labels(&context.client, &key, &stale, &plan).await;
     }
+    false
 }
 
 /// Whether the plan this tick is reconciling is still in the cluster, asked immediately before its
@@ -1879,7 +1886,8 @@ async fn finish_reconcile_tick(
     // Status first, labels after, and never the other way round: a label is a claim about what a
     // host carries, and the record it is derived from is the thing that survives a crash. A label
     // that got ahead of the record would outlive the only evidence for it.
-    reconcile_node_labels(context, object, resource_status, target_groups).await;
+    let published_labels =
+        reconcile_node_labels(context, object, resource_status, target_groups).await;
 
     for finished in finished_records {
         if finished.record == TerminalRecord::Present
@@ -1912,6 +1920,10 @@ async fn finish_reconcile_tick(
         ));
     }
 
+    if published_labels {
+        requeue_after = Some(label_reach_restate_after(requeue_after));
+    }
+
     if defer_finalizer_release {
         requeue_after = Some(finalizer_release_retry_after(requeue_after));
     }
@@ -1930,6 +1942,42 @@ async fn finish_reconcile_tick(
     }
 
     Ok(requeue_after.map_or_else(Action::await_change, Action::requeue))
+}
+
+/// How long a tick that has just written Node labels waits before looking at them again.
+///
+/// `ProvidesLabels` is derived from the Node cache in [`finish_reconcile_tick`], *before* the status
+/// write — and the labels are written after it, because a label must never get ahead of the record
+/// it is derived from. So the count a publishing tick writes down is the one from before its own
+/// writes, and it is only corrected by a tick that reads the cache again.
+///
+/// Usually one follows within moments: a run finishing produces several more status writes, and each
+/// re-derives the condition. Where none does — a tick whose status is otherwise unchanged, which is
+/// exactly the §4.8 republish after a crash between the status write and the label write — nothing
+/// wakes the plan, and a fully converged provider reads `on 0 of 0 Node(s)` until its next requeue:
+/// an hour for an idle `OneShot`, on the field `results-and-troubleshooting.md` sends a reader to
+/// first.
+///
+/// Long enough for the Node watch to deliver what the write loop just produced, short enough that
+/// nobody is reading the stale number by then, and the same 15 seconds [`prune_retry_after`] uses
+/// for the other piece of after-the-write bookkeeping.
+///
+/// A write that was *refused* asks for the same interval, for the sibling reason: the label is not
+/// on the Node at all, so every dependent is waiting on it, and nothing else would bring the plan
+/// back. Only a refusal another attempt could clear counts — `node_labels::worth_retrying_soon` is
+/// where that line is drawn, and where the reasoning for it lives.
+///
+/// **What it costs in a degraded cluster.** A Node watch that has stopped delivering leaves the diff
+/// non-empty for ever, so the plan keeps re-issuing the same (server-side no-op) PATCH and asking for
+/// this interval instead of its idle one. That is the state `NodeWatchFailures` already escalates
+/// about by name, and in which every other decision the tick makes is equally stale — so this buys a
+/// poll on a plan whose operator is already loudly broken, rather than one on a healthy cluster.
+const LABEL_REACH_RESTATE: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn label_reach_restate_after(current: Option<std::time::Duration>) -> std::time::Duration {
+    current
+        .unwrap_or(LABEL_REACH_RESTATE)
+        .min(LABEL_REACH_RESTATE)
 }
 
 /// How long a tick that owes the run-cleanup finalizer back waits before looking again.
@@ -4022,6 +4070,9 @@ fn inventory_input_failure(error: &ReconcileError) -> InputFailure {
         ReconcileError::AmbiguousHost { host, .. } => {
             format!("host {host:?} is both a Node and an external host")
         }
+        ReconcileError::AmbiguousHostCredentials { host, .. } => {
+            format!("host {host:?} is reached with two sets of SSH credentials")
+        }
         _ => "cannot read the plan's inventories".to_string(),
     };
     InputFailure {
@@ -4310,6 +4361,7 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         ReconcileError::ReservedInventoryVariable { .. }
         | ReconcileError::InventoryNotFound { .. }
         | ReconcileError::AmbiguousHost { .. }
+        | ReconcileError::AmbiguousHostCredentials { .. }
         | ReconcileError::SecretNotFound { .. } => true,
         ReconcileError::KubeError(_) => false,
         // Transient by construction, and the shortest-lived of them all: the inventory's own
@@ -4317,8 +4369,8 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         // write that does it wakes this plan. Giving up a prepared run over a wait measured in
         // seconds would abandon it for nothing.
         ReconcileError::InventoryNotSynced { .. } => false,
-        // A spec the user has to edit, exactly like the three above: no tick clears it, and holding
-        // a run open against it would hold host Leases for as long as the plan stays wrong.
+        // A spec the user has to edit, exactly like the first arm above: no tick clears it, and
+        // holding a run open against it would hold host Leases for as long as the plan stays wrong.
         ReconcileError::InvalidFileEntry { .. }
         | ReconcileError::WorkspaceSecretReferenced { .. } => true,
         // Neither is an input read — both come from a run's own infrastructure — but the enum is
@@ -6752,21 +6804,31 @@ async fn resolve_inventory(
     Ok((groups, dependencies))
 }
 
-/// Fails the reconcile if one host name is reached both as a cluster Node and as an external
-/// machine.
+/// Fails the reconcile if one host name is reached two different ways.
 ///
-/// Everything downstream is keyed by host *name* and assumes that name means one machine. The
-/// rendered inventory puts connection variables on the host entry inside each group
-/// (`ansible::inventory_renderer`), so a name in both kinds is emitted twice — once pointing at a
-/// managed-ssh proxy pod, once at the external machine's own address — and Ansible folds the two
-/// into a single host where one of the connection configs silently wins. The plan then holds one
-/// Lease, writes one `hostsStatus` row and reports one outcome for two machines, with no way for a
-/// reader to tell which was reached.
+/// Everything downstream is keyed by host *name* and assumes that name means one machine reached one
+/// way. The rendered inventory puts connection variables on the host entry inside each group
+/// (`ansible::inventory_renderer`), so a name in two groups is emitted twice, and Ansible folds the
+/// two into a single host where one of the connection configs silently wins.
+///
+/// There are two shapes of it, and the first is the worse one:
+///
+/// - **A cluster Node and an external host.** The two entries point at different machines — a
+///   managed-ssh proxy pod and the external machine's own address. The plan then holds one Lease,
+///   writes one `hostsStatus` row and reports one outcome for *two machines*, and the one that was
+///   never reached looks converged.
+/// - **Two external groups with different credentials.** Here the name is one machine, so a single
+///   Lease and a single row are right; what is ambiguous is the `ansible_user` and key it is reached
+///   with. Which one wins is Ansible's group-merge order, which no reader of the two manifests can
+///   predict. Two `StaticInventory`s naming the same host with the *same* user and Secret are left
+///   alone, because they agree about everything that reaches the machine — only the mount path
+///   differs, and either serves the same key.
 ///
 /// Refused rather than deduplicated or preferred: both entries are things the author wrote, and any
-/// rule for picking between them would quietly not run the playbook somewhere it was asked to.
-/// Classified like [`ReconcileError::ReservedInventoryVariable`] — a spec only an edit can fix, so a
-/// run waiting behind it is given up rather than held.
+/// rule for picking between them would quietly not run the playbook somewhere it was asked to, or
+/// run it as somebody the author did not choose. Classified like
+/// [`ReconcileError::ReservedInventoryVariable`] — a spec only an edit can fix, so a run waiting
+/// behind it is given up rather than held.
 ///
 /// Judged before the `NodeAccessPolicy` clamp, so the diagnosis does not depend on a policy that
 /// happens to exclude one of the two today and may stop doing so tomorrow.
@@ -6785,10 +6847,22 @@ fn reject_ambiguous_hosts(groups: &[ResolvedInventoryGroup]) -> Result<(), Recon
         })
         .collect();
 
+    // Keyed by host name: the first external group that claimed it, and the credentials it claimed
+    // it with. Only a *differing* second claim is a conflict, so this records the config rather than
+    // merely the fact of the claim.
+    let mut external_hosts: BTreeMap<&str, (&SshConfig, &str, &str)> = BTreeMap::new();
+
     for group in groups {
-        let ResolvedInventoryGroup::Ssh { hosts, .. } = group else {
+        let ResolvedInventoryGroup::Ssh {
+            hosts,
+            static_inventory_name,
+            config,
+            ..
+        } = group
+        else {
             continue;
         };
+
         for host in &hosts.hosts {
             if let Some(node_group) = node_hosts.get(host.as_str()) {
                 return Err(ReconcileError::AmbiguousHost {
@@ -6797,10 +6871,44 @@ fn reject_ambiguous_hosts(groups: &[ResolvedInventoryGroup]) -> Result<(), Recon
                     ssh_group: hosts.name.clone(),
                 });
             }
+
+            match external_hosts.get(host.as_str()) {
+                Some(&(claimed, inventory, group_name)) if !same_ssh_config(claimed, config) => {
+                    return Err(ReconcileError::AmbiguousHostCredentials {
+                        host: host.clone(),
+                        first: describe_ssh_source(inventory, group_name),
+                        second: describe_ssh_source(static_inventory_name, &hosts.name),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    external_hosts.insert(
+                        host.as_str(),
+                        (config, static_inventory_name, hosts.name.as_str()),
+                    );
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+/// Names one side of a host's two claims, for the error that refuses the pair.
+///
+/// Built only where a conflict is being reported: the check itself walks every external host of every
+/// group on every tick, and the overwhelmingly common answer is that there is nothing to say.
+fn describe_ssh_source(static_inventory_name: &str, group: &str) -> String {
+    format!("StaticInventory {static_inventory_name:?} group {group:?}")
+}
+
+/// Whether two `StaticInventory`s reach a host as the same user with the same key.
+///
+/// Compared field by field rather than by a derived `PartialEq`, so that adding a field to
+/// [`SshConfig`] is a deliberate decision here about whether it changes who the run connects as.
+/// Both Secrets are resolved in the plan's own namespace, so the name alone identifies the key.
+fn same_ssh_config(left: &SshConfig, right: &SshConfig) -> bool {
+    left.user == right.user && left.secret_ref.name == right.secret_ref.name
 }
 
 /// Fails the reconcile if an inventory group sets a variable the operator manages for
@@ -7494,6 +7602,66 @@ mod tests {
             "a host in two groups of the same kind is still one machine"
         );
         assert!(reject_ambiguous_hosts(&[]).is_ok());
+    }
+
+    /// The same fold, one step further in: here the two entries *are* one machine, so a single Lease
+    /// and a single record are right — what is ambiguous is who the run connects as. Which of the
+    /// two wins is Ansible's group-merge order, which neither manifest says anything about.
+    #[test]
+    fn an_external_host_reached_with_two_sets_of_credentials_is_refused() {
+        let different_key = reject_ambiguous_hosts(&[
+            ssh_group_with_key("edge", &["ccu.fritz.box"], "ccu", "ccu-key"),
+            ssh_group_with_key("backup", &["ccu.fritz.box"], "spare", "spare-key"),
+        ]);
+
+        assert!(matches!(
+            different_key,
+            Err(ReconcileError::AmbiguousHostCredentials { ref host, ref first, ref second })
+                if host == "ccu.fritz.box"
+                    && first.contains("\"ccu\"")
+                    && first.contains("\"edge\"")
+                    && second.contains("\"spare\"")
+                    && second.contains("\"backup\"")
+        ));
+
+        let different_user = reject_ambiguous_hosts(&[
+            ssh_group("edge", &["ccu.fritz.box"], "ccu"),
+            ResolvedInventoryGroup::Ssh {
+                hosts: ResolvedHosts {
+                    name: "backup".into(),
+                    hosts: vec!["ccu.fritz.box".into()],
+                    ..Default::default()
+                },
+                static_inventory_name: "spare".into(),
+                config: SshConfig {
+                    user: "admin".into(),
+                    secret_ref: SecretRef {
+                        name: "ssh-key".into(),
+                    },
+                },
+                variables: None,
+            },
+        ]);
+
+        assert!(matches!(
+            different_user,
+            Err(ReconcileError::AmbiguousHostCredentials { .. })
+        ));
+    }
+
+    /// Two `StaticInventory`s may legitimately name the same machine — one per playbook concern, say
+    /// — and while they agree about the user and the key there is nothing to be wrong about. Only
+    /// the mount path differs, and either one serves the same key, so refusing these would break
+    /// working plans for a conflict that does not exist.
+    #[test]
+    fn two_static_inventories_agreeing_on_the_credentials_are_accepted() {
+        assert!(
+            reject_ambiguous_hosts(&[
+                ssh_group_with_key("edge", &["ccu.fritz.box"], "ccu", "ssh-key"),
+                ssh_group_with_key("backup", &["ccu.fritz.box"], "spare", "ssh-key"),
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
@@ -9468,6 +9636,30 @@ mod tests {
         assert_eq!(
             prune_retry_after(std::time::Duration::from_secs(5)),
             std::time::Duration::from_secs(5)
+        );
+    }
+
+    /// A tick that publishes labels writes its `ProvidesLabels` count before making those labels
+    /// true, so the number it leaves behind is one observation out of date. Left to the caller's
+    /// interval it would stand for an hour on an idle `OneShot` — and the tick that publishes need
+    /// not change the status at all, so nothing else brings the plan back.
+    #[test]
+    fn a_published_label_is_restated_before_the_idle_requeue() {
+        assert_eq!(
+            label_reach_restate_after(Some(std::time::Duration::from_secs(3600))),
+            LABEL_REACH_RESTATE,
+            "the idle requeue must not decide when the reach is restated"
+        );
+        assert_eq!(
+            label_reach_restate_after(None),
+            LABEL_REACH_RESTATE,
+            "a tick that would have slept until woken still has to come back for it"
+        );
+        let sooner = std::time::Duration::from_secs(5);
+        assert_eq!(
+            label_reach_restate_after(Some(sooner)),
+            sooner,
+            "and it never delays a tick that was already coming back sooner"
         );
     }
 

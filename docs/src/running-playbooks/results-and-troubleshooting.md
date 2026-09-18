@@ -381,19 +381,21 @@ reconcile.
 Three summaries report that the operator could not read or build what the plan says it should be
 running, and so could not decide anything this tick:
 
-- **"inventory … not in sync" / "ClusterInventory … not found" / "StaticInventory … not found" / "inventory group … sets managed variable
-  …" / "host … is both a Node and an external host" / "cannot read the plan's inventories"** — a referenced `ClusterInventory` or `StaticInventory`
-  could not be read, or one of them is not usable. The summary is kept short enough for the
-  `Summary` column; the `Ready` condition carries the full diagnostic, prefixed with `cannot resolve
-  the plan's inventories:`. Three forms need an edit rather than a retry: `ClusterInventory "…" not found` or
-  `StaticInventory "…" not found` (the reference of that kind is wrong or the inventory was deleted), `inventory group "…" sets managed
-  variable "…"` (a group sets one of the connection variables the operator owns), and `host "…" is
-  both a Node and an external host` (see below). One form needs
-  nothing at all: `inventory "…" not in sync` means that inventory's own controller has not caught
-  up with a spec edit, so the plan is holding rather than running against the hosts the previous
-  spec resolved to — its next status write wakes the plan, normally within seconds; the condition
-  names the generation it is waiting for and the one the inventory last observed. Anything else is
-  an API error to retry, summarized as `cannot read the plan's inventories`.
+- **"inventory … not in sync" / "ClusterInventory … not found" / "StaticInventory … not found" /
+  "inventory group … sets managed variable …" / "host … is both a Node and an external host" /
+  "host … is reached with two sets of SSH credentials" / "cannot read the plan's inventories"** — a
+  referenced `ClusterInventory` or `StaticInventory` could not be read, or one of them is not usable.
+  The summary is kept short enough for the `Summary` column; the `Ready` condition carries the full
+  diagnostic, prefixed with `cannot resolve the plan's inventories:`. Four forms need an edit rather
+  than a retry: `ClusterInventory "…" not found` or `StaticInventory "…" not found` (the reference of
+  that kind is wrong or the inventory was deleted), `inventory group "…" sets managed variable "…"`
+  (a group sets one of the connection variables the operator owns), and `host "…" is both a Node and
+  an external host` or `host "…" is reached with two sets of SSH credentials` (see below). One form
+  needs nothing at all: `inventory "…" not in sync` means that inventory's own controller has not
+  caught up with a spec edit, so the plan is holding rather than running against the hosts the
+  previous spec resolved to — its next status write wakes the plan, normally within seconds; the
+  condition names the generation it is waiting for and the one the inventory last observed. Anything
+  else is an API error to retry, summarized as `cannot read the plan's inventories`.
 - **"cannot read referenced Secrets: …"** — a Secret named by `spec.template.variables` or
   `spec.template.files` could not be read. `Referenced Secret "…" does not exist` means the reference
   is wrong or the Secret was deleted; anything else is an API error to retry.
@@ -415,16 +417,26 @@ the name would be written into the inventory twice, once pointing at a managed-s
 at the external machine, Ansible would treat the two as a single host, and one of the two
 configurations would silently win — one Lease, one outcome, and no way to tell which machine ran.
 
-The operator refuses the plan rather than picking for you. Resolve it by renaming the external host
-in its `StaticInventory` (Ansible host names need not be resolvable — set `ansible_host` through the
-group's `variables` if the name was doing the addressing), or by narrowing one of the two inventories
-so the plan no longer reaches both. Only hosts of *one* plan are compared: two plans may each use the
-name for a different machine.
+The operator refuses the plan rather than picking for you. Resolve it by narrowing one of the two
+inventories so the plan no longer reaches both — a `ClusterInventory` selector that leaves out the
+Node, or a `StaticInventory` this plan stops referencing. Renaming the external host works only if
+its new name is also its address: the operator renders no `ansible_host` for a `StaticInventory`
+host, and the group's `variables` may not set one, so the name is what Ansible dials. Only hosts of
+*one* plan are compared: two plans may each use the name for a different machine.
+
+**"host … is reached with two sets of SSH credentials"** is the same fold one step further in. Two
+`StaticInventory`s referenced by one plan name the same host, but with a different `spec.ssh.user` or
+a different `spec.ssh.secretRef`. Here the name really is one machine, so one Lease and one
+`hostsStatus` row are right — what is ambiguous is who the run connects as, and which of the two
+wins is Ansible's group-merge order rather than anything either manifest states. Give the host one
+set of credentials, or reference only one of the two inventories from this plan. Two
+`StaticInventory`s that name the same host with the *same* user and the same Secret are fine and are
+not refused: they agree about everything that reaches the machine.
 
 A permanent problem — a missing resource, an inventory group that sets an operator-managed variable,
-one name meaning two machines, a file entry that cannot describe a volume, or a reference to the
-plan's own workspace — supersedes a run that has not launched; a transient read error holds it
-instead.
+one name meaning two machines or two connections, a file entry that cannot describe a volume, or a
+reference to the plan's own workspace — supersedes a run that has not launched; a transient read
+error holds it instead.
 
 None of them starts a run or changes `.status.hostsStatus`, so the plan holds its previous per-host
 results until the problem is resolved; the operator retries every tick. `.status.nextRun` is
