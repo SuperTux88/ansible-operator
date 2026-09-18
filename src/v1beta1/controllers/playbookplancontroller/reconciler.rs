@@ -22,8 +22,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::v1beta1::{
     ActiveRun, AnsibleInventory, ClusterInventory, ExecutionMode, GenericMap, NodeAccessPolicy,
-    Phase, Play, PlaybookPlanStatus, ResolvedHosts, ResolvedInventoryGroup, StaticInventory,
-    ansible, distinct_host_count, flatten_hosts, labels,
+    Phase, Play, PlaybookPlanStatus, ResolvedHosts, ResolvedInventoryGroup, SshConfig,
+    StaticInventory, ansible, distinct_host_count, flatten_hosts, labels,
     playbookplancontroller::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
         locking, managed_ssh,
@@ -4104,6 +4104,9 @@ fn inventory_input_failure(error: &ReconcileError) -> InputFailure {
         ReconcileError::AmbiguousHost { host, .. } => {
             format!("host {host:?} is both a Node and an external host")
         }
+        ReconcileError::AmbiguousHostCredentials { host, .. } => {
+            format!("host {host:?} is reached with two sets of SSH credentials")
+        }
         _ => "cannot read the plan's inventories".to_string(),
     };
     InputFailure {
@@ -4392,6 +4395,7 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         ReconcileError::ReservedInventoryVariable { .. }
         | ReconcileError::InventoryNotFound { .. }
         | ReconcileError::AmbiguousHost { .. }
+        | ReconcileError::AmbiguousHostCredentials { .. }
         | ReconcileError::SecretNotFound { .. } => true,
         ReconcileError::KubeError(_) => false,
         // Transient by construction, and the shortest-lived of them all: the inventory's own
@@ -6834,21 +6838,31 @@ async fn resolve_inventory(
     Ok((groups, dependencies))
 }
 
-/// Fails the reconcile if one host name is reached both as a cluster Node and as an external
-/// machine.
+/// Fails the reconcile if one host name is reached two different ways.
 ///
-/// Everything downstream is keyed by host *name* and assumes that name means one machine. The
-/// rendered inventory puts connection variables on the host entry inside each group
-/// (`ansible::inventory_renderer`), so a name in both kinds is emitted twice — once pointing at a
-/// managed-ssh proxy pod, once at the external machine's own address — and Ansible folds the two
-/// into a single host where one of the connection configs silently wins. The plan then holds one
-/// Lease, writes one `hostsStatus` row and reports one outcome for two machines, with no way for a
-/// reader to tell which was reached.
+/// Everything downstream is keyed by host *name* and assumes that name means one machine reached one
+/// way. The rendered inventory puts connection variables on the host entry inside each group
+/// (`ansible::inventory_renderer`), so a name in two groups is emitted twice, and Ansible folds the
+/// two into a single host where one of the connection configs silently wins.
+///
+/// There are two shapes of it, and the first is the worse one:
+///
+/// - **A cluster Node and an external host.** The two entries point at different machines — a
+///   managed-ssh proxy pod and the external machine's own address. The plan then holds one Lease,
+///   writes one `hostsStatus` row and reports one outcome for *two machines*, and the one that was
+///   never reached looks converged.
+/// - **Two external groups with different credentials.** Here the name is one machine, so a single
+///   Lease and a single row are right; what is ambiguous is the `ansible_user` and key it is reached
+///   with. Which one wins is Ansible's group-merge order, which no reader of the two manifests can
+///   predict. Two `StaticInventory`s naming the same host with the *same* user and Secret are left
+///   alone, because they agree about everything that reaches the machine — only the mount path
+///   differs, and either serves the same key.
 ///
 /// Refused rather than deduplicated or preferred: both entries are things the author wrote, and any
-/// rule for picking between them would quietly not run the playbook somewhere it was asked to.
-/// Classified like [`ReconcileError::ReservedInventoryVariable`] — a spec only an edit can fix, so a
-/// run waiting behind it is given up rather than held.
+/// rule for picking between them would quietly not run the playbook somewhere it was asked to, or
+/// run it as somebody the author did not choose. Classified like
+/// [`ReconcileError::ReservedInventoryVariable`] — a spec only an edit can fix, so a run waiting
+/// behind it is given up rather than held.
 ///
 /// Judged before the `NodeAccessPolicy` clamp, so the diagnosis does not depend on a policy that
 /// happens to exclude one of the two today and may stop doing so tomorrow.
@@ -6867,10 +6881,22 @@ fn reject_ambiguous_hosts(groups: &[ResolvedInventoryGroup]) -> Result<(), Recon
         })
         .collect();
 
+    // Keyed by host name: the first external group that claimed it, and the credentials it claimed
+    // it with. Only a *differing* second claim is a conflict, so this records the config rather than
+    // merely the fact of the claim.
+    let mut external_hosts: BTreeMap<&str, (&SshConfig, &str, &str)> = BTreeMap::new();
+
     for group in groups {
-        let ResolvedInventoryGroup::Ssh { hosts, .. } = group else {
+        let ResolvedInventoryGroup::Ssh {
+            hosts,
+            static_inventory_name,
+            config,
+            ..
+        } = group
+        else {
             continue;
         };
+
         for host in &hosts.hosts {
             if let Some(node_group) = node_hosts.get(host.as_str()) {
                 return Err(ReconcileError::AmbiguousHost {
@@ -6879,10 +6905,48 @@ fn reject_ambiguous_hosts(groups: &[ResolvedInventoryGroup]) -> Result<(), Recon
                     ssh_group: hosts.name.clone(),
                 });
             }
+
+            match external_hosts.get(host.as_str()) {
+                Some(&(claimed, inventory, group_name)) if !same_ssh_config(claimed, config) => {
+                    return Err(ReconcileError::AmbiguousHostCredentials {
+                        host: host.clone(),
+                        first: describe_ssh_source(inventory, group_name),
+                        second: describe_ssh_source(static_inventory_name, &hosts.name),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    external_hosts.insert(
+                        host.as_str(),
+                        (config, static_inventory_name, hosts.name.as_str()),
+                    );
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+/// Names one side of a host's two claims, for the error that refuses the pair.
+///
+/// Built only where a conflict is being reported: the check itself walks every external host of every
+/// group on every tick, and the overwhelmingly common answer is that there is nothing to say.
+fn describe_ssh_source(static_inventory_name: &str, group: &str) -> String {
+    format!("StaticInventory {static_inventory_name:?} group {group:?}")
+}
+
+/// Whether two `StaticInventory`s reach a host as the same user with the same key.
+///
+/// Destructured rather than compared by a derived `PartialEq`, so that adding a field to
+/// [`SshConfig`] does not compile until someone has decided here whether it changes who the run
+/// connects as. A new connection field silently left out would reopen exactly the ambiguity this
+/// refusal exists to catch. Both Secrets are resolved in the plan's own namespace, so the name
+/// alone identifies the key.
+fn same_ssh_config(left: &SshConfig, right: &SshConfig) -> bool {
+    let SshConfig { user, secret_ref } = left;
+
+    *user == right.user && secret_ref.name == right.secret_ref.name
 }
 
 /// Fails the reconcile if an inventory group sets a variable the operator manages for
@@ -7576,6 +7640,66 @@ mod tests {
             "a host in two groups of the same kind is still one machine"
         );
         assert!(reject_ambiguous_hosts(&[]).is_ok());
+    }
+
+    /// The same fold, one step further in: here the two entries *are* one machine, so a single Lease
+    /// and a single record are right — what is ambiguous is who the run connects as. Which of the
+    /// two wins is Ansible's group-merge order, which neither manifest says anything about.
+    #[test]
+    fn an_external_host_reached_with_two_sets_of_credentials_is_refused() {
+        let different_key = reject_ambiguous_hosts(&[
+            ssh_group_with_key("edge", &["ccu.fritz.box"], "ccu", "ccu-key"),
+            ssh_group_with_key("backup", &["ccu.fritz.box"], "spare", "spare-key"),
+        ]);
+
+        assert!(matches!(
+            different_key,
+            Err(ReconcileError::AmbiguousHostCredentials { ref host, ref first, ref second })
+                if host == "ccu.fritz.box"
+                    && first.contains("\"ccu\"")
+                    && first.contains("\"edge\"")
+                    && second.contains("\"spare\"")
+                    && second.contains("\"backup\"")
+        ));
+
+        let different_user = reject_ambiguous_hosts(&[
+            ssh_group("edge", &["ccu.fritz.box"], "ccu"),
+            ResolvedInventoryGroup::Ssh {
+                hosts: ResolvedHosts {
+                    name: "backup".into(),
+                    hosts: vec!["ccu.fritz.box".into()],
+                    ..Default::default()
+                },
+                static_inventory_name: "spare".into(),
+                config: SshConfig {
+                    user: "admin".into(),
+                    secret_ref: SecretRef {
+                        name: "ssh-key".into(),
+                    },
+                },
+                variables: None,
+            },
+        ]);
+
+        assert!(matches!(
+            different_user,
+            Err(ReconcileError::AmbiguousHostCredentials { .. })
+        ));
+    }
+
+    /// Two `StaticInventory`s may legitimately name the same machine — one per playbook concern, say
+    /// — and while they agree about the user and the key there is nothing to be wrong about. Only
+    /// the mount path differs, and either one serves the same key, so refusing these would break
+    /// working plans for a conflict that does not exist.
+    #[test]
+    fn two_static_inventories_agreeing_on_the_credentials_are_accepted() {
+        assert!(
+            reject_ambiguous_hosts(&[
+                ssh_group_with_key("edge", &["ccu.fritz.box"], "ccu", "ssh-key"),
+                ssh_group_with_key("backup", &["ccu.fritz.box"], "spare", "ssh-key"),
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
