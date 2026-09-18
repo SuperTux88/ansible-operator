@@ -11,7 +11,7 @@ use kube::{
     Api,
     api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions},
     runtime::{
-        Controller, WatchStreamExt as _,
+        Controller,
         controller::Action,
         reflector::{ObjectRef, Store, store::Writer},
         watcher,
@@ -38,7 +38,7 @@ use crate::{
         ca::CertificateAuthority,
         controllers::{
             reconcile_error::{ReconcileError, is_conflict, is_not_found},
-            watch_backoff::WatchBackoff,
+            watch_stream::{SharedBackoff, restarting_watcher},
         },
         playbookplancontroller::{
             callback_output, departed_hosts,
@@ -92,6 +92,15 @@ const NODE_WATCH_FAILURES_BEFORE_ESCALATING: u32 = 5;
 /// only once, it scrolls out of whatever window an admin reads with `kubectl logs --since`, leaving
 /// bare watch errors that do not say what they cost.
 const NODE_WATCH_ESCALATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// The trigger streams [`new`] sets up once for the whole cluster: the primary `PlaybookPlan` watch
+/// `Controller::new` adds, and one for each `.watches` chained onto it.
+///
+/// **Raise it when one is added.** `SharedBackoff` divides its ceiling by the total, and it cannot
+/// ask `Controller` how many there are, so a stale count is wrong silently and in both directions —
+/// too low re-throttles a recovery, too high spends the apiserver's budget on streams that do not
+/// exist. The per-namespace streams are counted in the loop that makes them.
+const CLUSTER_WIDE_TRIGGERS: usize = 5;
 
 pub struct WorkloadEgressPolicies {
     pub playbook: Option<Vec<NetworkPolicyEgressRule>>,
@@ -231,13 +240,13 @@ pub async fn new(
 
         let playbookplan_reflector = kube::runtime::reflector(
             playbookplan_reflector_writer,
-            // Every reflector in this function needs the backoff, and nothing else supplies one: a
-            // bare `watcher` re-lists on the very next poll after an error, `Controller::run` backs
-            // off only its own trigger streams, and these run in tasks of their own. Without it a
-            // persistent failure — a revoked grant, an apiserver refusing the watch — re-LISTs the
-            // whole collection as fast as the requests come back, and logs a line each time.
-            watcher(playbookplans_api.clone(), watcher::Config::default())
-                .backoff(WatchBackoff::default()),
+            // Every reflector in this function needs what `restarting_watcher` adds, and nothing
+            // else supplies it: a bare `watcher` re-lists on the very next poll after an error and
+            // resumes a failed response rather than dropping it, `Controller::run` backs off only
+            // its own trigger streams, and these run in tasks of their own. Without it a persistent
+            // failure — a revoked grant, an apiserver refusing the watch — re-LISTs the whole
+            // collection as fast as the requests come back, and logs a line each time.
+            restarting_watcher(playbookplans_api.clone(), watcher::Config::default()),
         );
 
         (playbookplan_reflector, playbookplan_reflector_reader)
@@ -249,8 +258,7 @@ pub async fn new(
 
         let reflector = kube::runtime::reflector(
             writer,
-            watcher(node_access_policies_api.clone(), watcher::Config::default())
-                .backoff(WatchBackoff::default()),
+            restarting_watcher(node_access_policies_api.clone(), watcher::Config::default()),
         );
 
         tokio::spawn(async move {
@@ -275,8 +283,7 @@ pub async fn new(
 
         let reflector = kube::runtime::reflector(
             writer,
-            watcher(static_inventories_api.clone(), watcher::Config::default())
-                .backoff(WatchBackoff::default()),
+            restarting_watcher(static_inventories_api.clone(), watcher::Config::default()),
         );
 
         tokio::spawn(async move {
@@ -301,7 +308,7 @@ pub async fn new(
 
         let reflector = kube::runtime::reflector(
             writer,
-            watcher(nodes_api.clone(), watcher::Config::default()).backoff(WatchBackoff::default()),
+            restarting_watcher(nodes_api.clone(), watcher::Config::default()),
         );
 
         tokio::spawn(async move {
@@ -431,6 +438,12 @@ pub async fn new(
     // whenever a reconcile happened — but nothing made one happen. A `ClusterInventory` that gained
     // a Node therefore reached its plans only on their next requeue (an hour for an idle `OneShot`
     // plan, the next slot for a scheduled one), and a `StaticInventory` edit had no path at all.
+    // `Controller::run` polls every trigger stream through one shared delay, and `SharedBackoff`
+    // divides its ceiling by how many there are — see there for why it has to be told rather than
+    // guessing at 30s. **Every `.watches` and `.owns` below is one of them**: the count is what
+    // pays for them, so it is kept next to them and raised where they are made.
+    let mut trigger_streams = CLUSTER_WIDE_TRIGGERS;
+
     let mut controller = Controller::new(playbookplans_api, watcher::Config::default())
         .watches(
             node_access_policies_api,
@@ -476,7 +489,10 @@ pub async fn new(
                     Arc::clone(&static_inventory_reflector_reader),
                 ),
             );
+        trigger_streams += 2;
     }
+
+    controller = controller.trigger_backoff(SharedBackoff::new(trigger_streams));
 
     controller.run(
         reconcile,
