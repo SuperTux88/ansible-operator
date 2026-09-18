@@ -2,12 +2,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 
 use futures::{Stream, StreamExt as _};
-use kube::runtime::{WatchStreamExt as _, watcher};
+use kube::runtime::watcher;
 use kube::{Api, Resource, ResourceExt as _};
 use serde::de::DeserializeOwned;
 use tracing::{debug, error};
 
-use crate::v1beta1::controllers::watch_backoff::WatchBackoff;
+use crate::v1beta1::controllers::watch_stream::restarting_watcher;
 
 /// How long a set-valued controller waits for label churn to stop before recomputing, as
 /// `Controller::with_config(Config::default().debounce(…))`.
@@ -63,14 +63,12 @@ where
 {
     let kind = M::kind(&M::DynamicType::default()).to_string();
 
-    watcher(api, watcher::Config::default())
-        // The delay `Controller::watches` used to supply. A bare `watcher` re-lists on the very
-        // next poll after an error, and the retry that made that acceptable belongs to the
-        // controller: `Controller::run` wraps its trigger streams in `StreamBackoff`, which only
-        // ever sees the errors that reach it as stream items. This one answers them here, so
-        // without this a persistent failure — a revoked `nodes` grant, an apiserver refusing the
-        // watch — would re-list as fast as the requests come back, and log a line each time.
-        .backoff(WatchBackoff::default())
+    // The delay `Controller::watches` used to supply, and the restart that makes a failure cost one
+    // error instead of a dozen — both are `restarting_watcher`'s, and a bare `watcher` has neither:
+    // it re-lists on the very next poll after an error, and the retry that made that acceptable
+    // belongs to the controller (`Controller::run` wraps its trigger streams in `StreamBackoff`,
+    // which only ever sees the errors that reach it as stream items).
+    restarting_watcher(api, watcher::Config::default())
         .scan(TrackedLabels::default(), move |tracked, event| {
             let tick = match event {
                 Ok(event) => tracked.absorb(&kind, event),
