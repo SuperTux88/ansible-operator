@@ -292,7 +292,47 @@ pub fn desired_labels(
     writes
 }
 
-/// Applies a diff to the Nodes, one merge patch each, and returns how many landed.
+/// What one pass of [`write_labels`] did, in the two numbers its caller decides on.
+#[derive(Debug, Default)]
+pub struct LabelWrites {
+    /// Patches the apiserver accepted.
+    pub published: usize,
+    /// Patches that failed for a reason another tick could plausibly clear — see
+    /// [`worth_retrying_soon`].
+    pub retryable: usize,
+}
+
+/// Whether a refused label patch is worth coming back for sooner than the plan otherwise would.
+///
+/// A refusal the cluster is going to repeat is not. The diff stays non-empty for as long as the
+/// label is missing, so hurrying back for one would re-issue the same refused PATCH every few
+/// seconds, for every providing plan, for as long as the cluster stays that way — and log a line
+/// each time. Both ways of getting there are configuration only an administrator can fix: the
+/// `nodes: patch` grant gone while `node_labels.enabled` is still on (the chart moves the two
+/// together precisely so this cannot happen by accident), and the chart's
+/// `ValidatingAdmissionPolicy` denying the write. Those wait for the plan's ordinary requeue, which
+/// is what they did before this distinction existed.
+///
+/// A conflict, a throttle, an apiserver mid-restart or a connection that failed are the opposite:
+/// nothing is wrong with the plan or the cluster's configuration, the write simply has to be made
+/// again. That is worth hurrying for, because a converged `OneShot` provider has no other reason to
+/// be looked at for an hour — `mappers::node_to_playbookplans` wakes a plan only for a Node it is
+/// still waiting on — so every dependent would wait that hour for a label a second attempt would
+/// have published.
+///
+/// A Node that is gone (404) is deliberately not in the retryable set: it leaves the cache, and with
+/// it the diff.
+fn worth_retrying_soon(error: &kube::Error) -> bool {
+    match error {
+        kube::Error::Api(status) => status.code == 409 || status.code == 429 || status.code >= 500,
+        // Not a verdict from the apiserver at all — a connection that failed, a request that timed
+        // out, a response that could not be read. Nothing about the plan produced it, and the patch
+        // is idempotent, so it is treated as passing.
+        _ => true,
+    }
+}
+
+/// Applies a diff to the Nodes, one merge patch each, and reports what became of them.
 ///
 /// One request per Node rather than anything cleverer: the diff is empty on a converged plan, so
 /// the common case costs nothing, and the uncommon one is a plan rolling out — where the writes are
@@ -300,15 +340,17 @@ pub fn desired_labels(
 ///
 /// A failure is logged and skipped rather than propagated. The labels are derived from recorded
 /// state on every tick, so anything missed here is simply recomputed next time; failing the tick
-/// instead would re-run everything around it for a label that will be retried regardless.
+/// instead would re-run everything around it for a label that will be retried regardless. The
+/// counted failures are the caller's only sign that a retry is owed, though, because nothing else
+/// about the tick changes when a label does not land.
 pub async fn write_labels(
     client: &kube::Client,
     key: &str,
     writes: &[LabelWrite],
     plan: &str,
-) -> usize {
+) -> LabelWrites {
     let nodes: kube::Api<Node> = kube::Api::all(client.clone());
-    let mut written = 0;
+    let mut written = LabelWrites::default();
 
     for write in writes {
         let patch = serde_json::json!({ "metadata": { "labels": { key: write.value } } });
@@ -321,18 +363,23 @@ pub async fn write_labels(
             .await
         {
             Ok(_) => {
-                written += 1;
+                written.published += 1;
                 tracing::info!(
                     "PlaybookPlan {plan}: labelled Node {} with {key}={}",
                     write.node,
                     write.value
                 );
             }
-            Err(error) => tracing::warn!(
-                "PlaybookPlan {plan}: could not label Node {} with {key}={}: {error}",
-                write.node,
-                write.value
-            ),
+            Err(error) => {
+                if worth_retrying_soon(&error) {
+                    written.retryable += 1;
+                }
+                tracing::warn!(
+                    "PlaybookPlan {plan}: could not label Node {} with {key}={}: {error}",
+                    write.node,
+                    write.value
+                );
+            }
         }
     }
 
@@ -770,5 +817,31 @@ mod tests {
         );
 
         assert!(writes.is_empty());
+    }
+
+    /// The caller shortens its requeue on a failure counted here, so what must not be counted is a
+    /// refusal that the next attempt will meet again: the diff never empties, and the plan would
+    /// poll the apiserver with the same refused PATCH for as long as the cluster stayed that way.
+    #[test]
+    fn only_a_refusal_another_attempt_could_clear_is_worth_hurrying_back_for() {
+        let api_error = |code| {
+            kube::Error::Api(Box::new(kube::core::Status {
+                code,
+                ..Default::default()
+            }))
+        };
+
+        // The `nodes: patch` grant is gone, or the chart's ValidatingAdmissionPolicy is denying the
+        // write. Both need an administrator; neither is fixed by asking again in 15 seconds.
+        assert!(!worth_retrying_soon(&api_error(403)));
+        assert!(!worth_retrying_soon(&api_error(401)));
+        // The Node is gone, and leaves the diff with the cache.
+        assert!(!worth_retrying_soon(&api_error(404)));
+
+        // Nothing about the plan or the cluster's configuration decided these.
+        assert!(worth_retrying_soon(&api_error(409)));
+        assert!(worth_retrying_soon(&api_error(429)));
+        assert!(worth_retrying_soon(&api_error(500)));
+        assert!(worth_retrying_soon(&api_error(503)));
     }
 }
