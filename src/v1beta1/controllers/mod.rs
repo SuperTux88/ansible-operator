@@ -7,6 +7,6 @@ pub mod playbookplancontroller;
 mod reconcile_error;
 mod selector_trigger;
 mod version;
-mod watch_backoff;
+mod watch_stream;
 
 pub use ansible_inventory::*;

@@ -11,7 +11,7 @@ use kube::{
     Api,
     api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions},
     runtime::{
-        Controller, WatchStreamExt as _,
+        Controller,
         controller::Action,
         reflector::{ObjectRef, Store, store::Writer},
         watcher,
@@ -38,7 +38,7 @@ use crate::{
         ca::CertificateAuthority,
         controllers::{
             reconcile_error::{ReconcileError, is_conflict, is_not_found},
-            watch_backoff::WatchBackoff,
+            watch_stream::restarting_watcher,
         },
         playbookplancontroller::{
             callback_output, departed_hosts,
@@ -231,13 +231,13 @@ pub async fn new(
 
         let playbookplan_reflector = kube::runtime::reflector(
             playbookplan_reflector_writer,
-            // Every reflector in this function needs the backoff, and nothing else supplies one: a
-            // bare `watcher` re-lists on the very next poll after an error, `Controller::run` backs
-            // off only its own trigger streams, and these run in tasks of their own. Without it a
-            // persistent failure — a revoked grant, an apiserver refusing the watch — re-LISTs the
-            // whole collection as fast as the requests come back, and logs a line each time.
-            watcher(playbookplans_api.clone(), watcher::Config::default())
-                .backoff(WatchBackoff::default()),
+            // Every reflector in this function needs what `restarting_watcher` adds, and nothing
+            // else supplies it: a bare `watcher` re-lists on the very next poll after an error and
+            // resumes a failed response rather than dropping it, `Controller::run` backs off only
+            // its own trigger streams, and these run in tasks of their own. Without it a persistent
+            // failure — a revoked grant, an apiserver refusing the watch — re-LISTs the whole
+            // collection as fast as the requests come back, and logs a line each time.
+            restarting_watcher(playbookplans_api.clone(), watcher::Config::default()),
         );
 
         (playbookplan_reflector, playbookplan_reflector_reader)
@@ -249,8 +249,7 @@ pub async fn new(
 
         let reflector = kube::runtime::reflector(
             writer,
-            watcher(node_access_policies_api.clone(), watcher::Config::default())
-                .backoff(WatchBackoff::default()),
+            restarting_watcher(node_access_policies_api.clone(), watcher::Config::default()),
         );
 
         tokio::spawn(async move {
@@ -275,8 +274,7 @@ pub async fn new(
 
         let reflector = kube::runtime::reflector(
             writer,
-            watcher(static_inventories_api.clone(), watcher::Config::default())
-                .backoff(WatchBackoff::default()),
+            restarting_watcher(static_inventories_api.clone(), watcher::Config::default()),
         );
 
         tokio::spawn(async move {
@@ -301,7 +299,7 @@ pub async fn new(
 
         let reflector = kube::runtime::reflector(
             writer,
-            watcher(nodes_api.clone(), watcher::Config::default()).backoff(WatchBackoff::default()),
+            restarting_watcher(nodes_api.clone(), watcher::Config::default()),
         );
 
         tokio::spawn(async move {
