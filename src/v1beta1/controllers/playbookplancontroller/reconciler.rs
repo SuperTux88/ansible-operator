@@ -1656,31 +1656,37 @@ struct TickConclusion<'a> {
 /// `provides` may own no labels, whatever its inventories do — so gating it on a resolved host set
 /// would let a plan that dropped the field keep its labels for as long as its schedule was invalid
 /// or an inventory of its would not resolve, with every dependent still admitting those Nodes.
+/// Returns whether this tick left something for a soon-after tick to do, which is what the caller
+/// shortens its requeue on — see [`LABEL_REACH_RESTATE`]. That is either a label **published**,
+/// whose reach the status has yet to state, or one refused in a way another attempt could clear. A
+/// refusal that will simply be repeated does not count, and neither does a withdrawal: a plan that
+/// has stopped providing has no `ProvidesLabels` condition left to restate.
 async fn reconcile_node_labels(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
     resource_status: &PlaybookPlanStatus,
     target_groups: Option<&[ResolvedInventoryGroup]>,
-) {
+) -> bool {
     if !context.node_labels_enabled {
-        return;
+        return false;
     }
     let Ok((namespace, name)) = namespace_and_name(object) else {
-        return;
+        return false;
     };
     let key = node_labels::label_key(namespace, name);
     let plan = format!("{namespace}/{name}");
 
     if object.provides_version().is_some() {
         let Some(target_groups) = target_groups else {
-            return;
+            return false;
         };
         let writes =
             node_labels::desired_labels(&key, target_groups, resource_status, &context.nodes);
         if !writes.is_empty() && plan_still_exists(&context.plans, namespace, name) {
-            node_labels::write_labels(&context.client, &key, &writes, &plan).await;
+            let written = node_labels::write_labels(&context.client, &key, &writes, &plan).await;
+            return written.published > 0 || written.retryable > 0;
         }
-        return;
+        return false;
     }
 
     // No `provides`: this plan claims nothing, so nothing may still be carrying its key. Because
@@ -1691,6 +1697,7 @@ async fn reconcile_node_labels(
         info!("PlaybookPlan {plan} no longer provides anything; removing {key} from {stale:?}");
         node_labels::remove_labels(&context.client, &key, &stale, &plan).await;
     }
+    false
 }
 
 /// Whether the plan this tick is reconciling is still in the cluster, asked immediately before its
@@ -1913,7 +1920,8 @@ async fn finish_reconcile_tick(
     // Status first, labels after, and never the other way round: a label is a claim about what a
     // host carries, and the record it is derived from is the thing that survives a crash. A label
     // that got ahead of the record would outlive the only evidence for it.
-    reconcile_node_labels(context, object, resource_status, target_groups).await;
+    let published_labels =
+        reconcile_node_labels(context, object, resource_status, target_groups).await;
 
     for finished in finished_records {
         if finished.record == TerminalRecord::Present
@@ -1946,6 +1954,10 @@ async fn finish_reconcile_tick(
         ));
     }
 
+    if published_labels {
+        requeue_after = Some(label_reach_restate_after(requeue_after));
+    }
+
     if defer_finalizer_release {
         requeue_after = Some(finalizer_release_retry_after(requeue_after));
     }
@@ -1964,6 +1976,42 @@ async fn finish_reconcile_tick(
     }
 
     Ok(requeue_after.map_or_else(Action::await_change, Action::requeue))
+}
+
+/// How long a tick that has just written Node labels waits before looking at them again.
+///
+/// `ProvidesLabels` is derived from the Node cache in [`finish_reconcile_tick`], *before* the status
+/// write — and the labels are written after it, because a label must never get ahead of the record
+/// it is derived from. So the count a publishing tick writes down is the one from before its own
+/// writes, and it is only corrected by a tick that reads the cache again.
+///
+/// Usually one follows within moments: a run finishing produces several more status writes, and each
+/// re-derives the condition. Where none does — a tick whose status is otherwise unchanged, which is
+/// exactly the §4.8 republish after a crash between the status write and the label write — nothing
+/// wakes the plan, and a fully converged provider reads `on 0 of 0 Node(s)` until its next requeue:
+/// an hour for an idle `OneShot`, on the field `results-and-troubleshooting.md` sends a reader to
+/// first.
+///
+/// Long enough for the Node watch to deliver what the write loop just produced, short enough that
+/// nobody is reading the stale number by then, and the same 15 seconds [`prune_retry_after`] uses
+/// for the other piece of after-the-write bookkeeping.
+///
+/// A write that was *refused* asks for the same interval, for the sibling reason: the label is not
+/// on the Node at all, so every dependent is waiting on it, and nothing else would bring the plan
+/// back. Only a refusal another attempt could clear counts — `node_labels::worth_retrying_soon` is
+/// where that line is drawn, and where the reasoning for it lives.
+///
+/// **What it costs in a degraded cluster.** A Node watch that has stopped delivering leaves the diff
+/// non-empty for ever, so the plan keeps re-issuing the same (server-side no-op) PATCH and asking for
+/// this interval instead of its idle one. That is the state `NodeWatchFailures` already escalates
+/// about by name, and in which every other decision the tick makes is equally stale — so this buys a
+/// poll on a plan whose operator is already loudly broken, rather than one on a healthy cluster.
+const LABEL_REACH_RESTATE: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn label_reach_restate_after(current: Option<std::time::Duration>) -> std::time::Duration {
+    current
+        .unwrap_or(LABEL_REACH_RESTATE)
+        .min(LABEL_REACH_RESTATE)
 }
 
 /// How long a tick that owes the run-cleanup finalizer back waits before looking again.
@@ -9502,6 +9550,30 @@ mod tests {
         assert_eq!(
             prune_retry_after(std::time::Duration::from_secs(5)),
             std::time::Duration::from_secs(5)
+        );
+    }
+
+    /// A tick that publishes labels writes its `ProvidesLabels` count before making those labels
+    /// true, so the number it leaves behind is one observation out of date. Left to the caller's
+    /// interval it would stand for an hour on an idle `OneShot` — and the tick that publishes need
+    /// not change the status at all, so nothing else brings the plan back.
+    #[test]
+    fn a_published_label_is_restated_before_the_idle_requeue() {
+        assert_eq!(
+            label_reach_restate_after(Some(std::time::Duration::from_secs(3600))),
+            LABEL_REACH_RESTATE,
+            "the idle requeue must not decide when the reach is restated"
+        );
+        assert_eq!(
+            label_reach_restate_after(None),
+            LABEL_REACH_RESTATE,
+            "a tick that would have slept until woken still has to come back for it"
+        );
+        let sooner = std::time::Duration::from_secs(5);
+        assert_eq!(
+            label_reach_restate_after(Some(sooner)),
+            sooner,
+            "and it never delays a tick that was already coming back sooner"
         );
     }
 
