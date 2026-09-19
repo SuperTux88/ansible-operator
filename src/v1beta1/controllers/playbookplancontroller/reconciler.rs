@@ -1812,10 +1812,10 @@ static DISABLED_SWEEP_REPORTED: std::sync::atomic::AtomicBool =
 ///
 /// The Nodes are read live. The plan is already gone, so there is no host set to consult and no
 /// reason to trust a cache that may not have caught up with the machines either; a label selector
-/// asks the API server for exactly the Nodes to clean. A plan that provided nothing is skipped
-/// before that call, so an ordinary deletion costs nothing.
+/// asks the API server for exactly the Nodes to clean. A plan that can never have published
+/// anything is skipped before that call, so an ordinary deletion costs nothing.
 async fn withdraw_deleted_plans_labels(client: &kube::Client, object: &PlaybookPlan) {
-    if object.provides_version().is_none() {
+    if !may_have_published_labels(object) {
         return;
     }
     let Ok((namespace, name)) = namespace_and_name(object) else {
@@ -1832,6 +1832,40 @@ async fn withdraw_deleted_plans_labels(client: &kube::Client, object: &PlaybookP
             "PlaybookPlan {plan} was deleted, but the Nodes carrying {key} could not be listed: {error}. They keep the label until the operator's next startup sweep"
         ),
     }
+}
+
+/// Whether a plan being deleted could still own Node labels — the spec alone cannot say.
+///
+/// The obvious reading, "it declares no `provides`, so it owns nothing", is wrong in the one
+/// direction that fails open. Dropping the field is what *starts* a withdrawal, and the tick that
+/// performs it can be prevented from ever running: every desired-input error returns before the
+/// label pass. A plan whose inventory has been deleted, and which then has `provides` removed and
+/// is itself deleted, would take its labels out of reach of both paths at once — and a label for a
+/// plan nobody has goes on admitting those Nodes to every dependent's inventory.
+///
+/// So the record is asked as well, and the second half of the test is `appliedVersion`: it is
+/// stamped by exactly the run that earns a label, so a plan carrying one may still own labels
+/// whatever its spec now says. The inverse is what makes the skip safe, and it holds because
+/// **every way of losing that field takes the label with it**:
+///
+/// - a later run of a revision that declares nothing clears it — and that run's own tick has
+///   already withdrawn the labels, since withdrawal is decided before the run;
+/// - `node_recreation` clears it for a machine rebuilt under the same name — and the label died
+///   with the Node object it was written on;
+/// - `departed_hosts` drops the whole row, which it only does once no Node of that name exists.
+///
+/// The status is read from the deleted object the watch delivered, so this stays a decision made
+/// with no cache and no request, and a plan that never provided anything is still skipped before
+/// the live LIST — an ordinary deletion costs exactly what it did before.
+fn may_have_published_labels(object: &PlaybookPlan) -> bool {
+    object.provides_version().is_some()
+        || object.status.as_ref().is_some_and(|status| {
+            status
+                .hosts_status
+                .iter()
+                .flatten()
+                .any(|(_, host)| host.applied_version.is_some())
+        })
 }
 
 /// Removes every Node label a plan owns, for the paths that end a plan's claim outright.
@@ -6920,11 +6954,15 @@ fn describe_ssh_source(static_inventory_name: &str, group: &str) -> String {
 
 /// Whether two `StaticInventory`s reach a host as the same user with the same key.
 ///
-/// Compared field by field rather than by a derived `PartialEq`, so that adding a field to
-/// [`SshConfig`] is a deliberate decision here about whether it changes who the run connects as.
-/// Both Secrets are resolved in the plan's own namespace, so the name alone identifies the key.
+/// Destructured rather than compared by a derived `PartialEq`, so that adding a field to
+/// [`SshConfig`] does not compile until someone has decided here whether it changes who the run
+/// connects as. A new connection field silently left out would reopen exactly the ambiguity this
+/// refusal exists to catch. Both Secrets are resolved in the plan's own namespace, so the name
+/// alone identifies the key.
 fn same_ssh_config(left: &SshConfig, right: &SshConfig) -> bool {
-    left.user == right.user && left.secret_ref.name == right.secret_ref.name
+    let SshConfig { user, secret_ref } = left;
+
+    *user == right.user && secret_ref.name == right.secret_ref.name
 }
 
 /// Fails the reconcile if an inventory group sets a variable the operator manages for
@@ -13216,5 +13254,45 @@ spec:
         assert_eq!(failed.phase, Phase::Failed);
         assert_eq!(failed.next_run, None);
         assert_eq!(failed.requeue, None);
+    }
+
+    /// The spec alone cannot answer this. Removing `provides` is what *starts* a withdrawal, and
+    /// every desired-input error returns before the tick reaches the label pass — so a plan whose
+    /// inventory is gone can drop the field, be deleted, and have its labels miss both paths. They
+    /// would then stand for a plan nobody has, admitting those Nodes to every dependent.
+    #[test]
+    fn a_deleted_plan_that_dropped_provides_is_still_asked_about_its_labels() {
+        let mut plan = PlaybookPlan::new("containerd", PlaybookPlanSpec::default());
+        plan.metadata.namespace = Some("platform".into());
+
+        assert!(
+            !may_have_published_labels(&plan),
+            "a plan that declares nothing and has published nothing owns no labels"
+        );
+
+        plan.status = Some(PlaybookPlanStatus {
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".into(),
+                v1beta1::HostStatus {
+                    last_outcome: v1beta1::HostOutcome::Succeeded,
+                    applied_version: Some("1.4.2".into()),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        });
+        assert!(
+            may_have_published_labels(&plan),
+            "a host that applied a version is evidence of a label the spec no longer admits to"
+        );
+
+        plan.status = None;
+        plan.spec.provides = Some(v1beta1::Provides {
+            version: "1.4.2".into(),
+        });
+        assert!(
+            may_have_published_labels(&plan),
+            "a plan that declares a version may own labels from an earlier revision too"
+        );
     }
 }
