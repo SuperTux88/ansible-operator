@@ -1577,6 +1577,18 @@ async fn reconcile(
                         resource_status.next_run = Some(next.fixed_offset());
                     }
                 } else {
+                    if let Some(schedule) = scheduling_configuration.schedule.as_ref()
+                        && let Some((next, after)) =
+                            deadline_swallows_a_tick(schedule, time_window, now())
+                    {
+                        warn!(
+                            "spec.startingDeadlineSeconds ({}s) is at least as long as the gap \
+                             between scheduled ticks ({next} → {after}), so a tick that falls \
+                             inside a window still open for an earlier slot never runs. Set a \
+                             deadline shorter than the schedule's interval, or schedule less often.",
+                            time_window.num_seconds(),
+                        );
+                    }
                     let run = RunContext {
                         triggered_slot: this_slot,
                         ..base_run
@@ -2483,6 +2495,33 @@ pub(super) fn retry_budget_closes_window(
     tries_spent > 0
         && slot_already_triggered(current_slot, budget_slot)
         && !retry_due(phase, tries_spent, max_attempts)
+}
+
+/// Whether `spec.startingDeadlineSeconds` is wide enough to swallow whole schedule ticks, and the
+/// two occurrences that show it.
+///
+/// `evaluate_schedule` looks back a full window and reports the *oldest* tick inside it, so a
+/// deadline at least as long as the interval keeps the plan on an older slot while later ones come
+/// and go: with `0 * * * *` and four hours, 06:30 still reports the 03:00 slot, and once that window
+/// is taken the plan sleeps to 07:00 — 04:00, 05:00 and 06:00 never ran.
+///
+/// It is a warning and not a rejection, because the configuration is valid and plans already exist
+/// that use it; rejecting it would break them on upgrade. A wide deadline is also what a maintenance
+/// window *is*, so the fix is a judgement the author has to make: usually a deadline shorter than
+/// the interval, occasionally a sparser schedule.
+///
+/// Reported where a run starts for a slot rather than wherever the schedule is parsed, which is what
+/// keeps it from repeating on every tick of an open window: the plan says it at most once per run it
+/// actually starts, in the tick whose slot the older window swallowed.
+fn deadline_swallows_a_tick<Tz: TimeZone>(
+    schedule: &Schedule,
+    deadline: chrono::Duration,
+    now: DateTime<Tz>,
+) -> Option<(DateTime<Tz>, DateTime<Tz>)> {
+    let next = forecast_next_run(schedule, now, None)?;
+    let after = forecast_next_run(schedule, next.clone(), None)?;
+
+    (deadline >= after.clone() - next.clone()).then_some((next, after))
 }
 
 /// The slot whose schedule window is open right now, from the plan's spec alone.
@@ -13214,6 +13253,36 @@ spec:
             Some(slot),
             1,
         ));
+    }
+
+    /// The maintenance-window trap: a deadline at least as long as the interval keeps the plan on
+    /// the oldest slot in the window, so the ticks inside it never run. Valid configuration, and the
+    /// only thing the operator can do about it is say so.
+    #[test]
+    fn a_deadline_as_wide_as_the_interval_is_reported_as_swallowing_ticks() {
+        let now = "2026-01-01T02:30:00Z".parse::<DateTime<Utc>>().unwrap();
+        let hourly = Schedule::parse("0 * * * *").unwrap();
+        let nightly = Schedule::parse("0 3 * * *").unwrap();
+        let four_hours = chrono::Duration::hours(4);
+
+        let (next, after) = deadline_swallows_a_tick(&hourly, four_hours, now)
+            .expect("four hours swallows three hourly ticks");
+        assert_eq!(
+            next,
+            "2026-01-01T03:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(
+            after,
+            "2026-01-01T04:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+
+        // The window this feature is for: four hours of grace on a nightly schedule leaves every
+        // other tick a day away, so nothing is swallowed.
+        assert!(deadline_swallows_a_tick(&nightly, four_hours, now).is_none());
+        // The boundary is inclusive: a deadline exactly as long as the interval already means the
+        // next tick opens while the previous window is still open.
+        assert!(deadline_swallows_a_tick(&hourly, chrono::Duration::hours(1), now).is_some());
+        assert!(deadline_swallows_a_tick(&hourly, chrono::Duration::minutes(59), now).is_none());
     }
 
     #[test]
