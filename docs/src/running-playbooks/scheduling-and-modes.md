@@ -37,13 +37,31 @@ pinned to a maintenance window.
 The plan's `.status.nextRun` shows the next computed fire time, and the `Next run` printer column
 surfaces it in `kubectl get playbookplan`.
 
-### One tick, one run per revision
+### One tick, one run per host
 
-Because a run may start anywhere inside that window, the trigger gate has to remember that the window
-has already been used — otherwise a run finishing inside its own window would immediately re-trigger
+Because a run may start anywhere inside that window, the trigger gate has to remember what the window
+has already done — otherwise a run finishing inside its own window would immediately re-trigger
 itself. The gate uses the attempt budget's `.status.retryCountSlot` and the plan's immutable `Play`
 records to identify the current tick. `.status.lastTriggeredRun` records the tick a run was last
 started for as an observable marker only; it is not a gate input.
+
+What the window is spent on is a **host**, not a run. A tick may start more than one run inside its
+window, and does exactly when a host becomes eligible after the window opened — a Node that joined
+overnight, one a plan you [depend on](./playbook-plans.md#declaring-what-a-plan-provides) has just
+labelled, an entry added to a `StaticInventory`. Such a host is owed the run the window promised,
+however well the hosts that were there at the tick did, so a run that succeeded closes the window
+only for the hosts it applied to. This is what makes a wide `startingDeadlineSeconds` a maintenance
+*window* rather than a single attempt at its opening minute: set it to four hours and a machine
+switched on three hours late still gets the playbook, on the same tick's budget.
+
+A host is never applied to twice within one window. Which hosts a run targets is decided by the
+[execution hash](#drift-detection) — a host carrying the current one is already converged and is not
+in the run — so the second run reaches only the hosts the first never did.
+
+The window still closes outright in the two cases where nothing more should start in it: while one
+of the plan's runs is **in flight**, and once its failures have spent the
+[attempt budget](#retries). That second one is the rule behind "if something actually failed, a host
+arriving later gets nothing": a failing playbook stops reaching further hosts until you fix it.
 
 That gating state is per revision, not per window: any change to the [execution hash](#drift-detection)
 clears the retry budget and makes prior `Play` records inapplicable, so an edit made moments after a
@@ -127,11 +145,12 @@ out of date because it has no recorded hash of its own.
   is keyed by the host's name, which is all the fresh machine inherits, so the operator compares the
   Node's `creationTimestamp` against the host's
   [`appliedAt`](./results-and-troubleshooting.md#per-host-outcomes) — the time the run that claimed
-  it was prepared — to tell the two apart. On a **scheduled** plan such a host waits for the next
-  slot, because the run it was replaced during consumed this one by succeeding.
+  it was prepared — to tell the two apart. On a **scheduled** plan such a host is owed a run inside
+  the current window like any other host that became eligible after it opened, so it is picked up
+  without waiting for the next slot, provided the window is still open and the budget unspent.
 - When you edit the playbook or change a referenced variables/files Secret, the hash changes **at
   once**: the operator watches the plan and the Secrets it names, so the desired hash, run numbering
-  and [consumed schedule slot](#one-tick-one-run-per-revision) update on the spot.
+  and [consumed schedule slot](#one-tick-one-run-per-host) update on the spot.
 - Changing `spec.provides.version` changes the hash, so the playbook re-runs on **every** host of
   the plan. That is what lets a Node's dependency label be trusted, and it is also the only way to
   re-run a plan whose playbook text has not changed. Adding or removing `provides` re-runs it once.

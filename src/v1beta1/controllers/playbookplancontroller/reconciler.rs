@@ -1533,6 +1533,7 @@ async fn reconcile(
                         slot,
                         &execution_hash,
                         max_attempts,
+                        &hosts_to_trigger,
                     )
                     .await?
                 } else {
@@ -2126,23 +2127,50 @@ async fn schedule_window_already_taken(
     slot: DateTime<FixedOffset>,
     desired_hash: &ExecutionHash,
     max_attempts: u32,
+    hosts_to_trigger: &[String],
 ) -> Result<bool, ReconcileError> {
     let (namespace, plan_name) = namespace_and_name(object)?;
-    let plays = Api::<Play>::namespaced(context.client.clone(), namespace)
+    let mut plays = Api::<Play>::namespaced(context.client.clone(), namespace)
         .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
-        .await?;
+        .await?
+        .items;
+    withdraw_replaced_machines(&mut plays, |host, prepared_at| {
+        context
+            .nodes
+            .get(&ObjectRef::new(host))
+            .is_some_and(|node| node_recreation::node_replaced_since(prepared_at, &node))
+    });
     Ok(window_taken_by_a_record(
-        &plays.items,
+        &plays,
         object,
         slot,
         desired_hash,
         max_attempts,
+        hosts_to_trigger,
     ))
 }
 
 /// Whether this schedule window has nothing left for a run to do, judged from the plan's own
-/// records: one of its runs is still going, one of them succeeded, or its failed runs have spent the
-/// execution's attempt budget.
+/// records: one of its runs is still going, its failed runs have spent the execution's attempt
+/// budget, or every host still waiting on a run has already had one succeed on it this window.
+///
+/// That last clause is what makes a window a *window* rather than a single run. A host can become
+/// eligible after the window opened — a Node joins overnight, a provider plan publishes the version
+/// its selector wants, a `StaticInventory` gains an entry — and it is owed the run its window
+/// promised, whatever the hosts that were present at the tick already did. Reading a `Succeeded`
+/// record as "this window is finished" denied it that until the next tick, which for a nightly plan
+/// is a day, and for a maintenance window whose machines are switched on late is the whole point of
+/// the window.
+///
+/// It is deliberately asked of the hosts the tick still wants to trigger rather than of the
+/// inventory at large, so nothing here re-runs a host the plan has no work for: for `OneShot` that
+/// set is already `find_outdated_hosts`, which excludes every host carrying the current hash. A
+/// window with no such hosts left is taken, which is also what keeps an empty set from reading as
+/// "still owed".
+///
+/// Coverage is by host name, so the caller first takes out of `plays` every Node replaced since its
+/// record was prepared ([`withdraw_replaced_machines`]): the fresh machine behind that name has not
+/// had this window's run.
 ///
 /// Pure so the rule stays pinned beside [`consumed_its_slot`], which asks the neighbouring question
 /// of a *live* run and must keep answering it the same way. The two differ in one place only: a
@@ -2169,6 +2197,7 @@ fn window_taken_by_a_record(
     slot: DateTime<FixedOffset>,
     desired_hash: &ExecutionHash,
     max_attempts: u32,
+    hosts_to_trigger: &[String],
 ) -> bool {
     let (Some(plan_name), Some(uid)) =
         (plan.metadata.name.as_deref(), plan.metadata.uid.as_deref())
@@ -2176,18 +2205,27 @@ fn window_taken_by_a_record(
         return false;
     };
     let mut failures = 0;
-    for status in plays
-        .iter()
-        .filter(|play| {
-            play_history::play_belongs_to_plan(play, plan_name, uid)
-                && play.spec.triggered_slot == Some(slot)
-                && play.spec.execution_hash == desired_hash.to_string()
-        })
-        .filter_map(|play| play.status.as_ref())
-    {
+    let mut applied: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for play in plays.iter().filter(|play| {
+        play_history::play_belongs_to_plan(play, plan_name, uid)
+            && play.spec.triggered_slot == Some(slot)
+            && play.spec.execution_hash == desired_hash.to_string()
+    }) {
+        let Some(status) = play.status.as_ref() else {
+            continue;
+        };
         match status.phase {
-            // Still going, or done and done well: either way the window is not a retry's to take.
-            v1beta1::PlayPhase::Running | v1beta1::PlayPhase::Succeeded => return true,
+            // Still going: the window is nobody else's to take while a run of it is in flight.
+            v1beta1::PlayPhase::Running => return true,
+            // Done, and done well — for the hosts it ran against. Those hosts are exactly its
+            // recorded inventory, since `play_history::terminal_status` only reaches `Succeeded`
+            // when every host in the run succeeded.
+            v1beta1::PlayPhase::Succeeded => applied.extend(
+                play.spec
+                    .inventory
+                    .iter()
+                    .flat_map(|group| group.hosts.iter().map(String::as_str)),
+            ),
             // `Unknown` counts as a failure here for the same reason it does everywhere else: a
             // recap that could not be read is not evidence the hosts were reached.
             v1beta1::PlayPhase::Failed | v1beta1::PlayPhase::Unknown
@@ -2198,7 +2236,42 @@ fn window_taken_by_a_record(
             _ => {}
         }
     }
-    failures >= max_attempts
+    if failures >= max_attempts {
+        return true;
+    }
+    hosts_to_trigger
+        .iter()
+        .all(|host| applied.contains(host.as_str()))
+}
+
+/// Removes from each record's inventory the cluster Nodes that `replaced_since` says are newer than
+/// the run that record describes, so [`window_taken_by_a_record`] does not count them as covered.
+///
+/// A record names its hosts, and a host name outlives the machine: a Node re-imaged during or after
+/// this window's successful run inherits the name, never the claim (`node_recreation`). Left in, the
+/// name alone would close the window on the fresh machine, and it would wait for the next slot while
+/// the window it is owed is still open. Only the in-memory copy the gate reads is changed.
+///
+/// Asked only of the hosts the record itself holds as Nodes (`ResolvedHosts.connection`), for the
+/// reason `node_recreation` gives: a `StaticInventory` host that shares a Node's name says nothing
+/// about that Node.
+fn withdraw_replaced_machines(
+    plays: &mut [Play],
+    replaced_since: impl Fn(&str, Option<DateTime<FixedOffset>>) -> bool,
+) {
+    for play in plays {
+        let prepared_at = play_prepared_at(play);
+        for group in play
+            .spec
+            .inventory
+            .iter_mut()
+            .filter(|group| group.connection == Some(v1beta1::HostConnection::ManagedSsh))
+        {
+            group
+                .hosts
+                .retain(|host| !replaced_since(host, prepared_at));
+        }
+    }
 }
 
 /// Checks that every `spec.template.files` entry can name a directory of its own under the
@@ -9155,7 +9228,9 @@ mod tests {
 
     /// The half of the start gate that does not go through the plan's status: a window one of the
     /// plan's own records already took must never be handed to a second run, however far behind
-    /// `lastTriggeredRun` happens to be.
+    /// `lastTriggeredRun` happens to be. Every record here ran against the one host the tick wants
+    /// to trigger, which is what makes the window theirs to spend; a window still owing a host
+    /// none of them reached is the neighbouring case, and has its own test.
     #[test]
     fn a_record_with_a_job_takes_the_window_for_its_own_revision() {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -9180,7 +9255,11 @@ mod tests {
                     preparation_fingerprint: "fingerprint".into(),
                     run_number: 1,
                     attempt: 1,
-                    inventory: Vec::new(),
+                    inventory: vec![ResolvedHosts {
+                        name: "group".into(),
+                        hosts: vec!["node-a".into()],
+                        ..Default::default()
+                    }],
                     provides_version: None,
                     triggered_slot,
                 },
@@ -9200,10 +9279,16 @@ mod tests {
         plan.metadata.uid = Some("plan-uid".into());
 
         // One try per tick — the `Recurring` default — so a single finished run spends the window.
-        let taken = |plays: &[Play]| window_taken_by_a_record(plays, &plan, slot, &hash, 1);
+        // The host the tick wants to trigger is the one every record here ran against, so a
+        // `Succeeded` record covers it and the window is spent; a window still owing a host the
+        // records never reached is the neighbouring case, pinned below.
+        let owed = ["node-a".to_string()];
+        let taken = |plays: &[Play]| window_taken_by_a_record(plays, &plan, slot, &hash, 1, &owed);
 
         // A run that reached a Job takes the window, running or already finished — the plan's
-        // marker is written from these and may be behind them, or missing entirely.
+        // marker is written from these and may be behind them, or missing entirely. For the
+        // succeeded one that is because it applied to the host this tick is asking about.
+
         for phase in [
             v1beta1::PlayPhase::Running,
             v1beta1::PlayPhase::Succeeded,
@@ -9249,6 +9334,7 @@ mod tests {
             slot,
             &other_hash,
             1,
+            &owed,
         ));
         assert!(!taken(&[play(
             "plan-uid",
@@ -9270,8 +9356,184 @@ mod tests {
         )]));
     }
 
+    /// The window is a window, not a single run. A host can become eligible after it opened — a
+    /// Node that joined overnight, one a provider plan has just labelled, an entry added to a
+    /// `StaticInventory` — and it is owed the run the window promised, however well the hosts that
+    /// were present at the tick did. A `Succeeded` record used to close the window outright, so
+    /// such a host waited for the next tick: a day, for a nightly plan, and for a maintenance
+    /// window whose machines are switched on late, the whole point of the window.
+    #[test]
+    fn a_succeeded_record_leaves_the_window_open_for_a_host_it_never_ran() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+
+        let succeeded_over = |hosts: &[&str]| {
+            let mut play = Play::new(
+                "apply-plan-abc-1",
+                v1beta1::PlaySpec {
+                    playbook_plan: "plan".into(),
+                    playbook_plan_uid: "plan-uid".into(),
+                    execution_hash: "1a".into(),
+                    run_id: "run-1".into(),
+                    preparation_fingerprint: "fp".into(),
+                    run_number: 1,
+                    attempt: 1,
+                    inventory: vec![ResolvedHosts {
+                        name: "group".into(),
+                        hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+                        ..Default::default()
+                    }],
+                    provides_version: None,
+                    triggered_slot: Some(slot),
+                },
+            );
+            play.metadata.owner_references = Some(vec![OwnerReference {
+                uid: "plan-uid".into(),
+                name: "plan".into(),
+                ..Default::default()
+            }]);
+            play.status = Some(v1beta1::PlayStatus {
+                phase: v1beta1::PlayPhase::Succeeded,
+                ..Default::default()
+            });
+            play
+        };
+        let taken = |plays: &[Play], owed: &[&str]| {
+            let owed: Vec<String> = owed.iter().map(|host| (*host).to_string()).collect();
+            window_taken_by_a_record(plays, &plan, slot, &hash, 1, &owed)
+        };
+
+        let ran_over_a_and_b = [succeeded_over(&["node-a", "node-b"])];
+
+        // The case the window exists for.
+        assert!(
+            !taken(&ran_over_a_and_b, &["node-c"]),
+            "a host this window never reached is still owed the run it promised"
+        );
+        // One uncovered host among covered ones is enough to keep it open — and the run that
+        // follows targets only what is outdated, so the covered ones are not applied to twice.
+        assert!(!taken(&ran_over_a_and_b, &["node-b", "node-c"]));
+
+        // What must not break: a window with nothing left to do is spent, exactly as before. The
+        // middle case is the one a lagging status produces, where the hosts still look outdated.
+        assert!(taken(&ran_over_a_and_b, &["node-a"]));
+        assert!(
+            taken(&ran_over_a_and_b, &["node-a", "node-b"]),
+            "every owed host already had this window's playbook applied"
+        );
+        assert!(
+            taken(&ran_over_a_and_b, &[]),
+            "a window owing no host at all is spent, not open"
+        );
+
+        // Two runs of one window cover it between them.
+        let ran_separately = [succeeded_over(&["node-a"]), succeeded_over(&["node-c"])];
+        assert!(taken(&ran_separately, &["node-a", "node-c"]));
+        assert!(!taken(&ran_separately, &["node-a", "node-d"]));
+    }
+
+    /// A Node re-imaged after this window's run succeeded on it keeps the host name and nothing
+    /// else: `node_recreation` drops its claim, so it is owed a run again — and it must get one in
+    /// this window, not wait for the next slot because the record still lists the name.
+    #[test]
+    fn a_machine_replaced_since_its_run_is_not_covered_by_it() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        use k8s_openapi::jiff::Timestamp;
+
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let prepared_at = "2025-08-12T20:00:05Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+
+        let mut play = Play::new(
+            "apply-plan-abc-1",
+            v1beta1::PlaySpec {
+                playbook_plan: "plan".into(),
+                playbook_plan_uid: "plan-uid".into(),
+                execution_hash: "1a".into(),
+                run_id: "run-1".into(),
+                preparation_fingerprint: "fp".into(),
+                run_number: 1,
+                attempt: 1,
+                inventory: vec![
+                    ResolvedHosts {
+                        name: "nodes".into(),
+                        hosts: vec!["node-a".into(), "node-b".into()],
+                        connection: Some(v1beta1::HostConnection::ManagedSsh),
+                    },
+                    // An external host that happens to share the replaced Node's name.
+                    ResolvedHosts {
+                        name: "edge".into(),
+                        hosts: vec!["node-b".into()],
+                        connection: Some(v1beta1::HostConnection::Ssh),
+                    },
+                ],
+                provides_version: None,
+                triggered_slot: Some(slot),
+            },
+        );
+        play.metadata.creation_timestamp = Some(Time(
+            Timestamp::from_second(prepared_at.timestamp()).unwrap(),
+        ));
+        play.metadata.owner_references = Some(vec![OwnerReference {
+            uid: "plan-uid".into(),
+            name: "plan".into(),
+            ..Default::default()
+        }]);
+        play.status = Some(v1beta1::PlayStatus {
+            phase: v1beta1::PlayPhase::Succeeded,
+            ..Default::default()
+        });
+
+        let mut plays = vec![play];
+        withdraw_replaced_machines(&mut plays, |host, claimed_at| {
+            assert_eq!(
+                claimed_at,
+                Some(prepared_at),
+                "judged against the run's own start"
+            );
+            host == "node-b"
+        });
+
+        assert_eq!(plays[0].spec.inventory[0].hosts, vec!["node-a".to_string()]);
+        assert_eq!(
+            plays[0].spec.inventory[1].hosts,
+            vec!["node-b".to_string()],
+            "a StaticInventory host says nothing about the Node it shares a name with"
+        );
+
+        let without_the_external_twin = {
+            let mut plays = plays.clone();
+            plays[0].spec.inventory.truncate(1);
+            plays
+        };
+        let owed = ["node-b".to_string()];
+        assert!(
+            !window_taken_by_a_record(&without_the_external_twin, &plan, slot, &hash, 1, &owed),
+            "the fresh machine is still owed this window's run"
+        );
+        assert!(window_taken_by_a_record(
+            &without_the_external_twin,
+            &plan,
+            slot,
+            &hash,
+            1,
+            &["node-a".to_string()]
+        ));
+    }
+
     /// With a budget above one, the window is a `Recurring` plan's to retry in until its failures
-    /// have spent it — but never while one of its runs is still going or has already succeeded.
+    /// have spent it — but never while one of its runs is still going, or while one that succeeded
+    /// has already applied to every host the tick is asking about.
     #[test]
     fn a_window_with_budget_left_is_free_for_a_retry() {
         let slot = "2025-08-12T20:00:00Z"
@@ -9292,7 +9554,11 @@ mod tests {
                     preparation_fingerprint: "fp".into(),
                     run_number: 1,
                     attempt: 1,
-                    inventory: Vec::new(),
+                    inventory: vec![ResolvedHosts {
+                        name: "group".into(),
+                        hosts: vec!["node-a".into()],
+                        ..Default::default()
+                    }],
                     provides_version: None,
                     triggered_slot: Some(slot),
                 },
@@ -9308,8 +9574,11 @@ mod tests {
             });
             play
         };
+        // Every record here ran against the one host the tick wants to trigger, so a success of
+        // theirs covers it.
+        let owed = ["node-a".to_string()];
         let taken = |plays: &[Play], max_attempts| {
-            window_taken_by_a_record(plays, &plan, slot, &hash, max_attempts)
+            window_taken_by_a_record(plays, &plan, slot, &hash, max_attempts, &owed)
         };
 
         assert!(!taken(&[failed("run-1")], 3));
@@ -9324,7 +9593,8 @@ mod tests {
         unknown.status.as_mut().unwrap().phase = v1beta1::PlayPhase::Unknown;
         assert!(taken(&[failed("run-1"), unknown], 2));
 
-        // Budget or no budget, a run that succeeded ends the window, and one still going owns it.
+        // Budget or no budget, a run that succeeded ends the window for the hosts it applied to —
+        // here, the only one there is — and one still going owns it outright.
         let mut succeeded = failed("run-2");
         succeeded.status.as_mut().unwrap().phase = v1beta1::PlayPhase::Succeeded;
         assert!(taken(&[failed("run-1"), succeeded], 3));
@@ -9417,12 +9687,16 @@ mod tests {
             Some(slot),
             1,
         ));
+        // The host the window still owes is the one the down Node kept it from: its own record
+        // never applied to it, so nothing here covers it.
+        let owed = ["node-b".to_string()];
         assert!(!window_taken_by_a_record(
             std::slice::from_ref(&missed_a_down_node),
             &oneshot,
             slot,
             &hash,
             1,
+            &owed,
         ));
 
         // A run the refund turns down still spent its try, and still closes the window.
@@ -9445,7 +9719,14 @@ mod tests {
             ),
         ] {
             assert!(
-                window_taken_by_a_record(std::slice::from_ref(play), &oneshot, slot, &hash, 1),
+                window_taken_by_a_record(
+                    std::slice::from_ref(play),
+                    &oneshot,
+                    slot,
+                    &hash,
+                    1,
+                    &owed
+                ),
                 "{what}"
             );
         }
@@ -9458,6 +9739,7 @@ mod tests {
             slot,
             &hash,
             1,
+            &owed,
         ));
     }
 
