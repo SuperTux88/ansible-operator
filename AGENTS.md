@@ -93,7 +93,7 @@ src/v1beta1/
     mappers.rs                       maps Secret, NodeAccessPolicy, ClusterInventory and StaticInventory changes to affected plans; the Secret watch asks two rules (named in `variables`/`files`, or holding a StaticInventory's SSH key)
     node_access.rs                   NodeAccessPolicy enforcement: fail-closed intersection clamp (INV-2/3/5)
     node_labels.rs                   publishes a plan's `spec.provides` version onto the Nodes it converged, as `<ns>.plan.ansible.cloudbending.dev/<plan>`, so other plans can gate their own inventories on it. Three load-bearing rules: **status first, labels after** (a label may lag the record, never lead it — a crash between the two must not leave a claim with no evidence); the diff reads the **resolved managed-ssh groups**, never `hostsStatus` alone (which is keyed by name, so a StaticInventory host would otherwise label a same-named Node); and it writes **only on a real change of value**, since every Node label change is broadcast to every Node watcher in the cluster. The key is derived from the plan's namespace and name, never from tenant input (INV-8)
-    node_readiness.rs                Node Ready-condition predicates + the OneShot "hold instead of starting" gate; readiness only, never authorization
+    node_readiness.rs                Node Ready-condition predicates + the "hold instead of starting" gate (both modes); readiness only, never authorization
     node_recreation.rs               drops a host's recorded application when its Node is newer than `appliedAt` (the time the run that claimed it was *prepared*) — a rebuilt machine inherits the name, never the claim. Both sides are apiserver-stamped on purpose: the run's finish time comes from the operator pod, and comparing clocks would re-run a freshly joined Node for ever. Level-triggered too: a deletion the operator was down for leaves no event to react to, and `status::apply_terminal_play_status` asks the same question once more before recording a claim at all
     departed_hosts.rs                prunes `hostsStatus` rows for hosts that left the inventory **and** no longer exist as Nodes (housekeeping; `hostsStatus` otherwise only ever grows). Requiring both is what stops a narrowed NodeAccessPolicy from dropping live machines' records and re-running them when it widens again. Deletion needs an explicit `null` per key — a merge patch cannot delete by omission
     managed_ssh.rs                   proxy pods (hostPID + nsenter = NODE ROOT), per-run sshd config/certs/principals, NetworkPolicy, cleanup (INV-4/7)
@@ -169,8 +169,12 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    **only when there is no `active_run`** — an in-flight run keeps `Applying` and its own hash
    (which lives in its `Play`), and the new revision waits for it.
 6. **Step 1 — schedule + outdated hosts.** `triggers::evaluate_schedule` in the plan's
-   timezone within a 15s window; `hosts_to_trigger` = outdated hosts (`OneShot`) or all hosts
-   (`Recurring`).
+   timezone within a 15s window; `hosts_to_trigger` = outdated hosts (`OneShot`) or, for
+   `Recurring` inside an open slot, the hosts that slot still owes
+   (`execution_evaluator::find_hosts_owing_slot`: no success of this slot per `appliedAt`, or not
+   on the current hash). A `Recurring` slot whose every host is served goes through
+   `update_idle_recurring_status`, which must set the requeue to the next slot — without it the
+   tick keeps the 1h default and sub-hourly schedules skip slots.
 7. **`try_start_run` (steps 2–5)** when eligible and nothing is active: `select_job` numbers
    the run one past everything still claiming a name (Jobs *and* retained `Play`s — it
    never adopts a running Job, see below), `play_history::record_prepared` writes the
@@ -224,8 +228,11 @@ comments (they encode hard-won runtime facts: BusyBox `nsenter` short-option qui
 
 - `OneShot` (default): only outdated hosts run; once every host is current, `Succeeded`/`Failed`
   and it goes quiet until the hash changes.
-- `Recurring`: *all* hosts run every schedule tick; keeps the finished run's `Succeeded`/`Failed`
-  and forecasts the next slot into `next_run` via `forecast_next_run`.
+- `Recurring`: *every* host runs once per schedule tick — a tick is a window
+  (`startingDeadlineSeconds`) that keeps starting runs for the hosts it still owes, so a machine
+  switched on late in the window still gets its run and one that already succeeded in it does not;
+  keeps the finished run's `Succeeded`/`Failed` and forecasts the next slot into `next_run` via
+  `forecast_next_run`.
 
 Either way the phase of a finished run comes from that run's own `Play` verdict
 (`phase_for_finished_run`), never from the plan's drift state: a failed `Recurring` run leaves every
@@ -259,10 +266,13 @@ host that received part of a playbook. The task name is duplicated in `playbook_
 `ansible_operator_recap.py`; a test pins them together, because a drift there reads as "nothing
 converged" on every plan at once.
 
-A `OneShot` run gets its budget back when it made all the progress that was available to it, which
-is a `Succeeded` verdict *or* a failure confined to Nodes the run recorded as not `Ready` at its
-launch commit **and that still applied the playbook to at least one host**
-(`classify_run_failure`, `PlayStatus::unreachable_hosts`). That record holds every host
+A run gets its budget back, in either mode, when it made all the progress that was available to it,
+which is a `Succeeded` verdict *or* a failure confined to Nodes the run recorded as not `Ready` at
+its launch commit **and that still applied the playbook to at least one host**
+(`returns_its_attempt`, `classify_run_failure`, `PlayStatus::unreachable_hosts`). The mode must not
+come back into it: `Recurring`'s budget is scoped to the slot and defaults to one try, so without the
+refund `retry_budget_closes_window` would close every window on its first run, success or not, and
+a host arriving later in the window would never be asked about. That record holds every host
 the run excluded, each flagged with whether its Node was itself down — a host excluded because a
 `Ready` Node's proxy pod never came up is a configuration problem and is not refunded. It has to be
 captured at launch and persisted: the recap says nothing at all about a host the run excluded, and
@@ -330,10 +340,15 @@ handful of decisions that are easy to undo by accident:
   `schedule_window_already_taken`/`window_taken_by_a_record` re-ask the question of the plan's own
   `Play`s (which book revision and slot before anything is created) before a new run is prepared.
   Since `maxAttempts` the question is no longer "did a run take this slot" but "is there anything
-  left for a run to do in it": a record still `Running` or one that `Succeeded` closes the window,
-  while failures close it only once they have spent the budget. A `OneShot` failure the budget
-  refunded (`returns_its_attempt`) spent nothing and is not counted — the refund and this count must
-  answer from the same predicate, or the refund is taken back here. `retryCountSlot` binds
+  left for a run to do in it": a record still `Running` closes the window, failures close it only
+  once they have spent the budget, and `Succeeded` records close it only once their recorded
+  inventories cover every host the tick would target (`hosts_to_trigger`) — one tick, one run *per
+  host*, so a host that joins after the slot's run succeeded still gets one inside the window. Do
+  not restore "any `Succeeded` record closes the window": that is the rule this replaced. A host whose
+  Node was re-created since a record was prepared is withdrawn from that record's coverage first
+  (`withdraw_replaced_machines`). A failure the budget refunded (`returns_its_attempt`) spent nothing
+  and is not counted — the refund and this count must answer from the same predicate, or the refund
+  is taken back here. `retryCountSlot` binds
   `retryCount` to its recurring execution, so status can close an exhausted window after its records
   have been pruned and `next_attempt` does not restart at one when `lastTriggeredRun` is stale.
 - **`spec.suspend` is decided before the inventory is read** (`resolve_unlaunched_before_inputs`),
@@ -423,14 +438,17 @@ spec fields would be invisible to it, so the two must move together.
 The plan controller also watches **Nodes**, through one reflector serving two jobs: the mapper
 (`mappers::node_to_playbookplans`) and the readiness lookups the reconcile does
 (`node_readiness::unready_nodes`). The mapper is deliberately narrow — a Node that is `Ready` *and*
-in the plan's `eligibleHosts` *and* not yet on the plan's `currentHash` — because every kubelet
-reposts its Node status periodically, so an "all plans" mapping would reconcile every plan every few
-minutes forever, scaling with node count. A converged cluster matches no plans and the heartbeats
-fall on the floor. It asks the *plan* as well as the host, because a wake the plan cannot act on
-costs exactly as much as one it can: a suspended plan, a `OneShot` plan out of attempts, and every
-`Recurring` plan are all refused. `Recurring` is refused outright because only the clock starts its
-runs — the readiness gate it would be released by is `OneShot`-only — and it is the one mode with no
-budget to bound the wakes, so one stuck host would otherwise wake it per heartbeat forever. The
+in the plan's `eligibleHosts` *and* still owed a run (`OneShot`: not yet on the plan's
+`currentHash`; `Recurring`: owed the open slot, `execution_evaluator::host_owes_slot`) — because
+every kubelet reposts its Node status periodically, so an "all plans" mapping would reconcile every
+plan every few minutes forever, scaling with node count. A converged cluster matches no plans and the
+heartbeats fall on the floor. It asks the *plan* as well as the host, because a wake the plan cannot
+act on costs exactly as much as one it can: a suspended plan, a `OneShot` plan out of attempts, and a
+scheduled plan outside its window (`reconciler::open_schedule_slot`) are all refused. `Recurring`
+has no hash-scoped budget to bound the wakes (`attempt_budget_available` is always `true` for it), so
+its arm is bounded three ways, each asked the way the reconcile asks it: the window is open, the host
+owes that slot, and the slot's budget is not spent (`reconciler::retry_budget_closes_window`).
+Dropping any of the three lets one stuck host wake the plan per heartbeat. The
 replacement half of that predicate is asked **only of hosts `eligibleHosts` records as cluster
 Nodes** (`ResolvedHosts.connection`): a `StaticInventory` host may share a name with a Node the plan
 never targets, and `node_recreation` rightly refuses to act on it — so asking would leave a wake

@@ -125,8 +125,8 @@ printer columns:
   - `ProxyPodsNotReady` — a run is under way and its managed-SSH proxy pods are not `Ready` yet. It
     clears when the proxies become Ready or their wait expires. See
     [NotReady nodes](./cluster-nodes.md#notready-nodes).
-  - `NodesNotReady` — no run was started, because every Node one would target is `NotReady`. Only
-    `OneShot` plans hold this way. It clears when one of those Nodes becomes `Ready`, which the
+  - `NodesNotReady` — no run was started, because every Node one would target is `NotReady`. Both
+    modes hold this way. It clears when one of those Nodes becomes `Ready`, which the
     operator notices at once — and also whenever the plan stops being held for any other reason:
     suspending it, a schedule window closing, or an inventory change that leaves it no such hosts.
     A held plan that is then suspended reports `suspended; no new run will start` instead, since
@@ -152,7 +152,7 @@ prevents an old Job and a new revision from targeting the same host concurrently
 |---|---|
 | `Succeeded` | Ansible applied the playbook to this host successfully, **and the playbook ran to the end for it**. `lastAppliedHash` is bumped to the current hash. |
 | `Failed` | Ansible connected to the host and a task failed on it. A host whose connection dropped part-way through also reads `Failed`: something ran and failed before it went. |
-| `Unreachable` | Nothing could connect to the host, so no task ran on it — a Node that was itself `NotReady`, a `StaticInventory` host that is down, or one refusing the key. Fixed on the host or the Node, not in the playbook. The plan is waiting for the machine, and a Node returning to `Ready` starts the next run on its own. See [NotReady nodes](./cluster-nodes.md#notready-nodes). |
+| `Unreachable` | Nothing could connect to the host, so no task ran on it — a Node that was itself `NotReady`, a `StaticInventory` host that is down, or one refusing the key. Fixed on the host or the Node, not in the playbook. The plan is waiting for the machine, and a Node returning to `Ready` starts the next run on its own — on a scheduled plan only while the tick's window is still open, otherwise at the next tick. See [NotReady nodes](./cluster-nodes.md#notready-nodes). |
 | `NotReached` | The host was in scope but nothing was attempted on it, and no Node coming back will change that — either an earlier host in its `serial` batch stopped the play, or the run excluded it because its managed-SSH proxy never came up on a Node that was otherwise `Ready`. An excluded host still counts `unreachable` in the recap — its own and the run's — because nothing connected to it, which is all that counter records; the outcome is what says where to look. See [Hosts show `NotReached`](#hosts-show-notreached). |
 | `Incomplete` | Tasks ran on this host and none of them failed, but the playbook stopped before finishing for it, because a **different** host failed — `any_errors_fatal`, a failed `serial` batch, `max_fail_percentage`. It received *part* of the playbook, so it is not recorded as converged and is re-applied on the next run. See [Hosts show `Incomplete`](#hosts-show-incomplete). |
 | `Unknown` | The operator could not read a recap for this host — its **own instrumentation** failed, not Ansible. Distinct from `NotReached`. Worth investigating (see below). |
