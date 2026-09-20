@@ -283,21 +283,21 @@ fn plan_awaits_node(
             })
         }
         ExecutionMode::Recurring => {
-            let Some(slot) = reconciler::open_schedule_slot(plan, now) else {
+            let Some(window) = reconciler::open_schedule_slot(plan, now) else {
                 return false;
             };
             if reconciler::retry_budget_closes_window(
                 &status.phase,
                 status.retry_count,
                 status.retry_count_slot,
-                Some(slot),
+                Some(window.slot()),
                 max_attempts,
             ) {
                 return false;
             }
 
             replaced_machine
-                || execution_evaluator::host_owes_slot(entry, &status.current_hash, slot)
+                || execution_evaluator::host_owes_slot(entry, &status.current_hash, window)
         }
     }
 }
