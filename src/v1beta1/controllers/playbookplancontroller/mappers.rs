@@ -150,10 +150,13 @@ pub fn node_to_playbookplans(
 /// `Recurring` is not woken at all, whatever its hosts say, because nothing it does is started by a
 /// Node. Its runs are started by the clock: a tick outside its schedule window lands in the
 /// `Timing::Delayed` arm and does nothing, and inside the window the plan is already requeueing on
-/// its own. The one thing a Node event releases — the readiness gate — is `OneShot`-only by
-/// construction (`node_readiness::holds_for_unready_nodes`), and every path that can make a
-/// `Recurring` plan actionable has a trigger of its own: the slot arriving is its own requeue, a hash
-/// edit the plan watch, a key rotation the Secret watch, a result the Job watch.
+/// its own, and every path that can make a `Recurring` plan actionable has a trigger of its own: the
+/// slot arriving is its own requeue, a hash edit the plan watch, a key rotation the Secret watch, a
+/// result the Job watch.
+///
+/// That last claim is no longer true of the readiness gate, which now holds a `Recurring` plan too
+/// (`node_readiness::holds_for_unready_nodes`): such a plan is waiting on precisely a Node event and
+/// is left to the tick's requeue until this predicate learns to bound the wake for that mode.
 ///
 /// Leaving it in cost what the rest of this predicate exists to avoid, with nothing to bound it: the
 /// budget check below cannot answer for that mode (`attempt_budget_available` returns `true`

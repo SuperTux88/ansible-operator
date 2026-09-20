@@ -1261,12 +1261,22 @@ async fn reconcile(
 
     // Which of this run's cluster nodes are down, and whether that leaves it nothing to do. Both are
     // computed here, before the start gate, because the *nodes* are what a held plan reports waiting
-    // on and what its Node watch will wake it for. A `Recurring` plan is deliberately not held: its
-    // contract is to re-apply at each tick against whatever exists then, so a tick that can only
-    // reach some of its hosts still reaches them and reports the rest unreachable.
+    // on and what its Node watch will wake it for. A tick that can still reach some of its hosts is
+    // never held: it reaches them and reports the rest unreachable.
     let unready_nodes = node_readiness::unready_nodes(&context.nodes, &run_groups);
+    let max_attempts = max_attempts(&object.spec.mode, object.spec.max_attempts);
+    let budget_closes_window = match &timing {
+        Timing::Now(start) => retry_budget_closes_window(
+            &resource_status.phase,
+            resource_status.retry_count,
+            resource_status.retry_count_slot,
+            start.as_ref().map(DateTime::fixed_offset),
+            max_attempts,
+        ),
+        Timing::Delayed(_) => false,
+    };
     let hold_for_unready_nodes =
-        held_back_by_unready_nodes(&timing, &object.spec.mode, &run_groups, &unready_nodes);
+        held_back_by_unready_nodes(&timing, budget_closes_window, &run_groups, &unready_nodes);
     if !hold_for_unready_nodes && status::held_for_unready_nodes(&resource_status) {
         // Retires a hold this plan is no longer under, whatever ended it — the nodes came back, the
         // inventory moved on, its schedule window closed. Written here rather than only where a hold
@@ -1303,7 +1313,6 @@ async fn reconcile(
         object.spec.schedule.is_some(),
         !hosts_to_trigger.is_empty(),
     );
-    let max_attempts = max_attempts(&object.spec.mode, object.spec.max_attempts);
     let eligible_to_start = may_start_new_run(
         object.spec.suspend,
         has_work_to_start,
@@ -1513,8 +1522,11 @@ async fn reconcile(
             // to do but wait — see `node_readiness::holds_for_unready_nodes`. Held before the slot
             // bookkeeping below, so the window is left unconsumed and the run this plan owes can
             // still start once the nodes report `Ready` and the watch wakes it.
-            Timing::Now(_) if hold_for_unready_nodes => {
+            Timing::Now(start) if hold_for_unready_nodes => {
                 hold_plan_for_unready_nodes(&mut resource_status, &unready_nodes);
+                if let Some(until_close) = until_held_window_closes(start, time_window, now()) {
+                    requeue_after = requeue_after.min(until_close);
+                }
             }
             Timing::Now(start) => {
                 let this_slot = start.map(|s| s.fixed_offset());
@@ -5142,11 +5154,12 @@ fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usi
     status.summary = Some(plan_summary(0, total_count, &Phase::Succeeded));
 }
 
-/// Reports a `OneShot` plan holding back a run because every node it would reach is not `Ready`.
+/// Reports a plan holding back a run because every node it would reach is not `Ready`.
 ///
-/// Deliberately writes no `requeue`: nothing here is worth polling for. The plan is released by the
+/// Writes no `requeue` of its own: nothing here is worth polling for. The plan is released by the
 /// controller's Node watch, which fires the moment one of these nodes reports `Ready` again
-/// (`mappers::node_to_playbookplans`), and the tick's ordinary idle requeue remains as the backstop.
+/// (`mappers::node_to_playbookplans`). The one other moment that matters, a scheduled window
+/// closing, is requeued for by the caller ([`until_held_window_closes`]).
 ///
 /// The verdict survives ([`phase_under_readiness_overlay`]) because a node going down does not undo
 /// what the plan last did — the summary is what says why nothing is happening now. A plan can sit
@@ -5154,10 +5167,19 @@ fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usi
 /// condition names it, and removing it from the inventory or from the cluster is an operator's call,
 /// not the operator's.
 ///
+/// For a `Recurring` plan over a fleet that is switched off at night, that surviving verdict is now
+/// the ordinary resting state rather than an edge case: the plan reads `Succeeded` from last night
+/// beside `Ready=False` and a summary naming the Nodes. Kept that way on purpose — the phase, the
+/// summary and `Ready` are all printer columns, so the row says what is happening, and a rule that
+/// overrode the phase would have to override `Failed` too, hiding a broken playbook behind a
+/// hardware excuse.
+///
 /// `next_run` is left alone for the same reason. This arm is only reached with a `Timing::Now`, so a
 /// *scheduled* plan is being held inside the starting-deadline window of a slot it still owes a run
-/// for, and that forecast is exactly what a reader needs while the hold lasts. An unscheduled plan
-/// has no forecast to keep.
+/// for, and a forecast of that slot is what a reader needs while the hold lasts. There may be none:
+/// a run that missed only down Nodes is retry-due, and [`decide_terminal`] clears `next_run` for
+/// that. The tick at the window's close writes the next slot's. An unscheduled plan has no forecast
+/// to keep.
 ///
 /// `Ready` is the one part of the verdict that does not survive. The phase says what the last run
 /// did; `Ready` is read as whether the plan is converged, and a held plan has by definition hosts it
@@ -5186,12 +5208,33 @@ fn release_node_readiness_hold(status: &mut PlaybookPlanStatus, outdated_count: 
     );
 }
 
+/// How long a held tick may sleep before its schedule window closes; `None` for an unscheduled plan.
+///
+/// Nothing else wakes a held plan when its window closes: the Node watch fires only for a Node
+/// coming back, and the hold arm otherwise leaves the hour-long default requeue standing. The tick
+/// at the close lands in `Timing::Delayed`, which retires the hold and requeues to the next slot —
+/// without it, a `Recurring` plan on a schedule tighter than an hour sleeps through the slots its
+/// healthy hosts are owed, while `WaitingForNodes` stands over a window that has already closed.
+fn until_held_window_closes<Tz: TimeZone>(
+    slot: Option<DateTime<Tz>>,
+    deadline: chrono::Duration,
+    now: DateTime<Tz>,
+) -> Option<std::time::Duration> {
+    slot.map(|slot| duration_until(&(slot + deadline), now))
+}
+
 /// Whether the plan is being held back by the readiness gate *right now*, which is a narrower
 /// question than [`node_readiness::holds_for_unready_nodes`] answers on its own.
 ///
-/// That predicate says "a run started now would be pointless", and its inputs are only the mode, the
-/// groups and the down Nodes. A plan whose schedule window is closed is not held by it, however far
+/// That predicate says "a run started now would be pointless", and its inputs are only the groups
+/// and the down Nodes. A plan whose schedule window is closed is not held by it, however far
 /// down its Nodes are — it is waiting on the clock, and the schedule arm reports that for itself.
+///
+/// Nor is a window whose attempt budget is already spent (`budget_closes_window`, from
+/// [`retry_budget_closes_window`]). A `OneShot` plan never gets here with its budget spent, since
+/// the start gate asks `attempt_budget_available` first; a `Recurring` plan does, because its budget
+/// is scoped to the slot and only the window gate asks about it — which the hold arm comes before.
+/// Held there, it would name Nodes whose return starts nothing.
 ///
 /// Composed here rather than at either call site because both the arm that *asserts* the hold and
 /// the retire that clears it have to agree on the answer. They ask from different places, and a
@@ -5199,12 +5242,13 @@ fn release_node_readiness_hold(status: &mut PlaybookPlanStatus, outdated_count: 
 /// that is not waiting for a Node — which reads as the reason it is not running.
 fn held_back_by_unready_nodes<Tz: chrono::TimeZone>(
     timing: &Timing<Tz>,
-    mode: &ExecutionMode,
+    budget_closes_window: bool,
     groups: &[ResolvedInventoryGroup],
     unready: &[String],
 ) -> bool {
     matches!(timing, Timing::Now(_))
-        && node_readiness::holds_for_unready_nodes(mode, groups, unready)
+        && !budget_closes_window
+        && node_readiness::holds_for_unready_nodes(groups, unready)
 }
 
 /// The phase an idle plan keeps while a readiness overlay explains why it is not running. A real
@@ -7940,11 +7984,7 @@ mod tests {
         let unready = vec!["node-b".to_string()];
 
         assert!(
-            !node_readiness::holds_for_unready_nodes(
-                &ExecutionMode::OneShot,
-                &run_groups,
-                &unready
-            ),
+            !node_readiness::holds_for_unready_nodes(&run_groups, &unready),
             "node-a is reachable, so the run has work to do and must start"
         );
 
@@ -10826,31 +10866,63 @@ spec:
 
         assert!(held_back_by_unready_nodes(
             &Timing::Now(Some(slot)),
-            &ExecutionMode::OneShot,
+            false,
             &groups,
             &unready
         ));
         assert!(
-            !held_back_by_unready_nodes(
-                &Timing::Delayed(slot),
-                &ExecutionMode::OneShot,
-                &groups,
-                &unready
-            ),
+            !held_back_by_unready_nodes(&Timing::Delayed(slot), false, &groups, &unready),
             "a shut window is why nothing is running, not the Node"
         );
-        // The gate's own half still decides the rest: `Recurring` never holds.
+    }
+
+    /// A held tick sleeps no longer than its window: every 15 minutes with a 10-minute deadline,
+    /// held at 00:03 because the only host still owed is down. Left at the hour-long default, the
+    /// plan would next wake at 01:03 and the healthy hosts would miss 00:15, 00:30 and 00:45.
+    #[test]
+    fn a_held_scheduled_tick_wakes_when_its_window_closes() {
+        let slot = "2025-08-12T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let held_at = "2025-08-12T00:03:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        assert_eq!(
+            until_held_window_closes(Some(slot), chrono::Duration::minutes(10), held_at),
+            Some(std::time::Duration::from_secs(7 * 60))
+        );
+        assert_eq!(
+            until_held_window_closes(None, chrono::Duration::minutes(10), held_at),
+            None,
+            "an unscheduled plan has no window to close; the Node watch is its only release"
+        );
+    }
+
+    /// A `Recurring` tick whose one try already failed for real, and whose remaining hosts have
+    /// since gone down. The window is closed by its budget, so the Nodes coming back would start
+    /// nothing — and a hold would say they would, with `Ready=False` and a summary naming them.
+    /// `OneShot` cannot reach this state: its start gate asks the budget before the hold.
+    #[test]
+    fn a_window_whose_budget_is_spent_is_not_held_by_its_nodes() {
+        let groups = vec![managed_ssh_group("workers", &["worker-1"], None)];
+        let unready = ["worker-1".to_string()];
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let spent = retry_budget_closes_window(&Phase::Failed, 1, Some(slot), Some(slot), 1);
+        assert!(
+            spent,
+            "one real failure spends a Recurring tick's default budget"
+        );
+
         assert!(!held_back_by_unready_nodes(
             &Timing::Now(Some(slot)),
-            &ExecutionMode::Recurring,
+            spent,
             &groups,
             &unready
         ));
     }
 
     /// A plan suspended while the readiness gate holds it. The hold is a queued run, so suspension
-    /// retracts it exactly as it retracts a forecast: the gate's own predicate reads only the mode,
-    /// the groups and the down Nodes, so it stays true and would leave `NodesNotReady` standing —
+    /// retracts it exactly as it retracts a forecast: the gate's own predicate reads only the
+    /// groups and the down Nodes, so it stays true and would leave `NodesNotReady` standing —
     /// with a summary naming a Node — over a plan that is not waiting for any Node.
     #[test]
     fn a_suspended_plan_retires_the_hold_that_was_waiting_for_its_nodes() {
