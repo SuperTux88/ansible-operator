@@ -2469,7 +2469,11 @@ fn retry_due(phase: &Phase, tries_spent: u32, max_attempts: u32) -> bool {
 
 /// Whether the persisted attempt budget proves that the current schedule window has no run left to
 /// start. The slot makes `retryCount` self-describing after its `Play` records have been pruned.
-fn retry_budget_closes_window(
+///
+/// Shared with `mappers::plan_awaits_node`, which needs exactly this question to decide whether a
+/// Node coming back can still make a `Recurring` plan do anything — restating it there would let the
+/// wake set and the start gate drift.
+pub(super) fn retry_budget_closes_window(
     phase: &Phase,
     tries_spent: u32,
     budget_slot: Option<DateTime<FixedOffset>>,
@@ -2479,6 +2483,40 @@ fn retry_budget_closes_window(
     tries_spent > 0
         && slot_already_triggered(current_slot, budget_slot)
         && !retry_due(phase, tries_spent, max_attempts)
+}
+
+/// The slot whose schedule window is open right now, from the plan's spec alone.
+///
+/// The mapper's half of the start gate, and the reason it can be asked at all: everything the answer
+/// needs — the cron expression, the time zone, the starting deadline — is spec, so a Node event can
+/// be judged against it without a cluster read. The reconcile asks the same question through
+/// [`validate_scheduling_configuration`] and keeps the parsed schedule for the rest of its tick;
+/// here the parse is thrown away, which is why this is only ever called after the cheaper checks
+/// have already found a reason to care about this plan.
+///
+/// `None` covers every case the caller must treat as "no window": an unscheduled plan, a plan whose
+/// schedule or time zone does not parse — the reconcile reports that, and a wake could not help it —
+/// and a window that is simply not open now.
+pub(super) fn open_schedule_slot(
+    object: &PlaybookPlan,
+    now: DateTime<Utc>,
+) -> Option<DateTime<FixedOffset>> {
+    let configuration = validate_scheduling_configuration(object, now).ok()?;
+    let window = chrono::Duration::seconds(
+        object
+            .spec
+            .starting_deadline_seconds
+            .unwrap_or(DEFAULT_STARTING_DEADLINE_SECONDS)
+            .into(),
+    );
+    match evaluate_schedule(
+        configuration.schedule.as_ref(),
+        now.with_timezone(&configuration.time_zone),
+        window,
+    )? {
+        Timing::Now(slot) => slot.map(|slot| slot.fixed_offset()),
+        Timing::Delayed(_) => None,
+    }
 }
 
 /// Whether a finished run hands its attempt back instead of spending it.

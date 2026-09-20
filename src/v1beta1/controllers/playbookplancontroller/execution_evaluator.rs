@@ -168,23 +168,41 @@ pub fn find_hosts_owing_slot(
     execution_hash: &ExecutionHash,
     slot: chrono::DateTime<chrono::FixedOffset>,
 ) -> Vec<String> {
-    let hosts = distinct_hosts(&status.eligible_hosts);
-
-    let Some(hosts_status) = &status.hosts_status else {
-        return hosts;
-    };
-
     let hash = execution_hash.to_string();
-    hosts
+    distinct_hosts(&status.eligible_hosts)
         .into_iter()
         .filter(|host| {
-            let Some(entry) = hosts_status.get(host) else {
-                return true;
-            };
-
-            !applied_within_slot(entry, slot) || entry.last_applied_hash != hash
+            host_owes_slot(
+                status
+                    .hosts_status
+                    .as_ref()
+                    .and_then(|hosts| hosts.get(host)),
+                &hash,
+                slot,
+            )
         })
         .collect()
+}
+
+/// [`find_hosts_owing_slot`] for a single host, taking the plan's current hash as the hex string the
+/// status stores.
+///
+/// Split out so the Node watch can ask it of one host without building the plan's whole owed set on
+/// every kubelet heartbeat — and, more importantly, so the wake set and the run's target set cannot
+/// drift apart: waking a plan for a host it would not then run is the wake storm the mapper's
+/// predicate exists to avoid.
+///
+/// A host with no record at all has never run anything, so it owes every slot.
+pub fn host_owes_slot(
+    entry: Option<&v1beta1::HostStatus>,
+    current_hash: &str,
+    slot: chrono::DateTime<chrono::FixedOffset>,
+) -> bool {
+    let Some(entry) = entry else {
+        return true;
+    };
+
+    !applied_within_slot(entry, slot) || entry.last_applied_hash != current_hash
 }
 
 /// Given a playbook and some secrets, calculate a hash that only changes if the inputs change.

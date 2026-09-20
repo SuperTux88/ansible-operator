@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use k8s_openapi::api::core::v1::{Node, Secret};
 use kube::runtime::reflector::{ObjectRef, Store};
 use tracing::debug;
@@ -7,7 +8,9 @@ use tracing::debug;
 use crate::v1beta1::{
     self, ClusterInventory, ExecutionMode, HostOutcome, InventoryRef, NodeAccessPolicy,
     StaticInventory,
-    playbookplancontroller::{node_readiness, node_recreation, reconciler, status},
+    playbookplancontroller::{
+        execution_evaluator, node_readiness, node_recreation, reconciler, status,
+    },
 };
 
 /// Returns a closure that maps a `NodeAccessPolicy` change to *every* PlaybookPlan, so their
@@ -120,11 +123,14 @@ pub fn node_to_playbookplans(
         if !node_readiness::is_ready(&node) {
             return Vec::new();
         }
+        // Read once per event rather than per plan, so every plan is judged against the same instant
+        // and a schedule window cannot open halfway down the list.
+        let now = Utc::now();
 
         playbookplan_reader
             .state()
             .iter()
-            .filter(|plan| plan_awaits_node(plan, &node, node_name))
+            .filter(|plan| plan_awaits_node(plan, &node, node_name, now))
             .map(|plan| ObjectRef::from(&**plan))
             .inspect(|obj_ref| {
                 debug!("Reconcile of {obj_ref} triggered by node {node_name} becoming Ready");
@@ -147,23 +153,32 @@ pub fn node_to_playbookplans(
 /// hash, so every host is outdated) would otherwise wake it on every kubelet heartbeat of every
 /// matching Node for as long as it stayed suspended, which is an ordinary workflow.
 ///
-/// `Recurring` is not woken at all, whatever its hosts say, because nothing it does is started by a
-/// Node. Its runs are started by the clock: a tick outside its schedule window lands in the
-/// `Timing::Delayed` arm and does nothing, and inside the window the plan is already requeueing on
-/// its own, and every path that can make a `Recurring` plan actionable has a trigger of its own: the
-/// slot arriving is its own requeue, a hash edit the plan watch, a key rotation the Secret watch, a
-/// result the Job watch.
+/// `Recurring` used to be refused outright, because nothing that mode did was started by a Node and
+/// nothing bounded the wake: `attempt_budget_available` answers `true` for it unconditionally — its
+/// budget is slot-scoped and enforced by the window gate — so a single host left `Unknown` or
+/// `Unreachable` would have woken the plan on that Node's every kubelet heartbeat for the life of
+/// the plan, at a cost of re-resolving both inventory kinds and re-reading every Secret each time.
 ///
-/// That last claim is no longer true of the readiness gate, which now holds a `Recurring` plan too
-/// (`node_readiness::holds_for_unready_nodes`): such a plan is waiting on precisely a Node event and
-/// is left to the tick's requeue until this predicate learns to bound the wake for that mode.
+/// It is woken now, because a Node returning is exactly what such a plan can be waiting for: the
+/// readiness gate holds its tick when every host it would reach is down
+/// (`node_readiness::holds_for_unready_nodes`), and the 06:00 machine inside an 03:00 window is the
+/// case the whole schedule-window feature exists for. Three bounds replace the blanket refusal, and
+/// each is asked of the same thing the reconcile would ask:
 ///
-/// Leaving it in cost what the rest of this predicate exists to avoid, with nothing to bound it: the
-/// budget check below cannot answer for that mode (`attempt_budget_available` returns `true`
-/// unconditionally for `Recurring`, because its slot-scoped budget is enforced by the window gate),
-/// so a single host left `Unknown` or `Unreachable` kept a `Recurring` plan woken by that Node's
-/// every kubelet heartbeat for the life of the plan. A `OneShot` plan in the same state at least
-/// stops once its attempts are spent.
+///   - **the window is open** (`reconciler::open_schedule_slot`). Outside it the tick lands in the
+///     `Timing::Delayed` arm and does nothing, so a wake could not help; this is also what keeps the
+///     exposure to the length of a window rather than the life of the plan.
+///   - **the host owes that slot** (`execution_evaluator::host_owes_slot`) — the same rule the run's
+///     target set is built from, so the plan is never woken for a host it would not then run.
+///   - **the slot's budget is not spent** (`reconciler::retry_budget_closes_window`). This is what
+///     replaces the outcome filter below for that mode: a host that was reached and failed for real
+///     spent the try, and with `Recurring`'s default `maxAttempts: 1` the window is closed, so the
+///     plan is not woken however often that Node reports `Ready`. Where a retry *is* still owed,
+///     waking for it is the point.
+///
+/// Every other path that makes a `Recurring` plan actionable still has its own trigger: the slot
+/// arriving is its own requeue, a hash edit the plan watch, a key rotation the Secret watch, a result
+/// the Job watch.
 ///
 /// A `OneShot` plan whose attempt budget is spent is the other half of that question, and it is
 /// asked through `reconciler::attempt_budget_available` rather than restated here so the wake set and
@@ -216,8 +231,13 @@ pub fn node_to_playbookplans(
 /// hosts), leaving a wake condition that every kubelet heartbeat re-triggers and nothing can ever
 /// clear. A record written before the connection was tracked answers "not a Node" and is simply not
 /// asked, which costs at most one delayed wake-up on the tick after an upgrade.
-fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &Node, node_name: &str) -> bool {
-    if plan.spec.suspend || !matches!(plan.spec.mode, ExecutionMode::OneShot) {
+fn plan_awaits_node(
+    plan: &v1beta1::PlaybookPlan,
+    node: &Node,
+    node_name: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    if plan.spec.suspend {
         return false;
     }
 
@@ -225,33 +245,61 @@ fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &Node, node_name: &str) 
         return false;
     };
 
-    if !reconciler::attempt_budget_available(
-        &plan.spec.mode,
-        status.retry_count,
-        reconciler::max_attempts(&plan.spec.mode, plan.spec.max_attempts),
-    ) {
-        return false;
-    }
-
     let targeted = status
         .eligible_hosts
         .iter()
         .any(|group| group.hosts.iter().any(|host| host == node_name));
+    if !targeted {
+        return false;
+    }
 
-    targeted
-        && status
-            .hosts_status
-            .as_ref()
-            .and_then(|hosts| hosts.get(node_name))
-            .is_none_or(|host| {
-                (node_recreation::node_replaced_since(host.applied_at, node)
-                    && v1beta1::is_node_host(&status.eligible_hosts, node_name))
+    let max_attempts = reconciler::max_attempts(&plan.spec.mode, plan.spec.max_attempts);
+    let entry = status
+        .hosts_status
+        .as_ref()
+        .and_then(|hosts| hosts.get(node_name));
+    let replaced_machine = entry.is_some_and(|host| {
+        node_recreation::node_replaced_since(host.applied_at, node)
+            && v1beta1::is_node_host(&status.eligible_hosts, node_name)
+    });
+
+    match plan.spec.mode {
+        ExecutionMode::OneShot => {
+            if !reconciler::attempt_budget_available(
+                &plan.spec.mode,
+                status.retry_count,
+                max_attempts,
+            ) {
+                return false;
+            }
+
+            entry.is_none_or(|host| {
+                replaced_machine
                     || (host.last_applied_hash != status.current_hash
                         && !matches!(
                             host.last_outcome,
                             HostOutcome::Failed | HostOutcome::NotReached | HostOutcome::Incomplete
                         ))
             })
+        }
+        ExecutionMode::Recurring => {
+            let Some(slot) = reconciler::open_schedule_slot(plan, now) else {
+                return false;
+            };
+            if reconciler::retry_budget_closes_window(
+                &status.phase,
+                status.retry_count,
+                status.retry_count_slot,
+                Some(slot),
+                max_attempts,
+            ) {
+                return false;
+            }
+
+            replaced_machine
+                || execution_evaluator::host_owes_slot(entry, &status.current_hash, slot)
+        }
+    }
 }
 
 /// Whether `plan` targets the inventory `namespace`/`name` of the kind `referenced` selects.
@@ -726,6 +774,18 @@ mod tests {
         }
     }
 
+    /// The cases below are all `OneShot`, which does not read the clock: nothing in that arm depends
+    /// on a schedule window. Pinning an instant here keeps each of them asking exactly what it asked
+    /// before the predicate learned about windows; the `Recurring` cases call the real function with
+    /// the instant they mean.
+    fn plan_awaits_node(plan: &PlaybookPlan, node: &Node, node_name: &str) -> bool {
+        super::plan_awaits_node(plan, node, node_name, at("2026-01-01T03:00:04Z"))
+    }
+
+    fn at(instant: &str) -> DateTime<Utc> {
+        instant.parse().unwrap()
+    }
+
     fn plan_awaiting(node: &str, host_status: crate::v1beta1::HostStatus) -> PlaybookPlan {
         plan_with_status(v1beta1::PlaybookPlanStatus {
             eligible_hosts: eligible(&[node]),
@@ -858,48 +918,6 @@ mod tests {
                     "node-a"
                 ),
                 "{outcome:?}: a plan with a try left is exactly what the watch is for"
-            );
-        }
-    }
-
-    /// A `Recurring` plan is started by its schedule and by nothing else, so a Node reporting
-    /// `Ready` is never what it was waiting for — and it is the one mode the budget check cannot
-    /// bound, since `attempt_budget_available` answers `true` for it unconditionally (its
-    /// slot-scoped budget lives in the window gate). Left in the wake set, one host stuck
-    /// `Unreachable` or `Unknown` woke such a plan on that Node's every heartbeat for the life of
-    /// the plan, with every woken tick falling straight through to the schedule arm.
-    #[test]
-    fn a_recurring_plan_is_never_woken_by_a_node() {
-        for outcome in [HostOutcome::Unreachable, HostOutcome::Unknown] {
-            let oneshot = plan_awaiting("node-a", host("", outcome.clone()));
-            assert!(
-                plan_awaits_node(&oneshot, &unreplaced_node(), "node-a"),
-                "{outcome:?}: the same plan as OneShot is one the watch exists for"
-            );
-
-            let mut recurring = oneshot;
-            recurring.spec.mode = ExecutionMode::Recurring;
-
-            assert!(!plan_awaits_node(&recurring, &unreplaced_node(), "node-a"));
-        }
-    }
-
-    /// The budget is asked of `OneShot` alone, so a `Recurring` plan must not reach it — the mode
-    /// check is what decides, not `retryCount`. Pinned separately so the two reasons stay legible:
-    /// a `Recurring` plan with attempts left is refused for the same reason as one without.
-    #[test]
-    fn a_recurring_plan_is_refused_whatever_its_retry_count() {
-        for retry_count in [0, 9] {
-            let mut plan = plan_awaiting_with_attempts(
-                "node-a",
-                host("", HostOutcome::Unreachable),
-                retry_count,
-            );
-            plan.spec.mode = ExecutionMode::Recurring;
-
-            assert!(
-                !plan_awaits_node(&plan, &unreplaced_node(), "node-a"),
-                "retryCount {retry_count}"
             );
         }
     }
@@ -1111,6 +1129,107 @@ mod tests {
             Some("tenant"),
             "workers",
             cluster_inventory_name
+        ));
+    }
+
+    /// A `Recurring` plan whose 03:00 tick was held because every node was down, woken at 06:00 by
+    /// the machine that was switched on — the case the schedule window exists for. The deadline is
+    /// wide enough that 06:00 is still inside the 03:00 window.
+    fn nightly_plan(host_status: crate::v1beta1::HostStatus) -> PlaybookPlan {
+        let mut plan = plan_awaiting("node-a", host_status);
+        plan.spec.mode = ExecutionMode::Recurring;
+        plan.spec.schedule = Some("0 3 * * *".into());
+        plan.spec.starting_deadline_seconds = Some(14_400);
+        plan
+    }
+
+    #[test]
+    fn a_recurring_plan_is_woken_by_a_node_inside_the_window_it_still_owes() {
+        let plan = nightly_plan(host("abc", HostOutcome::Unreachable));
+
+        assert!(super::plan_awaits_node(
+            &plan,
+            &unreplaced_node(),
+            "node-a",
+            at("2026-01-01T06:00:00Z"),
+        ));
+    }
+
+    /// The bound that keeps the mode's exposure to the length of a window rather than the life of
+    /// the plan: outside it the tick lands in the `Timing::Delayed` arm and can do nothing with the
+    /// wake-up, so the heartbeat falls on the floor.
+    #[test]
+    fn a_recurring_plan_is_not_woken_once_its_window_has_closed() {
+        let plan = nightly_plan(host("abc", HostOutcome::Unreachable));
+
+        assert!(!super::plan_awaits_node(
+            &plan,
+            &unreplaced_node(),
+            "node-a",
+            at("2026-01-01T08:00:00Z"),
+        ));
+        // An unscheduled plan of that mode has no window at all — and never starts a run either.
+        let mut unscheduled = plan.clone();
+        unscheduled.spec.schedule = None;
+        assert!(!super::plan_awaits_node(
+            &unscheduled,
+            &unreplaced_node(),
+            "node-a",
+            at("2026-01-01T06:00:00Z"),
+        ));
+    }
+
+    /// The host half: a machine this window already ran on is not owed it again, however often its
+    /// kubelet reposts. It is the same rule the run's own target set is built from.
+    #[test]
+    fn a_recurring_plan_is_not_woken_for_a_host_that_already_ran_this_slot() {
+        let mut served = host("abc", HostOutcome::Succeeded);
+        served.applied_at = Some("2026-01-01T03:00:04Z".parse().unwrap());
+        let plan = nightly_plan(served);
+
+        assert!(!super::plan_awaits_node(
+            &plan,
+            &unreplaced_node(),
+            "node-a",
+            at("2026-01-01T06:00:00Z"),
+        ));
+
+        // Last night's success is a different window, and this one is still owed.
+        let mut yesterday = host("abc", HostOutcome::Succeeded);
+        yesterday.applied_at = Some("2025-12-31T03:00:04Z".parse().unwrap());
+        assert!(super::plan_awaits_node(
+            &nightly_plan(yesterday),
+            &unreplaced_node(),
+            "node-a",
+            at("2026-01-01T06:00:00Z"),
+        ));
+    }
+
+    /// What replaces the outcome filter for this mode. A host that was reached and failed for real
+    /// spends the slot's try, and with `Recurring`'s default `maxAttempts: 1` that closes the
+    /// window — so the plan is not woken by a Node that has nothing left to supply. The same state
+    /// with a try still owed is woken, because that is a retry the window is still open for.
+    #[test]
+    fn a_recurring_plan_with_its_slots_budget_spent_awaits_nothing() {
+        let slot: DateTime<chrono::FixedOffset> = "2026-01-01T03:00:00Z".parse().unwrap();
+        let mut plan = nightly_plan(host("abc", HostOutcome::Failed));
+        plan.status.as_mut().unwrap().phase = Phase::Failed;
+        plan.status.as_mut().unwrap().retry_count = 1;
+        plan.status.as_mut().unwrap().retry_count_slot = Some(slot);
+
+        assert!(!super::plan_awaits_node(
+            &plan,
+            &unreplaced_node(),
+            "node-a",
+            at("2026-01-01T06:00:00Z"),
+        ));
+
+        plan.spec.max_attempts = Some(3);
+        assert!(super::plan_awaits_node(
+            &plan,
+            &unreplaced_node(),
+            "node-a",
+            at("2026-01-01T06:00:00Z"),
         ));
     }
 }
