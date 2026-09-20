@@ -1187,13 +1187,7 @@ async fn reconcile(
     // Step 1: compute outdated hosts and evaluate the schedule.
     let tz = scheduling_configuration.time_zone;
     let now = || Utc::now().with_timezone(&tz);
-    let time_window = chrono::Duration::seconds(
-        object
-            .spec
-            .starting_deadline_seconds
-            .unwrap_or(DEFAULT_STARTING_DEADLINE_SECONDS)
-            .into(),
-    );
+    let time_window = starting_deadline(&object);
     let Some(timing) = evaluate_schedule(
         scheduling_configuration.schedule.as_ref(),
         now(),
@@ -1250,7 +1244,16 @@ async fn reconcile(
     let hosts_to_trigger = match (&object.spec.mode, &timing) {
         (ExecutionMode::OneShot, _) => outdated_hosts.clone(),
         (ExecutionMode::Recurring, Timing::Now(Some(slot))) => {
-            find_hosts_owing_slot(&resource_status, &execution_hash, slot.fixed_offset())
+            scheduling_configuration.schedule.as_ref().map_or_else(
+                || all_hosts.clone(),
+                |schedule| {
+                    find_hosts_owing_slot(
+                        &resource_status,
+                        &execution_hash,
+                        slot_window(schedule, *slot, time_window),
+                    )
+                },
+            )
         }
         (ExecutionMode::Recurring, _) => all_hosts.clone(),
     };
@@ -2497,6 +2500,23 @@ pub(super) fn retry_budget_closes_window(
         && !retry_due(phase, tries_spent, max_attempts)
 }
 
+/// The open window a slot stands for, with the grace its schedule leaves room for.
+///
+/// The one place that pairs a slot with the tick after it, so the clamp
+/// ([`execution_evaluator::SlotWindow::new`]) is derived the same way for the run's target set and
+/// for the Node watch's wake set — the two that must not disagree about what a window still owes.
+///
+/// `slot` carries the plan's time zone, not just its offset: the next tick is found by iterating
+/// the schedule in that zone, and a fixed offset would misplace it by an hour across a DST change.
+fn slot_window<Tz: TimeZone>(
+    schedule: &Schedule,
+    slot: DateTime<Tz>,
+    deadline: chrono::Duration,
+) -> execution_evaluator::SlotWindow {
+    let next = forecast_next_run(schedule, slot.clone(), None).map(|next| next.fixed_offset());
+    execution_evaluator::SlotWindow::new(slot.fixed_offset(), next, deadline)
+}
+
 /// Whether `spec.startingDeadlineSeconds` is wide enough to swallow whole schedule ticks, and the
 /// two occurrences that show it.
 ///
@@ -2524,7 +2544,7 @@ fn deadline_swallows_a_tick<Tz: TimeZone>(
     (deadline >= after.clone() - next.clone()).then_some((next, after))
 }
 
-/// The slot whose schedule window is open right now, from the plan's spec alone.
+/// The schedule window that is open right now, from the plan's spec alone.
 ///
 /// The mapper's half of the start gate, and the reason it can be asked at all: everything the answer
 /// needs — the cron expression, the time zone, the starting deadline — is spec, so a Node event can
@@ -2539,23 +2559,34 @@ fn deadline_swallows_a_tick<Tz: TimeZone>(
 pub(super) fn open_schedule_slot(
     object: &PlaybookPlan,
     now: DateTime<Utc>,
-) -> Option<DateTime<FixedOffset>> {
+) -> Option<execution_evaluator::SlotWindow> {
     let configuration = validate_scheduling_configuration(object, now).ok()?;
-    let window = chrono::Duration::seconds(
+    let deadline = starting_deadline(object);
+    let schedule = configuration.schedule.as_ref()?;
+    match evaluate_schedule(
+        Some(schedule),
+        now.with_timezone(&configuration.time_zone),
+        deadline,
+    )? {
+        Timing::Now(slot) => slot.map(|slot| slot_window(schedule, slot, deadline)),
+        Timing::Delayed(_) => None,
+    }
+}
+
+/// How long after its slot a run may still start, from the plan's spec.
+///
+/// One function rather than the expression written out wherever it is wanted, because
+/// [`slot_window`] is reached from two places that must agree on it exactly: the tick that builds a
+/// run's target set, and the Node watch deciding whether to wake the plan at all. Two copies that
+/// drift would make those two disagree about what a window still owes.
+fn starting_deadline(object: &PlaybookPlan) -> chrono::Duration {
+    chrono::Duration::seconds(
         object
             .spec
             .starting_deadline_seconds
             .unwrap_or(DEFAULT_STARTING_DEADLINE_SECONDS)
             .into(),
-    );
-    match evaluate_schedule(
-        configuration.schedule.as_ref(),
-        now.with_timezone(&configuration.time_zone),
-        window,
-    )? {
-        Timing::Now(slot) => slot.map(|slot| slot.fixed_offset()),
-        Timing::Delayed(_) => None,
-    }
+    )
 }
 
 /// Whether a finished run hands its attempt back instead of spending it.
@@ -13253,6 +13284,39 @@ spec:
             Some(slot),
             1,
         ));
+    }
+
+    /// The gap to the next tick is measured in the plan's own time zone. The night before the
+    /// spring DST change, a 03:00 Zurich tick is 23 hours from the next one, not 24: with a 22h59m
+    /// deadline only a minute is free between the windows, so the grace is 30s — where a fixed
+    /// offset would have seen an hour free and granted the full 60s, reaching into the previous
+    /// window.
+    #[test]
+    fn a_slot_window_finds_the_next_tick_in_the_plans_time_zone() {
+        use chrono::TimeZone as _;
+
+        let zurich = chrono_tz::Europe::Zurich;
+        let slot = zurich.with_ymd_and_hms(2026, 3, 28, 3, 0, 0).unwrap();
+        let window = slot_window(
+            &Schedule::parse("0 3 * * *").unwrap(),
+            slot,
+            chrono::Duration::hours(22) + chrono::Duration::minutes(59),
+        );
+
+        let applied = |before: i64| v1beta1::HostStatus {
+            last_applied_hash: "1".into(),
+            applied_at: Some(slot.fixed_offset() - chrono::Duration::seconds(before)),
+            ..Default::default()
+        };
+        assert!(!execution_evaluator::host_owes_slot(
+            Some(&applied(30)),
+            "1",
+            window
+        ));
+        assert!(
+            execution_evaluator::host_owes_slot(Some(&applied(45)), "1", window),
+            "45s early is past the 30s the shortened day leaves room for"
+        );
     }
 
     /// The maintenance-window trap: a deadline at least as long as the interval keeps the plan on
