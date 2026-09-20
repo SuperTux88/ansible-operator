@@ -472,7 +472,9 @@ pub struct PlaybookPlanStatus {
     /// run included. Unlike `lastRunNumber` this counts, and it counts within one execution only:
     /// it restarts at 1 whenever `currentHash` changes and, for `Recurring` plans, whenever a new
     /// schedule tick starts a run — the two events that begin a new execution. A successful
-    /// `OneShot` execution resets it to 0 so newly eligible hosts can begin a new execution.
+    /// execution resets it to 0, in either mode, so hosts that become eligible afterwards can begin
+    /// a new one: for `Recurring` that is what leaves a schedule window open for a machine switched
+    /// on later in it.
     ///
     /// Written from the run's own `Play` record, so a status that lags a run in flight cannot hand
     /// the budget back by forgetting a try that was already made.
@@ -481,7 +483,8 @@ pub struct PlaybookPlanStatus {
     pub retry_count: u32,
     /// The schedule slot to which `retryCount` belongs. Set for scheduled runs and used by
     /// `Recurring` plans to distinguish retries in the current tick from the first attempt in the
-    /// next one. `None` for an execution that has not started or an unscheduled run.
+    /// next one. `None` for an execution that has not started, an unscheduled run, and a run that
+    /// handed its try back — the budget it would describe is no longer spent.
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub retry_count_slot: Option<DateTime<FixedOffset>>,

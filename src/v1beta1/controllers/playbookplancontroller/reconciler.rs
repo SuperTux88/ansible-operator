@@ -1146,7 +1146,6 @@ async fn reconcile(
         sync_desired_hash_after_finished_run(
             &mut resource_status,
             &execution_hash,
-            &object.spec.mode,
             &finished.run,
             &finished.failure,
             surviving_run.as_deref(),
@@ -2239,7 +2238,7 @@ fn window_taken_by_a_record(
             // `Unknown` counts as a failure here for the same reason it does everywhere else: a
             // recap that could not be read is not evidence the hosts were reached.
             v1beta1::PlayPhase::Failed | v1beta1::PlayPhase::Unknown
-                if !returns_its_attempt(&plan.spec.mode, &classify_run_failure(status)) =>
+                if !returns_its_attempt(&classify_run_failure(status)) =>
             {
                 failures += 1;
             }
@@ -2472,21 +2471,31 @@ fn retry_budget_closes_window(
 
 /// Whether a finished run hands its attempt back instead of spending it.
 ///
-/// Only `OneShot` ever does, in two cases:
+/// Two outcomes do:
 ///
 ///   - it succeeded. The execution is complete, and resetting its budget is what lets inventory
 ///     growth trigger a new run for hosts that were not present in it.
 ///   - nothing the operator could reach failed either ([`RunFailure::OnlyUnreachableNodes`]), so it
 ///     made all the progress there was to make. The plan does not immediately retry on that budget:
-///     with every remaining outdated host on a Node that is down, the start gate holds it until the
-///     Node watch says one is back. Without that gate this would loop.
+///     with every remaining host on a Node that is down, the start gate holds it until the Node
+///     watch says one is back. Without that gate this would loop.
+///
+/// Neither depends on the mode, and requiring `OneShot` is what used to make a schedule window
+/// worthless to a `Recurring` plan. Its budget is scoped to the slot, so the slot *is* the
+/// execution: a run that finished it must leave the budget alone for exactly the reason a `OneShot`
+/// revision does, or [`retry_budget_closes_window`] closes the window from the status before
+/// [`window_taken_by_a_record`] is ever asked whether the window still owes somebody a run — with
+/// the mode's default `maxAttempts: 1`, on the first run of the window, success or not.
+///
+/// What bounds the refund is [`classify_run_failure`]'s "applied to at least one host", which is
+/// mode-independent too: a run that reached nobody is [`RunFailure::Real`] and spends its try,
+/// whichever mode asked for it.
 ///
 /// One predicate for both places that count attempts — the budget reset after a run
 /// ([`sync_desired_hash_after_finished_run`]) and the schedule window's count of its records
 /// ([`window_taken_by_a_record`]) — because a refund only one of them honours is not a refund.
-fn returns_its_attempt(mode: &ExecutionMode, failure: &RunFailure) -> bool {
-    matches!(mode, ExecutionMode::OneShot)
-        && matches!(failure, RunFailure::None | RunFailure::OnlyUnreachableNodes)
+fn returns_its_attempt(failure: &RunFailure) -> bool {
+    matches!(failure, RunFailure::None | RunFailure::OnlyUnreachableNodes)
 }
 
 /// Which try a run about to start is, from the budget the plan has already spent.
@@ -5413,7 +5422,6 @@ fn stage_finished_run(finished: &RecordedRun, resource_status: &mut PlaybookPlan
 fn sync_desired_hash_after_finished_run(
     status: &mut PlaybookPlanStatus,
     desired_hash: &ExecutionHash,
-    mode: &ExecutionMode,
     finished: &RecordedRun,
     finished_failure: &RunFailure,
     surviving: Option<&SurvivingRun>,
@@ -5448,7 +5456,7 @@ fn sync_desired_hash_after_finished_run(
     if let Some((attempt, slot)) = surviving_attempt {
         record_retry_budget(status, attempt, slot);
     } else if finished.execution_hash == *desired_hash {
-        if returns_its_attempt(mode, finished_failure) {
+        if returns_its_attempt(finished_failure) {
             record_retry_budget(status, 0, None);
         } else {
             record_retry_budget(
@@ -9704,7 +9712,6 @@ mod tests {
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 1, 1, slot),
             &classify_run_failure(missed_a_down_node.status.as_ref().unwrap()),
             None,
@@ -9760,10 +9767,20 @@ mod tests {
             );
         }
 
-        // `Recurring` is never refunded, and a second run in its slot is what the records exist to
-        // prevent.
-        assert!(window_taken_by_a_record(
+        // `Recurring` earns the same refund, and for the same reason: the slot is a window, and the
+        // host it could not reach is still owed the run that window promised.
+        assert!(!window_taken_by_a_record(
             std::slice::from_ref(&missed_a_down_node),
+            &plan_in(ExecutionMode::Recurring),
+            slot,
+            &hash,
+            1,
+            &owed,
+        ));
+
+        // What still closes it for that mode is a failure that spent the try, exactly as above.
+        assert!(window_taken_by_a_record(
+            std::slice::from_ref(&reached_nobody),
             &plan_in(ExecutionMode::Recurring),
             slot,
             &hash,
@@ -12929,7 +12946,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, slot),
             &RunFailure::Real,
             None,
@@ -12973,7 +12989,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 1, slot),
             &RunFailure::None,
             None,
@@ -13010,7 +13025,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 3, slot),
             &RunFailure::OnlyUnreachableNodes,
             None,
@@ -13042,7 +13056,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 3, slot),
             &RunFailure::Real,
             None,
@@ -13057,28 +13070,40 @@ spec:
         ));
     }
 
+    /// A `Recurring` slot is a window that can still owe hosts a run, so the run that served it
+    /// hands its try back like a `OneShot` execution does. Without that, the budget half of the
+    /// start gate closes the window from the status alone — on the very first run, given the mode's
+    /// default `maxAttempts: 1` — and the records are never asked whether a host that appeared
+    /// meanwhile is still owed one.
     #[test]
-    fn a_successful_recurring_run_keeps_its_slot_budget() {
+    fn a_successful_recurring_run_hands_its_slot_budget_back() {
         let slot = "2025-08-12T20:00:00Z"
             .parse::<DateTime<FixedOffset>>()
             .unwrap();
         let hash = ExecutionHash::from_hex("1").unwrap();
         let mut status = PlaybookPlanStatus {
             current_hash: hash.to_string(),
+            phase: Phase::Succeeded,
             ..Default::default()
         };
 
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::Recurring,
             &finished_run(hash, 3, 1, slot),
             &RunFailure::None,
             None,
         );
 
-        assert_eq!(status.retry_count, 1);
-        assert_eq!(status.retry_count_slot, Some(slot));
+        assert_eq!(status.retry_count, 0);
+        assert_eq!(status.retry_count_slot, None);
+        assert!(!retry_budget_closes_window(
+            &status.phase,
+            status.retry_count,
+            status.retry_count_slot,
+            Some(slot),
+            1,
+        ));
     }
 
     #[test]
@@ -13288,7 +13313,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
             &RunFailure::Real,
             Some(&surviving_run(hash, Some(live_slot))),
@@ -13327,7 +13351,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
             &RunFailure::Real,
             Some(&surviving_run(hash, Some(live_slot))),
@@ -13354,7 +13377,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
             &RunFailure::Real,
             Some(&surviving_run(hash, None)),
@@ -13399,7 +13421,6 @@ spec:
             sync_desired_hash_after_finished_run(
                 &mut status,
                 &hash,
-                &ExecutionMode::OneShot,
                 &finished_run(hash, 3, 2, finished_slot),
                 &RunFailure::Real,
                 Some(&surviving_run_in(phase.clone(), hash, Some(live_slot))),
@@ -13449,7 +13470,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
-            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
             &RunFailure::Real,
             None,
@@ -13478,7 +13498,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
-            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
             &RunFailure::Real,
             Some(&surviving_run(old_hash, Some(slot))),
@@ -13507,7 +13526,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
-            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 3, slot),
             &RunFailure::Real,
             Some(&surviving),
@@ -13534,7 +13552,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
-            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
             &RunFailure::Real,
             None,
