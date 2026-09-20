@@ -42,7 +42,7 @@ use crate::{
         },
         playbookplancontroller::{
             callback_output, departed_hosts,
-            execution_evaluator::{self, find_outdated_hosts},
+            execution_evaluator::{self, find_hosts_owing_slot, find_outdated_hosts},
             job_builder, mappers, node_access, node_labels, node_readiness, node_recreation,
             play_history, status,
         },
@@ -1242,9 +1242,18 @@ async fn reconcile(
     clear_scheduling_configuration_failure(&mut resource_status, outdated_hosts.len());
     clear_input_failure(&mut resource_status, outdated_hosts.len());
 
-    let hosts_to_trigger = match object.spec.mode {
-        ExecutionMode::OneShot => outdated_hosts.clone(),
-        ExecutionMode::Recurring => all_hosts.clone(),
+    // What this tick would apply to, if it starts a run. A `Recurring` plan inside a schedule window
+    // owes that *slot*, not the tick: a host it already succeeded on in this window is done until
+    // the next one, so a second run inside the window carries only the hosts still owed — a machine
+    // switched on at 06:00 inside an 03:00 window, one a retry is owed after a partial failure, one
+    // that joined the inventory meanwhile. Outside a window there is no slot to owe anything to, so
+    // the tick keeps the mode's whole host set and behaves exactly as it did before.
+    let hosts_to_trigger = match (&object.spec.mode, &timing) {
+        (ExecutionMode::OneShot, _) => outdated_hosts.clone(),
+        (ExecutionMode::Recurring, Timing::Now(Some(slot))) => {
+            find_hosts_owing_slot(&resource_status, &execution_hash, slot.fixed_offset())
+        }
+        (ExecutionMode::Recurring, _) => all_hosts.clone(),
     };
 
     // Filter the resolved inventory to this run's hosts once, preserving the user's groups, so the
@@ -1594,6 +1603,7 @@ async fn reconcile(
         scheduling_configuration.schedule.as_ref(),
         object.spec.suspend,
         !hosts_to_trigger.is_empty(),
+        !all_hosts.is_empty(),
         now(),
         &mut resource_status,
     ) {
@@ -2525,23 +2535,38 @@ fn duration_until<Tz: TimeZone>(until: &DateTime<Tz>, now: DateTime<Tz>) -> std:
     (until.clone() - now).to_std().unwrap_or_default()
 }
 
-/// Keeps an idle `Recurring` plan scheduled even when its authorized inventory is empty.
+/// Keeps a `Recurring` plan ticking through the states where it has no run to start.
 ///
-/// Zero hosts is not work a run can start: [`has_work_to_start`] must keep rejecting it so the
-/// operator neither creates an empty Job nor resumes a `Prepared` run whose hosts disappeared. It
-/// is still a valid observation of a scheduled plan, though, and needs its own status. Otherwise the
-/// start gate also blocks schedule maintenance, leaving the last run's summary and `nextRun`
-/// standing indefinitely after a selector or `NodeAccessPolicy` change removes every host.
+/// Nothing to trigger is not work a run can start: [`has_work_to_start`] must keep rejecting it so
+/// the operator neither creates an empty Job nor resumes a `Prepared` run whose hosts disappeared.
+/// The plan still has to be woken for its next slot, though, and this is the only thing that does
+/// it on these paths — the start gate that would otherwise requeue is closed, so without this the
+/// tick leaves the hour-long default requeue standing and the plan sleeps through the slots in
+/// between.
+///
+/// Two states reach here, and they differ in what is worth *saying*:
+///
+///   - **The plan resolves to no hosts at all**, after a selector or `NodeAccessPolicy` change
+///     removed every one of them. That is a state of the plan, and reporting it is the only thing
+///     that stops the last run's summary and `nextRun` from standing indefinitely over a plan that
+///     can no longer do anything.
+///   - **Every host has already had its run in the open schedule window.** The slot is served, not
+///     empty, so the status is left exactly as the run that served it wrote it: the verdict, and
+///     the summary saying what that run did, are the truth about this plan until the next slot.
+///     Overwriting them here would also clobber the finished run's own report, because the run's
+///     per-host results are applied (`status::apply_terminal_play_status`) long before the owed set
+///     is computed — so the tick that finishes a run is itself one of these ticks.
 ///
 /// The next *future* occurrence is advertised rather than a slot whose grace window is currently
-/// open: there is nothing to run in that slot. Another reconcile can still start the current slot if
-/// hosts return before its grace window closes. A previous verdict remains the phase, following
-/// [`phase_while_waiting_for_schedule`]; the summary is what reports why no run is starting now.
+/// open: there is nothing left to run in that slot. Another reconcile can still start the current
+/// slot if hosts return, or become owed, before its grace window closes. A previous verdict remains
+/// the phase, following [`phase_while_waiting_for_schedule`].
 fn update_idle_recurring_status<Tz: TimeZone>(
     mode: &ExecutionMode,
     schedule: Option<&Schedule>,
     suspend: bool,
     has_hosts_to_trigger: bool,
+    resolves_to_hosts: bool,
     now: DateTime<Tz>,
     status: &mut PlaybookPlanStatus,
 ) -> Option<std::time::Duration> {
@@ -2552,7 +2577,9 @@ fn update_idle_recurring_status<Tz: TimeZone>(
         return None;
     }
 
-    status.summary = Some("plan currently resolves to no hosts".to_string());
+    if !resolves_to_hosts {
+        status.summary = Some("plan currently resolves to no hosts".to_string());
+    }
 
     let Some(schedule) = schedule else {
         status.next_run = None;
@@ -2563,7 +2590,9 @@ fn update_idle_recurring_status<Tz: TimeZone>(
         return None;
     }
 
-    status.phase = phase_while_waiting_for_schedule(&status.phase);
+    if !resolves_to_hosts {
+        status.phase = phase_while_waiting_for_schedule(&status.phase);
+    }
     let next = forecast_next_run(schedule, now.clone(), None)?;
     status.next_run = Some(next.fixed_offset());
     (next - now).to_std().ok()
@@ -10466,6 +10495,7 @@ spec:
             Some(&Schedule::parse("0 20 * * *").unwrap()),
             false,
             false,
+            false,
             now,
             &mut status,
         );
@@ -10484,10 +10514,58 @@ spec:
             Some(&Schedule::parse("0 20 * * *").unwrap()),
             false,
             false,
+            false,
             now,
             &mut never_run,
         );
         assert_eq!(never_run.phase, Phase::Delayed);
+    }
+
+    /// The state per-slot targeting introduces: the window is still open, but every host has had its
+    /// run in it. Nothing is owed, so the start gate is closed — and this is then the only thing left
+    /// to requeue the plan. Without it the tick keeps the hour-long default and a plan on a schedule
+    /// tighter than that sleeps through the slots in between.
+    ///
+    /// The status is the served slot's own and is left alone: the verdict and the summary saying what
+    /// that run did are what this plan has to report until the next slot. That matters most on the
+    /// tick the run finishes, which is one of these ticks — the run's per-host results are applied
+    /// before the owed set is computed, so its success empties the set in the same pass that reports
+    /// it.
+    #[test]
+    fn a_recurring_plan_whose_slot_is_served_keeps_its_verdict_and_wakes_for_the_next_slot() {
+        let now = "2025-08-12T20:00:10Z".parse::<DateTime<Utc>>().unwrap();
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Succeeded,
+            next_run: Some(
+                "2025-08-12T20:00:00Z"
+                    .parse::<DateTime<FixedOffset>>()
+                    .unwrap(),
+            ),
+            summary: Some("3/3 up-to-date".into()),
+            ..Default::default()
+        };
+
+        let requeue = update_idle_recurring_status(
+            &ExecutionMode::Recurring,
+            Some(&Schedule::parse("0 20 * * *").unwrap()),
+            false,
+            false,
+            true,
+            now,
+            &mut status,
+        );
+
+        assert_eq!(status.phase, Phase::Succeeded);
+        assert_eq!(status.summary.as_deref(), Some("3/3 up-to-date"));
+        assert_eq!(
+            status.next_run,
+            Some(
+                "2025-08-13T20:00:00Z"
+                    .parse::<DateTime<FixedOffset>>()
+                    .unwrap()
+            )
+        );
+        assert_eq!(requeue, Some(std::time::Duration::from_secs(86_390)));
     }
 
     #[test]
@@ -10502,6 +10580,7 @@ spec:
         update_idle_recurring_status(
             &ExecutionMode::Recurring,
             Some(&Schedule::parse("0 20 * * *").unwrap()),
+            false,
             false,
             false,
             now,
@@ -10598,6 +10677,7 @@ spec:
                 Some(&Schedule::parse("0 20 * * *").unwrap()),
                 true,
                 false,
+                false,
                 now,
                 &mut suspended,
             ),
@@ -10630,6 +10710,7 @@ spec:
             update_idle_recurring_status(
                 &ExecutionMode::Recurring,
                 Some(&Schedule::parse("0 20 * * *").unwrap()),
+                false,
                 false,
                 false,
                 now,

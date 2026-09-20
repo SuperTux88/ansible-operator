@@ -118,6 +118,75 @@ pub fn find_all_hosts(status: &v1beta1::PlaybookPlanStatus) -> Vec<String> {
     distinct_hosts(&status.eligible_hosts)
 }
 
+/// How far `appliedAt` may precede a slot and still count as belonging to it.
+///
+/// The two timestamps come from different clocks — `appliedAt` is the API server's, the slot is the
+/// operator's, derived from the cron expression — so the comparison needs slack in the direction
+/// where the operator is ahead: a `Play` is created within milliseconds of the slot start, and an
+/// operator one second ahead would otherwise stamp a success at `slot - 1s` and read it as not
+/// having happened.
+const SLOT_MEMBERSHIP_GRACE: chrono::Duration = chrono::Duration::seconds(60);
+
+/// Whether this host's last success belongs to the schedule window starting at `slot`.
+///
+/// The grace ([`SLOT_MEMBERSHIP_GRACE`]) is safe because getting it wrong is asymmetric:
+///
+///   - *Skipping a host that is owed* needs the **previous** slot's success to have landed within
+///     the grace before this slot began. That slot is a whole schedule interval earlier and can
+///     only run inside its own window, so it takes `interval - startingDeadlineSeconds < grace` —
+///     the overlapping-window configuration `validate_scheduling_configuration` warns about.
+///   - *Re-running a host that already ran* needs the API server's clock more than a minute behind
+///     the operator's, at which point host-lock `Lease` expiry is already unreliable.
+///
+/// An absent `appliedAt` reads as "has not run this slot": the field is only absent on a record
+/// written before it existed (see `HostStatus::applied_at`), so the first tick after an upgrade
+/// targets every host, exactly as it did before this function existed.
+fn applied_within_slot(
+    entry: &v1beta1::HostStatus,
+    slot: chrono::DateTime<chrono::FixedOffset>,
+) -> bool {
+    entry
+        .applied_at
+        .is_some_and(|applied| applied >= slot - SLOT_MEMBERSHIP_GRACE)
+}
+
+/// Which hosts the schedule window starting at `slot` still owes a run.
+///
+/// The `Recurring` counterpart to [`find_outdated_hosts`], and the difference between them is the
+/// whole of what a schedule window means for that mode: a slot is a mini-revision, so a host owes
+/// it until a run *of that slot* has succeeded on it, however current its hash is.
+///
+/// The hash is still asked, second, and it is what preserves today's behaviour for a mid-window
+/// edit: an edit clears the per-host claims it invalidates, so every host owes the new revision
+/// again — including one that already ran the old revision in this same slot.
+///
+/// Only a *success* moves `appliedAt` (`status::apply_terminal_play_status`), so a host this window
+/// already reached and failed on still reads as owed — which is what lets a retry inside the window
+/// target it while leaving the hosts that worked alone.
+pub fn find_hosts_owing_slot(
+    status: &v1beta1::PlaybookPlanStatus,
+    execution_hash: &ExecutionHash,
+    slot: chrono::DateTime<chrono::FixedOffset>,
+) -> Vec<String> {
+    let hosts = distinct_hosts(&status.eligible_hosts);
+
+    let Some(hosts_status) = &status.hosts_status else {
+        return hosts;
+    };
+
+    let hash = execution_hash.to_string();
+    hosts
+        .into_iter()
+        .filter(|host| {
+            let Some(entry) = hosts_status.get(host) else {
+                return true;
+            };
+
+            !applied_within_slot(entry, slot) || entry.last_applied_hash != hash
+        })
+        .collect()
+}
+
 /// Given a playbook and some secrets, calculate a hash that only changes if the inputs change.
 /// With regards to the secrets, the hash is order-insensitive.
 pub fn calculate_execution_hash<'a, T: IntoIterator<Item = &'a BTreeMap<String, ByteString>>>(
@@ -514,5 +583,144 @@ mod tests {
             calculate_execution_hash("playbook", std::iter::empty()),
         );
         assert_ne!(hash_secret_data([&key]), hash_secret_data([&rotated]));
+    }
+
+    /// A plan whose hosts each carry a last success at a given time on a given revision.
+    fn slot_status(hosts: &[(&str, Option<&str>, &str)]) -> PlaybookPlanStatus {
+        PlaybookPlanStatus {
+            eligible_hosts: vec![ResolvedHosts {
+                name: "test-inventory".into(),
+                hosts: hosts.iter().map(|(host, _, _)| (*host).into()).collect(),
+                ..Default::default()
+            }],
+            hosts_status: Some(BTreeMap::from_iter(hosts.iter().map(
+                |(host, applied_at, hash)| {
+                    (
+                        (*host).to_owned(),
+                        HostStatus {
+                            last_applied_hash: (*hash).to_owned(),
+                            applied_at: applied_at.map(|at| at.parse().unwrap()),
+                            last_outcome: crate::v1beta1::HostOutcome::Succeeded,
+                            ..Default::default()
+                        },
+                    )
+                },
+            ))),
+            ..Default::default()
+        }
+    }
+
+    /// The rule that makes a slot a mini-revision: the hash says nothing about *when* the host ran,
+    /// so a `Recurring` plan whose hosts are all current still owes them the slot it has not run.
+    #[test]
+    fn a_host_owes_a_slot_its_last_success_came_before() {
+        let slot = "2025-08-13T03:00:00Z"
+            .parse::<chrono::DateTime<chrono::FixedOffset>>()
+            .unwrap();
+        let status = slot_status(&[
+            ("ran-last-night", Some("2025-08-12T03:00:04Z"), "1"),
+            ("ran-this-window", Some("2025-08-13T03:00:04Z"), "1"),
+        ]);
+
+        assert_eq!(
+            find_hosts_owing_slot(&status, &ExecutionHash(1), slot),
+            vec!["ran-last-night".to_owned()]
+        );
+    }
+
+    /// The skew direction that decides the grace. The `Play` is created within milliseconds of the
+    /// slot start, so an operator clock a little ahead of the API server stamps the success just
+    /// *before* the slot it belongs to. Without the grace that host reads as owed and a
+    /// non-idempotent playbook is applied to it twice in one window.
+    #[test]
+    fn a_success_stamped_just_before_its_own_slot_still_belongs_to_it() {
+        let slot = "2025-08-13T03:00:00Z"
+            .parse::<chrono::DateTime<chrono::FixedOffset>>()
+            .unwrap();
+
+        let inside = slot_status(&[("worker-1", Some("2025-08-13T02:59:59Z"), "1")]);
+        assert!(find_hosts_owing_slot(&inside, &ExecutionHash(1), slot).is_empty());
+
+        // The other end of the grace: a success older than it is the previous window's, and that
+        // host is owed this one.
+        let outside = slot_status(&[("worker-1", Some("2025-08-13T02:58:59Z"), "1")]);
+        assert_eq!(
+            find_hosts_owing_slot(&outside, &ExecutionHash(1), slot),
+            vec!["worker-1".to_owned()]
+        );
+    }
+
+    /// An edit mid-window re-applies to every host, including the ones this slot already served:
+    /// they ran a revision that no longer exists.
+    #[test]
+    fn a_host_that_ran_this_slot_on_another_revision_is_owed_it_again() {
+        let slot = "2025-08-13T03:00:00Z"
+            .parse::<chrono::DateTime<chrono::FixedOffset>>()
+            .unwrap();
+        let status = slot_status(&[("worker-1", Some("2025-08-13T03:00:04Z"), "1")]);
+
+        assert_eq!(
+            find_hosts_owing_slot(&status, &ExecutionHash(2), slot),
+            vec!["worker-1".to_owned()]
+        );
+    }
+
+    /// Only a success moves `appliedAt`, which is what lets a retry inside the window pick up
+    /// exactly the hosts the first run did not finish — and leave the ones it did alone.
+    #[test]
+    fn a_host_this_window_failed_on_is_still_owed_the_slot() {
+        let slot = "2025-08-13T03:00:00Z"
+            .parse::<chrono::DateTime<chrono::FixedOffset>>()
+            .unwrap();
+        let mut status = slot_status(&[
+            ("failed", Some("2025-08-12T03:00:04Z"), "1"),
+            ("succeeded", Some("2025-08-13T03:00:04Z"), "1"),
+        ]);
+        if let Some(entry) = status
+            .hosts_status
+            .as_mut()
+            .and_then(|hosts| hosts.get_mut("failed"))
+        {
+            entry.last_outcome = crate::v1beta1::HostOutcome::Failed;
+            entry.last_transition_time = Some(
+                "2025-08-13T03:05:00Z"
+                    .parse::<chrono::DateTime<chrono::FixedOffset>>()
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(
+            find_hosts_owing_slot(&status, &ExecutionHash(1), slot),
+            vec!["failed".to_owned()]
+        );
+    }
+
+    /// The upgrade case: `appliedAt` is absent on a record written before the field existed, and a
+    /// host that cannot prove it ran this slot is owed it. The first tick after an upgrade
+    /// therefore targets everyone, exactly as it did before slots were tracked.
+    #[test]
+    fn a_host_with_no_recorded_run_is_owed_the_slot() {
+        let slot = "2025-08-13T03:00:00Z"
+            .parse::<chrono::DateTime<chrono::FixedOffset>>()
+            .unwrap();
+        let before_the_field = slot_status(&[("worker-1", None, "1")]);
+        assert_eq!(
+            find_hosts_owing_slot(&before_the_field, &ExecutionHash(1), slot),
+            vec!["worker-1".to_owned()]
+        );
+
+        let never_ran = PlaybookPlanStatus {
+            eligible_hosts: vec![ResolvedHosts {
+                name: "test-inventory".into(),
+                hosts: vec!["worker-1".into()],
+                ..Default::default()
+            }],
+            hosts_status: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            find_hosts_owing_slot(&never_ran, &ExecutionHash(1), slot),
+            vec!["worker-1".to_owned()]
+        );
     }
 }
