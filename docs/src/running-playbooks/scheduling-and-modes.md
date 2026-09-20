@@ -232,12 +232,19 @@ it now reads.
 
 This second case is triggered by more than the execution hash. An unlaunched run is abandoned
 whenever *any* part of the plan spec changes — the image, tolerations, verbosity, inventory
-references — or when the set of nodes the plan resolves to changes, for instance because a node was
-relabelled or a `NodeAccessPolicy` was narrowed. The hash decides which hosts are out of date; this
-check decides whether a run still matches the plan it was prepared for, and it is deliberately
-the stricter of the two. Setting `spec.suspend: true` has the same effect, for the same reason:
-nothing irrevocable exists for an unlaunched run, so a paused plan drops it instead of launching
-it later.
+references — or when the set of hosts **that run is applying to** changes, for instance because one
+of them was relabelled out of the inventory or a `NodeAccessPolicy` was narrowed. The hash decides
+which hosts are out of date; this check decides whether a run still matches the plan it was prepared
+for, and it is deliberately the stricter of the two. Setting `spec.suspend: true` has the same
+effect, for the same reason: nothing irrevocable exists for an unlaunched run, so a paused plan
+drops it instead of launching it later.
+
+A host *arriving* is the one inventory change that does not abandon it. A node that joins, that a
+[dependency](./playbook-plans.md#declaring-what-a-plan-provides) makes eligible, or that is added to
+a `StaticInventory` was never part of this run and cannot change what it is applying — so the run
+carries on and the new host is picked up by a later one. Tearing the run down instead would cost it
+the locks and proxy pods it had already acquired, and a fleet where hosts keep arriving could keep
+it from ever launching at all.
 
 One trigger is narrower than the rest. A run that is still waiting for its **host locks** is
 also dropped if it misses its schedule window, because it has yet to consume the slot it was started

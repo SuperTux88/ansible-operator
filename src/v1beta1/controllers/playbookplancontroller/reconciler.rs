@@ -1302,14 +1302,6 @@ async fn reconcile(
         attempt_budget_available(&object.spec.mode, resource_status.retry_count, max_attempts),
     );
 
-    // Whether a recorded run's preparation inputs are still the desired ones. While this holds,
-    // the plan spec, resolved groups and Job blueprint are re-derivable from live state; once it
-    // stops holding, the absent-Job run is superseded.
-    let inputs_unchanged = |unlaunched: &UnlaunchedRun| -> bool {
-        unlaunched.run.mirror.execution_hash == execution_hash.to_string()
-            && live_preparation_fingerprint == unlaunched.preparation_fingerprint
-    };
-
     if let Some(unlaunched) = unlaunched_run {
         requeue_after = std::time::Duration::from_secs(15);
         let slot_is_current = matches!(
@@ -1317,9 +1309,14 @@ async fn reconcile(
             Timing::Now(start)
                 if start.map(|slot| slot.fixed_offset()) == unlaunched.run.mirror.triggered_slot
         );
+        // Everything this run is resumed with comes from its own record rather than from this
+        // tick's target set — the groups the Job blueprint is rebuilt from as much as the
+        // fingerprint they are judged by. See `rebuild_prepared_inputs`.
+        let prepared =
+            rebuild_prepared_inputs(&object, &target_groups, &execution_hash, &unlaunched)?;
         match decide_unlaunched_action(
             &unlaunched.phase,
-            inputs_unchanged(&unlaunched),
+            prepared.unchanged,
             has_work_to_start,
             slot_is_current,
         ) {
@@ -1343,7 +1340,7 @@ async fn reconcile(
                 requeue_after = std::time::Duration::from_secs(1);
             }
             UnlaunchedAction::ResumeLaunching { may_proceed } => {
-                let resume_with = may_proceed.then_some(run_groups.as_slice());
+                let resume_with = may_proceed.then_some(prepared.groups.as_slice());
                 let resume = resume_launching_run(
                     &context,
                     &object,
@@ -1387,6 +1384,8 @@ async fn reconcile(
             UnlaunchedAction::ResumePreparing => {
                 let resumed = RunContext {
                     triggered_slot: unlaunched.run.mirror.triggered_slot,
+                    run_groups: &prepared.groups,
+                    preparation_fingerprint: &prepared.fingerprint,
                     ..base_run
                 };
                 let started = try_start_run(
@@ -2547,6 +2546,54 @@ enum UnlaunchedAction {
     Abandon,
     ResumePreparing,
     ResumeLaunching { may_proceed: bool },
+}
+
+/// What an absent-Job run is applying to, rebuilt from its own record.
+struct PreparedInputs {
+    /// The resolved groups filtered to the hosts the run recorded.
+    groups: Vec<ResolvedInventoryGroup>,
+    /// Their fingerprint alongside the live plan spec.
+    fingerprint: String,
+    /// Whether those inputs are still the desired ones — see [`rebuild_prepared_inputs`].
+    unchanged: bool,
+}
+
+/// Rebuilds a recovered absent-Job run's preparation inputs, and says whether they are still the
+/// desired ones. While `unchanged` holds, the plan spec, resolved groups and Job blueprint are
+/// re-derivable from live state; once it stops holding, the run is superseded
+/// ([`decide_unlaunched_action`]).
+///
+/// The groups are rebuilt from the run's **own recorded hosts** rather than from this tick's target
+/// set, and both halves of that matter. They are what the resume paths rebuild the committed Job
+/// blueprint from, so they have to be the set the run actually prepared against — and they are what
+/// the fingerprint has to be taken over for the comparison to mean anything, since a host the run
+/// never targeted cannot change what it is applying.
+///
+/// Reading the live target set instead breaks once a scheduled window can owe a run to a host that
+/// appeared mid-window ([`window_taken_by_a_record`]): that host would supersede the run already
+/// preparing, then supersede its replacement on the next tick, for as long as hosts kept arriving —
+/// a plan that never launches. The run's own record is the one answer that cannot move underneath it
+/// while it waits on its locks or its proxy pods.
+///
+/// What still supersedes the run: a new execution hash, a change to the plan spec, or a change to
+/// the groups it is actually applying to — an inventory edit, a relabelled node, a narrowed
+/// `NodeAccessPolicy`. A host *leaving* the run's set moves the fingerprint exactly as it did
+/// before, because the filter then yields a smaller group than the one the run recorded.
+fn rebuild_prepared_inputs(
+    plan: &PlaybookPlan,
+    target_groups: &[ResolvedInventoryGroup],
+    execution_hash: &ExecutionHash,
+    unlaunched: &UnlaunchedRun,
+) -> Result<PreparedInputs, ReconcileError> {
+    let groups = filter_groups_to_hosts(target_groups, &unlaunched.run.mirror.hosts);
+    let fingerprint = preparation_fingerprint(plan, &groups)?;
+    let unchanged = unlaunched.run.mirror.execution_hash == execution_hash.to_string()
+        && fingerprint == unlaunched.preparation_fingerprint;
+    Ok(PreparedInputs {
+        groups,
+        fingerprint,
+        unchanged,
+    })
 }
 
 /// Decides a recovered absent-Job run after its desired inputs have been resolved. `Prepared`
@@ -8146,6 +8193,90 @@ mod tests {
             serde_json::to_value(&prepared).unwrap(),
             serde_json::to_value(&rebuilt).unwrap(),
             "the same recorded identity and inputs must rebuild byte-identically"
+        );
+    }
+
+    /// The host set a prepared run is judged against is its **own**, not the tick's. Once
+    /// `window_taken_by_a_record` hands an open window to a host that appeared mid-window, judging
+    /// against the live target set would tear down the run still acquiring its locks — and tear
+    /// down its replacement on the next tick, for as long as hosts kept arriving.
+    #[test]
+    fn a_host_appearing_mid_window_does_not_supersede_a_run_already_preparing() {
+        let mut plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("uid".into());
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+
+        let prepared_groups = vec![managed_ssh_group("nodes", &["a", "b"], None)];
+        let unlaunched = UnlaunchedRun {
+            run: RecordedRun {
+                mirror: ActiveRun {
+                    execution_hash: hash.to_string(),
+                    run_id: "run-1".into(),
+                    job_name: "apply-web-abc-1".into(),
+                    play_uid: "play-uid".into(),
+                    hosts: vec!["a".into(), "b".into()],
+                    run_number: 1,
+                    attempt: 1,
+                    triggered_slot: None,
+                },
+                execution_hash: hash,
+            },
+            phase: v1beta1::PlayPhase::Prepared,
+            preparation_fingerprint: preparation_fingerprint(&plan, &prepared_groups).unwrap(),
+        };
+
+        // A node joins the plan's inventory while the run waits on its locks.
+        let joined = vec![managed_ssh_group("nodes", &["a", "b", "c"], None)];
+        let rebuilt = rebuild_prepared_inputs(&plan, &joined, &hash, &unlaunched).unwrap();
+        assert!(
+            rebuilt.unchanged,
+            "a host this run never targeted cannot change what it is applying"
+        );
+
+        // The groups that come back are what the resume paths rebuild the committed Job blueprint
+        // from, so the joined host must not be in them: resuming against the tick's target set
+        // would launch a Job for a host the run never prepared against.
+        let resumed_hosts: Vec<String> = rebuilt
+            .groups
+            .iter()
+            .flat_map(|group| group.hosts().hosts.clone())
+            .collect();
+        assert_eq!(
+            resumed_hosts,
+            vec!["a".to_string(), "b".to_string()],
+            "a resumed run is rebuilt from the hosts it recorded"
+        );
+        assert_eq!(
+            rebuilt.fingerprint, unlaunched.preparation_fingerprint,
+            "and so reproduces the fingerprint it committed to"
+        );
+
+        // Everything that superseded the run before still does. A host leaving its own set...
+        let shrunk = vec![managed_ssh_group("nodes", &["a"], None)];
+        assert!(
+            !rebuild_prepared_inputs(&plan, &shrunk, &hash, &unlaunched)
+                .unwrap()
+                .unchanged,
+            "a host leaving the run's own set changes what it is applying to"
+        );
+
+        // ...a spec edit the execution hash cannot see...
+        let mut retagged = plan.clone();
+        retagged.spec.image = "ansible:2.19".into();
+        assert!(
+            !rebuild_prepared_inputs(&retagged, &joined, &hash, &unlaunched)
+                .unwrap()
+                .unchanged,
+            "an image change must still supersede the run"
+        );
+
+        // ...and a new revision, refused before the groups are rebuilt at all.
+        let edited = ExecutionHash::from_hex("2b").unwrap();
+        assert!(
+            !rebuild_prepared_inputs(&plan, &joined, &edited, &unlaunched)
+                .unwrap()
+                .unchanged,
+            "a new execution hash supersedes the run whatever its hosts say"
         );
     }
 
