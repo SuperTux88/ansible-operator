@@ -327,7 +327,7 @@ never recorded as `Failed`, since no task ever ran on it; which [outcome
 what the operator saw at launch:
 
 - the Node was itself `NotReady` — `Unreachable`. Its return to `Ready` starts the next run on its
-  own, so this heals without anyone touching the plan. For a `Recurring` plan that holds while its
+  own, so this heals without anyone touching the plan. For a scheduled plan that holds while its
   tick's window is still open; after it closes, the plan heals at its next tick.
 - the Node was `Ready` and only the proxy pod failed to come up — `NotReached`. Nothing about the
   Node is going to change, so nothing wakes the plan for it. See

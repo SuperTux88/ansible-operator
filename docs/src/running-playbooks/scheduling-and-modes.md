@@ -201,7 +201,7 @@ timer. The watched inputs are:
 | A Secret it names in `variables` or `files` | at once |
 | A `ClusterInventory` or `StaticInventory` it names — including the Nodes a `ClusterInventory` resolves to | at once |
 | A `NodeAccessPolicy` (which may change [which Nodes the namespace may target](../cluster-operators/node-access-policies.md)) | at once |
-| A Node it is still waiting on becoming `Ready` | at once — for a `Recurring` plan, only while its tick's window is open |
+| A Node it is still waiting on becoming `Ready` | at once — for a scheduled plan, only while its tick's window is open |
 | A `StaticInventory`'s SSH key Secret | at once, but **only for a plan whose last run did not succeed** |
 | The run's Job finishing | at once |
 | Nothing at all | on a timer: the time until the next scheduled tick, or an hour for an unscheduled plan — a plan [held](./cluster-nodes.md#holding-instead-of-starting) for its Nodes also once when its tick's window closes |
@@ -228,11 +228,11 @@ what its hosts need. Three answers say it could not, and none of them is somethi
   turning `Ready` under it changes nothing until the budget comes back — which an edit, a
   `StaticInventory` SSH key rotation or a successful run does, and each of those has its own row in
   the table above.
-- a **`Recurring`** plan outside its tick's window is waiting on the clock, so a Node returning early
-  brings its next tick no closer. *Inside* the window it is woken like any other plan, because there
-  it can act: the Node may be one the tick still owes a run, or the one thing a
-  [held](./cluster-nodes.md#holding-instead-of-starting) tick is waiting for. Once the tick's
-  [attempts](#retries) are spent, a Node turning `Ready` changes nothing there either.
+- a **scheduled** plan outside its tick's window is waiting on the clock, so a Node returning early
+  brings its next tick no closer — whatever its mode. *Inside* the window it is woken like any other
+  plan, because there it can act: the Node may be one the tick still owes a run, or the one thing a
+  [held](./cluster-nodes.md#holding-instead-of-starting) tick is waiting for. Once a `Recurring`
+  tick's [attempts](#retries) are spent, a Node turning `Ready` changes nothing there either.
 
 The SSH key row is deliberately one-sided. Rotating a key changes how the operator connects, not what
 it applies, so it must never re-apply the playbook to hosts that are already current — which is why
