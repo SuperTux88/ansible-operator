@@ -190,6 +190,12 @@ pub fn node_to_playbookplans(
 /// route either — a hash edit, an SSH key rotation and a successful run each have their own watch —
 /// so a Node event cannot be the thing that makes an exhausted plan actionable.
 ///
+/// A *scheduled* `OneShot` plan is bounded by its window as well, for the reason the first
+/// `Recurring` bound gives: outside it the tick lands in `Timing::Delayed` and can do nothing with
+/// the wake-up, while a host that joined at 09:00 would otherwise wake a nightly plan on every
+/// update of its Node until 03:00. Asked last, after the host has proved owed, since it parses the
+/// schedule.
+///
 /// The budget check cannot strand a plan the readiness gate is holding, which is the trap the
 /// allow-list version of this predicate fell into: that hold is only ever asserted inside
 /// `eligible_to_start`, which already requires the budget, so a held plan always has one.
@@ -273,14 +279,17 @@ fn plan_awaits_node(
                 return false;
             }
 
-            entry.is_none_or(|host| {
+            let owed = entry.is_none_or(|host| {
                 replaced_machine
                     || (host.last_applied_hash != status.current_hash
                         && !matches!(
                             host.last_outcome,
                             HostOutcome::Failed | HostOutcome::NotReached | HostOutcome::Incomplete
                         ))
-            })
+            });
+
+            owed && (plan.spec.schedule.is_none()
+                || reconciler::open_schedule_slot(plan, now).is_some())
         }
         ExecutionMode::Recurring => {
             let Some(window) = reconciler::open_schedule_slot(plan, now) else {
@@ -774,10 +783,10 @@ mod tests {
         }
     }
 
-    /// The cases below are all `OneShot`, which does not read the clock: nothing in that arm depends
-    /// on a schedule window. Pinning an instant here keeps each of them asking exactly what it asked
-    /// before the predicate learned about windows; the `Recurring` cases call the real function with
-    /// the instant they mean.
+    /// The cases below are all unscheduled `OneShot` plans, which do not read the clock: nothing in
+    /// that arm depends on a schedule window. Pinning an instant here keeps each of them asking
+    /// exactly what it asked before the predicate learned about windows; the scheduled cases call
+    /// the real function with the instant they mean.
     fn plan_awaits_node(plan: &PlaybookPlan, node: &Node, node_name: &str) -> bool {
         super::plan_awaits_node(plan, node, node_name, at("2026-01-01T03:00:04Z"))
     }
@@ -1230,6 +1239,29 @@ mod tests {
             &unreplaced_node(),
             "node-a",
             at("2026-01-01T06:00:00Z"),
+        ));
+    }
+
+    /// A scheduled `OneShot` plan owed a run on a Node that joined mid-morning can do nothing with
+    /// that Node's updates until its next window opens, so they do not wake it. Inside the window
+    /// the same host wakes it as it always did — that is where a held run gets released.
+    #[test]
+    fn a_scheduled_oneshot_plan_is_woken_only_inside_its_window() {
+        let mut plan = plan_awaiting("node-a", host("", HostOutcome::Unreachable));
+        plan.spec.schedule = Some("0 3 * * *".into());
+        plan.spec.starting_deadline_seconds = Some(14_400);
+
+        assert!(super::plan_awaits_node(
+            &plan,
+            &unreplaced_node(),
+            "node-a",
+            at("2026-01-01T06:00:00Z"),
+        ));
+        assert!(!super::plan_awaits_node(
+            &plan,
+            &unreplaced_node(),
+            "node-a",
+            at("2026-01-01T09:00:00Z"),
         ));
     }
 }
