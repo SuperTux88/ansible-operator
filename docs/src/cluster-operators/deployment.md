@@ -117,9 +117,14 @@ Node — Ansible reports it unreachable, and it is retried on the next run. The 
 an old-credential pod still terminating after a reset; it is never reused. A pod that has reached
 `Running` normally is waited on until Ready as usual.
 
+The same wait bounds a proxy pod that does not come up on a `Ready` Node, such as one still pulling
+its image: the tiers below look only at the heartbeat, not at whether the Node is `Ready`.
+
 The wait scales with how long the Node has been silent (its last `Ready` heartbeat): a Node that only
-just went `NotReady` is given the full wait, one silent for longer is given up on sooner. Tune it via
-`managedSsh.readiness`:
+just went `NotReady` is given the full wait, one silent for longer is given up on sooner. A healthy
+Node's heartbeat is up to a few minutes old, since the kubelet only reports its status every few
+minutes when nothing changes, so a threshold of `0` days matches practically no Node, healthy ones
+included. Tune it via `managedSsh.readiness`:
 
 ```yaml
 # values.yaml
