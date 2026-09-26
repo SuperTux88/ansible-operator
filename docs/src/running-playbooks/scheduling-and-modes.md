@@ -22,6 +22,9 @@ wide that window is: if the run has not started within this many seconds of the 
 operator was busy or restarting — that tick is skipped and the run waits for the next one. It
 defaults to **30** seconds. Raise it for a plan that must not miss a tick even if the operator is
 briefly down at the scheduled time. This is the same idea as a CronJob's `.spec.startingDeadlineSeconds`.
+It also caps how long a run waits for a Node that is `NotReady` before reporting it unreachable, so
+it is the setting to raise when Nodes may still be rebooting at the tick; see
+[NotReady nodes](./cluster-nodes.md#notready-nodes).
 
 ```yaml
 spec:

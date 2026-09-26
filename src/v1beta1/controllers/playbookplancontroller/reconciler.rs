@@ -2517,6 +2517,31 @@ fn slot_window<Tz: TimeZone>(
     execution_evaluator::SlotWindow::new(slot.fixed_offset(), next, deadline)
 }
 
+/// The longest a run of `slot` waits for a proxy pod on a Node that is not `Ready`.
+///
+/// A run launches only once every proxy pod is up or given up on, so a dead Node's wait is the whole
+/// run's, and it is paid again by every run, because each creates its own pods. Unbounded by the
+/// schedule, the operator-wide grace (ten minutes by default) outlasts a short schedule's interval,
+/// and a plan every five minutes would miss every other tick for as long as one Node is down.
+///
+/// Two bounds, for two different questions. The deadline keeps the wait within the time the author
+/// gave a run to start in. Half the interval is what keeps runs from falling behind: a run that takes
+/// longer than the interval starts the next tick later each time, until one starts past its window
+/// and that tick is skipped — so the other half is left for the playbook itself. Neither can make a
+/// playbook that outlasts its interval keep up.
+///
+/// The interval is measured forward, as in [`slot_window`] (see
+/// [`execution_evaluator::SlotWindow`] for what that means on an irregular schedule); a schedule
+/// with nothing after `slot` is bounded by the deadline alone.
+fn not_ready_proxy_grace_cap<Tz: TimeZone>(
+    schedule: &Schedule,
+    slot: DateTime<Tz>,
+    deadline: chrono::Duration,
+) -> chrono::Duration {
+    forecast_next_run(schedule, slot.clone(), None)
+        .map_or(deadline, |next| deadline.min((next - slot) / 2))
+}
+
 /// Whether `spec.startingDeadlineSeconds` is wide enough to swallow whole schedule ticks, and the
 /// two occurrences that show it.
 ///
@@ -3387,6 +3412,20 @@ async fn ensure_infra_and_launch(
     )
     .await?;
 
+    // The run's recorded slot rather than whichever window is open now: a resumed run still belongs
+    // to the tick it was prepared for. This only times a wait, so a live schedule that no longer
+    // parses falls back to the uncapped grace rather than failing the launch.
+    let not_ready_grace_cap_secs = run.mirror.triggered_slot.and_then(|slot| {
+        let configuration = validate_scheduling_configuration(object, Utc::now()).ok()?;
+        let schedule = configuration.schedule.as_ref()?;
+        let cap = not_ready_proxy_grace_cap(
+            schedule,
+            slot.with_timezone(&configuration.time_zone),
+            starting_deadline(object),
+        );
+        Some(cap.num_seconds())
+    });
+
     let proxy_readiness = managed_ssh::ensure_proxy_infra(
         &context.client,
         &context.operator_namespace,
@@ -3395,6 +3434,7 @@ async fn ensure_infra_and_launch(
         &run.mirror.run_id,
         &proxy_hosts,
         &context.proxy_grace,
+        not_ready_grace_cap_secs,
         &context.ca,
         &context.proxy_image,
         context.workload_egress_policies.managed_ssh.clone(),
@@ -13347,6 +13387,47 @@ spec:
         // next tick opens while the previous window is still open.
         assert!(deadline_swallows_a_tick(&hourly, chrono::Duration::hours(1), now).is_some());
         assert!(deadline_swallows_a_tick(&hourly, chrono::Duration::minutes(59), now).is_none());
+    }
+
+    /// A dead Node's proxy wait is paid by every run, so on a short schedule it has to fit both the
+    /// window a run may start in and half the interval, or runs fall behind their ticks.
+    #[test]
+    fn a_not_ready_nodes_proxy_wait_fits_the_window_and_half_the_interval() {
+        let slot = "2026-01-01T03:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let every_five_minutes = Schedule::parse("*/5 * * * *").unwrap();
+        let nightly = Schedule::parse("0 3 * * *").unwrap();
+
+        assert_eq!(
+            not_ready_proxy_grace_cap(&every_five_minutes, slot, chrono::Duration::seconds(30)),
+            chrono::Duration::seconds(30),
+            "the default deadline is the tighter bound"
+        );
+        assert_eq!(
+            not_ready_proxy_grace_cap(&every_five_minutes, slot, chrono::Duration::minutes(5)),
+            chrono::Duration::seconds(150),
+            "a window as wide as the interval still leaves half of it for the playbook"
+        );
+        assert_eq!(
+            not_ready_proxy_grace_cap(&nightly, slot, chrono::Duration::hours(4)),
+            chrono::Duration::hours(4),
+            "a maintenance window is wider than any operator grace, which is left alone"
+        );
+    }
+
+    /// Measured forward, like the slot window: a weekday schedule's Friday tick has the weekend in
+    /// front of it, so only the deadline bounds it.
+    #[test]
+    fn a_not_ready_nodes_proxy_wait_measures_the_interval_forward() {
+        let weekdays = Schedule::parse("0 3 * * MON-FRI").unwrap();
+        let a_day = chrono::Duration::days(1);
+        let thursday = "2026-01-01T03:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let friday = "2026-01-02T03:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        assert_eq!(
+            not_ready_proxy_grace_cap(&weekdays, thursday, a_day),
+            chrono::Duration::hours(12)
+        );
+        assert_eq!(not_ready_proxy_grace_cap(&weekdays, friday, a_day), a_day);
     }
 
     #[test]
