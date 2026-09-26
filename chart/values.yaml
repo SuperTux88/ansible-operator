@@ -26,12 +26,14 @@ managedSsh:
   # How long the operator waits for a managed-ssh proxy pod to become Ready before it gives up on
   # that node for the run (Ansible then reports the node unreachable, and it is retried on the next
   # run). The wait covers pods stuck before Running, on any node — Ready or not, so it also bounds a
-  # slow image pull — and old-credential pods still terminating after a reset; a pod that has reached
-  # Running normally is waited on until Ready as usual. The wait scales with how long the node has
-  # been silent (the age of its last `Ready` heartbeat): it is `graceSeconds` for a node whose last
-  # heartbeat is within `thresholdDays[0]`, divided by `aggressiveness` again at each further
-  # threshold, and 0 (given up immediately) past the last one. A healthy node's heartbeat is up to a
-  # few minutes old, so a threshold of 0 days matches practically no node, healthy ones included.
+  # slow image pull — old-credential pods still terminating after a reset, and pods that reached
+  # Running on a node that then stopped being Ready (timed from when the pod lost readiness); a pod
+  # that has reached Running on a Ready node is waited on until Ready. The wait scales with how long
+  # the node has been silent (the age of its last `Ready` heartbeat): it is `graceSeconds` for a
+  # node whose last heartbeat is within `thresholdDays[0]`, divided by `aggressiveness` again at
+  # each further threshold, and 0 (given up immediately) past the last one. A healthy node's
+  # heartbeat is up to a few minutes old, so a threshold of 0 days matches practically no node,
+  # healthy ones included.
   # Defaults give 600 / 300 / 150 / 0 seconds at 3 / 7 / 30 day boundaries.
   readiness:
     graceSeconds: 600
