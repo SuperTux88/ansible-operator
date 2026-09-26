@@ -273,6 +273,27 @@ fn effective_grace_secs(heartbeat_age_secs: Option<i64>, policy: &ProxyGracePoli
     0
 }
 
+/// The grace a proxy pod actually gets: the heartbeat-scaled `tiered_secs`, shortened to
+/// `not_ready_cap_secs` when its Node exists and is not `Ready`.
+///
+/// Only such a host is capped because only it has somewhere to go afterwards: it is excluded as
+/// `node_not_ready`, which refunds the run's attempt, and the Node's return to `Ready` wakes the plan
+/// for it while the tick's window is still open. A longer tolerance for down Nodes is the plan's
+/// `startingDeadlineSeconds`, not this wait, which every other host of the run sits out at the start
+/// with it. A pod on a `Ready` Node is still making progress (being scheduled, pulling
+/// the image), and cutting that short would turn a slow first pull into a spent attempt, so it keeps
+/// the full grace.
+fn proxy_grace_secs(
+    tiered_secs: i64,
+    node_not_ready: bool,
+    not_ready_cap_secs: Option<i64>,
+) -> i64 {
+    match not_ready_cap_secs {
+        Some(cap) if node_not_ready => tiered_secs.min(cap),
+        _ => tiered_secs,
+    }
+}
+
 fn proxy_wait_age_secs(pod: &Pod, state: &PodReadyState, now_epoch_secs: i64) -> Option<i64> {
     let started = match state {
         PodReadyState::Terminating => pod.metadata.deletion_timestamp.as_ref(),
@@ -848,6 +869,9 @@ async fn ensure_client_cert(
 
 /// Ensures a proxy pod (+ its Secret + the run's NetworkPolicy) exists and is Ready for every
 /// host in `hosts`. Safe to call every reconcile tick — only missing pieces are created.
+///
+/// `not_ready_grace_cap_secs` bounds the wait for a host whose Node is not `Ready` (see
+/// [`proxy_grace_secs`]); `None` leaves every host on `grace_policy` alone.
 // Each argument is a distinct, unrelated input (two namespaces, hash, hosts, CA, image, policy,
 // owner); bundling them into a struct would only move the noise, so keep them explicit.
 #[allow(clippy::too_many_arguments)]
@@ -859,6 +883,7 @@ pub async fn ensure_proxy_infra(
     run_id: &str,
     hosts: &[ProxyHost],
     grace_policy: &ProxyGracePolicy,
+    not_ready_grace_cap_secs: Option<i64>,
     ca: &CertificateAuthority,
     proxy_image: &str,
     network_policy_egress: Option<Vec<NetworkPolicyEgressRule>>,
@@ -979,14 +1004,21 @@ pub async fn ensure_proxy_infra(
                 let heartbeat_age = node
                     .as_ref()
                     .and_then(|node| node_ready_heartbeat_age_secs(node, now));
-                let grace = effective_grace_secs(heartbeat_age, grace_policy);
+                // A host with no Node object at all is deliberately not recorded as not-ready:
+                // nothing will ever report it `Ready` again either, so crediting it as a Node that
+                // might come back would leave a plan refunding attempts to it forever.
+                let node_not_ready = node
+                    .as_ref()
+                    .is_some_and(|node| !node_readiness::is_ready(node));
+                let grace = proxy_grace_secs(
+                    effective_grace_secs(heartbeat_age, grace_policy),
+                    node_not_ready,
+                    not_ready_grace_cap_secs,
+                );
                 match proxy_wait_age_secs(&pod, &state, now) {
-                    // A host with no Node object at all is deliberately not recorded as not-ready:
-                    // nothing will ever report it `Ready` again either, so crediting it as a Node
-                    // that might come back would leave a plan refunding attempts to it forever.
                     Some(age) if age >= grace => unreachable.push(UnreachableHost {
                         host: host.clone(),
-                        node_not_ready: node.is_some_and(|node| !node_readiness::is_ready(&node)),
+                        node_not_ready,
                     }),
                     _ => waiting.push(host.clone()),
                 }
@@ -1780,6 +1812,20 @@ mod tests {
         assert_eq!(effective_grace_secs(Some(5 * DAY), &flat), 600);
         assert_eq!(effective_grace_secs(Some(20 * DAY), &flat), 600);
         assert_eq!(effective_grace_secs(Some(40 * DAY), &flat), 0);
+    }
+
+    #[test]
+    fn only_a_not_ready_node_has_its_grace_capped() {
+        assert_eq!(proxy_grace_secs(600, true, Some(30)), 30);
+        // A `Ready` Node's pod may still be pulling its image: it keeps the full wait.
+        assert_eq!(proxy_grace_secs(600, false, Some(30)), 600);
+        assert_eq!(proxy_grace_secs(600, true, None), 600);
+    }
+
+    #[test]
+    fn the_cap_never_lengthens_the_tiered_grace() {
+        assert_eq!(proxy_grace_secs(150, true, Some(14_400)), 150);
+        assert_eq!(proxy_grace_secs(0, true, Some(30)), 0);
     }
 }
 

@@ -335,7 +335,16 @@ what the operator saw at launch:
   [Hosts show `NotReached`](./results-and-troubleshooting.md#hosts-show-notreached).
 
 The wait window is set by the cluster operator and shrinks the longer a Node has been unreachable
-(see [Deployment](../cluster-operators/deployment.md)).
+(see [Deployment](../cluster-operators/deployment.md#notready-nodes)). On a scheduled plan, a Node
+that is `NotReady` is waited on for no longer than the plan's `startingDeadlineSeconds`, and no
+longer than half the time to its next tick. The run launches only once every proxy pod is up or
+given up on, and every run waits again, so without that bound one dead Node would stretch each run
+of a short schedule past its interval and make the plan miss ticks. A Node that is `Ready` keeps the
+full wait: its proxy pod may simply still be pulling its image. The down Node is reported
+`Unreachable` as before. By the time the operator gives up on it, the tick's window has usually
+closed, so it waits for the next tick. If Nodes are expected to be down around the tick (rebooting,
+say), give the plan a longer `startingDeadlineSeconds`. That lengthens this wait too, and once the
+window outlasts the wait, the Node's return to `Ready` still gets a run within the same tick.
 
 Excluding rather than dropping is what keeps the inventory honest. The Node stays a member of its
 groups, so a playbook templating a cluster member list out of `groups['workers']` still sees the

@@ -11,10 +11,17 @@ Two independent things decide *when* a plan runs and *what* runs:
 `spec.schedule` is a standard **5-field cron** expression (`minute hour day-of-month month
 day-of-week`). `spec.timeZone` is the IANA time zone it is evaluated in; if omitted, **UTC** is used.
 The granularity is minutes, not seconds. Schedules with a seconds or year field are not accepted.
+Days of the week are numbered as in standard cron: `0` is Sunday, `1-5` is Monday to Friday, and `7`
+is Sunday again. Day names (`MON-FRI`, `sun`) work too.
 Invalid cron expressions, unknown time zones, and expressions with no future occurrence are rejected;
 the plan does not run until the field is corrected. Its status identifies the invalid field; see
 [The plan's schedule or time zone is
 invalid](./results-and-troubleshooting.md#the-plans-schedule-or-time-zone-is-invalid).
+
+When both day-of-month and day-of-week are restricted, **both** must match. `0 3 1-7 * MON` runs at
+03:00 on the first Monday of each month. This differs from standard cron and from a Kubernetes
+`CronJob`, where the same expression runs on each of the first seven days *and* on every Monday. To
+run on either kind of day, use two plans, one per day field.
 
 The operator evaluates the schedule on its own reconcile cycle rather than exactly on the tick, so a
 run starts within a short window *after* each scheduled time. `spec.startingDeadlineSeconds` sets how

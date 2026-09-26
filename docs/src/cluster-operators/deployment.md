@@ -117,9 +117,14 @@ Node — Ansible reports it unreachable, and it is retried on the next run. The 
 an old-credential pod still terminating after a reset; it is never reused. A pod that has reached
 `Running` normally is waited on until Ready as usual.
 
+The same wait bounds a proxy pod that does not come up on a `Ready` Node, such as one still pulling
+its image: the tiers below look only at the heartbeat, not at whether the Node is `Ready`.
+
 The wait scales with how long the Node has been silent (its last `Ready` heartbeat): a Node that only
-just went `NotReady` is given the full wait, one silent for longer is given up on sooner. Tune it via
-`managedSsh.readiness`:
+just went `NotReady` is given the full wait, one silent for longer is given up on sooner. A healthy
+Node's heartbeat is up to a few minutes old, since the kubelet only reports its status every few
+minutes when nothing changes, so a threshold of `0` days matches practically no Node, healthy ones
+included. Tune it via `managedSsh.readiness`:
 
 ```yaml
 # values.yaml
@@ -132,6 +137,12 @@ managedSsh:
 
 The defaults wait 600 / 300 / 150 / 0 seconds for a Node last seen within 3 / 7 / 30 / more days.
 Like the other config values, a change rolls the operator rather than hot-reloading.
+
+For a run of a scheduled `PlaybookPlan`, the wait for a Node that is `NotReady` is further capped
+at the plan's `startingDeadlineSeconds` and at half the time to its next tick. Every run waits
+again, so a longer wait on a short schedule would make the plan miss ticks. See
+[NotReady nodes](../running-playbooks/cluster-nodes.md#notready-nodes) for what happens to such a
+Node afterwards.
 
 ## Enrolled namespaces
 
