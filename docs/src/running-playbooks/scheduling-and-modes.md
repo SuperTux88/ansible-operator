@@ -11,6 +11,8 @@ Two independent things decide *when* a plan runs and *what* runs:
 `spec.schedule` is a standard **5-field cron** expression (`minute hour day-of-month month
 day-of-week`). `spec.timeZone` is the IANA time zone it is evaluated in; if omitted, **UTC** is used.
 The granularity is minutes, not seconds. Schedules with a seconds or year field are not accepted.
+Days of the week are numbered as in standard cron: `0` is Sunday, `1-5` is Monday to Friday, and `7`
+is Sunday again. Day names (`MON-FRI`, `sun`) work too.
 Invalid cron expressions, unknown time zones, and expressions with no future occurrence are rejected;
 the plan does not run until the field is corrected. Its status identifies the invalid field; see
 [The plan's schedule or time zone is
