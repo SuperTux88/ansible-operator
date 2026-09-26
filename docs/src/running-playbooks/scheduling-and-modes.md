@@ -18,6 +18,11 @@ the plan does not run until the field is corrected. Its status identifies the in
 [The plan's schedule or time zone is
 invalid](./results-and-troubleshooting.md#the-plans-schedule-or-time-zone-is-invalid).
 
+When both day-of-month and day-of-week are restricted, **both** must match. `0 3 1-7 * MON` runs at
+03:00 on the first Monday of each month. This differs from standard cron and from a Kubernetes
+`CronJob`, where the same expression runs on each of the first seven days *and* on every Monday. To
+run on either kind of day, use two plans, one per day field.
+
 The operator evaluates the schedule on its own reconcile cycle rather than exactly on the tick, so a
 run starts within a short window *after* each scheduled time. `spec.startingDeadlineSeconds` sets how
 wide that window is: if the run has not started within this many seconds of the tick — because the
