@@ -52,6 +52,14 @@ pub const MAX_PLAN_NAME_LEN: usize = 63;
     // reconciler checks it too.
     validation = Rule::new("!has(self.metadata.name) || self.metadata.name.size() <= 63")
         .message("PlaybookPlan name must be at most 63 characters: it is used as a label value on the objects each run creates"),
+    // A `Recurring` plan is started by its schedule and by nothing else — `reconciler::has_work_to_start`
+    // refuses one without a schedule — so without this the plan is accepted, reports nothing wrong,
+    // and silently never runs. Said at admission because there is no later moment that reads better:
+    // the plan has no failure to report, only an absence. Same caveat as the rule above, so
+    // `validate_scheduling_configuration` would be the place to re-check it for an API server that
+    // ignores validation rules; unlike the name cap, nothing downstream misbehaves without it.
+    validation = Rule::new("!has(self.spec.mode) || self.spec.mode != 'Recurring' || has(self.spec.schedule)")
+        .message("a Recurring PlaybookPlan requires spec.schedule: nothing else starts a run for it"),
     printcolumn = r#"{"name":"Mode","type":"string","jsonPath":".spec.mode"}"#,
     printcolumn = r#"{"name":"Schedule","type":"string","jsonPath":".spec.schedule"}"#,
     printcolumn = r#"{"name":"Suspended","type":"boolean","jsonPath":".spec.suspend"}"#,
@@ -472,7 +480,9 @@ pub struct PlaybookPlanStatus {
     /// run included. Unlike `lastRunNumber` this counts, and it counts within one execution only:
     /// it restarts at 1 whenever `currentHash` changes and, for `Recurring` plans, whenever a new
     /// schedule tick starts a run — the two events that begin a new execution. A successful
-    /// `OneShot` execution resets it to 0 so newly eligible hosts can begin a new execution.
+    /// execution resets it to 0, in either mode, so hosts that become eligible afterwards can begin
+    /// a new one: for `Recurring` that is what leaves a schedule window open for a machine switched
+    /// on later in it.
     ///
     /// Written from the run's own `Play` record, so a status that lags a run in flight cannot hand
     /// the budget back by forgetting a try that was already made.
@@ -481,7 +491,8 @@ pub struct PlaybookPlanStatus {
     pub retry_count: u32,
     /// The schedule slot to which `retryCount` belongs. Set for scheduled runs and used by
     /// `Recurring` plans to distinguish retries in the current tick from the first attempt in the
-    /// next one. `None` for an execution that has not started or an unscheduled run.
+    /// next one. `None` for an execution that has not started, an unscheduled run, and a run that
+    /// handed its try back — the budget it would describe is no longer spent.
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub retry_count_slot: Option<DateTime<FixedOffset>>,
@@ -736,6 +747,39 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message.contains("label value")),
             "the message has to say why, or the cap reads as arbitrary"
+        );
+    }
+
+    /// A `Recurring` plan with no `schedule` is refused at `kubectl apply`. Nothing but the clock
+    /// starts a run for that mode, so such a plan is admitted, reports nothing wrong and never runs
+    /// — an absence no status field is a good place to report.
+    #[test]
+    fn crd_refuses_a_recurring_plan_without_a_schedule() {
+        use kube::CustomResourceExt as _;
+
+        let crd = serde_json::to_value(PlaybookPlan::crd()).unwrap();
+        let root = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
+        let validations = root["x-kubernetes-validations"].as_array().unwrap();
+
+        let rule = validations
+            .iter()
+            .find(|validation| {
+                validation["rule"]
+                    .as_str()
+                    .is_some_and(|rule| rule.contains("Recurring"))
+            })
+            .expect("the schedule rule reaches the API server");
+
+        assert_eq!(
+            rule["rule"],
+            "!has(self.spec.mode) || self.spec.mode != 'Recurring' || has(self.spec.schedule)",
+            "the rule must tolerate an absent mode, which the schema defaults"
+        );
+        assert!(
+            rule["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("spec.schedule")),
+            "the message has to name the field the author has to add"
         );
     }
 

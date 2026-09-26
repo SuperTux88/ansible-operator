@@ -42,7 +42,7 @@ use crate::{
         },
         playbookplancontroller::{
             callback_output, departed_hosts,
-            execution_evaluator::{self, find_outdated_hosts},
+            execution_evaluator::{self, find_hosts_owing_slot, find_outdated_hosts},
             job_builder, mappers, node_access, node_labels, node_readiness, node_recreation,
             play_history, status,
         },
@@ -1146,7 +1146,6 @@ async fn reconcile(
         sync_desired_hash_after_finished_run(
             &mut resource_status,
             &execution_hash,
-            &object.spec.mode,
             &finished.run,
             &finished.failure,
             surviving_run.as_deref(),
@@ -1188,13 +1187,7 @@ async fn reconcile(
     // Step 1: compute outdated hosts and evaluate the schedule.
     let tz = scheduling_configuration.time_zone;
     let now = || Utc::now().with_timezone(&tz);
-    let time_window = chrono::Duration::seconds(
-        object
-            .spec
-            .starting_deadline_seconds
-            .unwrap_or(DEFAULT_STARTING_DEADLINE_SECONDS)
-            .into(),
-    );
+    let time_window = starting_deadline(&object);
     let Some(timing) = evaluate_schedule(
         scheduling_configuration.schedule.as_ref(),
         now(),
@@ -1242,9 +1235,27 @@ async fn reconcile(
     clear_scheduling_configuration_failure(&mut resource_status, outdated_hosts.len());
     clear_input_failure(&mut resource_status, outdated_hosts.len());
 
-    let hosts_to_trigger = match object.spec.mode {
-        ExecutionMode::OneShot => outdated_hosts.clone(),
-        ExecutionMode::Recurring => all_hosts.clone(),
+    // What this tick would apply to, if it starts a run. A `Recurring` plan inside a schedule window
+    // owes that *slot*, not the tick: a host it already succeeded on in this window is done until
+    // the next one, so a second run inside the window carries only the hosts still owed — a machine
+    // switched on at 06:00 inside an 03:00 window, one a retry is owed after a partial failure, one
+    // that joined the inventory meanwhile. Outside a window there is no slot to owe anything to, so
+    // the tick keeps the mode's whole host set and behaves exactly as it did before.
+    let hosts_to_trigger = match (&object.spec.mode, &timing) {
+        (ExecutionMode::OneShot, _) => outdated_hosts.clone(),
+        (ExecutionMode::Recurring, Timing::Now(Some(slot))) => {
+            scheduling_configuration.schedule.as_ref().map_or_else(
+                || all_hosts.clone(),
+                |schedule| {
+                    find_hosts_owing_slot(
+                        &resource_status,
+                        &execution_hash,
+                        slot_window(schedule, *slot, time_window),
+                    )
+                },
+            )
+        }
+        (ExecutionMode::Recurring, _) => all_hosts.clone(),
     };
 
     // Filter the resolved inventory to this run's hosts once, preserving the user's groups, so the
@@ -1253,12 +1264,22 @@ async fn reconcile(
 
     // Which of this run's cluster nodes are down, and whether that leaves it nothing to do. Both are
     // computed here, before the start gate, because the *nodes* are what a held plan reports waiting
-    // on and what its Node watch will wake it for. A `Recurring` plan is deliberately not held: its
-    // contract is to re-apply at each tick against whatever exists then, so a tick that can only
-    // reach some of its hosts still reaches them and reports the rest unreachable.
+    // on and what its Node watch will wake it for. A tick that can still reach some of its hosts is
+    // never held: it reaches them and reports the rest unreachable.
     let unready_nodes = node_readiness::unready_nodes(&context.nodes, &run_groups);
+    let max_attempts = max_attempts(&object.spec.mode, object.spec.max_attempts);
+    let budget_closes_window = match &timing {
+        Timing::Now(start) => retry_budget_closes_window(
+            &resource_status.phase,
+            resource_status.retry_count,
+            resource_status.retry_count_slot,
+            start.as_ref().map(DateTime::fixed_offset),
+            max_attempts,
+        ),
+        Timing::Delayed(_) => false,
+    };
     let hold_for_unready_nodes =
-        held_back_by_unready_nodes(&timing, &object.spec.mode, &run_groups, &unready_nodes);
+        held_back_by_unready_nodes(&timing, budget_closes_window, &run_groups, &unready_nodes);
     if !hold_for_unready_nodes && status::held_for_unready_nodes(&resource_status) {
         // Retires a hold this plan is no longer under, whatever ended it — the nodes came back, the
         // inventory moved on, its schedule window closed. Written here rather than only where a hold
@@ -1295,20 +1316,11 @@ async fn reconcile(
         object.spec.schedule.is_some(),
         !hosts_to_trigger.is_empty(),
     );
-    let max_attempts = max_attempts(&object.spec.mode, object.spec.max_attempts);
     let eligible_to_start = may_start_new_run(
         object.spec.suspend,
         has_work_to_start,
         attempt_budget_available(&object.spec.mode, resource_status.retry_count, max_attempts),
     );
-
-    // Whether a recorded run's preparation inputs are still the desired ones. While this holds,
-    // the plan spec, resolved groups and Job blueprint are re-derivable from live state; once it
-    // stops holding, the absent-Job run is superseded.
-    let inputs_unchanged = |unlaunched: &UnlaunchedRun| -> bool {
-        unlaunched.run.mirror.execution_hash == execution_hash.to_string()
-            && live_preparation_fingerprint == unlaunched.preparation_fingerprint
-    };
 
     if let Some(unlaunched) = unlaunched_run {
         requeue_after = std::time::Duration::from_secs(15);
@@ -1317,9 +1329,14 @@ async fn reconcile(
             Timing::Now(start)
                 if start.map(|slot| slot.fixed_offset()) == unlaunched.run.mirror.triggered_slot
         );
+        // Everything this run is resumed with comes from its own record rather than from this
+        // tick's target set — the groups the Job blueprint is rebuilt from as much as the
+        // fingerprint they are judged by. See `rebuild_prepared_inputs`.
+        let prepared =
+            rebuild_prepared_inputs(&object, &target_groups, &execution_hash, &unlaunched)?;
         match decide_unlaunched_action(
             &unlaunched.phase,
-            inputs_unchanged(&unlaunched),
+            prepared.unchanged,
             has_work_to_start,
             slot_is_current,
         ) {
@@ -1343,7 +1360,7 @@ async fn reconcile(
                 requeue_after = std::time::Duration::from_secs(1);
             }
             UnlaunchedAction::ResumeLaunching { may_proceed } => {
-                let resume_with = may_proceed.then_some(run_groups.as_slice());
+                let resume_with = may_proceed.then_some(prepared.groups.as_slice());
                 let resume = resume_launching_run(
                     &context,
                     &object,
@@ -1387,6 +1404,8 @@ async fn reconcile(
             UnlaunchedAction::ResumePreparing => {
                 let resumed = RunContext {
                     triggered_slot: unlaunched.run.mirror.triggered_slot,
+                    run_groups: &prepared.groups,
+                    preparation_fingerprint: &prepared.fingerprint,
                     ..base_run
                 };
                 let started = try_start_run(
@@ -1506,8 +1525,11 @@ async fn reconcile(
             // to do but wait — see `node_readiness::holds_for_unready_nodes`. Held before the slot
             // bookkeeping below, so the window is left unconsumed and the run this plan owes can
             // still start once the nodes report `Ready` and the watch wakes it.
-            Timing::Now(_) if hold_for_unready_nodes => {
+            Timing::Now(start) if hold_for_unready_nodes => {
                 hold_plan_for_unready_nodes(&mut resource_status, &unready_nodes);
+                if let Some(until_close) = until_held_window_closes(start, time_window, now()) {
+                    requeue_after = requeue_after.min(until_close);
+                }
             }
             Timing::Now(start) => {
                 let this_slot = start.map(|s| s.fixed_offset());
@@ -1534,6 +1556,7 @@ async fn reconcile(
                         slot,
                         &execution_hash,
                         max_attempts,
+                        &hosts_to_trigger,
                     )
                     .await?
                 } else {
@@ -1557,6 +1580,18 @@ async fn reconcile(
                         resource_status.next_run = Some(next.fixed_offset());
                     }
                 } else {
+                    if let Some(schedule) = scheduling_configuration.schedule.as_ref()
+                        && let Some((next, after)) =
+                            deadline_swallows_a_tick(schedule, time_window, now())
+                    {
+                        warn!(
+                            "spec.startingDeadlineSeconds ({}s) is at least as long as the gap \
+                             between scheduled ticks ({next} → {after}), so a tick that falls \
+                             inside a window still open for an earlier slot never runs. Set a \
+                             deadline shorter than the schedule's interval, or schedule less often.",
+                            time_window.num_seconds(),
+                        );
+                    }
                     let run = RunContext {
                         triggered_slot: this_slot,
                         ..base_run
@@ -1594,6 +1629,7 @@ async fn reconcile(
         scheduling_configuration.schedule.as_ref(),
         object.spec.suspend,
         !hosts_to_trigger.is_empty(),
+        !all_hosts.is_empty(),
         now(),
         &mut resource_status,
     ) {
@@ -2127,23 +2163,50 @@ async fn schedule_window_already_taken(
     slot: DateTime<FixedOffset>,
     desired_hash: &ExecutionHash,
     max_attempts: u32,
+    hosts_to_trigger: &[String],
 ) -> Result<bool, ReconcileError> {
     let (namespace, plan_name) = namespace_and_name(object)?;
-    let plays = Api::<Play>::namespaced(context.client.clone(), namespace)
+    let mut plays = Api::<Play>::namespaced(context.client.clone(), namespace)
         .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
-        .await?;
+        .await?
+        .items;
+    withdraw_replaced_machines(&mut plays, |host, prepared_at| {
+        context
+            .nodes
+            .get(&ObjectRef::new(host))
+            .is_some_and(|node| node_recreation::node_replaced_since(prepared_at, &node))
+    });
     Ok(window_taken_by_a_record(
-        &plays.items,
+        &plays,
         object,
         slot,
         desired_hash,
         max_attempts,
+        hosts_to_trigger,
     ))
 }
 
 /// Whether this schedule window has nothing left for a run to do, judged from the plan's own
-/// records: one of its runs is still going, one of them succeeded, or its failed runs have spent the
-/// execution's attempt budget.
+/// records: one of its runs is still going, its failed runs have spent the execution's attempt
+/// budget, or every host still waiting on a run has already had one succeed on it this window.
+///
+/// That last clause is what makes a window a *window* rather than a single run. A host can become
+/// eligible after the window opened — a Node joins overnight, a provider plan publishes the version
+/// its selector wants, a `StaticInventory` gains an entry — and it is owed the run its window
+/// promised, whatever the hosts that were present at the tick already did. Reading a `Succeeded`
+/// record as "this window is finished" denied it that until the next tick, which for a nightly plan
+/// is a day, and for a maintenance window whose machines are switched on late is the whole point of
+/// the window.
+///
+/// It is deliberately asked of the hosts the tick still wants to trigger rather than of the
+/// inventory at large, so nothing here re-runs a host the plan has no work for: for `OneShot` that
+/// set is already `find_outdated_hosts`, which excludes every host carrying the current hash. A
+/// window with no such hosts left is taken, which is also what keeps an empty set from reading as
+/// "still owed".
+///
+/// Coverage is by host name, so the caller first takes out of `plays` every Node replaced since its
+/// record was prepared ([`withdraw_replaced_machines`]): the fresh machine behind that name has not
+/// had this window's run.
 ///
 /// Pure so the rule stays pinned beside [`consumed_its_slot`], which asks the neighbouring question
 /// of a *live* run and must keep answering it the same way. The two differ in one place only: a
@@ -2170,6 +2233,7 @@ fn window_taken_by_a_record(
     slot: DateTime<FixedOffset>,
     desired_hash: &ExecutionHash,
     max_attempts: u32,
+    hosts_to_trigger: &[String],
 ) -> bool {
     let (Some(plan_name), Some(uid)) =
         (plan.metadata.name.as_deref(), plan.metadata.uid.as_deref())
@@ -2177,29 +2241,73 @@ fn window_taken_by_a_record(
         return false;
     };
     let mut failures = 0;
-    for status in plays
-        .iter()
-        .filter(|play| {
-            play_history::play_belongs_to_plan(play, plan_name, uid)
-                && play.spec.triggered_slot == Some(slot)
-                && play.spec.execution_hash == desired_hash.to_string()
-        })
-        .filter_map(|play| play.status.as_ref())
-    {
+    let mut applied: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for play in plays.iter().filter(|play| {
+        play_history::play_belongs_to_plan(play, plan_name, uid)
+            && play.spec.triggered_slot == Some(slot)
+            && play.spec.execution_hash == desired_hash.to_string()
+    }) {
+        let Some(status) = play.status.as_ref() else {
+            continue;
+        };
         match status.phase {
-            // Still going, or done and done well: either way the window is not a retry's to take.
-            v1beta1::PlayPhase::Running | v1beta1::PlayPhase::Succeeded => return true,
+            // Still going: the window is nobody else's to take while a run of it is in flight.
+            v1beta1::PlayPhase::Running => return true,
+            // Done, and done well — for the hosts it ran against. Those hosts are exactly its
+            // recorded inventory, since `play_history::terminal_status` only reaches `Succeeded`
+            // when every host in the run succeeded.
+            v1beta1::PlayPhase::Succeeded => applied.extend(
+                play.spec
+                    .inventory
+                    .iter()
+                    .flat_map(|group| group.hosts.iter().map(String::as_str)),
+            ),
             // `Unknown` counts as a failure here for the same reason it does everywhere else: a
             // recap that could not be read is not evidence the hosts were reached.
             v1beta1::PlayPhase::Failed | v1beta1::PlayPhase::Unknown
-                if !returns_its_attempt(&plan.spec.mode, &classify_run_failure(status)) =>
+                if !returns_its_attempt(&classify_run_failure(status)) =>
             {
                 failures += 1;
             }
             _ => {}
         }
     }
-    failures >= max_attempts
+    if failures >= max_attempts {
+        return true;
+    }
+    hosts_to_trigger
+        .iter()
+        .all(|host| applied.contains(host.as_str()))
+}
+
+/// Removes from each record's inventory the cluster Nodes that `replaced_since` says are newer than
+/// the run that record describes, so [`window_taken_by_a_record`] does not count them as covered.
+///
+/// A record names its hosts, and a host name outlives the machine: a Node re-imaged during or after
+/// this window's successful run inherits the name, never the claim (`node_recreation`). Left in, the
+/// name alone would close the window on the fresh machine, and it would wait for the next slot while
+/// the window it is owed is still open. Only the in-memory copy the gate reads is changed.
+///
+/// Asked only of the hosts the record itself holds as Nodes (`ResolvedHosts.connection`), for the
+/// reason `node_recreation` gives: a `StaticInventory` host that shares a Node's name says nothing
+/// about that Node.
+fn withdraw_replaced_machines(
+    plays: &mut [Play],
+    replaced_since: impl Fn(&str, Option<DateTime<FixedOffset>>) -> bool,
+) {
+    for play in plays {
+        let prepared_at = play_prepared_at(play);
+        for group in play
+            .spec
+            .inventory
+            .iter_mut()
+            .filter(|group| group.connection == Some(v1beta1::HostConnection::ManagedSsh))
+        {
+            group
+                .hosts
+                .retain(|host| !replaced_since(host, prepared_at));
+        }
+    }
 }
 
 /// Checks that every `spec.template.files` entry can name a directory of its own under the
@@ -2376,7 +2484,11 @@ fn retry_due(phase: &Phase, tries_spent: u32, max_attempts: u32) -> bool {
 
 /// Whether the persisted attempt budget proves that the current schedule window has no run left to
 /// start. The slot makes `retryCount` self-describing after its `Play` records have been pruned.
-fn retry_budget_closes_window(
+///
+/// Shared with `mappers::plan_awaits_node`, which needs exactly this question to decide whether a
+/// Node coming back can still make a `Recurring` plan do anything — restating it there would let the
+/// wake set and the start gate drift.
+pub(super) fn retry_budget_closes_window(
     phase: &Phase,
     tries_spent: u32,
     budget_slot: Option<DateTime<FixedOffset>>,
@@ -2388,23 +2500,122 @@ fn retry_budget_closes_window(
         && !retry_due(phase, tries_spent, max_attempts)
 }
 
+/// The open window a slot stands for, with the grace its schedule leaves room for.
+///
+/// The one place that pairs a slot with the tick after it, so the clamp
+/// ([`execution_evaluator::SlotWindow::new`]) is derived the same way for the run's target set and
+/// for the Node watch's wake set — the two that must not disagree about what a window still owes.
+///
+/// `slot` carries the plan's time zone, not just its offset: the next tick is found by iterating
+/// the schedule in that zone, and a fixed offset would misplace it by an hour across a DST change.
+fn slot_window<Tz: TimeZone>(
+    schedule: &Schedule,
+    slot: DateTime<Tz>,
+    deadline: chrono::Duration,
+) -> execution_evaluator::SlotWindow {
+    let next = forecast_next_run(schedule, slot.clone(), None).map(|next| next.fixed_offset());
+    execution_evaluator::SlotWindow::new(slot.fixed_offset(), next, deadline)
+}
+
+/// Whether `spec.startingDeadlineSeconds` is wide enough to swallow whole schedule ticks, and the
+/// two occurrences that show it.
+///
+/// `evaluate_schedule` looks back a full window and reports the *oldest* tick inside it, so a
+/// deadline at least as long as the interval keeps the plan on an older slot while later ones come
+/// and go: with `0 * * * *` and four hours, 06:30 still reports the 03:00 slot, and once that window
+/// is taken the plan sleeps to 07:00 — 04:00, 05:00 and 06:00 never ran.
+///
+/// It is a warning and not a rejection, because the configuration is valid and plans already exist
+/// that use it; rejecting it would break them on upgrade. A wide deadline is also what a maintenance
+/// window *is*, so the fix is a judgement the author has to make: usually a deadline shorter than
+/// the interval, occasionally a sparser schedule.
+///
+/// Reported where a run starts for a slot rather than wherever the schedule is parsed, which is what
+/// keeps it from repeating on every tick of an open window: the plan says it at most once per run it
+/// actually starts, in the tick whose slot the older window swallowed.
+fn deadline_swallows_a_tick<Tz: TimeZone>(
+    schedule: &Schedule,
+    deadline: chrono::Duration,
+    now: DateTime<Tz>,
+) -> Option<(DateTime<Tz>, DateTime<Tz>)> {
+    let next = forecast_next_run(schedule, now, None)?;
+    let after = forecast_next_run(schedule, next.clone(), None)?;
+
+    (deadline >= after.clone() - next.clone()).then_some((next, after))
+}
+
+/// The schedule window that is open right now, from the plan's spec alone.
+///
+/// The mapper's half of the start gate, and the reason it can be asked at all: everything the answer
+/// needs — the cron expression, the time zone, the starting deadline — is spec, so a Node event can
+/// be judged against it without a cluster read. The reconcile asks the same question through
+/// [`validate_scheduling_configuration`] and keeps the parsed schedule for the rest of its tick;
+/// here the parse is thrown away, which is why this is only ever called after the cheaper checks
+/// have already found a reason to care about this plan.
+///
+/// `None` covers every case the caller must treat as "no window": an unscheduled plan, a plan whose
+/// schedule or time zone does not parse — the reconcile reports that, and a wake could not help it —
+/// and a window that is simply not open now.
+pub(super) fn open_schedule_slot(
+    object: &PlaybookPlan,
+    now: DateTime<Utc>,
+) -> Option<execution_evaluator::SlotWindow> {
+    let configuration = validate_scheduling_configuration(object, now).ok()?;
+    let deadline = starting_deadline(object);
+    let schedule = configuration.schedule.as_ref()?;
+    match evaluate_schedule(
+        Some(schedule),
+        now.with_timezone(&configuration.time_zone),
+        deadline,
+    )? {
+        Timing::Now(slot) => slot.map(|slot| slot_window(schedule, slot, deadline)),
+        Timing::Delayed(_) => None,
+    }
+}
+
+/// How long after its slot a run may still start, from the plan's spec.
+///
+/// One function rather than the expression written out wherever it is wanted, because
+/// [`slot_window`] is reached from two places that must agree on it exactly: the tick that builds a
+/// run's target set, and the Node watch deciding whether to wake the plan at all. Two copies that
+/// drift would make those two disagree about what a window still owes.
+fn starting_deadline(object: &PlaybookPlan) -> chrono::Duration {
+    chrono::Duration::seconds(
+        object
+            .spec
+            .starting_deadline_seconds
+            .unwrap_or(DEFAULT_STARTING_DEADLINE_SECONDS)
+            .into(),
+    )
+}
+
 /// Whether a finished run hands its attempt back instead of spending it.
 ///
-/// Only `OneShot` ever does, in two cases:
+/// Two outcomes do:
 ///
 ///   - it succeeded. The execution is complete, and resetting its budget is what lets inventory
 ///     growth trigger a new run for hosts that were not present in it.
 ///   - nothing the operator could reach failed either ([`RunFailure::OnlyUnreachableNodes`]), so it
 ///     made all the progress there was to make. The plan does not immediately retry on that budget:
-///     with every remaining outdated host on a Node that is down, the start gate holds it until the
-///     Node watch says one is back. Without that gate this would loop.
+///     with every remaining host on a Node that is down, the start gate holds it until the Node
+///     watch says one is back. Without that gate this would loop.
+///
+/// Neither depends on the mode, and requiring `OneShot` is what used to make a schedule window
+/// worthless to a `Recurring` plan. Its budget is scoped to the slot, so the slot *is* the
+/// execution: a run that finished it must leave the budget alone for exactly the reason a `OneShot`
+/// revision does, or [`retry_budget_closes_window`] closes the window from the status before
+/// [`window_taken_by_a_record`] is ever asked whether the window still owes somebody a run — with
+/// the mode's default `maxAttempts: 1`, on the first run of the window, success or not.
+///
+/// What bounds the refund is [`classify_run_failure`]'s "applied to at least one host", which is
+/// mode-independent too: a run that reached nobody is [`RunFailure::Real`] and spends its try,
+/// whichever mode asked for it.
 ///
 /// One predicate for both places that count attempts — the budget reset after a run
 /// ([`sync_desired_hash_after_finished_run`]) and the schedule window's count of its records
 /// ([`window_taken_by_a_record`]) — because a refund only one of them honours is not a refund.
-fn returns_its_attempt(mode: &ExecutionMode, failure: &RunFailure) -> bool {
-    matches!(mode, ExecutionMode::OneShot)
-        && matches!(failure, RunFailure::None | RunFailure::OnlyUnreachableNodes)
+fn returns_its_attempt(failure: &RunFailure) -> bool {
+    matches!(failure, RunFailure::None | RunFailure::OnlyUnreachableNodes)
 }
 
 /// Which try a run about to start is, from the budget the plan has already spent.
@@ -2453,23 +2664,38 @@ fn duration_until<Tz: TimeZone>(until: &DateTime<Tz>, now: DateTime<Tz>) -> std:
     (until.clone() - now).to_std().unwrap_or_default()
 }
 
-/// Keeps an idle `Recurring` plan scheduled even when its authorized inventory is empty.
+/// Keeps a `Recurring` plan ticking through the states where it has no run to start.
 ///
-/// Zero hosts is not work a run can start: [`has_work_to_start`] must keep rejecting it so the
-/// operator neither creates an empty Job nor resumes a `Prepared` run whose hosts disappeared. It
-/// is still a valid observation of a scheduled plan, though, and needs its own status. Otherwise the
-/// start gate also blocks schedule maintenance, leaving the last run's summary and `nextRun`
-/// standing indefinitely after a selector or `NodeAccessPolicy` change removes every host.
+/// Nothing to trigger is not work a run can start: [`has_work_to_start`] must keep rejecting it so
+/// the operator neither creates an empty Job nor resumes a `Prepared` run whose hosts disappeared.
+/// The plan still has to be woken for its next slot, though, and this is the only thing that does
+/// it on these paths — the start gate that would otherwise requeue is closed, so without this the
+/// tick leaves the hour-long default requeue standing and the plan sleeps through the slots in
+/// between.
+///
+/// Two states reach here, and they differ in what is worth *saying*:
+///
+///   - **The plan resolves to no hosts at all**, after a selector or `NodeAccessPolicy` change
+///     removed every one of them. That is a state of the plan, and reporting it is the only thing
+///     that stops the last run's summary and `nextRun` from standing indefinitely over a plan that
+///     can no longer do anything.
+///   - **Every host has already had its run in the open schedule window.** The slot is served, not
+///     empty, so the status is left exactly as the run that served it wrote it: the verdict, and
+///     the summary saying what that run did, are the truth about this plan until the next slot.
+///     Overwriting them here would also clobber the finished run's own report, because the run's
+///     per-host results are applied (`status::apply_terminal_play_status`) long before the owed set
+///     is computed — so the tick that finishes a run is itself one of these ticks.
 ///
 /// The next *future* occurrence is advertised rather than a slot whose grace window is currently
-/// open: there is nothing to run in that slot. Another reconcile can still start the current slot if
-/// hosts return before its grace window closes. A previous verdict remains the phase, following
-/// [`phase_while_waiting_for_schedule`]; the summary is what reports why no run is starting now.
+/// open: there is nothing left to run in that slot. Another reconcile can still start the current
+/// slot if hosts return, or become owed, before its grace window closes. A previous verdict remains
+/// the phase, following [`phase_while_waiting_for_schedule`].
 fn update_idle_recurring_status<Tz: TimeZone>(
     mode: &ExecutionMode,
     schedule: Option<&Schedule>,
     suspend: bool,
     has_hosts_to_trigger: bool,
+    resolves_to_hosts: bool,
     now: DateTime<Tz>,
     status: &mut PlaybookPlanStatus,
 ) -> Option<std::time::Duration> {
@@ -2480,7 +2706,9 @@ fn update_idle_recurring_status<Tz: TimeZone>(
         return None;
     }
 
-    status.summary = Some("plan currently resolves to no hosts".to_string());
+    if !resolves_to_hosts {
+        status.summary = Some("plan currently resolves to no hosts".to_string());
+    }
 
     let Some(schedule) = schedule else {
         status.next_run = None;
@@ -2491,7 +2719,9 @@ fn update_idle_recurring_status<Tz: TimeZone>(
         return None;
     }
 
-    status.phase = phase_while_waiting_for_schedule(&status.phase);
+    if !resolves_to_hosts {
+        status.phase = phase_while_waiting_for_schedule(&status.phase);
+    }
     let next = forecast_next_run(schedule, now.clone(), None)?;
     status.next_run = Some(next.fixed_offset());
     (next - now).to_std().ok()
@@ -2547,6 +2777,54 @@ enum UnlaunchedAction {
     Abandon,
     ResumePreparing,
     ResumeLaunching { may_proceed: bool },
+}
+
+/// What an absent-Job run is applying to, rebuilt from its own record.
+struct PreparedInputs {
+    /// The resolved groups filtered to the hosts the run recorded.
+    groups: Vec<ResolvedInventoryGroup>,
+    /// Their fingerprint alongside the live plan spec.
+    fingerprint: String,
+    /// Whether those inputs are still the desired ones — see [`rebuild_prepared_inputs`].
+    unchanged: bool,
+}
+
+/// Rebuilds a recovered absent-Job run's preparation inputs, and says whether they are still the
+/// desired ones. While `unchanged` holds, the plan spec, resolved groups and Job blueprint are
+/// re-derivable from live state; once it stops holding, the run is superseded
+/// ([`decide_unlaunched_action`]).
+///
+/// The groups are rebuilt from the run's **own recorded hosts** rather than from this tick's target
+/// set, and both halves of that matter. They are what the resume paths rebuild the committed Job
+/// blueprint from, so they have to be the set the run actually prepared against — and they are what
+/// the fingerprint has to be taken over for the comparison to mean anything, since a host the run
+/// never targeted cannot change what it is applying.
+///
+/// Reading the live target set instead breaks once a scheduled window can owe a run to a host that
+/// appeared mid-window ([`window_taken_by_a_record`]): that host would supersede the run already
+/// preparing, then supersede its replacement on the next tick, for as long as hosts kept arriving —
+/// a plan that never launches. The run's own record is the one answer that cannot move underneath it
+/// while it waits on its locks or its proxy pods.
+///
+/// What still supersedes the run: a new execution hash, a change to the plan spec, or a change to
+/// the groups it is actually applying to — an inventory edit, a relabelled node, a narrowed
+/// `NodeAccessPolicy`. A host *leaving* the run's set moves the fingerprint exactly as it did
+/// before, because the filter then yields a smaller group than the one the run recorded.
+fn rebuild_prepared_inputs(
+    plan: &PlaybookPlan,
+    target_groups: &[ResolvedInventoryGroup],
+    execution_hash: &ExecutionHash,
+    unlaunched: &UnlaunchedRun,
+) -> Result<PreparedInputs, ReconcileError> {
+    let groups = filter_groups_to_hosts(target_groups, &unlaunched.run.mirror.hosts);
+    let fingerprint = preparation_fingerprint(plan, &groups)?;
+    let unchanged = unlaunched.run.mirror.execution_hash == execution_hash.to_string()
+        && fingerprint == unlaunched.preparation_fingerprint;
+    Ok(PreparedInputs {
+        groups,
+        fingerprint,
+        unchanged,
+    })
 }
 
 /// Decides a recovered absent-Job run after its desired inputs have been resolved. `Prepared`
@@ -4984,11 +5262,12 @@ fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usi
     status.summary = Some(plan_summary(0, total_count, &Phase::Succeeded));
 }
 
-/// Reports a `OneShot` plan holding back a run because every node it would reach is not `Ready`.
+/// Reports a plan holding back a run because every node it would reach is not `Ready`.
 ///
-/// Deliberately writes no `requeue`: nothing here is worth polling for. The plan is released by the
+/// Writes no `requeue` of its own: nothing here is worth polling for. The plan is released by the
 /// controller's Node watch, which fires the moment one of these nodes reports `Ready` again
-/// (`mappers::node_to_playbookplans`), and the tick's ordinary idle requeue remains as the backstop.
+/// (`mappers::node_to_playbookplans`). The one other moment that matters, a scheduled window
+/// closing, is requeued for by the caller ([`until_held_window_closes`]).
 ///
 /// The verdict survives ([`phase_under_readiness_overlay`]) because a node going down does not undo
 /// what the plan last did — the summary is what says why nothing is happening now. A plan can sit
@@ -4996,10 +5275,19 @@ fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usi
 /// condition names it, and removing it from the inventory or from the cluster is an operator's call,
 /// not the operator's.
 ///
+/// For a `Recurring` plan over a fleet that is switched off at night, that surviving verdict is now
+/// the ordinary resting state rather than an edge case: the plan reads `Succeeded` from last night
+/// beside `Ready=False` and a summary naming the Nodes. Kept that way on purpose — the phase, the
+/// summary and `Ready` are all printer columns, so the row says what is happening, and a rule that
+/// overrode the phase would have to override `Failed` too, hiding a broken playbook behind a
+/// hardware excuse.
+///
 /// `next_run` is left alone for the same reason. This arm is only reached with a `Timing::Now`, so a
 /// *scheduled* plan is being held inside the starting-deadline window of a slot it still owes a run
-/// for, and that forecast is exactly what a reader needs while the hold lasts. An unscheduled plan
-/// has no forecast to keep.
+/// for, and a forecast of that slot is what a reader needs while the hold lasts. There may be none:
+/// a run that missed only down Nodes is retry-due, and [`decide_terminal`] clears `next_run` for
+/// that. The tick at the window's close writes the next slot's. An unscheduled plan has no forecast
+/// to keep.
 ///
 /// `Ready` is the one part of the verdict that does not survive. The phase says what the last run
 /// did; `Ready` is read as whether the plan is converged, and a held plan has by definition hosts it
@@ -5028,12 +5316,33 @@ fn release_node_readiness_hold(status: &mut PlaybookPlanStatus, outdated_count: 
     );
 }
 
+/// How long a held tick may sleep before its schedule window closes; `None` for an unscheduled plan.
+///
+/// Nothing else wakes a held plan when its window closes: the Node watch fires only for a Node
+/// coming back, and the hold arm otherwise leaves the hour-long default requeue standing. The tick
+/// at the close lands in `Timing::Delayed`, which retires the hold and requeues to the next slot —
+/// without it, a `Recurring` plan on a schedule tighter than an hour sleeps through the slots its
+/// healthy hosts are owed, while `WaitingForNodes` stands over a window that has already closed.
+fn until_held_window_closes<Tz: TimeZone>(
+    slot: Option<DateTime<Tz>>,
+    deadline: chrono::Duration,
+    now: DateTime<Tz>,
+) -> Option<std::time::Duration> {
+    slot.map(|slot| duration_until(&(slot + deadline), now))
+}
+
 /// Whether the plan is being held back by the readiness gate *right now*, which is a narrower
 /// question than [`node_readiness::holds_for_unready_nodes`] answers on its own.
 ///
-/// That predicate says "a run started now would be pointless", and its inputs are only the mode, the
-/// groups and the down Nodes. A plan whose schedule window is closed is not held by it, however far
+/// That predicate says "a run started now would be pointless", and its inputs are only the groups
+/// and the down Nodes. A plan whose schedule window is closed is not held by it, however far
 /// down its Nodes are — it is waiting on the clock, and the schedule arm reports that for itself.
+///
+/// Nor is a window whose attempt budget is already spent (`budget_closes_window`, from
+/// [`retry_budget_closes_window`]). A `OneShot` plan never gets here with its budget spent, since
+/// the start gate asks `attempt_budget_available` first; a `Recurring` plan does, because its budget
+/// is scoped to the slot and only the window gate asks about it — which the hold arm comes before.
+/// Held there, it would name Nodes whose return starts nothing.
 ///
 /// Composed here rather than at either call site because both the arm that *asserts* the hold and
 /// the retire that clears it have to agree on the answer. They ask from different places, and a
@@ -5041,12 +5350,13 @@ fn release_node_readiness_hold(status: &mut PlaybookPlanStatus, outdated_count: 
 /// that is not waiting for a Node — which reads as the reason it is not running.
 fn held_back_by_unready_nodes<Tz: chrono::TimeZone>(
     timing: &Timing<Tz>,
-    mode: &ExecutionMode,
+    budget_closes_window: bool,
     groups: &[ResolvedInventoryGroup],
     unready: &[String],
 ) -> bool {
     matches!(timing, Timing::Now(_))
-        && node_readiness::holds_for_unready_nodes(mode, groups, unready)
+        && !budget_closes_window
+        && node_readiness::holds_for_unready_nodes(groups, unready)
 }
 
 /// The phase an idle plan keeps while a readiness overlay explains why it is not running. A real
@@ -5264,7 +5574,6 @@ fn stage_finished_run(finished: &RecordedRun, resource_status: &mut PlaybookPlan
 fn sync_desired_hash_after_finished_run(
     status: &mut PlaybookPlanStatus,
     desired_hash: &ExecutionHash,
-    mode: &ExecutionMode,
     finished: &RecordedRun,
     finished_failure: &RunFailure,
     surviving: Option<&SurvivingRun>,
@@ -5299,7 +5608,7 @@ fn sync_desired_hash_after_finished_run(
     if let Some((attempt, slot)) = surviving_attempt {
         record_retry_budget(status, attempt, slot);
     } else if finished.execution_hash == *desired_hash {
-        if returns_its_attempt(mode, finished_failure) {
+        if returns_its_attempt(finished_failure) {
             record_retry_budget(status, 0, None);
         } else {
             record_retry_budget(
@@ -7783,11 +8092,7 @@ mod tests {
         let unready = vec!["node-b".to_string()];
 
         assert!(
-            !node_readiness::holds_for_unready_nodes(
-                &ExecutionMode::OneShot,
-                &run_groups,
-                &unready
-            ),
+            !node_readiness::holds_for_unready_nodes(&run_groups, &unready),
             "node-a is reachable, so the run has work to do and must start"
         );
 
@@ -8146,6 +8451,90 @@ mod tests {
             serde_json::to_value(&prepared).unwrap(),
             serde_json::to_value(&rebuilt).unwrap(),
             "the same recorded identity and inputs must rebuild byte-identically"
+        );
+    }
+
+    /// The host set a prepared run is judged against is its **own**, not the tick's. Once
+    /// `window_taken_by_a_record` hands an open window to a host that appeared mid-window, judging
+    /// against the live target set would tear down the run still acquiring its locks — and tear
+    /// down its replacement on the next tick, for as long as hosts kept arriving.
+    #[test]
+    fn a_host_appearing_mid_window_does_not_supersede_a_run_already_preparing() {
+        let mut plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("uid".into());
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+
+        let prepared_groups = vec![managed_ssh_group("nodes", &["a", "b"], None)];
+        let unlaunched = UnlaunchedRun {
+            run: RecordedRun {
+                mirror: ActiveRun {
+                    execution_hash: hash.to_string(),
+                    run_id: "run-1".into(),
+                    job_name: "apply-web-abc-1".into(),
+                    play_uid: "play-uid".into(),
+                    hosts: vec!["a".into(), "b".into()],
+                    run_number: 1,
+                    attempt: 1,
+                    triggered_slot: None,
+                },
+                execution_hash: hash,
+            },
+            phase: v1beta1::PlayPhase::Prepared,
+            preparation_fingerprint: preparation_fingerprint(&plan, &prepared_groups).unwrap(),
+        };
+
+        // A node joins the plan's inventory while the run waits on its locks.
+        let joined = vec![managed_ssh_group("nodes", &["a", "b", "c"], None)];
+        let rebuilt = rebuild_prepared_inputs(&plan, &joined, &hash, &unlaunched).unwrap();
+        assert!(
+            rebuilt.unchanged,
+            "a host this run never targeted cannot change what it is applying"
+        );
+
+        // The groups that come back are what the resume paths rebuild the committed Job blueprint
+        // from, so the joined host must not be in them: resuming against the tick's target set
+        // would launch a Job for a host the run never prepared against.
+        let resumed_hosts: Vec<String> = rebuilt
+            .groups
+            .iter()
+            .flat_map(|group| group.hosts().hosts.clone())
+            .collect();
+        assert_eq!(
+            resumed_hosts,
+            vec!["a".to_string(), "b".to_string()],
+            "a resumed run is rebuilt from the hosts it recorded"
+        );
+        assert_eq!(
+            rebuilt.fingerprint, unlaunched.preparation_fingerprint,
+            "and so reproduces the fingerprint it committed to"
+        );
+
+        // Everything that superseded the run before still does. A host leaving its own set...
+        let shrunk = vec![managed_ssh_group("nodes", &["a"], None)];
+        assert!(
+            !rebuild_prepared_inputs(&plan, &shrunk, &hash, &unlaunched)
+                .unwrap()
+                .unchanged,
+            "a host leaving the run's own set changes what it is applying to"
+        );
+
+        // ...a spec edit the execution hash cannot see...
+        let mut retagged = plan.clone();
+        retagged.spec.image = "ansible:2.19".into();
+        assert!(
+            !rebuild_prepared_inputs(&retagged, &joined, &hash, &unlaunched)
+                .unwrap()
+                .unchanged,
+            "an image change must still supersede the run"
+        );
+
+        // ...and a new revision, refused before the groups are rebuilt at all.
+        let edited = ExecutionHash::from_hex("2b").unwrap();
+        assert!(
+            !rebuild_prepared_inputs(&plan, &joined, &edited, &unlaunched)
+                .unwrap()
+                .unchanged,
+            "a new execution hash supersedes the run whatever its hosts say"
         );
     }
 
@@ -9024,7 +9413,9 @@ mod tests {
 
     /// The half of the start gate that does not go through the plan's status: a window one of the
     /// plan's own records already took must never be handed to a second run, however far behind
-    /// `lastTriggeredRun` happens to be.
+    /// `lastTriggeredRun` happens to be. Every record here ran against the one host the tick wants
+    /// to trigger, which is what makes the window theirs to spend; a window still owing a host
+    /// none of them reached is the neighbouring case, and has its own test.
     #[test]
     fn a_record_with_a_job_takes_the_window_for_its_own_revision() {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -9049,7 +9440,11 @@ mod tests {
                     preparation_fingerprint: "fingerprint".into(),
                     run_number: 1,
                     attempt: 1,
-                    inventory: Vec::new(),
+                    inventory: vec![ResolvedHosts {
+                        name: "group".into(),
+                        hosts: vec!["node-a".into()],
+                        ..Default::default()
+                    }],
                     provides_version: None,
                     triggered_slot,
                 },
@@ -9069,10 +9464,16 @@ mod tests {
         plan.metadata.uid = Some("plan-uid".into());
 
         // One try per tick — the `Recurring` default — so a single finished run spends the window.
-        let taken = |plays: &[Play]| window_taken_by_a_record(plays, &plan, slot, &hash, 1);
+        // The host the tick wants to trigger is the one every record here ran against, so a
+        // `Succeeded` record covers it and the window is spent; a window still owing a host the
+        // records never reached is the neighbouring case, pinned below.
+        let owed = ["node-a".to_string()];
+        let taken = |plays: &[Play]| window_taken_by_a_record(plays, &plan, slot, &hash, 1, &owed);
 
         // A run that reached a Job takes the window, running or already finished — the plan's
-        // marker is written from these and may be behind them, or missing entirely.
+        // marker is written from these and may be behind them, or missing entirely. For the
+        // succeeded one that is because it applied to the host this tick is asking about.
+
         for phase in [
             v1beta1::PlayPhase::Running,
             v1beta1::PlayPhase::Succeeded,
@@ -9118,6 +9519,7 @@ mod tests {
             slot,
             &other_hash,
             1,
+            &owed,
         ));
         assert!(!taken(&[play(
             "plan-uid",
@@ -9139,8 +9541,184 @@ mod tests {
         )]));
     }
 
+    /// The window is a window, not a single run. A host can become eligible after it opened — a
+    /// Node that joined overnight, one a provider plan has just labelled, an entry added to a
+    /// `StaticInventory` — and it is owed the run the window promised, however well the hosts that
+    /// were present at the tick did. A `Succeeded` record used to close the window outright, so
+    /// such a host waited for the next tick: a day, for a nightly plan, and for a maintenance
+    /// window whose machines are switched on late, the whole point of the window.
+    #[test]
+    fn a_succeeded_record_leaves_the_window_open_for_a_host_it_never_ran() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+
+        let succeeded_over = |hosts: &[&str]| {
+            let mut play = Play::new(
+                "apply-plan-abc-1",
+                v1beta1::PlaySpec {
+                    playbook_plan: "plan".into(),
+                    playbook_plan_uid: "plan-uid".into(),
+                    execution_hash: "1a".into(),
+                    run_id: "run-1".into(),
+                    preparation_fingerprint: "fp".into(),
+                    run_number: 1,
+                    attempt: 1,
+                    inventory: vec![ResolvedHosts {
+                        name: "group".into(),
+                        hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+                        ..Default::default()
+                    }],
+                    provides_version: None,
+                    triggered_slot: Some(slot),
+                },
+            );
+            play.metadata.owner_references = Some(vec![OwnerReference {
+                uid: "plan-uid".into(),
+                name: "plan".into(),
+                ..Default::default()
+            }]);
+            play.status = Some(v1beta1::PlayStatus {
+                phase: v1beta1::PlayPhase::Succeeded,
+                ..Default::default()
+            });
+            play
+        };
+        let taken = |plays: &[Play], owed: &[&str]| {
+            let owed: Vec<String> = owed.iter().map(|host| (*host).to_string()).collect();
+            window_taken_by_a_record(plays, &plan, slot, &hash, 1, &owed)
+        };
+
+        let ran_over_a_and_b = [succeeded_over(&["node-a", "node-b"])];
+
+        // The case the window exists for.
+        assert!(
+            !taken(&ran_over_a_and_b, &["node-c"]),
+            "a host this window never reached is still owed the run it promised"
+        );
+        // One uncovered host among covered ones is enough to keep it open — and the run that
+        // follows targets only what is outdated, so the covered ones are not applied to twice.
+        assert!(!taken(&ran_over_a_and_b, &["node-b", "node-c"]));
+
+        // What must not break: a window with nothing left to do is spent, exactly as before. The
+        // middle case is the one a lagging status produces, where the hosts still look outdated.
+        assert!(taken(&ran_over_a_and_b, &["node-a"]));
+        assert!(
+            taken(&ran_over_a_and_b, &["node-a", "node-b"]),
+            "every owed host already had this window's playbook applied"
+        );
+        assert!(
+            taken(&ran_over_a_and_b, &[]),
+            "a window owing no host at all is spent, not open"
+        );
+
+        // Two runs of one window cover it between them.
+        let ran_separately = [succeeded_over(&["node-a"]), succeeded_over(&["node-c"])];
+        assert!(taken(&ran_separately, &["node-a", "node-c"]));
+        assert!(!taken(&ran_separately, &["node-a", "node-d"]));
+    }
+
+    /// A Node re-imaged after this window's run succeeded on it keeps the host name and nothing
+    /// else: `node_recreation` drops its claim, so it is owed a run again — and it must get one in
+    /// this window, not wait for the next slot because the record still lists the name.
+    #[test]
+    fn a_machine_replaced_since_its_run_is_not_covered_by_it() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        use k8s_openapi::jiff::Timestamp;
+
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let prepared_at = "2025-08-12T20:00:05Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+
+        let mut play = Play::new(
+            "apply-plan-abc-1",
+            v1beta1::PlaySpec {
+                playbook_plan: "plan".into(),
+                playbook_plan_uid: "plan-uid".into(),
+                execution_hash: "1a".into(),
+                run_id: "run-1".into(),
+                preparation_fingerprint: "fp".into(),
+                run_number: 1,
+                attempt: 1,
+                inventory: vec![
+                    ResolvedHosts {
+                        name: "nodes".into(),
+                        hosts: vec!["node-a".into(), "node-b".into()],
+                        connection: Some(v1beta1::HostConnection::ManagedSsh),
+                    },
+                    // An external host that happens to share the replaced Node's name.
+                    ResolvedHosts {
+                        name: "edge".into(),
+                        hosts: vec!["node-b".into()],
+                        connection: Some(v1beta1::HostConnection::Ssh),
+                    },
+                ],
+                provides_version: None,
+                triggered_slot: Some(slot),
+            },
+        );
+        play.metadata.creation_timestamp = Some(Time(
+            Timestamp::from_second(prepared_at.timestamp()).unwrap(),
+        ));
+        play.metadata.owner_references = Some(vec![OwnerReference {
+            uid: "plan-uid".into(),
+            name: "plan".into(),
+            ..Default::default()
+        }]);
+        play.status = Some(v1beta1::PlayStatus {
+            phase: v1beta1::PlayPhase::Succeeded,
+            ..Default::default()
+        });
+
+        let mut plays = vec![play];
+        withdraw_replaced_machines(&mut plays, |host, claimed_at| {
+            assert_eq!(
+                claimed_at,
+                Some(prepared_at),
+                "judged against the run's own start"
+            );
+            host == "node-b"
+        });
+
+        assert_eq!(plays[0].spec.inventory[0].hosts, vec!["node-a".to_string()]);
+        assert_eq!(
+            plays[0].spec.inventory[1].hosts,
+            vec!["node-b".to_string()],
+            "a StaticInventory host says nothing about the Node it shares a name with"
+        );
+
+        let without_the_external_twin = {
+            let mut plays = plays.clone();
+            plays[0].spec.inventory.truncate(1);
+            plays
+        };
+        let owed = ["node-b".to_string()];
+        assert!(
+            !window_taken_by_a_record(&without_the_external_twin, &plan, slot, &hash, 1, &owed),
+            "the fresh machine is still owed this window's run"
+        );
+        assert!(window_taken_by_a_record(
+            &without_the_external_twin,
+            &plan,
+            slot,
+            &hash,
+            1,
+            &["node-a".to_string()]
+        ));
+    }
+
     /// With a budget above one, the window is a `Recurring` plan's to retry in until its failures
-    /// have spent it — but never while one of its runs is still going or has already succeeded.
+    /// have spent it — but never while one of its runs is still going, or while one that succeeded
+    /// has already applied to every host the tick is asking about.
     #[test]
     fn a_window_with_budget_left_is_free_for_a_retry() {
         let slot = "2025-08-12T20:00:00Z"
@@ -9161,7 +9739,11 @@ mod tests {
                     preparation_fingerprint: "fp".into(),
                     run_number: 1,
                     attempt: 1,
-                    inventory: Vec::new(),
+                    inventory: vec![ResolvedHosts {
+                        name: "group".into(),
+                        hosts: vec!["node-a".into()],
+                        ..Default::default()
+                    }],
                     provides_version: None,
                     triggered_slot: Some(slot),
                 },
@@ -9177,8 +9759,11 @@ mod tests {
             });
             play
         };
+        // Every record here ran against the one host the tick wants to trigger, so a success of
+        // theirs covers it.
+        let owed = ["node-a".to_string()];
         let taken = |plays: &[Play], max_attempts| {
-            window_taken_by_a_record(plays, &plan, slot, &hash, max_attempts)
+            window_taken_by_a_record(plays, &plan, slot, &hash, max_attempts, &owed)
         };
 
         assert!(!taken(&[failed("run-1")], 3));
@@ -9193,7 +9778,8 @@ mod tests {
         unknown.status.as_mut().unwrap().phase = v1beta1::PlayPhase::Unknown;
         assert!(taken(&[failed("run-1"), unknown], 2));
 
-        // Budget or no budget, a run that succeeded ends the window, and one still going owns it.
+        // Budget or no budget, a run that succeeded ends the window for the hosts it applied to —
+        // here, the only one there is — and one still going owns it outright.
         let mut succeeded = failed("run-2");
         succeeded.status.as_mut().unwrap().phase = v1beta1::PlayPhase::Succeeded;
         assert!(taken(&[failed("run-1"), succeeded], 3));
@@ -9274,7 +9860,6 @@ mod tests {
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 1, 1, slot),
             &classify_run_failure(missed_a_down_node.status.as_ref().unwrap()),
             None,
@@ -9286,12 +9871,16 @@ mod tests {
             Some(slot),
             1,
         ));
+        // The host the window still owes is the one the down Node kept it from: its own record
+        // never applied to it, so nothing here covers it.
+        let owed = ["node-b".to_string()];
         assert!(!window_taken_by_a_record(
             std::slice::from_ref(&missed_a_down_node),
             &oneshot,
             slot,
             &hash,
             1,
+            &owed,
         ));
 
         // A run the refund turns down still spent its try, and still closes the window.
@@ -9314,19 +9903,37 @@ mod tests {
             ),
         ] {
             assert!(
-                window_taken_by_a_record(std::slice::from_ref(play), &oneshot, slot, &hash, 1),
+                window_taken_by_a_record(
+                    std::slice::from_ref(play),
+                    &oneshot,
+                    slot,
+                    &hash,
+                    1,
+                    &owed
+                ),
                 "{what}"
             );
         }
 
-        // `Recurring` is never refunded, and a second run in its slot is what the records exist to
-        // prevent.
-        assert!(window_taken_by_a_record(
+        // `Recurring` earns the same refund, and for the same reason: the slot is a window, and the
+        // host it could not reach is still owed the run that window promised.
+        assert!(!window_taken_by_a_record(
             std::slice::from_ref(&missed_a_down_node),
             &plan_in(ExecutionMode::Recurring),
             slot,
             &hash,
             1,
+            &owed,
+        ));
+
+        // What still closes it for that mode is a failure that spent the try, exactly as above.
+        assert!(window_taken_by_a_record(
+            std::slice::from_ref(&reached_nobody),
+            &plan_in(ExecutionMode::Recurring),
+            slot,
+            &hash,
+            1,
+            &owed,
         ));
     }
 
@@ -10053,6 +10660,7 @@ spec:
             Some(&Schedule::parse("0 20 * * *").unwrap()),
             false,
             false,
+            false,
             now,
             &mut status,
         );
@@ -10071,10 +10679,58 @@ spec:
             Some(&Schedule::parse("0 20 * * *").unwrap()),
             false,
             false,
+            false,
             now,
             &mut never_run,
         );
         assert_eq!(never_run.phase, Phase::Delayed);
+    }
+
+    /// The state per-slot targeting introduces: the window is still open, but every host has had its
+    /// run in it. Nothing is owed, so the start gate is closed — and this is then the only thing left
+    /// to requeue the plan. Without it the tick keeps the hour-long default and a plan on a schedule
+    /// tighter than that sleeps through the slots in between.
+    ///
+    /// The status is the served slot's own and is left alone: the verdict and the summary saying what
+    /// that run did are what this plan has to report until the next slot. That matters most on the
+    /// tick the run finishes, which is one of these ticks — the run's per-host results are applied
+    /// before the owed set is computed, so its success empties the set in the same pass that reports
+    /// it.
+    #[test]
+    fn a_recurring_plan_whose_slot_is_served_keeps_its_verdict_and_wakes_for_the_next_slot() {
+        let now = "2025-08-12T20:00:10Z".parse::<DateTime<Utc>>().unwrap();
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Succeeded,
+            next_run: Some(
+                "2025-08-12T20:00:00Z"
+                    .parse::<DateTime<FixedOffset>>()
+                    .unwrap(),
+            ),
+            summary: Some("3/3 up-to-date".into()),
+            ..Default::default()
+        };
+
+        let requeue = update_idle_recurring_status(
+            &ExecutionMode::Recurring,
+            Some(&Schedule::parse("0 20 * * *").unwrap()),
+            false,
+            false,
+            true,
+            now,
+            &mut status,
+        );
+
+        assert_eq!(status.phase, Phase::Succeeded);
+        assert_eq!(status.summary.as_deref(), Some("3/3 up-to-date"));
+        assert_eq!(
+            status.next_run,
+            Some(
+                "2025-08-13T20:00:00Z"
+                    .parse::<DateTime<FixedOffset>>()
+                    .unwrap()
+            )
+        );
+        assert_eq!(requeue, Some(std::time::Duration::from_secs(86_390)));
     }
 
     #[test]
@@ -10089,6 +10745,7 @@ spec:
         update_idle_recurring_status(
             &ExecutionMode::Recurring,
             Some(&Schedule::parse("0 20 * * *").unwrap()),
+            false,
             false,
             false,
             now,
@@ -10185,6 +10842,7 @@ spec:
                 Some(&Schedule::parse("0 20 * * *").unwrap()),
                 true,
                 false,
+                false,
                 now,
                 &mut suspended,
             ),
@@ -10217,6 +10875,7 @@ spec:
             update_idle_recurring_status(
                 &ExecutionMode::Recurring,
                 Some(&Schedule::parse("0 20 * * *").unwrap()),
+                false,
                 false,
                 false,
                 now,
@@ -10315,31 +10974,63 @@ spec:
 
         assert!(held_back_by_unready_nodes(
             &Timing::Now(Some(slot)),
-            &ExecutionMode::OneShot,
+            false,
             &groups,
             &unready
         ));
         assert!(
-            !held_back_by_unready_nodes(
-                &Timing::Delayed(slot),
-                &ExecutionMode::OneShot,
-                &groups,
-                &unready
-            ),
+            !held_back_by_unready_nodes(&Timing::Delayed(slot), false, &groups, &unready),
             "a shut window is why nothing is running, not the Node"
         );
-        // The gate's own half still decides the rest: `Recurring` never holds.
+    }
+
+    /// A held tick sleeps no longer than its window: every 15 minutes with a 10-minute deadline,
+    /// held at 00:03 because the only host still owed is down. Left at the hour-long default, the
+    /// plan would next wake at 01:03 and the healthy hosts would miss 00:15, 00:30 and 00:45.
+    #[test]
+    fn a_held_scheduled_tick_wakes_when_its_window_closes() {
+        let slot = "2025-08-12T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let held_at = "2025-08-12T00:03:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        assert_eq!(
+            until_held_window_closes(Some(slot), chrono::Duration::minutes(10), held_at),
+            Some(std::time::Duration::from_secs(7 * 60))
+        );
+        assert_eq!(
+            until_held_window_closes(None, chrono::Duration::minutes(10), held_at),
+            None,
+            "an unscheduled plan has no window to close; the Node watch is its only release"
+        );
+    }
+
+    /// A `Recurring` tick whose one try already failed for real, and whose remaining hosts have
+    /// since gone down. The window is closed by its budget, so the Nodes coming back would start
+    /// nothing — and a hold would say they would, with `Ready=False` and a summary naming them.
+    /// `OneShot` cannot reach this state: its start gate asks the budget before the hold.
+    #[test]
+    fn a_window_whose_budget_is_spent_is_not_held_by_its_nodes() {
+        let groups = vec![managed_ssh_group("workers", &["worker-1"], None)];
+        let unready = ["worker-1".to_string()];
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let spent = retry_budget_closes_window(&Phase::Failed, 1, Some(slot), Some(slot), 1);
+        assert!(
+            spent,
+            "one real failure spends a Recurring tick's default budget"
+        );
+
         assert!(!held_back_by_unready_nodes(
             &Timing::Now(Some(slot)),
-            &ExecutionMode::Recurring,
+            spent,
             &groups,
             &unready
         ));
     }
 
     /// A plan suspended while the readiness gate holds it. The hold is a queued run, so suspension
-    /// retracts it exactly as it retracts a forecast: the gate's own predicate reads only the mode,
-    /// the groups and the down Nodes, so it stays true and would leave `NodesNotReady` standing —
+    /// retracts it exactly as it retracts a forecast: the gate's own predicate reads only the
+    /// groups and the down Nodes, so it stays true and would leave `NodesNotReady` standing —
     /// with a summary naming a Node — over a plan that is not waiting for any Node.
     #[test]
     fn a_suspended_plan_retires_the_hold_that_was_waiting_for_its_nodes() {
@@ -12435,7 +13126,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, slot),
             &RunFailure::Real,
             None,
@@ -12479,7 +13169,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 1, slot),
             &RunFailure::None,
             None,
@@ -12516,7 +13205,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 3, slot),
             &RunFailure::OnlyUnreachableNodes,
             None,
@@ -12548,7 +13236,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 3, slot),
             &RunFailure::Real,
             None,
@@ -12563,28 +13250,103 @@ spec:
         ));
     }
 
+    /// A `Recurring` slot is a window that can still owe hosts a run, so the run that served it
+    /// hands its try back like a `OneShot` execution does. Without that, the budget half of the
+    /// start gate closes the window from the status alone — on the very first run, given the mode's
+    /// default `maxAttempts: 1` — and the records are never asked whether a host that appeared
+    /// meanwhile is still owed one.
     #[test]
-    fn a_successful_recurring_run_keeps_its_slot_budget() {
+    fn a_successful_recurring_run_hands_its_slot_budget_back() {
         let slot = "2025-08-12T20:00:00Z"
             .parse::<DateTime<FixedOffset>>()
             .unwrap();
         let hash = ExecutionHash::from_hex("1").unwrap();
         let mut status = PlaybookPlanStatus {
             current_hash: hash.to_string(),
+            phase: Phase::Succeeded,
             ..Default::default()
         };
 
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::Recurring,
             &finished_run(hash, 3, 1, slot),
             &RunFailure::None,
             None,
         );
 
-        assert_eq!(status.retry_count, 1);
-        assert_eq!(status.retry_count_slot, Some(slot));
+        assert_eq!(status.retry_count, 0);
+        assert_eq!(status.retry_count_slot, None);
+        assert!(!retry_budget_closes_window(
+            &status.phase,
+            status.retry_count,
+            status.retry_count_slot,
+            Some(slot),
+            1,
+        ));
+    }
+
+    /// The gap to the next tick is measured in the plan's own time zone. The night before the
+    /// spring DST change, a 03:00 Zurich tick is 23 hours from the next one, not 24: with a 22h59m
+    /// deadline only a minute is free between the windows, so the grace is 30s — where a fixed
+    /// offset would have seen an hour free and granted the full 60s, reaching into the previous
+    /// window.
+    #[test]
+    fn a_slot_window_finds_the_next_tick_in_the_plans_time_zone() {
+        use chrono::TimeZone as _;
+
+        let zurich = chrono_tz::Europe::Zurich;
+        let slot = zurich.with_ymd_and_hms(2026, 3, 28, 3, 0, 0).unwrap();
+        let window = slot_window(
+            &Schedule::parse("0 3 * * *").unwrap(),
+            slot,
+            chrono::Duration::hours(22) + chrono::Duration::minutes(59),
+        );
+
+        let applied = |before: i64| v1beta1::HostStatus {
+            last_applied_hash: "1".into(),
+            applied_at: Some(slot.fixed_offset() - chrono::Duration::seconds(before)),
+            ..Default::default()
+        };
+        assert!(!execution_evaluator::host_owes_slot(
+            Some(&applied(30)),
+            "1",
+            window
+        ));
+        assert!(
+            execution_evaluator::host_owes_slot(Some(&applied(45)), "1", window),
+            "45s early is past the 30s the shortened day leaves room for"
+        );
+    }
+
+    /// The maintenance-window trap: a deadline at least as long as the interval keeps the plan on
+    /// the oldest slot in the window, so the ticks inside it never run. Valid configuration, and the
+    /// only thing the operator can do about it is say so.
+    #[test]
+    fn a_deadline_as_wide_as_the_interval_is_reported_as_swallowing_ticks() {
+        let now = "2026-01-01T02:30:00Z".parse::<DateTime<Utc>>().unwrap();
+        let hourly = Schedule::parse("0 * * * *").unwrap();
+        let nightly = Schedule::parse("0 3 * * *").unwrap();
+        let four_hours = chrono::Duration::hours(4);
+
+        let (next, after) = deadline_swallows_a_tick(&hourly, four_hours, now)
+            .expect("four hours swallows three hourly ticks");
+        assert_eq!(
+            next,
+            "2026-01-01T03:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(
+            after,
+            "2026-01-01T04:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+
+        // The window this feature is for: four hours of grace on a nightly schedule leaves every
+        // other tick a day away, so nothing is swallowed.
+        assert!(deadline_swallows_a_tick(&nightly, four_hours, now).is_none());
+        // The boundary is inclusive: a deadline exactly as long as the interval already means the
+        // next tick opens while the previous window is still open.
+        assert!(deadline_swallows_a_tick(&hourly, chrono::Duration::hours(1), now).is_some());
+        assert!(deadline_swallows_a_tick(&hourly, chrono::Duration::minutes(59), now).is_none());
     }
 
     #[test]
@@ -12794,7 +13556,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
             &RunFailure::Real,
             Some(&surviving_run(hash, Some(live_slot))),
@@ -12833,7 +13594,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
             &RunFailure::Real,
             Some(&surviving_run(hash, Some(live_slot))),
@@ -12860,7 +13620,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &hash,
-            &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
             &RunFailure::Real,
             Some(&surviving_run(hash, None)),
@@ -12905,7 +13664,6 @@ spec:
             sync_desired_hash_after_finished_run(
                 &mut status,
                 &hash,
-                &ExecutionMode::OneShot,
                 &finished_run(hash, 3, 2, finished_slot),
                 &RunFailure::Real,
                 Some(&surviving_run_in(phase.clone(), hash, Some(live_slot))),
@@ -12955,7 +13713,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
-            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
             &RunFailure::Real,
             None,
@@ -12984,7 +13741,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
-            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
             &RunFailure::Real,
             Some(&surviving_run(old_hash, Some(slot))),
@@ -13013,7 +13769,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
-            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 3, slot),
             &RunFailure::Real,
             Some(&surviving),
@@ -13040,7 +13795,6 @@ spec:
         sync_desired_hash_after_finished_run(
             &mut status,
             &new_hash,
-            &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
             &RunFailure::Real,
             None,

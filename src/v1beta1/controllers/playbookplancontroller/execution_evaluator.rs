@@ -118,6 +118,152 @@ pub fn find_all_hosts(status: &v1beta1::PlaybookPlanStatus) -> Vec<String> {
     distinct_hosts(&status.eligible_hosts)
 }
 
+/// The most `appliedAt` may precede a slot and still count as belonging to it.
+///
+/// The two timestamps come from different clocks — `appliedAt` is the API server's, the slot is the
+/// operator's, derived from the cron expression — so the comparison needs slack in the direction
+/// where the operator is ahead: a `Play` is created within milliseconds of the slot start, and an
+/// operator one second ahead would otherwise stamp a success at `slot - 1s` and read it as not
+/// having happened.
+///
+/// A ceiling rather than the grace itself: [`SlotWindow`] shortens it to whatever the schedule
+/// leaves free between two windows.
+const SLOT_MEMBERSHIP_GRACE: chrono::Duration = chrono::Duration::seconds(60);
+
+/// A schedule window, as the slot it opens at and how far before that a success still belongs to it.
+///
+/// The grace exists for clock skew (see [`SLOT_MEMBERSHIP_GRACE`]) and is capped there, but it must
+/// never reach back into the *previous* window, or a host that ran late in that one reads as having
+/// already run this one and the slot is silently skipped for it. The previous window can still be
+/// open `startingDeadlineSeconds` after its own slot, so what is free between the two is
+/// `interval - deadline`, and the grace takes at most **half** of it. The other half is margin on
+/// the far side: a run decided in the last instant of the previous window still has its `Play`
+/// created some time later — after the record list and the hash work — and an API server clock
+/// running ahead pushes that stamp later again. Both directions of skew get the same room.
+///
+/// Windows that overlap outright — a deadline at or past the interval, which
+/// `reconciler::deadline_swallows_a_tick` warns about — leave nothing free, and the grace becomes
+/// zero. That is the honest end of the trade rather than a degradation: a schedule with no room
+/// between its windows has no room for skew tolerance either, and the two cannot both be had,
+/// because "ran late in the previous window" and "ran just before this slot" are then the same
+/// instant. What it costs is the skew tolerance itself: an operator clock running ahead of the API
+/// server's by more than the round trip that books the `Play` stamps `appliedAt` before its own
+/// slot, and the host reads as still owed. `window_taken_by_a_record` is what keeps that from
+/// becoming a second application — the slot's own `Succeeded` record still names the host — so it
+/// takes that skew *and* a pruned record to apply a playbook twice. The exact fix, if it ever
+/// matters, is to record the slot a host last ran for rather than infer it from a timestamp.
+///
+/// That the interval is measured **forward** from `slot`, rather than back to the previous
+/// occurrence, is a concession to `cron`, which only iterates forwards. The two agree on every
+/// regular schedule; on an irregular one (`0 3 * * 1-5`, whose Friday tick is three days from the
+/// next and one from the last) the forward gap is the longer, so the grace can come out at its
+/// ceiling where a backward measurement would have shortened it. It errs only towards the ceiling,
+/// never below what a backward measurement would allow, so the worst case is the 60s this used to
+/// grant unconditionally.
+#[derive(Debug, Clone, Copy)]
+pub struct SlotWindow {
+    slot: chrono::DateTime<chrono::FixedOffset>,
+    grace: chrono::Duration,
+}
+
+impl SlotWindow {
+    /// The window `slot` opens, on a plan scheduled by `next_occurrence` with `deadline` of grace.
+    ///
+    /// `next_occurrence` is the tick after `slot`; `None` for a schedule with nothing after it,
+    /// which leaves the full ceiling because there is no following window to protect.
+    pub fn new(
+        slot: chrono::DateTime<chrono::FixedOffset>,
+        next_occurrence: Option<chrono::DateTime<chrono::FixedOffset>>,
+        deadline: chrono::Duration,
+    ) -> Self {
+        let free =
+            next_occurrence.map_or(SLOT_MEMBERSHIP_GRACE, |next| (next - slot - deadline) / 2);
+        Self {
+            slot,
+            grace: SLOT_MEMBERSHIP_GRACE
+                .min(free)
+                .max(chrono::Duration::zero()),
+        }
+    }
+
+    /// The instant the window opened, which is what the rest of the slot bookkeeping is keyed by.
+    pub fn slot(&self) -> chrono::DateTime<chrono::FixedOffset> {
+        self.slot
+    }
+
+    /// Whether this host's last success belongs to this window.
+    ///
+    /// Inclusive of the boundary, which matters most where the grace is zero: `appliedAt` is the
+    /// `Play`'s creation time floored to the second, so a run prepared in the same second its slot
+    /// opened stamps `appliedAt == slot` — the ordinary case, not an edge one. Only where windows
+    /// touch or overlap can a run of the previous window land on that boundary too, and it then
+    /// counts for this one: it started as close to this slot as a run of this slot could have.
+    ///
+    /// An absent `appliedAt` reads as "has not run this slot": the field is only absent on a record
+    /// written before it existed (see `HostStatus::applied_at`), so the first tick after an upgrade
+    /// targets every host, exactly as it did before this function existed.
+    fn applied_within(&self, entry: &v1beta1::HostStatus) -> bool {
+        entry
+            .applied_at
+            .is_some_and(|applied| applied >= self.slot - self.grace)
+    }
+}
+
+/// Which hosts `window` still owes a run.
+///
+/// The `Recurring` counterpart to [`find_outdated_hosts`], and the difference between them is the
+/// whole of what a schedule window means for that mode: a slot is a mini-revision, so a host owes
+/// it until a run *of that slot* has succeeded on it, however current its hash is.
+///
+/// The hash is still asked, second, and it is what preserves today's behaviour for a mid-window
+/// edit: an edit clears the per-host claims it invalidates, so every host owes the new revision
+/// again — including one that already ran the old revision in this same slot.
+///
+/// Only a *success* moves `appliedAt` (`status::apply_terminal_play_status`), so a host this window
+/// already reached and failed on still reads as owed — which is what lets a retry inside the window
+/// target it while leaving the hosts that worked alone.
+pub fn find_hosts_owing_slot(
+    status: &v1beta1::PlaybookPlanStatus,
+    execution_hash: &ExecutionHash,
+    window: SlotWindow,
+) -> Vec<String> {
+    let hash = execution_hash.to_string();
+    distinct_hosts(&status.eligible_hosts)
+        .into_iter()
+        .filter(|host| {
+            host_owes_slot(
+                status
+                    .hosts_status
+                    .as_ref()
+                    .and_then(|hosts| hosts.get(host)),
+                &hash,
+                window,
+            )
+        })
+        .collect()
+}
+
+/// [`find_hosts_owing_slot`] for a single host, taking the plan's current hash as the hex string the
+/// status stores.
+///
+/// Split out so the Node watch can ask it of one host without building the plan's whole owed set on
+/// every kubelet heartbeat — and, more importantly, so the wake set and the run's target set cannot
+/// drift apart: waking a plan for a host it would not then run is the wake storm the mapper's
+/// predicate exists to avoid.
+///
+/// A host with no record at all has never run anything, so it owes every slot.
+pub fn host_owes_slot(
+    entry: Option<&v1beta1::HostStatus>,
+    current_hash: &str,
+    window: SlotWindow,
+) -> bool {
+    let Some(entry) = entry else {
+        return true;
+    };
+
+    !window.applied_within(entry) || entry.last_applied_hash != current_hash
+}
+
 /// Given a playbook and some secrets, calculate a hash that only changes if the inputs change.
 /// With regards to the secrets, the hash is order-insensitive.
 pub fn calculate_execution_hash<'a, T: IntoIterator<Item = &'a BTreeMap<String, ByteString>>>(
@@ -514,5 +660,213 @@ mod tests {
             calculate_execution_hash("playbook", std::iter::empty()),
         );
         assert_ne!(hash_secret_data([&key]), hash_secret_data([&rotated]));
+    }
+
+    /// A plan whose hosts each carry a last success at a given time on a given revision.
+    fn slot_status(hosts: &[(&str, Option<&str>, &str)]) -> PlaybookPlanStatus {
+        PlaybookPlanStatus {
+            eligible_hosts: vec![ResolvedHosts {
+                name: "test-inventory".into(),
+                hosts: hosts.iter().map(|(host, _, _)| (*host).into()).collect(),
+                ..Default::default()
+            }],
+            hosts_status: Some(BTreeMap::from_iter(hosts.iter().map(
+                |(host, applied_at, hash)| {
+                    (
+                        (*host).to_owned(),
+                        HostStatus {
+                            last_applied_hash: (*hash).to_owned(),
+                            applied_at: applied_at.map(|at| at.parse().unwrap()),
+                            last_outcome: crate::v1beta1::HostOutcome::Succeeded,
+                            ..Default::default()
+                        },
+                    )
+                },
+            ))),
+            ..Default::default()
+        }
+    }
+
+    fn at(instant: &str) -> chrono::DateTime<chrono::FixedOffset> {
+        instant.parse().unwrap()
+    }
+
+    /// The window the feature is for: a nightly tick with four hours of deadline. A whole day of
+    /// schedule leaves far more room than the grace needs, so this is the unclamped case.
+    fn nightly(slot: &str) -> SlotWindow {
+        SlotWindow::new(
+            at(slot),
+            Some(at(slot) + chrono::Duration::days(1)),
+            chrono::Duration::hours(4),
+        )
+    }
+
+    /// The rule that makes a slot a mini-revision: the hash says nothing about *when* the host ran,
+    /// so a `Recurring` plan whose hosts are all current still owes them the slot it has not run.
+    #[test]
+    fn a_host_owes_a_slot_its_last_success_came_before() {
+        let status = slot_status(&[
+            ("ran-last-night", Some("2025-08-12T03:00:04Z"), "1"),
+            ("ran-this-window", Some("2025-08-13T03:00:04Z"), "1"),
+        ]);
+
+        assert_eq!(
+            find_hosts_owing_slot(&status, &ExecutionHash(1), nightly("2025-08-13T03:00:00Z")),
+            vec!["ran-last-night".to_owned()]
+        );
+    }
+
+    /// The skew direction that decides the grace. The `Play` is created within milliseconds of the
+    /// slot start, so an operator clock a little ahead of the API server stamps the success just
+    /// *before* the slot it belongs to. Without the grace that host reads as owed and a
+    /// non-idempotent playbook is applied to it twice in one window.
+    #[test]
+    fn a_success_stamped_just_before_its_own_slot_still_belongs_to_it() {
+        let window = nightly("2025-08-13T03:00:00Z");
+
+        let inside = slot_status(&[("worker-1", Some("2025-08-13T02:59:59Z"), "1")]);
+        assert!(find_hosts_owing_slot(&inside, &ExecutionHash(1), window).is_empty());
+
+        // The other end of the grace: a success older than it is the previous window's, and that
+        // host is owed this one.
+        let outside = slot_status(&[("worker-1", Some("2025-08-13T02:58:59Z"), "1")]);
+        assert_eq!(
+            find_hosts_owing_slot(&outside, &ExecutionHash(1), window),
+            vec!["worker-1".to_owned()]
+        );
+    }
+
+    /// What the grace must never do: reach back into the window before it. A run may start anywhere
+    /// inside its own deadline, so on a schedule whose ticks are less than a grace apart from the
+    /// end of the previous window, a fixed 60s would read last window's late success as this
+    /// window's and skip the host — silently, because an empty owed set starts no run and says
+    /// nothing. The clamp is what keeps every tick its own.
+    #[test]
+    fn a_grace_never_reaches_into_the_window_before_it() {
+        // Every minute, at the default 30s deadline. The previous run can only have started in the
+        // 30s after its own slot, so 30s is free between the windows and the grace takes half.
+        let every_minute = SlotWindow::new(
+            at("2025-08-13T03:01:00Z"),
+            Some(at("2025-08-13T03:02:00Z")),
+            chrono::Duration::seconds(30),
+        );
+        let ran_last_minute = slot_status(&[("worker-1", Some("2025-08-13T03:00:05Z"), "1")]);
+        assert_eq!(
+            find_hosts_owing_slot(&ran_last_minute, &ExecutionHash(1), every_minute),
+            vec!["worker-1".to_owned()],
+            "a success from the 03:00 tick does not serve the 03:01 one"
+        );
+        // The other half is margin for the previous window's latest possible run: decided at the
+        // very end of it, with its `Play` stamped a few seconds later still.
+        let ran_at_the_end_of_last_minute =
+            slot_status(&[("worker-1", Some("2025-08-13T03:00:33Z"), "1")]);
+        assert_eq!(
+            find_hosts_owing_slot(
+                &ran_at_the_end_of_last_minute,
+                &ExecutionHash(1),
+                every_minute
+            ),
+            vec!["worker-1".to_owned()],
+            "a run stamped just after the 03:00 window closed is still that window's"
+        );
+        // Its own tick still serves it, skew and all.
+        let ran_this_minute = slot_status(&[("worker-1", Some("2025-08-13T03:00:59Z"), "1")]);
+        assert!(
+            find_hosts_owing_slot(&ran_this_minute, &ExecutionHash(1), every_minute).is_empty()
+        );
+
+        // Windows that overlap outright leave no room at all, and the grace collapses to zero
+        // rather than going negative. `deadline_swallows_a_tick` warns about this configuration;
+        // what matters here is that it cannot also cost a host its run — and that a run prepared
+        // in the same second its slot opened still counts, since that is the ordinary case.
+        let overlapping = SlotWindow::new(
+            at("2025-08-13T04:00:00Z"),
+            Some(at("2025-08-13T05:00:00Z")),
+            chrono::Duration::hours(4),
+        );
+        let ran_at_the_boundary = slot_status(&[("worker-1", Some("2025-08-13T04:00:00Z"), "1")]);
+        assert!(
+            find_hosts_owing_slot(&ran_at_the_boundary, &ExecutionHash(1), overlapping).is_empty(),
+            "a success stamped at the slot itself is still this window's"
+        );
+        let ran_a_second_early = slot_status(&[("worker-1", Some("2025-08-13T03:59:59Z"), "1")]);
+        assert_eq!(
+            find_hosts_owing_slot(&ran_a_second_early, &ExecutionHash(1), overlapping),
+            vec!["worker-1".to_owned()],
+            "with no room to spare there is no skew tolerance left to give"
+        );
+    }
+
+    /// An edit mid-window re-applies to every host, including the ones this slot already served:
+    /// they ran a revision that no longer exists.
+    #[test]
+    fn a_host_that_ran_this_slot_on_another_revision_is_owed_it_again() {
+        let status = slot_status(&[("worker-1", Some("2025-08-13T03:00:04Z"), "1")]);
+
+        assert_eq!(
+            find_hosts_owing_slot(&status, &ExecutionHash(2), nightly("2025-08-13T03:00:00Z")),
+            vec!["worker-1".to_owned()]
+        );
+    }
+
+    /// Only a success moves `appliedAt`, which is what lets a retry inside the window pick up
+    /// exactly the hosts the first run did not finish — and leave the ones it did alone.
+    #[test]
+    fn a_host_this_window_failed_on_is_still_owed_the_slot() {
+        let mut status = slot_status(&[
+            ("failed", Some("2025-08-12T03:00:04Z"), "1"),
+            ("succeeded", Some("2025-08-13T03:00:04Z"), "1"),
+        ]);
+        if let Some(entry) = status
+            .hosts_status
+            .as_mut()
+            .and_then(|hosts| hosts.get_mut("failed"))
+        {
+            entry.last_outcome = crate::v1beta1::HostOutcome::Failed;
+            entry.last_transition_time = Some(at("2025-08-13T03:05:00Z"));
+        }
+
+        assert_eq!(
+            find_hosts_owing_slot(&status, &ExecutionHash(1), nightly("2025-08-13T03:00:00Z")),
+            vec!["failed".to_owned()]
+        );
+    }
+
+    /// The upgrade case: `appliedAt` is absent on a record written before the field existed, and a
+    /// host that cannot prove it ran this slot is owed it. The first tick after an upgrade
+    /// therefore targets everyone, exactly as it did before slots were tracked.
+    #[test]
+    fn a_host_with_no_recorded_run_is_owed_the_slot() {
+        let window = nightly("2025-08-13T03:00:00Z");
+        let before_the_field = slot_status(&[("worker-1", None, "1")]);
+        assert_eq!(
+            find_hosts_owing_slot(&before_the_field, &ExecutionHash(1), window),
+            vec!["worker-1".to_owned()]
+        );
+
+        let never_ran = PlaybookPlanStatus {
+            eligible_hosts: vec![ResolvedHosts {
+                name: "test-inventory".into(),
+                hosts: vec!["worker-1".into()],
+                ..Default::default()
+            }],
+            hosts_status: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            find_hosts_owing_slot(&never_ran, &ExecutionHash(1), window),
+            vec!["worker-1".to_owned()]
+        );
+    }
+
+    /// A schedule with nothing after this tick has no following window to protect, so the grace
+    /// stays at its ceiling. `forecast_next_run` answers `None` for one, which must not read as
+    /// "no room".
+    #[test]
+    fn a_last_ever_tick_keeps_the_full_grace() {
+        let window = SlotWindow::new(at("2025-08-13T03:00:00Z"), None, chrono::Duration::hours(4));
+        let skewed = slot_status(&[("worker-1", Some("2025-08-13T02:59:59Z"), "1")]);
+
+        assert!(find_hosts_owing_slot(&skewed, &ExecutionHash(1), window).is_empty());
     }
 }

@@ -37,13 +37,41 @@ pinned to a maintenance window.
 The plan's `.status.nextRun` shows the next computed fire time, and the `Next run` printer column
 surfaces it in `kubectl get playbookplan`.
 
-### One tick, one run per revision
+### One tick, one run per host
 
-Because a run may start anywhere inside that window, the trigger gate has to remember that the window
-has already been used — otherwise a run finishing inside its own window would immediately re-trigger
+Because a run may start anywhere inside that window, the trigger gate has to remember what the window
+has already done — otherwise a run finishing inside its own window would immediately re-trigger
 itself. The gate uses the attempt budget's `.status.retryCountSlot` and the plan's immutable `Play`
 records to identify the current tick. `.status.lastTriggeredRun` records the tick a run was last
 started for as an observable marker only; it is not a gate input.
+
+What the window is spent on is a **host**, not a run. A tick may start more than one run inside its
+window, and does exactly when a host becomes eligible after the window opened — a Node that joined
+overnight, one a plan you [depend on](./playbook-plans.md#declaring-what-a-plan-provides) has just
+labelled, an entry added to a `StaticInventory`. Such a host is owed the run the window promised,
+however well the hosts that were there at the tick did, so a run that succeeded closes the window
+only for the hosts it applied to. This is what makes a wide `startingDeadlineSeconds` a maintenance
+*window* rather than a single attempt at its opening minute: set it to four hours and a machine
+switched on three hours late still gets the playbook, on the same tick's budget.
+
+A host that a run of this window has **succeeded** on is not applied to again in it. Which hosts a
+run targets is decided by what the window still owes them, so a later run reaches only the hosts no
+run of this window has succeeded on yet. For a `OneShot` plan that is the
+[execution hash](#drift-detection): a host carrying the current one is converged and is not in the
+run. For a `Recurring` plan, which re-applies to hosts that are already current, it is the tick
+itself — a host is in the run until a run *of this tick* has succeeded on it, and is then done until
+the next one. A [retry](#retries) does target a host that a failed run reached, including one whose
+result could not be read, so a playbook that is not idempotent can run twice on such a host.
+
+A deadline at least as long as the gap between two ticks is worth avoiding. The operator reports the
+*oldest* tick still inside its window, so with `schedule: "0 * * * *"` and four hours of deadline,
+06:30 is still working on the 03:00 tick and 04:00, 05:00 and 06:00 never run at all. The operator
+logs a warning naming the two occurrences when a run starts under such a schedule.
+
+The window still closes outright in the two cases where nothing more should start in it: while one
+of the plan's runs is **in flight**, and once its failures have spent the
+[attempt budget](#retries). That second one is the rule behind "if something actually failed, a host
+arriving later gets nothing": a failing playbook stops reaching further hosts until you fix it.
 
 That gating state is per revision, not per window: any change to the [execution hash](#drift-detection)
 clears the retry budget and makes prior `Play` records inapplicable, so an edit made moments after a
@@ -96,11 +124,20 @@ or a one-time migration and confirm every host got it.
 
 ### `Recurring`
 
-Re-apply on **every** schedule tick. *All* hosts run each time, regardless of whether they ran
-successfully last time. Between ticks the phase keeps the latest run's `Succeeded` or `Failed`
-result, while `.status.nextRun` names the next tick. Good for periodic enforcement or inherently
-repeating work: nightly package upgrades, drift correction, health tasks. A `Recurring` plan needs a
-`schedule`.
+Re-apply on **every** schedule tick. *Every* host runs each time, regardless of whether it ran
+successfully last time — but only once per tick: a host a run of this tick already succeeded on is
+done until the next one, so a second run inside the same window carries only the hosts the first did
+not reach. Between ticks the phase keeps the latest run's `Succeeded` or `Failed` result, while
+`.status.nextRun` names the next tick. Good for periodic enforcement or inherently repeating work:
+nightly package upgrades, drift correction, health tasks. A `Recurring` plan needs a `schedule`.
+
+That is what makes a wide `startingDeadlineSeconds` work for a fleet that is not all switched on at
+once. A tick whose machines are every one of them down [holds](./cluster-nodes.md#holding-instead-of-starting)
+rather than burning itself on a run that can reach nobody, and a machine that comes up later in the
+window still gets the playbook on that tick's budget. While it holds, the plan reads the *previous*
+run's verdict — `Succeeded` from last night — with `Ready=False` and a summary naming the Nodes it
+is waiting for. The phase says what the plan last did; the summary says why nothing is happening
+now.
 
 ## Drift detection
 
@@ -127,11 +164,12 @@ out of date because it has no recorded hash of its own.
   is keyed by the host's name, which is all the fresh machine inherits, so the operator compares the
   Node's `creationTimestamp` against the host's
   [`appliedAt`](./results-and-troubleshooting.md#per-host-outcomes) — the time the run that claimed
-  it was prepared — to tell the two apart. On a **scheduled** plan such a host waits for the next
-  slot, because the run it was replaced during consumed this one by succeeding.
+  it was prepared — to tell the two apart. On a **scheduled** plan such a host is owed a run inside
+  the current window like any other host that became eligible after it opened, so it is picked up
+  without waiting for the next slot, provided the window is still open and the budget unspent.
 - When you edit the playbook or change a referenced variables/files Secret, the hash changes **at
   once**: the operator watches the plan and the Secrets it names, so the desired hash, run numbering
-  and [consumed schedule slot](#one-tick-one-run-per-revision) update on the spot.
+  and [consumed schedule slot](#one-tick-one-run-per-host) update on the spot.
 - Changing `spec.provides.version` changes the hash, so the playbook re-runs on **every** host of
   the plan. That is what lets a Node's dependency label be trusted, and it is also the only way to
   re-run a plan whose playbook text has not changed. Adding or removing `provides` re-runs it once.
@@ -163,12 +201,17 @@ timer. The watched inputs are:
 | A Secret it names in `variables` or `files` | at once |
 | A `ClusterInventory` or `StaticInventory` it names — including the Nodes a `ClusterInventory` resolves to | at once |
 | A `NodeAccessPolicy` (which may change [which Nodes the namespace may target](../cluster-operators/node-access-policies.md)) | at once |
-| A Node it is still waiting on becoming `Ready` | at once, for a `OneShot` plan |
+| A Node it is still waiting on becoming `Ready` | at once — for a scheduled plan, only while its tick's window is open |
 | A `StaticInventory`'s SSH key Secret | at once, but **only for a plan whose last run did not succeed** |
 | The run's Job finishing | at once |
-| Nothing at all | on a timer: the time until the next scheduled tick, or an hour for an unscheduled plan |
+| Nothing at all | on a timer: the time until the next scheduled tick, or an hour for an unscheduled plan — a plan [held](./cluster-nodes.md#holding-instead-of-starting) for its Nodes also once when its tick's window closes |
 
-"Still waiting on" is narrower than "not current". For a host whose `lastAppliedHash` differs from
+"Still waiting on" is narrower than "not current", and it is the same question the run's target set
+answers — so a plan is never woken for a host it would not then run. For a `Recurring` plan that is
+the tick: a Node whose host this tick has already run on wakes nothing, however often its kubelet
+reports.
+
+For a host whose `lastAppliedHash` differs from
 the current hash, a Node turning `Ready` wakes a plan if it has never run against that host, left it
 [unreachable](./cluster-nodes.md#holding-instead-of-starting), could not read its recap, or last
 succeeded on an older revision. It does **not** wake a plan for a host left `Failed`, `NotReached`,
@@ -185,10 +228,11 @@ what its hosts need. Three answers say it could not, and none of them is somethi
   turning `Ready` under it changes nothing until the budget comes back — which an edit, a
   `StaticInventory` SSH key rotation or a successful run does, and each of those has its own row in
   the table above.
-- a **`Recurring`** plan is started by its schedule and by nothing else, so a Node is never what it
-  is waiting for: it runs at its next tick against whatever it can reach then, and it is never
-  [held](./cluster-nodes.md#holding-instead-of-starting) in the meantime. A Node returning early
-  brings its tick no closer.
+- a **scheduled** plan outside its tick's window is waiting on the clock, so a Node returning early
+  brings its next tick no closer — whatever its mode. *Inside* the window it is woken like any other
+  plan, because there it can act: the Node may be one the tick still owes a run, or the one thing a
+  [held](./cluster-nodes.md#holding-instead-of-starting) tick is waiting for. Once a `Recurring`
+  tick's [attempts](#retries) are spent, a Node turning `Ready` changes nothing there either.
 
 The SSH key row is deliberately one-sided. Rotating a key changes how the operator connects, not what
 it applies, so it must never re-apply the playbook to hosts that are already current — which is why
@@ -232,12 +276,19 @@ it now reads.
 
 This second case is triggered by more than the execution hash. An unlaunched run is abandoned
 whenever *any* part of the plan spec changes — the image, tolerations, verbosity, inventory
-references — or when the set of nodes the plan resolves to changes, for instance because a node was
-relabelled or a `NodeAccessPolicy` was narrowed. The hash decides which hosts are out of date; this
-check decides whether a run still matches the plan it was prepared for, and it is deliberately
-the stricter of the two. Setting `spec.suspend: true` has the same effect, for the same reason:
-nothing irrevocable exists for an unlaunched run, so a paused plan drops it instead of launching
-it later.
+references — or when the set of hosts **that run is applying to** changes, for instance because one
+of them was relabelled out of the inventory or a `NodeAccessPolicy` was narrowed. The hash decides
+which hosts are out of date; this check decides whether a run still matches the plan it was prepared
+for, and it is deliberately the stricter of the two. Setting `spec.suspend: true` has the same
+effect, for the same reason: nothing irrevocable exists for an unlaunched run, so a paused plan
+drops it instead of launching it later.
+
+A host *arriving* is the one inventory change that does not abandon it. A node that joins, that a
+[dependency](./playbook-plans.md#declaring-what-a-plan-provides) makes eligible, or that is added to
+a `StaticInventory` was never part of this run and cannot change what it is applying — so the run
+carries on and the new host is picked up by a later one. Tearing the run down instead would cost it
+the locks and proxy pods it had already acquired, and a fleet where hosts keep arriving could keep
+it from ever launching at all.
 
 One trigger is narrower than the rest. A run that is still waiting for its **host locks** is
 also dropped if it misses its schedule window, because it has yet to consume the slot it was started
@@ -305,7 +356,11 @@ What the budget covers depends on the mode, because what counts as "the same pie
 - **`Recurring`** spends its budget on one schedule tick, and defaults to `1` — no retry, since the
   next tick re-applies the same playbook anyway. With a higher `maxAttempts` a failed run is retried
   within the current tick, and the next tick starts over with a full budget whatever the previous one
-  did. Retries are still bound by `startingDeadlineSeconds` (see above), measured from the original
+  did. A retry targets only the hosts the tick still owes, so hosts the failed run *did* succeed on
+  are not applied to a second time — the same rule `OneShot` retries follow. A run that succeeded,
+  or that missed only hosts on Nodes nothing could reach, hands its try back instead of spending it,
+  which is what leaves the window open for a machine that comes up later in it. Retries are still
+  bound by `startingDeadlineSeconds` (see above), measured from the original
   schedule tick rather than from the time an attempt fails. Every retry must start before that
   original deadline, so time spent running earlier attempts counts against the window. With the
   default 30 seconds, a first attempt that runs for longer than 30 seconds cannot be retried. When

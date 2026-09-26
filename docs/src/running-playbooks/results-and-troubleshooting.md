@@ -187,13 +187,16 @@ The same comparison is made once more when a result is recorded, so a machine re
 operator was down — between a run finishing and its result being written to the plan — makes no
 claim at all and is simply run again.
 
-**On a scheduled plan, "run again" means the next slot.** That run *succeeded* — it is only the one
-host's claim that was withheld — and a successful run
-[consumes its schedule slot](./scheduling-and-modes.md#one-tick-one-run-per-revision) for the
-revision. So the rebuilt machine stays outdated, and carries no dependency label, until the plan's
-next scheduled tick; on a daily schedule that is a day, and any plan depending on this one waits the
-same. An unscheduled `OneShot` picks it up on the following reconcile instead. Editing the plan
-moves the hash, which clears the slot and runs immediately, if you would rather not wait.
+**On a scheduled plan, "run again" means inside the same window.** That run *succeeded* — it is only
+the one host's claim that was withheld — but a successful run
+[spends its schedule slot only on the hosts it applied to](./scheduling-and-modes.md#one-tick-one-run-per-host),
+and this one is not among them. So the rebuilt machine is picked up by a further run of the same
+tick, as long as the window is still open and the
+[attempt budget](./scheduling-and-modes.md#retries) unspent. Once the window has closed it waits for
+the next scheduled tick — on a daily schedule that is a day, and any plan depending on this one
+waits the same — so a plan whose machines are re-imaged during a narrow
+`startingDeadlineSeconds` is worth widening. Editing the plan moves the hash, which clears the slot
+and runs immediately, if you would rather not wait.
 
 Records written before this field existed carry no `appliedAt` and are deliberately left alone
 until their next success, so upgrading the operator does not re-run every plan in the cluster. Until

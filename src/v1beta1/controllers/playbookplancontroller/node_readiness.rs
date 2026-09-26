@@ -8,7 +8,7 @@
 use k8s_openapi::api::core::v1::Node;
 use kube::runtime::reflector::{ObjectRef, Store};
 
-use crate::v1beta1::{ExecutionMode, ResolvedInventoryGroup};
+use crate::v1beta1::ResolvedInventoryGroup;
 
 /// Whether a Node reports `Ready=True`.
 ///
@@ -60,24 +60,24 @@ pub fn unready_nodes(nodes: &Store<Node>, groups: &[ResolvedInventoryGroup]) -> 
 ///
 /// Such a run is not harmless. Each of those nodes gets a proxy pod that cannot come up, the run
 /// waits out the full grace window, and Ansible then reports every host unreachable — spending one
-/// of a `OneShot` plan's attempts on an outcome that was knowable before the Job existed. Holding
-/// instead costs nothing, because the controller's Node watch wakes the plan the moment one of them
-/// reports `Ready` again.
+/// of the plan's attempts on an outcome that was knowable before the Job existed. Holding instead
+/// costs nothing, because the controller's Node watch wakes the plan the moment one of them reports
+/// `Ready` again.
 ///
 /// It is deliberately "every", not "any". A run that can still reach *some* of its hosts must go
 /// ahead and reach them, carrying the unreachable ones along so they are reported as such in the
 /// play result rather than silently dropped from it.
 ///
-/// `Recurring` never holds, whatever the nodes are doing: its contract is to re-apply at each tick
-/// against whatever exists then, and its budget already resets per tick, so a tick that reaches
-/// nobody costs it nothing to skip. The mode is taken here rather than checked at the call site so
-/// that both halves of the rule are decided — and tested — in one place.
-pub fn holds_for_unready_nodes(
-    mode: &ExecutionMode,
-    groups: &[ResolvedInventoryGroup],
-    unready: &[String],
-) -> bool {
-    if !matches!(mode, ExecutionMode::OneShot) || unready.is_empty() {
+/// The mode does not come into it. `Recurring` used to be excluded on the grounds that it re-applies
+/// at each tick against whatever exists then, so a tick that reaches nobody costs nothing to skip —
+/// but a tick is now a *window* that can still owe its hosts a run, and burning it at 03:00 because
+/// the fleet is switched off is what the window exists to prevent. The run would achieve nothing and
+/// take the full grace window to find that out, which was always the argument.
+///
+/// What bounds the hold for that mode is the caller: `reconciler::held_back_by_unready_nodes`
+/// requires a `Timing::Now`, so the hold lasts no longer than the window it is held for.
+pub fn holds_for_unready_nodes(groups: &[ResolvedInventoryGroup], unready: &[String]) -> bool {
+    if unready.is_empty() {
         return false;
     }
 
@@ -158,38 +158,25 @@ mod tests {
         let groups = vec![managed("workers", &["node-a", "node-b"])];
 
         assert!(holds_for_unready_nodes(
-            &ExecutionMode::OneShot,
             &groups,
             &["node-a".to_string(), "node-b".to_string()]
         ));
         assert!(
-            !holds_for_unready_nodes(&ExecutionMode::OneShot, &groups, &["node-a".to_string()]),
+            !holds_for_unready_nodes(&groups, &["node-a".to_string()]),
             "node-b can still be reached, so the run has work to do"
         );
-        assert!(!holds_for_unready_nodes(
-            &ExecutionMode::OneShot,
-            &groups,
-            &[]
-        ));
+        assert!(!holds_for_unready_nodes(&groups, &[]));
     }
 
-    /// A `Recurring` plan re-applies at each tick against whatever exists then, and its budget
-    /// resets per tick, so it has nothing to protect by waiting and a skipped tick is simply a tick
-    /// that did not happen. It runs even when every one of its nodes is down.
+    /// The 03:00 tick of a fleet that is switched on at 06:00. A `Recurring` plan used to run
+    /// anyway, reach nobody, and spend the window on a result that was knowable before the Job
+    /// existed. It now waits — and the window is still open at 06:00 for the run it owes.
     #[test]
-    fn a_recurring_run_starts_even_when_every_node_is_down() {
+    fn a_recurring_run_waits_for_its_nodes_like_any_other() {
         let groups = vec![managed("workers", &["node-a", "node-b"])];
         let unready = ["node-a".to_string(), "node-b".to_string()];
 
-        assert!(!holds_for_unready_nodes(
-            &ExecutionMode::Recurring,
-            &groups,
-            &unready
-        ));
-        assert!(
-            holds_for_unready_nodes(&ExecutionMode::OneShot, &groups, &unready),
-            "the same inputs hold a OneShot plan — the mode is the only difference"
-        );
+        assert!(holds_for_unready_nodes(&groups, &unready));
     }
 
     /// A `StaticInventory` host is reached over its own SSH key, with no Node and no proxy pod
@@ -202,10 +189,6 @@ mod tests {
             ssh("edge", &["host.example.com"]),
         ];
 
-        assert!(!holds_for_unready_nodes(
-            &ExecutionMode::OneShot,
-            &groups,
-            &["node-a".to_string()]
-        ));
+        assert!(!holds_for_unready_nodes(&groups, &["node-a".to_string()]));
     }
 }

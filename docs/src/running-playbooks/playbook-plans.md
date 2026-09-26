@@ -287,7 +287,8 @@ just finished. `HostsUnreachable` is a failure that is not the playbook's fault:
 was applied, and what is left is a machine that is down. A `Recurring` plan keeps that result between ticks and
 advertises the next one through `.status.nextRun`. Drift detection decides *which* hosts actually run: an
 execution hash over the playbook plus every referenced Secret marks hosts out of date, and a host
-that already succeeded on the current hash is skipped. See
+that already succeeded on the current hash is skipped — a `Recurring` plan re-applies to hosts that
+are already current, and skips only the ones its current tick has already run. See
 [Scheduling and execution modes](./scheduling-and-modes.md) for the mechanics and
 [Reading results](./results-and-troubleshooting.md) for how to read the outcome.
 

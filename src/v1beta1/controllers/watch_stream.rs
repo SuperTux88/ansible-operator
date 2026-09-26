@@ -7,8 +7,8 @@ use kube::runtime::{WatchStreamExt as _, watcher};
 use kube::{Api, Resource};
 use serde::de::DeserializeOwned;
 
-/// The watch stream every reflector and trigger in this operator is built on: a [`watcher`] that is
-/// **thrown away and rebuilt from a fresh LIST after any error**, rather than resumed.
+/// The watch stream every reflector and trigger in this operator is built on: a [`watcher()`] that
+/// is **thrown away and rebuilt from a fresh LIST after any error**, rather than resumed.
 ///
 /// `watcher` resumes. On an error it hands the error up and keeps the state it had — including, in
 /// `State::Watching`, the very HTTP response body that produced the error. The next poll does not
