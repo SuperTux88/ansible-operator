@@ -240,6 +240,28 @@ mod tests {
         assert_eq!(days_of("*").len(), 7);
     }
 
+    /// Standard cron (and a Kubernetes `CronJob`) runs when *either* day field matches once both are
+    /// restricted, which makes "the first Monday of the month" impossible to express. Both must match
+    /// here, and the guide says so; this pins it against a change in the `cron` crate.
+    #[test]
+    fn both_day_fields_must_match_when_both_are_restricted() {
+        let schedule = Schedule::parse("0 3 1-7 * MON").unwrap();
+        let ticks: Vec<_> = schedule
+            .0
+            .after(&parse("2026-01-01T00:00:00Z"))
+            .take(3)
+            .collect();
+
+        assert_eq!(
+            ticks,
+            [
+                parse("2026-01-05T03:00:00Z"),
+                parse("2026-02-02T03:00:00Z"),
+                parse("2026-03-02T03:00:00Z"),
+            ]
+        );
+    }
+
     #[test]
     fn a_day_of_week_outside_the_week_is_refused() {
         for day_of_week in ["8", "5-1", "FRI-MON", "*/0", "1-", "x", "1,,2"] {
