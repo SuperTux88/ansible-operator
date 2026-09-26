@@ -133,6 +133,12 @@ managedSsh:
 The defaults wait 600 / 300 / 150 / 0 seconds for a Node last seen within 3 / 7 / 30 / more days.
 Like the other config values, a change rolls the operator rather than hot-reloading.
 
+For a run of a scheduled `PlaybookPlan`, the wait for a Node that is `NotReady` is further capped
+at the plan's `startingDeadlineSeconds` and at half the time to its next tick. Every run waits
+again, so a longer wait on a short schedule would make the plan miss ticks. See
+[NotReady nodes](../running-playbooks/cluster-nodes.md#notready-nodes) for what happens to such a
+Node afterwards.
+
 ## Enrolled namespaces
 
 The operator's cluster-wide RBAC does **not** include `secrets`, `jobs`, or `pods`. Those verbs are
