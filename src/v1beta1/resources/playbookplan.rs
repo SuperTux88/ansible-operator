@@ -133,7 +133,10 @@ pub struct PlaybookPlanSpec {
     /// tick is skipped and the run waits for the next one. The same idea as a CronJob's
     /// `.spec.startingDeadlineSeconds`. A `Recurring` retry shares the original tick's deadline; the
     /// window does not restart when an attempt fails, so time spent running earlier attempts counts
-    /// against it. Only affects scheduled (`schedule`) plans. Defaults to 30.
+    /// against it. It also caps how long a run waits for the proxy pod of a Node that is not
+    /// `Ready` before reporting that Node unreachable (half the time to the next tick caps it
+    /// too), so raise it for a plan whose Nodes may still be rebooting at the tick. Only affects
+    /// scheduled (`schedule`) plans. Defaults to 30.
     #[schemars(with = "Option<UnsignedInt>")]
     pub starting_deadline_seconds: Option<u32>,
 
