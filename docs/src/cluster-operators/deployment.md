@@ -115,7 +115,9 @@ When a `ClusterInventory` targets a `NotReady` Node, the operator still schedule
 waits for the pod to become Ready. If it does not become Ready in time, the run proceeds without that
 Node — Ansible reports it unreachable, and it is retried on the next run. The same bound applies to
 an old-credential pod still terminating after a reset; it is never reused. A pod that has reached
-`Running` normally is waited on until Ready as usual.
+`Running` is waited on until Ready without a limit while its Node is `Ready`. If its Node stops
+being `Ready` first, the same bound applies from the moment the pod lost its readiness, so a Node
+that dies while the run is still bringing up other proxies cannot hold the run until it returns.
 
 The same wait bounds a proxy pod that does not come up on a `Ready` Node, such as one still pulling
 its image: the tiers below look only at the heartbeat, not at whether the Node is `Ready`.

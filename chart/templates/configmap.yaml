@@ -37,9 +37,10 @@ data:
     enabled = {{ if .Values.nodeLabels.enabled }}true{{ else }}false{{ end }}
     {{- with (.Values.managedSsh).readiness }}
 
-    # Adaptive readiness grace for managed-ssh proxy pods not yet Running, scaled by the age of the
-    # node's last heartbeat: wait `grace_seconds`, divided by `aggressiveness` at each
-    # `threshold_days` boundary, then give up (report unreachable).
+    # Adaptive readiness grace for managed-ssh proxy pods not yet Running (or Running on a node that
+    # stopped being Ready), scaled by the age of the node's last heartbeat: wait `grace_seconds`,
+    # divided by `aggressiveness` at each `threshold_days` boundary, then give up (report
+    # unreachable).
     [managed_ssh]
     grace_seconds = {{ .graceSeconds | int }}
     aggressiveness = {{ .aggressiveness | int }}
