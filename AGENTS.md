@@ -113,7 +113,7 @@ src/v1beta1/
     render_error.rs                  shared YAML rendering error type
     ansible_operator_preflight.py    managed-ssh preflight gate; waits for every reachable proxy SSH banner
     ansible_operator_recap.py        Ansible callback plugin: writes per-host recap to /dev/termination-log
-  labels.rs                          PLAYBOOKPLAN_NAME / _HASH / _HOST / RUN_ID label keys, plus PLAY_UID_ANNOTATION (an annotation, never selectable)
+  labels.rs                          PLAYBOOKPLAN_NAME / _HASH / _HOST / RUN_ID label keys, plus PLAY_UID_ANNOTATION (an annotation, never selectable) and RETRY_ANNOTATION (user-set retry request)
 ```
 
 The managed-SSH preflight script is covered by `tests/python/test_preflight.py` and `just test-python`.
@@ -298,6 +298,20 @@ waking it alone would achieve nothing. `mappers::ssh_secret_to_playbookplans` su
 and both sides share `status::may_need_another_run` so the mapper can never wake a plan the reset
 would then decline. The first observation is recorded without acting, which is what keeps an upgrade
 from handing every failed plan a free retry at once.
+
+A human can hand the budget back too, without editing anything a Helm or GitOps source renders: a
+new value in the `ansible.cloudbending.dev/retry` annotation (`labels::RETRY_ANNOTATION`) restores
+the whole budget of a plan whose last run failed (`sync_retry_request`), and
+`status.observedRetryToken` records it so each value is honoured once — that dedupe is what keeps
+`maxAttempts` a bound. It looks like `sync_ssh_key_revision` and deliberately differs from it in
+three places. The **first observation acts**: an annotation that appears is a request, and no plan
+carried one before the feature, so there is no upgrade to protect. The gate is
+**`is_failure_verdict`**, not `may_need_another_run`, and it needs no mapper, since the primary plan
+watch has no predicate and an annotation change already reconciles. And it is **judged by the
+finished run's verdict** when a run of the current hash finished this tick, not by `status.phase`,
+which only receives that verdict later in the terminal branch: reading `phase` there sees `Applying`
+and silently spends a request made during the run. While a run is in flight (`activeRun`, including
+one adopted behind a drained result) nothing is recorded, so the request waits for that run's result.
 
 The "applied to at least one host" half is a bound, not a nicety: the gate reads the Node at tick
 time while `node_not_ready` is read a grace window later, so a Node that alternates across that

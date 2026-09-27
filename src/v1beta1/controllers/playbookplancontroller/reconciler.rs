@@ -1184,6 +1184,28 @@ async fn reconcile(
         );
     }
 
+    let last_verdict = retry_request_verdict(
+        finished_active_run.as_ref(),
+        &execution_hash,
+        &resource_status.phase,
+    );
+    if sync_retry_request(
+        &mut resource_status,
+        object
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(labels::RETRY_ANNOTATION))
+            .map(String::as_str),
+        &last_verdict,
+    ) {
+        info!(
+            "PlaybookPlan {namespace}/{name}: retry requested through {} — restoring its \
+             attempt budget",
+            labels::RETRY_ANNOTATION
+        );
+    }
+
     // Step 1: compute outdated hosts and evaluate the schedule.
     let tz = scheduling_configuration.time_zone;
     let now = || Utc::now().with_timezone(&tz);
@@ -5763,6 +5785,81 @@ fn sync_ssh_key_revision(
 
     record_retry_budget(status, 0, None);
     true
+}
+
+/// Acts on a user's request to retry a failed plan (`labels::RETRY_ANNOTATION`): a token the plan
+/// has not observed restores the whole attempt budget when `last_verdict` is a failure. Returns
+/// whether it did.
+///
+/// Modelled on [`sync_ssh_key_revision`], with three deliberate differences. The first observation
+/// acts, because an annotation that appears is a request, while a key that appears is not a
+/// rotation. `Recurring` is included and its budget slot cleared, because restarting the current
+/// tick's budget is what was asked for. And the gate is a failure verdict rather than
+/// [`status::may_need_another_run`]: a `Pending` or `Delayed` plan has nothing to retry, and
+/// consuming the token there would leave the user's request with nothing to show for it.
+///
+/// `last_verdict` is passed in rather than read from `status.phase` because, on the tick a run
+/// finishes, `phase` is only set to that run's verdict later. A request made during the run would
+/// otherwise be judged against `Applying` and dismissed.
+///
+/// Deferred, not dismissed, while a run is in flight: nothing is recorded, so the tick that finds
+/// the plan idle sees the request and judges it by that run's result. That includes a run still
+/// going behind a result drained this tick, which is adopted into `active_run` before this is asked.
+fn sync_retry_request(
+    status: &mut PlaybookPlanStatus,
+    requested: Option<&str>,
+    last_verdict: &Phase,
+) -> bool {
+    let Some(requested) = requested.map(retry_token) else {
+        return false;
+    };
+    if status.active_run.is_some() || status.observed_retry_token.as_ref() == Some(&requested) {
+        return false;
+    }
+
+    status.observed_retry_token = Some(requested);
+    if !is_failure_verdict(last_verdict) {
+        return false;
+    }
+
+    record_retry_budget(status, 0, None);
+    true
+}
+
+/// The verdict [`sync_retry_request`] judges a request by: that of the run which finished on this
+/// tick when it applied the desired revision, the plan's `phase` otherwise.
+///
+/// A finished run's verdict only reaches `phase` in the terminal branch, after the request has been
+/// judged, so reading `phase` on that tick sees `Applying` and dismisses a request made during the
+/// run. A run of an older revision says nothing about the current one, whose budget
+/// `update_desired_hash` has already restored.
+fn retry_request_verdict(
+    finished: Option<&FinishedRun>,
+    desired_hash: &ExecutionHash,
+    phase: &Phase,
+) -> Phase {
+    match finished {
+        Some(finished) if finished.run.execution_hash == *desired_hash => finished.verdict.clone(),
+        _ => phase.clone(),
+    }
+}
+
+/// Longest retry annotation value recorded verbatim in `status.observedRetryToken`.
+const MAX_RETRY_TOKEN_LEN: usize = 64;
+
+/// The form a retry annotation value is recorded and compared in: the value itself up to
+/// [`MAX_RETRY_TOKEN_LEN`] characters, else a readable prefix and a hash of the whole value.
+///
+/// An annotation value may be up to 256 KiB, and every status write carries the recorded token, so
+/// a long one is abbreviated rather than copied. It is not refused: the operator has no admission
+/// step to refuse it at, and a request that is dropped with only a log line would look ignored.
+fn retry_token(requested: &str) -> String {
+    if requested.chars().count() <= MAX_RETRY_TOKEN_LEN {
+        return requested.to_string();
+    }
+    let prefix: String = requested.chars().take(MAX_RETRY_TOKEN_LEN / 2).collect();
+    let hash = twox_hash::XxHash3_64::oneshot(requested.as_bytes());
+    format!("{prefix}…{hash:016x}")
 }
 
 fn record_retry_budget(
@@ -12813,6 +12910,174 @@ spec:
             Some("same")
         ));
         assert_eq!(status.retry_count, 3);
+    }
+
+    fn failed_with_spent_budget(phase: Phase) -> PlaybookPlanStatus {
+        PlaybookPlanStatus {
+            phase,
+            retry_count: 3,
+            retry_count_slot: Some(
+                "2025-08-12T20:00:00Z"
+                    .parse::<DateTime<FixedOffset>>()
+                    .unwrap(),
+            ),
+            observed_retry_token: Some("before".into()),
+            ..Default::default()
+        }
+    }
+
+    /// The feature: a new token on a plan whose last run failed hands it a full budget again, slot
+    /// included, so a `Recurring` plan restarts the tick it is in rather than continuing its count.
+    #[test]
+    fn a_retry_request_restores_a_failed_plans_budget() {
+        for verdict in [Phase::Failed, Phase::HostsUnreachable] {
+            let mut status = failed_with_spent_budget(verdict.clone());
+            assert!(sync_retry_request(&mut status, Some("now"), &verdict));
+            assert_eq!(status.retry_count, 0);
+            assert_eq!(status.retry_count_slot, None);
+            assert_eq!(status.observed_retry_token.as_deref(), Some("now"));
+        }
+    }
+
+    /// Unlike an SSH key, a retry annotation seen for the first time *is* a request: nothing
+    /// carried it before this feature, so there is no upgrade to protect.
+    #[test]
+    fn the_first_retry_request_a_plan_sees_acts() {
+        let mut status = failed_with_spent_budget(Phase::Failed);
+        status.observed_retry_token = None;
+        assert!(sync_retry_request(
+            &mut status,
+            Some("first"),
+            &Phase::Failed
+        ));
+        assert_eq!(status.retry_count, 0);
+    }
+
+    /// A token is one request. Seen again on the next tick it must do nothing, or every tick of a
+    /// failing plan would refund its budget and `maxAttempts` would bound nothing.
+    #[test]
+    fn a_retry_request_is_honoured_once() {
+        let mut status = failed_with_spent_budget(Phase::Failed);
+        status.observed_retry_token = Some("now".into());
+        assert!(!sync_retry_request(
+            &mut status,
+            Some("now"),
+            &Phase::Failed
+        ));
+        assert_eq!(status.retry_count, 3);
+    }
+
+    /// A long value is recorded abbreviated, and still works as a request: the same value is
+    /// recognised on the next tick, and a different one sharing its prefix is a new request.
+    #[test]
+    fn a_long_retry_request_is_recorded_abbreviated() {
+        let long = format!("{}-a", "x".repeat(100));
+        let mut status = failed_with_spent_budget(Phase::Failed);
+        assert!(sync_retry_request(&mut status, Some(&long), &Phase::Failed));
+        let recorded = status.observed_retry_token.clone().unwrap();
+        assert!(recorded.starts_with(&"x".repeat(MAX_RETRY_TOKEN_LEN / 2)));
+        assert!(recorded.chars().count() <= MAX_RETRY_TOKEN_LEN);
+
+        status.retry_count = 3;
+        assert!(!sync_retry_request(
+            &mut status,
+            Some(&long),
+            &Phase::Failed
+        ));
+        assert_eq!(status.retry_count, 3);
+
+        let other = format!("{}-b", "x".repeat(100));
+        assert!(sync_retry_request(
+            &mut status,
+            Some(&other),
+            &Phase::Failed
+        ));
+        assert_eq!(status.retry_count, 0);
+    }
+
+    /// Removing the annotation is not a request either, and the observed value is kept so that
+    /// re-adding the same one is not mistaken for a new request.
+    #[test]
+    fn removing_the_annotation_is_not_a_retry_request() {
+        let mut status = failed_with_spent_budget(Phase::Failed);
+        assert!(!sync_retry_request(&mut status, None, &Phase::Failed));
+        assert_eq!(status.retry_count, 3);
+        assert_eq!(status.observed_retry_token.as_deref(), Some("before"));
+    }
+
+    /// Only a failure has anything to retry. The request is still recorded, so a later failure
+    /// needs a request of its own rather than inheriting this one.
+    #[test]
+    fn a_retry_request_on_a_plan_that_did_not_fail_is_recorded_only() {
+        for verdict in [Phase::Succeeded, Phase::Pending, Phase::Delayed] {
+            let mut status = failed_with_spent_budget(verdict.clone());
+            assert!(!sync_retry_request(&mut status, Some("now"), &verdict));
+            assert_eq!(status.retry_count, 3);
+            assert_eq!(status.observed_retry_token.as_deref(), Some("now"));
+        }
+    }
+
+    /// Asked for during a run, the retry is judged by that run's outcome: nothing is recorded
+    /// now, so the tick the run finishes on still sees the request.
+    #[test]
+    fn a_retry_request_during_a_run_waits_for_its_result() {
+        let mut status = failed_with_spent_budget(Phase::Applying);
+        status.active_run = Some(v1beta1::ActiveRun {
+            execution_hash: "abc".into(),
+            run_id: "run-1".into(),
+            job_name: "apply-plan-1".into(),
+            play_uid: "play-uid".into(),
+            hosts: vec!["node-a".into()],
+            run_number: 1,
+            attempt: 1,
+            triggered_slot: None,
+        });
+        assert!(!sync_retry_request(
+            &mut status,
+            Some("now"),
+            &Phase::Applying
+        ));
+        assert_eq!(status.observed_retry_token.as_deref(), Some("before"));
+    }
+
+    /// The tick a run finishes on has not written its verdict to `phase` yet, so the caller
+    /// passes the verdict itself. A failed verdict must act even though `phase` still reads
+    /// `Applying`, or a request made during the run would be spent on nothing.
+    #[test]
+    fn a_retry_request_is_judged_by_the_verdict_it_is_given() {
+        let mut status = failed_with_spent_budget(Phase::Applying);
+        assert!(sync_retry_request(&mut status, Some("now"), &Phase::Failed));
+        assert_eq!(status.retry_count, 0);
+    }
+
+    /// The verdict comes from a run of the desired revision that finished on this tick, because
+    /// `phase` still reads `Applying` there. A run of an older revision, or no run at all, leaves
+    /// the plan's own phase as the answer.
+    #[test]
+    fn a_retry_request_is_judged_by_this_ticks_run_of_the_desired_revision() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let desired = ExecutionHash::from_hex("1").unwrap();
+        let finished = |hash: &str| FinishedRun {
+            run: finished_run(ExecutionHash::from_hex(hash).unwrap(), 1, 1, slot),
+            verdict: Phase::Failed,
+            failure: RunFailure::Real,
+            diagnostic: RunDiagnostic::None,
+        };
+
+        assert_eq!(
+            retry_request_verdict(Some(&finished("1")), &desired, &Phase::Applying),
+            Phase::Failed
+        );
+        assert_eq!(
+            retry_request_verdict(Some(&finished("2")), &desired, &Phase::Applying),
+            Phase::Applying
+        );
+        assert_eq!(
+            retry_request_verdict(None, &desired, &Phase::HostsUnreachable),
+            Phase::HostsUnreachable
+        );
     }
 
     /// Only `StaticInventory` groups carry key material; a managed-ssh Node is reached with a

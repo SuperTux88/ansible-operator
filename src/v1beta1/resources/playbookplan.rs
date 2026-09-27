@@ -510,6 +510,13 @@ pub struct PlaybookPlanStatus {
     /// and `lastAppliedHash` still keeps the run off the hosts that are already converged.
     #[serde(default)]
     pub observed_ssh_key_revision: Option<String>,
+    /// The last `ansible.cloudbending.dev/retry` annotation value this plan has acted on or
+    /// dismissed; a value over 64 characters is recorded as its first 32 and a hash of the whole.
+    /// A value different from this one is a new request: if the plan's last run failed, its
+    /// attempt budget is restored so it tries again, on the hosts that are still outdated only.
+    /// A request made while a run is in flight waits for that run and is judged by its result.
+    #[serde(default)]
+    pub observed_retry_token: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]

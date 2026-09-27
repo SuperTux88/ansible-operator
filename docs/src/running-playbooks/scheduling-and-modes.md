@@ -236,8 +236,8 @@ what its hosts need. Three answers say it could not, and none of them is somethi
   hosts are — resuming it is what starts the run.
 - a `OneShot` plan that has spent its [attempts](#retries) may not start another run, so a Node
   turning `Ready` under it changes nothing until the budget comes back — which an edit, a
-  `StaticInventory` SSH key rotation or a successful run does, and each of those has its own row in
-  the table above.
+  [retry request](#asking-a-failed-plan-to-try-again), a `StaticInventory` SSH key rotation or a
+  successful run does, and each of those has its own row in the table above.
 - a **scheduled** plan outside its tick's window is waiting on the clock, so a Node returning early
   brings its next tick no closer — whatever its mode. *Inside* the window it is woken like any other
   plan, because there it can act: the Node may be one the tick still owes a run, or the one thing a
@@ -357,8 +357,9 @@ What the budget covers depends on the mode, because what counts as "the same pie
   spent the plan stays `Failed` and starts nothing further — that is the point: its hosts are still
   out of date precisely *because* the runs failed, so nothing else would stop it. Editing the
   playbook or a referenced Secret changes the execution hash and hands it a fresh budget; so does
-  raising `maxAttempts`. A successful run also closes that execution and resets the budget, so hosts
-  added to the inventory later can run without an unrelated plan edit — and so does a run whose only
+  raising `maxAttempts`, or [asking it to try again](#asking-a-failed-plan-to-try-again). A
+  successful run also closes that execution and resets the budget, so hosts added to the inventory
+  later can run without an unrelated plan edit — and so does a run whose only
   non-successes were hosts on Nodes that were already `NotReady` when it launched, since every host
   it could reach did succeed (see [Unreachable Nodes and the attempt
   budget](./cluster-nodes.md#unreachable-nodes-and-the-attempt-budget)). A `schedule` does not reset a
@@ -384,6 +385,34 @@ scheduled execution can still start, as after a host-lock takeover clears within
 the unspent attempt remains available. Giving up a retry restores the preceding `Failed` verdict;
 giving up an execution's first attempt leaves the plan `Pending` because it has no verdict yet.
 
+### Asking a failed plan to try again
+
+Once the cause of a failure is fixed outside the plan — a full disk cleaned up, a package mirror back
+online — the plan can be told to try again without touching its spec, playbook or Secrets, by setting
+the `ansible.cloudbending.dev/retry` annotation:
+
+```bash
+kubectl annotate playbookplan <name> -n <namespace> \
+  ansible.cloudbending.dev/retry="$(date -Is)" --overwrite
+```
+
+Any value different from the last one the plan took in is a request, which is why a timestamp is a
+good choice: use a fresh one each time. Setting the same value again, or removing the annotation, does
+nothing. `.status.observedRetryToken` shows the last value the plan took in; a value longer than 64
+characters is shown shortened to its first 32 and a hash, and still works as a request.
+
+A request acts only when the plan's last run failed (`Failed` or `HostsUnreachable`), and then
+restores the whole `maxAttempts` budget. Like any retry it targets only the hosts that are still
+outdated, so hosts already on the current execution hash are not run again. On a plan that did not
+fail the request is recorded and changes nothing; a later failure needs a request of its own. A
+request made while a run is in flight waits for that run and takes effect only if it fails, and one
+made on a suspended plan is taken in at once, with the retry running when the plan is resumed.
+
+An unscheduled plan starts the retry straight away. A scheduled plan retries in its next window.
+
+The request is an annotation rather than a spec field so that a plan managed by Helm can be retried
+without editing its values: `helm upgrade` leaves alone an annotation that the chart does not render.
+
 ## Dependencies do not re-trigger a plan
 
 A dependency label says "this plan **may** run here", never "this plan **must** run again because
@@ -397,7 +426,8 @@ nothing at all, **including for hosts that become eligible later**. So if your p
 `maxAttempts` while its provider was still working through the fleet, it will not pick up the Nodes
 that were labelled afterwards. That is deliberate — a playbook that is failing should be fixed
 before it reaches more hosts — but it means the fix is to correct the plan (which hands it a fresh
-budget), not to wait.
+budget) or, once the cause is gone, to [ask it to try again](#asking-a-failed-plan-to-try-again),
+not to wait.
 
 ## Host locks
 
