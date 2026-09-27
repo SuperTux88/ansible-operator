@@ -1173,11 +1173,7 @@ async fn reconcile(
     } else {
         None
     };
-    if sync_ssh_key_revision(
-        &mut resource_status,
-        &object.spec.mode,
-        observed_ssh_key_revision.as_deref(),
-    ) {
+    if sync_ssh_key_revision(&mut resource_status, observed_ssh_key_revision.as_deref()) {
         info!(
             "PlaybookPlan {namespace}/{name}: the SSH key its StaticInventory hosts are reached \
              with has changed and its last run did not succeed — restoring its attempt budget"
@@ -5764,6 +5760,11 @@ async fn observe_ssh_key_revision(
 /// only act on if it is also given a try to act with. Like a retry request, the reset starts a new
 /// `retryGeneration`, so a scheduled plan retries inside a window its failures had closed.
 ///
+/// That holds for `Recurring` as much as for `OneShot`. Its budget would restart at the next tick
+/// anyway, so outside a window the reset changes nothing; inside one, clearing the slot the window's
+/// budget belongs to is what lets the plan act on the new key there rather than a whole interval
+/// later — the same thing [`sync_retry_request`] does on a user's request.
+///
 /// Three cases deliberately do not reset it:
 ///
 /// - **the first observation.** A plan upgraded into this field has not rotated anything, and a plan
@@ -5778,11 +5779,7 @@ async fn observe_ssh_key_revision(
 ///   be noticed once the run drains. The caller skips the Secret read on the same condition rather
 ///   than paying for an answer this would discard; the check stays here so the rule lives with the
 ///   reasoning for it and does not depend on a caller remembering it.
-fn sync_ssh_key_revision(
-    status: &mut PlaybookPlanStatus,
-    mode: &ExecutionMode,
-    observed: Option<&str>,
-) -> bool {
+fn sync_ssh_key_revision(status: &mut PlaybookPlanStatus, observed: Option<&str>) -> bool {
     let Some(observed) = observed else {
         return false;
     };
@@ -5794,13 +5791,7 @@ fn sync_ssh_key_revision(
     let first_observation = status.observed_ssh_key_revision.is_none();
     status.observed_ssh_key_revision = Some(observed.to_string());
 
-    // `Recurring` is left out because its budget already restarts at every schedule tick, so there
-    // is nothing here to give back — and `record_retry_budget` would clear the slot the current
-    // tick's budget belongs to.
-    if first_observation
-        || !matches!(mode, ExecutionMode::OneShot)
-        || !status::may_need_another_run(status)
-    {
+    if first_observation || !status::may_need_another_run(status) {
         return false;
     }
 
@@ -5813,10 +5804,9 @@ fn sync_ssh_key_revision(
 /// whether it did. It also starts a new `retryGeneration`, which is what lets the request reopen a
 /// schedule window its failures closed (see [`window_taken_by_a_record`]).
 ///
-/// Modelled on [`sync_ssh_key_revision`], with three deliberate differences. The first observation
+/// Modelled on [`sync_ssh_key_revision`], with two deliberate differences. The first observation
 /// acts, because an annotation that appears is a request, while a key that appears is not a
-/// rotation. `Recurring` is included and its budget slot cleared, because restarting the current
-/// tick's budget is what was asked for. And the gate is a failure verdict rather than
+/// rotation. And the gate is a failure verdict rather than
 /// [`status::may_need_another_run`]: a `Pending` or `Delayed` plan has nothing to retry, and
 /// consuming the token there would leave the user's request with nothing to show for it.
 ///
@@ -12921,11 +12911,7 @@ spec:
     fn rotating_the_ssh_key_gives_a_failed_plan_its_attempts_back() {
         let mut status = rotated("old", Phase::Failed);
 
-        assert!(sync_ssh_key_revision(
-            &mut status,
-            &ExecutionMode::OneShot,
-            Some("new")
-        ));
+        assert!(sync_ssh_key_revision(&mut status, Some("new")));
         assert_eq!(status.retry_count, 0);
         assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("new"));
         // A new generation, as for a retry request: the failures before the rotation no longer
@@ -12940,11 +12926,7 @@ spec:
     fn rotating_the_ssh_key_does_not_disturb_a_plan_that_succeeded() {
         let mut status = rotated("old", Phase::Succeeded);
 
-        assert!(!sync_ssh_key_revision(
-            &mut status,
-            &ExecutionMode::OneShot,
-            Some("new")
-        ));
+        assert!(!sync_ssh_key_revision(&mut status, Some("new")));
         assert_eq!(status.retry_count, 3);
         assert_eq!(status.retry_generation, 0);
         // Still recorded: the plan has seen this key, so a *later* failure must not be credited
@@ -12963,11 +12945,7 @@ spec:
             ..Default::default()
         };
 
-        assert!(!sync_ssh_key_revision(
-            &mut status,
-            &ExecutionMode::OneShot,
-            Some("first")
-        ));
+        assert!(!sync_ssh_key_revision(&mut status, Some("first")));
         assert_eq!(status.retry_count, 3);
         assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("first"));
     }
@@ -12979,11 +12957,7 @@ spec:
     fn an_unanswerable_key_observation_decides_nothing() {
         let mut status = rotated("old", Phase::Failed);
 
-        assert!(!sync_ssh_key_revision(
-            &mut status,
-            &ExecutionMode::OneShot,
-            None
-        ));
+        assert!(!sync_ssh_key_revision(&mut status, None));
         assert_eq!(status.retry_count, 3);
         assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("old"));
     }
@@ -13006,11 +12980,7 @@ spec:
             retry_generation: 0,
         });
 
-        assert!(!sync_ssh_key_revision(
-            &mut status,
-            &ExecutionMode::OneShot,
-            Some("new")
-        ));
+        assert!(!sync_ssh_key_revision(&mut status, Some("new")));
         assert_eq!(
             status.observed_ssh_key_revision.as_deref(),
             Some("old"),
@@ -13018,10 +12988,11 @@ spec:
         );
     }
 
-    /// `Recurring` already restarts its budget at every schedule tick, so there is nothing to give
-    /// back — and `record_retry_budget` would clear the slot the current tick's budget belongs to.
+    /// A `Recurring` plan's budget belongs to a schedule slot. A rotation inside that slot's window
+    /// hands the slot's budget back too, so the plan acts on the new key in the window it failed in
+    /// rather than a whole interval later — as it would on a user's retry request.
     #[test]
-    fn a_recurring_plan_records_the_rotation_without_touching_its_budget() {
+    fn a_rotation_hands_back_a_slot_scoped_budget() {
         let mut status = rotated("old", Phase::Failed);
         status.retry_count_slot = Some(
             "2025-08-12T20:00:00Z"
@@ -13029,13 +13000,10 @@ spec:
                 .unwrap(),
         );
 
-        assert!(!sync_ssh_key_revision(
-            &mut status,
-            &ExecutionMode::Recurring,
-            Some("new")
-        ));
-        assert_eq!(status.retry_count, 3);
-        assert!(status.retry_count_slot.is_some());
+        assert!(sync_ssh_key_revision(&mut status, Some("new")));
+        assert_eq!(status.retry_count, 0);
+        assert_eq!(status.retry_count_slot, None);
+        assert_eq!(status.retry_generation, 1);
         assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("new"));
     }
 
@@ -13045,11 +13013,7 @@ spec:
     fn an_unchanged_key_is_not_a_rotation() {
         let mut status = rotated("same", Phase::Failed);
 
-        assert!(!sync_ssh_key_revision(
-            &mut status,
-            &ExecutionMode::OneShot,
-            Some("same")
-        ));
+        assert!(!sync_ssh_key_revision(&mut status, Some("same")));
         assert_eq!(status.retry_count, 3);
     }
 

@@ -291,10 +291,11 @@ An SSH key rotation is the one input that is *noticed* without being hashed. `St
 key material is deliberately outside the execution hash — that hash decides which hosts are outdated,
 so folding a key into it would re-apply the playbook to hosts that are already current. Instead
 `status.observedSshKeyRevision` fingerprints it (`execution_evaluator::hash_secret_data`), and a
-change restores a `OneShot` plan's attempt budget when its last run did not succeed
-(`sync_ssh_key_revision`). The budget reset is the point: a plan whose hosts rejected the old key has
-spent every try by then — a `StaticInventory` host has no proxy grace window in front of it — so
-waking it alone would achieve nothing. `mappers::ssh_secret_to_playbookplans` supplies the wake-up,
+change restores the plan's attempt budget when its last run did not succeed
+(`sync_ssh_key_revision`) — in either mode: for `Recurring` that is the open slot's budget, so the
+plan acts on the new key inside that window rather than an interval later. The budget reset is the
+point: a plan whose hosts rejected the old key has spent every try by then — a `StaticInventory`
+host has no proxy grace window in front of it — so waking it alone would achieve nothing. `mappers::ssh_secret_to_playbookplans` supplies the wake-up,
 and both sides share `status::may_need_another_run` so the mapper can never wake a plan the reset
 would then decline. The first observation is recorded without acting, which is what keeps an upgrade
 from handing every failed plan a free retry at once.
