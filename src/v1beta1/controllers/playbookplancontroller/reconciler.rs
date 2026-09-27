@@ -1578,6 +1578,7 @@ async fn reconcile(
                         slot,
                         &execution_hash,
                         max_attempts,
+                        resource_status.retry_generation,
                         &hosts_to_trigger,
                     )
                     .await?
@@ -2185,6 +2186,7 @@ async fn schedule_window_already_taken(
     slot: DateTime<FixedOffset>,
     desired_hash: &ExecutionHash,
     max_attempts: u32,
+    retry_generation: u32,
     hosts_to_trigger: &[String],
 ) -> Result<bool, ReconcileError> {
     let (namespace, plan_name) = namespace_and_name(object)?;
@@ -2204,6 +2206,7 @@ async fn schedule_window_already_taken(
         slot,
         desired_hash,
         max_attempts,
+        retry_generation,
         hosts_to_trigger,
     ))
 }
@@ -2249,12 +2252,18 @@ async fn schedule_window_already_taken(
 /// `Failed` on its record, yet the budget handed its attempt back; counting it here anyway took
 /// back what the refund gave, so with `maxAttempts: 1` the Node's return inside the window found it
 /// closed and waited for the next tick.
+///
+/// Failures from an earlier `retryGeneration` are not counted: a user's retry request
+/// ([`sync_retry_request`]) handed the budget back after them. Only the budget: `Running` and
+/// `Succeeded` records close the window whatever their generation, because a run in flight and a
+/// host already covered are facts about the window, not about how many tries it cost.
 fn window_taken_by_a_record(
     plays: &[Play],
     plan: &PlaybookPlan,
     slot: DateTime<FixedOffset>,
     desired_hash: &ExecutionHash,
     max_attempts: u32,
+    retry_generation: u32,
     hosts_to_trigger: &[String],
 ) -> bool {
     let (Some(plan_name), Some(uid)) =
@@ -2287,7 +2296,8 @@ fn window_taken_by_a_record(
             // `Unknown` counts as a failure here for the same reason it does everywhere else: a
             // recap that could not be read is not evidence the hosts were reached.
             v1beta1::PlayPhase::Failed | v1beta1::PlayPhase::Unknown
-                if !returns_its_attempt(&classify_run_failure(status)) =>
+                if play.spec.retry_generation == retry_generation
+                    && !returns_its_attempt(&classify_run_failure(status)) =>
             {
                 failures += 1;
             }
@@ -3263,6 +3273,7 @@ async fn try_start_run(
                     preparation_fingerprint: run.preparation_fingerprint,
                     run_number: selected.run_number,
                     attempt,
+                    retry_generation: resource_status.retry_generation,
                     inventory: &inventory,
                     triggered_slot: run.triggered_slot,
                 },
@@ -5440,6 +5451,9 @@ fn adopt_recovered_run(status: &mut PlaybookPlanStatus, active_run: &ActiveRun) 
         status.last_run_number = status.last_run_number.max(active_run.run_number);
         record_retry_budget(status, active_run.attempt, active_run.triggered_slot);
     }
+    // A cached status behind the hand-back that prepared this run would otherwise write the older
+    // generation back, and the next hand-back would reissue this run's number.
+    status.retry_generation = status.retry_generation.max(active_run.retry_generation);
     status.phase = Phase::Applying;
     status.summary = Some(applying_summary(active_run));
     status.active_run = Some(active_run.clone());
@@ -5633,6 +5647,10 @@ fn stage_finished_run(finished: &RecordedRun, resource_status: &mut PlaybookPlan
 /// execution that made all the progress there was to make is complete, so the current-revision
 /// surviving run is authoritative when present, and the finished run is authoritative otherwise.
 /// Its slot travels with it so a pruned record cannot leave an unscoped count behind.
+///
+/// Except for a run of an older `retryGeneration`: that is a result replayed after the budget was
+/// handed back (`sync_retry_request`), because its record could not be
+/// acknowledged, and writing its attempt again would take back what was handed back.
 fn sync_desired_hash_after_finished_run(
     status: &mut PlaybookPlanStatus,
     desired_hash: &ExecutionHash,
@@ -5669,7 +5687,9 @@ fn sync_desired_hash_after_finished_run(
         });
     if let Some((attempt, slot)) = surviving_attempt {
         record_retry_budget(status, attempt, slot);
-    } else if finished.execution_hash == *desired_hash {
+    } else if finished.execution_hash == *desired_hash
+        && finished.mirror.retry_generation >= status.retry_generation
+    {
         if returns_its_attempt(finished_failure) {
             record_retry_budget(status, 0, None);
         } else {
@@ -5789,7 +5809,8 @@ fn sync_ssh_key_revision(
 
 /// Acts on a user's request to retry a failed plan (`labels::RETRY_ANNOTATION`): a token the plan
 /// has not observed restores the whole attempt budget when `last_verdict` is a failure. Returns
-/// whether it did.
+/// whether it did. It also starts a new `retryGeneration`, which is what lets the request reopen a
+/// schedule window its failures closed (see [`window_taken_by_a_record`]).
 ///
 /// Modelled on [`sync_ssh_key_revision`], with three deliberate differences. The first observation
 /// acts, because an annotation that appears is a request, while a key that appears is not a
@@ -5823,6 +5844,7 @@ fn sync_retry_request(
     }
 
     record_retry_budget(status, 0, None);
+    status.retry_generation = status.retry_generation.saturating_add(1);
     true
 }
 
@@ -6287,6 +6309,7 @@ fn recorded_run_from_play(play: &Play) -> Result<RecordedRun, ReconcileError> {
             run_number: play.spec.run_number,
             attempt: play.spec.attempt,
             triggered_slot: play.spec.triggered_slot,
+            retry_generation: play.spec.retry_generation,
         },
         execution_hash,
     })
@@ -8613,6 +8636,7 @@ mod tests {
                     run_number: 1,
                     attempt: 1,
                     triggered_slot: None,
+                    retry_generation: 0,
                 },
                 execution_hash: hash,
             },
@@ -8877,6 +8901,7 @@ mod tests {
                 run_number: 1,
                 attempt: 1,
                 triggered_slot: None,
+                retry_generation: 0,
             },
         };
         let mirroring = |mirrored: Option<&RecordedRun>| PlaybookPlanStatus {
@@ -8926,6 +8951,7 @@ mod tests {
                 run_number: 1,
                 attempt: 1,
                 triggered_slot: None,
+                retry_generation: 0,
             },
         };
         let next_run = "2025-08-12T20:00:00Z"
@@ -8958,6 +8984,7 @@ mod tests {
                 run_number: 8,
                 attempt,
                 triggered_slot: None,
+                retry_generation: 0,
             },
         };
         let slot = "2025-08-12T20:00:00Z"
@@ -9050,6 +9077,7 @@ mod tests {
                 run_number: 8,
                 attempt: 2,
                 triggered_slot: None,
+                retry_generation: 0,
             },
         };
         let mut status = PlaybookPlanStatus {
@@ -9126,6 +9154,7 @@ mod tests {
                 run_number: 1,
                 attempt: 1,
                 triggered_slot: None,
+                retry_generation: 0,
             }),
             ..Default::default()
         }
@@ -9285,6 +9314,7 @@ mod tests {
                 run_number: 1,
                 attempt: 1,
                 triggered_slot: None,
+                retry_generation: 0,
             },
         };
 
@@ -9331,6 +9361,7 @@ mod tests {
                     }],
                     provides_version: None,
                     triggered_slot: None,
+                    retry_generation: 0,
                 },
             );
             play.metadata = ObjectMeta {
@@ -9382,6 +9413,7 @@ mod tests {
                 run_number: 1,
                 attempt: 1,
                 triggered_slot: None,
+                retry_generation: 0,
             }),
             ..Default::default()
         });
@@ -9584,6 +9616,7 @@ mod tests {
                     }],
                     provides_version: None,
                     triggered_slot,
+                    retry_generation: 0,
                 },
             );
             play.metadata = ObjectMeta {
@@ -9605,7 +9638,8 @@ mod tests {
         // `Succeeded` record covers it and the window is spent; a window still owing a host the
         // records never reached is the neighbouring case, pinned below.
         let owed = ["node-a".to_string()];
-        let taken = |plays: &[Play]| window_taken_by_a_record(plays, &plan, slot, &hash, 1, &owed);
+        let taken =
+            |plays: &[Play]| window_taken_by_a_record(plays, &plan, slot, &hash, 1, 0, &owed);
 
         // A run that reached a Job takes the window, running or already finished — the plan's
         // marker is written from these and may be behind them, or missing entirely. For the
@@ -9656,6 +9690,7 @@ mod tests {
             slot,
             &other_hash,
             1,
+            0,
             &owed,
         ));
         assert!(!taken(&[play(
@@ -9711,6 +9746,7 @@ mod tests {
                     }],
                     provides_version: None,
                     triggered_slot: Some(slot),
+                    retry_generation: 0,
                 },
             );
             play.metadata.owner_references = Some(vec![OwnerReference {
@@ -9726,7 +9762,7 @@ mod tests {
         };
         let taken = |plays: &[Play], owed: &[&str]| {
             let owed: Vec<String> = owed.iter().map(|host| (*host).to_string()).collect();
-            window_taken_by_a_record(plays, &plan, slot, &hash, 1, &owed)
+            window_taken_by_a_record(plays, &plan, slot, &hash, 1, 0, &owed)
         };
 
         let ran_over_a_and_b = [succeeded_over(&["node-a", "node-b"])];
@@ -9801,6 +9837,7 @@ mod tests {
                 ],
                 provides_version: None,
                 triggered_slot: Some(slot),
+                retry_generation: 0,
             },
         );
         play.metadata.creation_timestamp = Some(Time(
@@ -9840,7 +9877,7 @@ mod tests {
         };
         let owed = ["node-b".to_string()];
         assert!(
-            !window_taken_by_a_record(&without_the_external_twin, &plan, slot, &hash, 1, &owed),
+            !window_taken_by_a_record(&without_the_external_twin, &plan, slot, &hash, 1, 0, &owed),
             "the fresh machine is still owed this window's run"
         );
         assert!(window_taken_by_a_record(
@@ -9849,6 +9886,7 @@ mod tests {
             slot,
             &hash,
             1,
+            0,
             &["node-a".to_string()]
         ));
     }
@@ -9883,6 +9921,7 @@ mod tests {
                     }],
                     provides_version: None,
                     triggered_slot: Some(slot),
+                    retry_generation: 0,
                 },
             );
             play.metadata.owner_references = Some(vec![OwnerReference {
@@ -9900,7 +9939,7 @@ mod tests {
         // theirs covers it.
         let owed = ["node-a".to_string()];
         let taken = |plays: &[Play], max_attempts| {
-            window_taken_by_a_record(plays, &plan, slot, &hash, max_attempts, &owed)
+            window_taken_by_a_record(plays, &plan, slot, &hash, max_attempts, 0, &owed)
         };
 
         assert!(!taken(&[failed("run-1")], 3));
@@ -9923,6 +9962,76 @@ mod tests {
         let mut running = failed("run-2");
         running.status.as_mut().unwrap().phase = v1beta1::PlayPhase::Running;
         assert!(taken(&[failed("run-1"), running], 3));
+    }
+
+    /// A retry request reopens a window its failures had closed, and only that: failures from
+    /// before it stop counting, while a run still going or one that already covered the host keep
+    /// the window closed whatever generation it belongs to.
+    #[test]
+    fn a_retry_request_reopens_a_window_its_failures_closed() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.metadata.uid = Some("plan-uid".into());
+
+        let record = |name: &str, phase: v1beta1::PlayPhase, retry_generation: u32| {
+            let mut play = Play::new(
+                name,
+                v1beta1::PlaySpec {
+                    playbook_plan: "plan".into(),
+                    playbook_plan_uid: "plan-uid".into(),
+                    execution_hash: "1a".into(),
+                    run_id: name.into(),
+                    preparation_fingerprint: "fp".into(),
+                    run_number: 1,
+                    attempt: 1,
+                    inventory: vec![ResolvedHosts {
+                        name: "group".into(),
+                        hosts: vec!["node-a".into()],
+                        ..Default::default()
+                    }],
+                    provides_version: None,
+                    triggered_slot: Some(slot),
+                    retry_generation,
+                },
+            );
+            play.metadata.owner_references = Some(vec![OwnerReference {
+                uid: "plan-uid".into(),
+                name: "plan".into(),
+                ..Default::default()
+            }]);
+            play.status = Some(v1beta1::PlayStatus {
+                phase,
+                ..Default::default()
+            });
+            play
+        };
+        let owed = ["node-a".to_string()];
+        let taken = |plays: &[Play], retry_generation| {
+            window_taken_by_a_record(plays, &plan, slot, &hash, 1, retry_generation, &owed)
+        };
+
+        let spent = [record("run-1", v1beta1::PlayPhase::Failed, 0)];
+        assert!(taken(&spent, 0));
+        assert!(
+            !taken(&spent, 1),
+            "a failure from before the request must not count"
+        );
+        assert!(taken(
+            &[
+                record("run-1", v1beta1::PlayPhase::Failed, 0),
+                record("run-2", v1beta1::PlayPhase::Failed, 1),
+            ],
+            1
+        ));
+
+        assert!(taken(
+            &[record("run-1", v1beta1::PlayPhase::Succeeded, 0)],
+            1
+        ));
+        assert!(taken(&[record("run-1", v1beta1::PlayPhase::Running, 0)], 1));
     }
 
     /// The refund and the window must agree. A scheduled `OneShot` run that reached every host it
@@ -9963,6 +10072,7 @@ mod tests {
                     inventory: Vec::new(),
                     provides_version: None,
                     triggered_slot: Some(slot),
+                    retry_generation: 0,
                 },
             );
             play.metadata.owner_references = Some(vec![OwnerReference {
@@ -10017,6 +10127,7 @@ mod tests {
             slot,
             &hash,
             1,
+            0,
             &owed,
         ));
 
@@ -10046,6 +10157,7 @@ mod tests {
                     slot,
                     &hash,
                     1,
+                    0,
                     &owed
                 ),
                 "{what}"
@@ -10060,6 +10172,7 @@ mod tests {
             slot,
             &hash,
             1,
+            0,
             &owed,
         ));
 
@@ -10070,6 +10183,7 @@ mod tests {
             slot,
             &hash,
             1,
+            0,
             &owed,
         ));
     }
@@ -10271,6 +10385,7 @@ mod tests {
                 run_number: 1,
                 attempt: 1,
                 triggered_slot: None,
+                retry_generation: 0,
             }),
             ..Default::default()
         };
@@ -10341,6 +10456,7 @@ mod tests {
                         run_number: 1,
                         attempt: 1,
                         triggered_slot: None,
+                        retry_generation: 0,
                     },
                     execution_hash: hash,
                 },
@@ -10367,6 +10483,7 @@ mod tests {
                         run_number: 1,
                         attempt: 1,
                         triggered_slot: None,
+                        retry_generation: 0,
                     },
                     execution_hash: hash,
                 },
@@ -11003,6 +11120,7 @@ spec:
                 run_number: 1,
                 attempt: 1,
                 triggered_slot: Some(old_next),
+                retry_generation: 0,
             }),
             summary: Some("applying run apply-plan-1-1".into()),
             ..Default::default()
@@ -11483,6 +11601,7 @@ spec:
                 run_number: 1,
                 attempt: 1,
                 triggered_slot: Some(slot),
+                retry_generation: 0,
             }),
             current_hash: old_hash.to_string(),
             phase: Phase::Applying,
@@ -11558,6 +11677,7 @@ spec:
             run_number: 4,
             attempt: 4,
             triggered_slot: None,
+            retry_generation: 0,
         };
         let error = unsynced_inventory();
         assert!(!input_error_supersedes_unlaunched(&error));
@@ -11701,6 +11821,7 @@ spec:
                 run_number: 1,
                 attempt: 1,
                 triggered_slot: None,
+                retry_generation: 0,
             }),
             phase: Phase::Applying,
             ..Default::default()
@@ -11744,6 +11865,7 @@ spec:
                 run_number: 1,
                 attempt: 1,
                 triggered_slot: None,
+                retry_generation: 0,
             }),
             ..Default::default()
         };
@@ -12089,6 +12211,7 @@ spec:
             run_number: 4,
             attempt: 4,
             triggered_slot: Some(slot),
+            retry_generation: 0,
         };
         let mut matching = PlaybookPlanStatus {
             current_hash: "1".into(),
@@ -12142,6 +12265,7 @@ spec:
             run_number: 4,
             attempt: 4,
             triggered_slot: None,
+            retry_generation: 0,
         };
 
         let mut status = PlaybookPlanStatus::default();
@@ -12193,6 +12317,7 @@ spec:
                 run_number: 4,
                 attempt: 2,
                 triggered_slot: None,
+                retry_generation: 0,
             },
         };
         let mut status = PlaybookPlanStatus {
@@ -12290,6 +12415,7 @@ spec:
                     }],
                     provides_version: None,
                     triggered_slot: None,
+                    retry_generation: 0,
                 },
             );
             play.metadata = ObjectMeta {
@@ -12413,6 +12539,7 @@ spec:
                 }],
                 provides_version: None,
                 triggered_slot: None,
+                retry_generation: 0,
             },
         );
         play.metadata.uid = Some("play-uid".into());
@@ -12567,6 +12694,7 @@ spec:
                 run_number,
                 attempt,
                 triggered_slot: Some(slot),
+                retry_generation: 0,
             },
         }
     }
@@ -12863,6 +12991,7 @@ spec:
             run_number: 1,
             attempt: 1,
             triggered_slot: None,
+            retry_generation: 0,
         });
 
         assert!(!sync_ssh_key_revision(
@@ -13031,6 +13160,7 @@ spec:
             run_number: 1,
             attempt: 1,
             triggered_slot: None,
+            retry_generation: 0,
         });
         assert!(!sync_retry_request(
             &mut status,
@@ -13078,6 +13208,23 @@ spec:
             retry_request_verdict(None, &desired, &Phase::HostsUnreachable),
             Phase::HostsUnreachable
         );
+    }
+
+    /// Acting on a request starts a new generation; recording one without acting does not, since
+    /// nothing was reopened.
+    #[test]
+    fn only_an_honoured_retry_request_starts_a_generation() {
+        let mut failed = failed_with_spent_budget(Phase::Failed);
+        assert!(sync_retry_request(&mut failed, Some("now"), &Phase::Failed));
+        assert_eq!(failed.retry_generation, 1);
+
+        let mut succeeded = failed_with_spent_budget(Phase::Succeeded);
+        assert!(!sync_retry_request(
+            &mut succeeded,
+            Some("now"),
+            &Phase::Succeeded
+        ));
+        assert_eq!(succeeded.retry_generation, 0);
     }
 
     /// Only `StaticInventory` groups carry key material; a managed-ssh Node is reached with a
@@ -13444,6 +13591,79 @@ spec:
         // Still the desired revision, so the slot it consumed keeps it from re-triggering itself
         // inside its own grace window.
         assert_eq!(status.last_triggered_run, Some(slot));
+    }
+
+    /// A finished result is replayed when its record could not be acknowledged after the status
+    /// write. If a retry request handed the budget back on the first pass, the replay must not
+    /// spend it again: the token is already observed, so the request would be lost for good.
+    #[test]
+    fn a_replayed_result_does_not_take_back_an_honoured_retry_request() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let finished = finished_run(hash, 3, 3, slot);
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &finished,
+            &RunFailure::Real,
+            None,
+        );
+        assert!(sync_retry_request(&mut status, Some("now"), &Phase::Failed));
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &finished,
+            &RunFailure::Real,
+            None,
+        );
+        assert!(!sync_retry_request(
+            &mut status,
+            Some("now"),
+            &Phase::Failed
+        ));
+        assert_eq!(status.retry_count, 0);
+        assert_eq!(status.retry_count_slot, None);
+        // The rest of the replay still applies: the run's number and slot are claimed as before.
+        assert_eq!(status.last_run_number, 3);
+        assert_eq!(status.last_triggered_run, Some(slot));
+    }
+
+    /// A tick reading a cached status from before the hand-back that prepared a run must not write
+    /// the older generation back: the next hand-back would reissue the run's number, and its failure
+    /// would count against a window the hand-back was meant to reopen. Only ever raised, since an
+    /// older run adopted behind a drained result says nothing about the plan's current generation.
+    #[test]
+    fn adopting_a_run_never_lowers_the_retry_generation() {
+        let run = |retry_generation| ActiveRun {
+            execution_hash: "1".into(),
+            run_id: "run-1".into(),
+            job_name: "apply-plan-1-4".into(),
+            play_uid: "play-uid".into(),
+            hosts: vec!["worker-1".into()],
+            run_number: 4,
+            attempt: 1,
+            triggered_slot: None,
+            retry_generation,
+        };
+
+        let mut stale = PlaybookPlanStatus::default();
+        adopt_recovered_run(&mut stale, &run(1));
+        assert_eq!(stale.retry_generation, 1);
+
+        let mut current = PlaybookPlanStatus {
+            retry_generation: 2,
+            ..Default::default()
+        };
+        adopt_recovered_run(&mut current, &run(1));
+        assert_eq!(current.retry_generation, 2);
     }
 
     #[test]
@@ -13873,6 +14093,7 @@ spec:
                     run_number: 4,
                     attempt: 4,
                     triggered_slot: slot,
+                    retry_generation: 0,
                 },
             },
             phase,

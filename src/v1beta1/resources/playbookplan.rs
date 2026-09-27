@@ -517,6 +517,12 @@ pub struct PlaybookPlanStatus {
     /// A request made while a run is in flight waits for that run and is judged by its result.
     #[serde(default)]
     pub observed_retry_token: Option<String>,
+    /// How many retry requests this plan has acted on. Stamped onto every `Play` it prepares, so a
+    /// schedule window closed by failed runs can be reopened by a request: only the failures of the
+    /// current generation count against the window's budget.
+    #[serde(default)]
+    #[schemars(with = "UnsignedInt")]
+    pub retry_generation: u32,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
@@ -542,6 +548,11 @@ pub struct ActiveRun {
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub triggered_slot: Option<DateTime<FixedOffset>>,
+    /// The plan's `status.retryGeneration` this run was prepared under. A result replayed after a
+    /// newer generation handed the budget back does not spend it again.
+    #[serde(default)]
+    #[schemars(with = "UnsignedInt")]
+    pub retry_generation: u32,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]

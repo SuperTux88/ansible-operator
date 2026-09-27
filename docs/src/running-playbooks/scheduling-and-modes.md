@@ -408,7 +408,17 @@ fail the request is recorded and changes nothing; a later failure needs a reques
 request made while a run is in flight waits for that run and takes effect only if it fails, and one
 made on a suspended plan is taken in at once, with the retry running when the plan is resumed.
 
-An unscheduled plan starts the retry straight away. A scheduled plan retries in its next window.
+An unscheduled plan starts the retry straight away. A scheduled plan inside an open window retries
+in that window, because the failures from before the request no longer count against it; like any
+retry it must still start before `startingDeadlineSeconds` runs out. Outside a window it waits for
+the next slot — which for a `Recurring` plan would have started with a fresh budget anyway, so the
+request matters there only while a window is open.
+
+What stops the earlier failures counting is a generation number. Each request that acts raises
+`.status.retryGeneration`, every `Play` records the generation it was started under
+(`.spec.retryGeneration`), and a window counts only the failures of the current generation. So after
+a request, `kubectl get plays -o wide` can show a window's earlier failed runs next to new ones whose
+`Try` starts again at 1: the earlier ones belong to an older generation and no longer count.
 
 The request is an annotation rather than a spec field so that a plan managed by Helm can be retried
 without editing its values: `helm upgrade` leaves alone an annotation that the chart does not render.

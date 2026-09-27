@@ -985,6 +985,13 @@ spec:
                   playUid:
                     description: UID of the immutable `Play` recovery record correlated with the Job and its pod template.
                     type: string
+                  retryGeneration:
+                    default: 0
+                    description: |-
+                      The plan's `status.retryGeneration` this run was prepared under. A result replayed after a
+                      newer generation handed the budget back does not spend it again.
+                    minimum: 0.0
+                    type: integer
                   runId:
                     description: Stable per-run resource/cleanup identity, distinct even across same-hash retries.
                     type: string
@@ -1221,6 +1228,14 @@ spec:
                   handed its try back — the budget it would describe is no longer spent.
                 nullable: true
                 type: string
+              retryGeneration:
+                default: 0
+                description: |-
+                  How many retry requests this plan has acted on. Stamped onto every `Play` it prepares, so a
+                  schedule window closed by failed runs can be reopened by a request: only the failures of the
+                  current generation count against the window's budget.
+                minimum: 0.0
+                type: integer
               summary:
                 nullable: true
                 type: string

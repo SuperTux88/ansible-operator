@@ -61,6 +61,7 @@ pub struct PlayRef<'a> {
     pub preparation_fingerprint: &'a str,
     pub run_number: u32,
     pub attempt: u32,
+    pub retry_generation: u32,
     pub inventory: &'a [ResolvedHosts],
     pub triggered_slot: Option<chrono::DateTime<chrono::FixedOffset>>,
 }
@@ -711,6 +712,7 @@ fn build_play(play: &PlayRef<'_>) -> Result<Play, ReconcileError> {
             // with it would describe a revision that never existed.
             provides_version: play.plan.provides_version().map(str::to_string),
             triggered_slot: play.triggered_slot,
+            retry_generation: play.retry_generation,
         },
     );
     object.metadata.labels = Some(BTreeMap::from([
@@ -1035,6 +1037,7 @@ mod tests {
             preparation_fingerprint: fingerprint,
             run_number,
             attempt: 1,
+            retry_generation: 0,
             inventory,
             triggered_slot: None,
         }
@@ -1042,6 +1045,17 @@ mod tests {
 
     fn hash() -> ExecutionHash {
         ExecutionHash::from_hex("1").unwrap()
+    }
+
+    /// The generation is the caller's, taken from the tick's own status: the plan's copy is the
+    /// reflector's and does not yet hold a request acted on in this tick.
+    #[test]
+    fn build_play_records_the_retry_generation_it_is_given() {
+        let hash = hash();
+        let plan = plan("web", "plan-uid");
+        let mut play = play_ref(&plan, &hash, "run-1", "fp", 1, &[]);
+        play.retry_generation = 3;
+        assert_eq!(build_play(&play).unwrap().spec.retry_generation, 3);
     }
 
     /// The record is what a host's `appliedVersion` is later stamped from, so it has to be taken

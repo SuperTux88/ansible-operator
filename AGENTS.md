@@ -313,6 +313,18 @@ which only receives that verdict later in the terminal branch: reading `phase` t
 and silently spends a request made during the run. While a run is in flight (`activeRun`, including
 one adopted behind a drained result) nothing is recorded, so the request waits for that run's result.
 
+Resetting `retryCount` alone cannot reopen a schedule window, because `window_taken_by_a_record`
+counts the slot's failed `Play`s precisely *because* status may lag them. So each honoured request
+also bumps `status.retryGeneration`, every `Play` records the generation it was prepared under
+(passed through `PlayRef` from the tick's own status, never read from the reflector's plan), and the
+window gate counts only the current generation's failures. The same number keeps a *replayed* result
+(a terminal record whose acknowledgement failed after the status write) from taking the handed-back
+budget away again: `sync_desired_hash_after_finished_run` does not write the attempt of a run from an
+older generation, which is why `activeRun` mirrors the generation too. Do not replace it with the
+token on the record (values may repeat, `A → B → A`, which would count the first era's failures
+again), a timestamp cutoff (operator clock against apiserver clock) or a run-number cutoff (numbers
+restart below it once pruning frees them, so failures would stop counting at all).
+
 The "applied to at least one host" half is a bound, not a nicety: the gate reads the Node at tick
 time while `node_not_ready` is read a grace window later, so a Node that alternates across that
 window passes the gate *and* earns the refund, and the plan would run every grace window forever.
