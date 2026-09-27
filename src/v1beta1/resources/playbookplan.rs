@@ -510,6 +510,20 @@ pub struct PlaybookPlanStatus {
     /// and `lastAppliedHash` still keeps the run off the hosts that are already converged.
     #[serde(default)]
     pub observed_ssh_key_revision: Option<String>,
+    /// The last `ansible.cloudbending.dev/retry` annotation value this plan has acted on or
+    /// dismissed; a value over 64 characters is recorded as its first 32 and a hash of the whole.
+    /// A value different from this one is a new request: if the plan's last run failed, its
+    /// attempt budget is restored so it tries again, on the hosts that are still outdated only.
+    /// A request made while a run is in flight waits for that run and is judged by its result.
+    #[serde(default)]
+    pub observed_retry_token: Option<String>,
+    /// How many times this plan's attempt budget was handed back from outside a run: retry requests
+    /// acted on, and SSH key rotations that reset it. Stamped onto every `Play` it prepares, so a
+    /// schedule window closed by failed runs can be reopened by either: only the failures of the
+    /// current generation count against the window's budget.
+    #[serde(default)]
+    #[schemars(with = "UnsignedInt")]
+    pub retry_generation: u32,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
@@ -535,6 +549,11 @@ pub struct ActiveRun {
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub triggered_slot: Option<DateTime<FixedOffset>>,
+    /// The plan's `status.retryGeneration` this run was prepared under. A result replayed after a
+    /// newer generation handed the budget back does not spend it again.
+    #[serde(default)]
+    #[schemars(with = "UnsignedInt")]
+    pub retry_generation: u32,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]

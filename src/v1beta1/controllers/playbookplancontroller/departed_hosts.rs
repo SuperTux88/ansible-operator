@@ -212,6 +212,7 @@ mod tests {
             run_number: 1,
             attempt: 1,
             triggered_slot: None,
+            retry_generation: 0,
         });
 
         let departed = prune_departed_hosts(&store(vec![]), &mut status);

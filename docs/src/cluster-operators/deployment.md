@@ -122,9 +122,6 @@ that dies while the run is still bringing up other proxies cannot hold the run u
 The same wait bounds a proxy pod that does not come up on a `Ready` Node, such as one still pulling
 its image: the tiers below look only at the heartbeat, not at whether the Node is `Ready`.
 
-The same wait bounds a proxy pod that does not come up on a `Ready` Node, such as one still pulling
-its image: the tiers below look only at the heartbeat, not at whether the Node is `Ready`.
-
 The wait scales with how long the Node has been silent (its last `Ready` heartbeat): a Node that only
 just went `NotReady` is given the full wait, one silent for longer is given up on sooner. A healthy
 Node's heartbeat is up to a few minutes old, since the kubelet only reports its status every few

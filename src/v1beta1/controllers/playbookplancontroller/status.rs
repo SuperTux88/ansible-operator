@@ -566,8 +566,12 @@ pub fn held_for_unready_nodes(status: &PlaybookPlanStatus) -> bool {
 /// the budget reset that lets the woken plan act must agree exactly. If the mapper were the wider of
 /// the two it would wake plans that then decline to do anything; if it were the narrower, a plan
 /// would sit on a fix it had already been given.
-pub fn may_need_another_run(status: &PlaybookPlanStatus) -> bool {
-    status.phase != Phase::Succeeded
+///
+/// Takes the verdict rather than the status because the two sides read it from different places:
+/// the mapper from the cached `phase`, the reset from the run that finished on its tick when there
+/// is one, whose verdict only reaches `phase` later in that tick.
+pub fn may_need_another_run(last_verdict: &Phase) -> bool {
+    *last_verdict != Phase::Succeeded
 }
 
 pub fn clear_run_conditions(status: &mut PlaybookPlanStatus) {
@@ -1277,6 +1281,7 @@ mod tests {
                 run_number: 1,
                 attempt: 1,
                 triggered_slot: None,
+                retry_generation: 0,
             }),
             ..Default::default()
         };
@@ -1304,6 +1309,7 @@ mod tests {
                 run_number: 1,
                 attempt: 1,
                 triggered_slot: None,
+                retry_generation: 0,
             }),
             ..Default::default()
         };

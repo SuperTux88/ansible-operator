@@ -1038,7 +1038,8 @@ another run — see above.
 
 It has spent its [attempt budget](./scheduling-and-modes.md#retries): `.status.retryCount` has
 reached `spec.maxAttempts` (3 by default), so the plan holds its `Failed` result instead of applying
-a playbook its hosts have already refused that many times. Fix the cause and edit the playbook or a
-referenced Secret — the new execution hash starts a fresh budget — or raise `maxAttempts` to let it
-try again with the inputs unchanged. The failed runs are still in the plan's
+a playbook its hosts have already refused that many times. Fix the cause, then [ask it to try
+again](./scheduling-and-modes.md#asking-a-failed-plan-to-try-again), which restores its budget with
+the plan unchanged. Editing the playbook or a referenced Secret also starts a fresh budget, through
+the new execution hash, and so does raising `maxAttempts`. The failed runs are still in the plan's
 [run history](#run-history), which is where the recap of each attempt is.

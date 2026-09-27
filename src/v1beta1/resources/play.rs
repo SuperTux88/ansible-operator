@@ -115,6 +115,15 @@ pub struct PlaySpec {
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub triggered_slot: Option<DateTime<FixedOffset>>,
+
+    /// The plan's `status.retryGeneration` when this run was prepared. A failed run counts against
+    /// its schedule window's attempt budget only while the plan is still on this generation, which
+    /// is how a user's retry request, or an SSH key rotation that restores the budget, reopens a
+    /// window its failures had closed. Absent (0) on records written before this field existed,
+    /// matching a plan that never had a request.
+    #[serde(default)]
+    #[schemars(with = "UnsignedInt")]
+    pub retry_generation: u32,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]

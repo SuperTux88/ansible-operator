@@ -177,8 +177,8 @@ pub fn node_to_playbookplans(
 ///     waking for it is the point.
 ///
 /// Every other path that makes a `Recurring` plan actionable still has its own trigger: the slot
-/// arriving is its own requeue, a hash edit the plan watch, a key rotation the Secret watch, a result
-/// the Job watch.
+/// arriving is its own requeue, a hash edit or a retry request the plan watch, a key rotation the
+/// Secret watch, a result the Job watch.
 ///
 /// A `OneShot` plan whose attempt budget is spent is the other half of that question, and it is
 /// asked through `reconciler::attempt_budget_available` rather than restated here so the wake set and
@@ -187,8 +187,8 @@ pub fn node_to_playbookplans(
 /// the run repeats, and a host a down Node excluded stays `Unreachable` after the flap rule
 /// (`classify_run_failure`) has refused to refund the attempts. Both then sit on a Node that is
 /// `Ready` again and has nothing left to supply. Nothing that restores the budget arrives by this
-/// route either — a hash edit, an SSH key rotation and a successful run each have their own watch —
-/// so a Node event cannot be the thing that makes an exhausted plan actionable.
+/// route either — a hash edit, a retry request, an SSH key rotation and a successful run each have
+/// their own watch — so a Node event cannot be the thing that makes an exhausted plan actionable.
 ///
 /// A *scheduled* `OneShot` plan is bounded by its window as well, for the reason the first
 /// `Recurring` bound gives: outside it the tick lands in `Timing::Delayed` and can do nothing with
@@ -400,7 +400,7 @@ pub fn ssh_secret_to_playbookplans(
             .filter(|plan| {
                 plan.status
                     .as_ref()
-                    .is_some_and(status::may_need_another_run)
+                    .is_some_and(|status| status::may_need_another_run(&status.phase))
             })
             .filter(|plan| {
                 plan.spec

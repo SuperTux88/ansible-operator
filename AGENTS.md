@@ -113,7 +113,7 @@ src/v1beta1/
     render_error.rs                  shared YAML rendering error type
     ansible_operator_preflight.py    managed-ssh preflight gate; waits for every reachable proxy SSH banner
     ansible_operator_recap.py        Ansible callback plugin: writes per-host recap to /dev/termination-log
-  labels.rs                          PLAYBOOKPLAN_NAME / _HASH / _HOST / RUN_ID label keys, plus PLAY_UID_ANNOTATION (an annotation, never selectable)
+  labels.rs                          PLAYBOOKPLAN_NAME / _HASH / _HOST / RUN_ID label keys, plus PLAY_UID_ANNOTATION (an annotation, never selectable) and RETRY_ANNOTATION (user-set retry request)
 ```
 
 The managed-SSH preflight script is covered by `tests/python/test_preflight.py` and `just test-python`.
@@ -291,13 +291,44 @@ An SSH key rotation is the one input that is *noticed* without being hashed. `St
 key material is deliberately outside the execution hash — that hash decides which hosts are outdated,
 so folding a key into it would re-apply the playbook to hosts that are already current. Instead
 `status.observedSshKeyRevision` fingerprints it (`execution_evaluator::hash_secret_data`), and a
-change restores a `OneShot` plan's attempt budget when its last run did not succeed
-(`sync_ssh_key_revision`). The budget reset is the point: a plan whose hosts rejected the old key has
-spent every try by then — a `StaticInventory` host has no proxy grace window in front of it — so
-waking it alone would achieve nothing. `mappers::ssh_secret_to_playbookplans` supplies the wake-up,
+change restores the plan's attempt budget when its last run did not succeed
+(`sync_ssh_key_revision`) — in either mode: for `Recurring` that is the open slot's budget, so the
+plan acts on the new key inside that window rather than an interval later. The budget reset is the
+point: a plan whose hosts rejected the old key has spent every try by then — a `StaticInventory`
+host has no proxy grace window in front of it — so waking it alone would achieve nothing. `mappers::ssh_secret_to_playbookplans` supplies the wake-up,
 and both sides share `status::may_need_another_run` so the mapper can never wake a plan the reset
 would then decline. The first observation is recorded without acting, which is what keeps an upgrade
 from handing every failed plan a free retry at once.
+
+A human can hand the budget back too, without editing anything a Helm or GitOps source renders: a
+new value in the `ansible.cloudbending.dev/retry` annotation (`labels::RETRY_ANNOTATION`) restores
+the whole budget of a plan whose last run failed (`sync_retry_request`), and
+`status.observedRetryToken` records it so each value is honoured once — that dedupe is what keeps
+`maxAttempts` a bound. It looks like `sync_ssh_key_revision` and deliberately differs from it in
+two places. The **first observation acts**: an annotation that appears is a request, and no plan
+carried one before the feature, so there is no upgrade to protect. And the gate is
+**`is_failure_verdict`**, not `may_need_another_run`, and it needs no mapper, since the primary plan
+watch has no predicate and an annotation change already reconciles.
+
+Both hand-backs are **judged by the finished run's verdict** (`last_run_verdict`) when a run of the
+current hash finished this tick, not by `status.phase`, which only receives that verdict later in the
+terminal branch: reading `phase` there sees `Applying`, which would silently spend a retry request
+made during the run and hand a budget back for a key rotated during a run that succeeded. While a run
+is in flight (`activeRun`, including one adopted behind a drained result) nothing is recorded, so a
+request or rotation waits for that run's result.
+
+Resetting `retryCount` alone cannot reopen a schedule window, because `window_taken_by_a_record`
+counts the slot's failed `Play`s precisely *because* status may lag them. So each honoured request
+— and each SSH key rotation that resets the budget, through the same `hand_back_retry_budget` —
+also bumps `status.retryGeneration`, every `Play` records the generation it was prepared under
+(passed through `PlayRef` from the tick's own status, never read from the reflector's plan), and the
+window gate counts only the current generation's failures. The same number keeps a *replayed* result
+(a terminal record whose acknowledgement failed after the status write) from taking the handed-back
+budget away again: `sync_desired_hash_after_finished_run` does not write the attempt of a run from an
+older generation, which is why `activeRun` mirrors the generation too. Do not replace it with the
+token on the record (values may repeat, `A → B → A`, which would count the first era's failures
+again), a timestamp cutoff (operator clock against apiserver clock) or a run-number cutoff (numbers
+restart below it once pruning frees them, so failures would stop counting at all).
 
 The "applied to at least one host" half is a bound, not a nicety: the gate reads the Node at tick
 time while `node_not_ready` is read a grace window later, so a Node that alternates across that

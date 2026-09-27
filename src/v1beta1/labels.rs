@@ -16,6 +16,12 @@ pub const RUN_ID: &str = "ansible.cloudbending.dev/run-id";
 /// Annotation (not label): for exact-value comparison only. Never use in `LabelSelector`.
 pub const PLAY_UID_ANNOTATION: &str = "ansible.cloudbending.dev/play-uid";
 
+/// Set by a user on a `PlaybookPlan` to ask a failed plan to try again: any value different from the
+/// last one the plan observed (`status.observedRetryToken`) restores its attempt budget. An
+/// annotation rather than a spec field so a plan deployed by Helm or GitOps can be retried without
+/// drifting from its source.
+pub const RETRY_ANNOTATION: &str = "ansible.cloudbending.dev/retry";
+
 pub const COMPONENT: &str = "ansible.cloudbending.dev/component";
 pub const MANAGED_SSH_PROXY_COMPONENT: &str = "managed-ssh-proxy";
 pub const PLAYBOOK_COMPONENT: &str = "playbook";
