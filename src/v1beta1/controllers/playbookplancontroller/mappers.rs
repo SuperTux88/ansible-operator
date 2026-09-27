@@ -400,7 +400,7 @@ pub fn ssh_secret_to_playbookplans(
             .filter(|plan| {
                 plan.status
                     .as_ref()
-                    .is_some_and(status::may_need_another_run)
+                    .is_some_and(|status| status::may_need_another_run(&status.phase))
             })
             .filter(|plan| {
                 plan.spec

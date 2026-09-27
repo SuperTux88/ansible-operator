@@ -305,14 +305,17 @@ new value in the `ansible.cloudbending.dev/retry` annotation (`labels::RETRY_ANN
 the whole budget of a plan whose last run failed (`sync_retry_request`), and
 `status.observedRetryToken` records it so each value is honoured once — that dedupe is what keeps
 `maxAttempts` a bound. It looks like `sync_ssh_key_revision` and deliberately differs from it in
-three places. The **first observation acts**: an annotation that appears is a request, and no plan
-carried one before the feature, so there is no upgrade to protect. The gate is
+two places. The **first observation acts**: an annotation that appears is a request, and no plan
+carried one before the feature, so there is no upgrade to protect. And the gate is
 **`is_failure_verdict`**, not `may_need_another_run`, and it needs no mapper, since the primary plan
-watch has no predicate and an annotation change already reconciles. And it is **judged by the
-finished run's verdict** when a run of the current hash finished this tick, not by `status.phase`,
-which only receives that verdict later in the terminal branch: reading `phase` there sees `Applying`
-and silently spends a request made during the run. While a run is in flight (`activeRun`, including
-one adopted behind a drained result) nothing is recorded, so the request waits for that run's result.
+watch has no predicate and an annotation change already reconciles.
+
+Both hand-backs are **judged by the finished run's verdict** (`last_run_verdict`) when a run of the
+current hash finished this tick, not by `status.phase`, which only receives that verdict later in the
+terminal branch: reading `phase` there sees `Applying`, which would silently spend a retry request
+made during the run and hand a budget back for a key rotated during a run that succeeded. While a run
+is in flight (`activeRun`, including one adopted behind a drained result) nothing is recorded, so a
+request or rotation waits for that run's result.
 
 Resetting `retryCount` alone cannot reopen a schedule window, because `window_taken_by_a_record`
 counts the slot's failed `Play`s precisely *because* status may lag them. So each honoured request

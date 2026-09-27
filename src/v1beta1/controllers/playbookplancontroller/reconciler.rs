@@ -1173,18 +1173,24 @@ async fn reconcile(
     } else {
         None
     };
-    if sync_ssh_key_revision(&mut resource_status, observed_ssh_key_revision.as_deref()) {
+    // Both hand-backs below judge the plan's last run, which on the tick a run finishes is that run's
+    // verdict and not `phase` — see `last_run_verdict`.
+    let last_verdict = last_run_verdict(
+        finished_active_run.as_ref(),
+        &execution_hash,
+        &resource_status.phase,
+    );
+    if sync_ssh_key_revision(
+        &mut resource_status,
+        observed_ssh_key_revision.as_deref(),
+        &last_verdict,
+    ) {
         info!(
             "PlaybookPlan {namespace}/{name}: the SSH key its StaticInventory hosts are reached \
              with has changed and its last run did not succeed — restoring its attempt budget"
         );
     }
 
-    let last_verdict = retry_request_verdict(
-        finished_active_run.as_ref(),
-        &execution_hash,
-        &resource_status.phase,
-    );
     if sync_retry_request(
         &mut resource_status,
         object
@@ -5773,13 +5779,19 @@ async fn observe_ssh_key_revision(
 /// - **a `Succeeded` plan.** Its hosts are converged and the key it connected with worked; a
 ///   rotation is not a reason to touch them again. This is the same rule the mapper applies, from
 ///   [`status::may_need_another_run`], so a plan can never be woken for a rotation it would then
-///   decline to act on.
+///   decline to act on. It is asked of `last_verdict` ([`last_run_verdict`]) rather than of
+///   `status.phase`, which still reads `Applying` on the tick a run finishes, so a rotation during a
+///   run that then succeeded is recorded without acting.
 /// - **a run in flight.** Its outcome is not known yet, and resetting mid-run would talk over the
 ///   attempt it is currently spending. Nothing is recorded either, so the rotation is still there to
 ///   be noticed once the run drains. The caller skips the Secret read on the same condition rather
 ///   than paying for an answer this would discard; the check stays here so the rule lives with the
 ///   reasoning for it and does not depend on a caller remembering it.
-fn sync_ssh_key_revision(status: &mut PlaybookPlanStatus, observed: Option<&str>) -> bool {
+fn sync_ssh_key_revision(
+    status: &mut PlaybookPlanStatus,
+    observed: Option<&str>,
+    last_verdict: &Phase,
+) -> bool {
     let Some(observed) = observed else {
         return false;
     };
@@ -5791,7 +5803,7 @@ fn sync_ssh_key_revision(status: &mut PlaybookPlanStatus, observed: Option<&str>
     let first_observation = status.observed_ssh_key_revision.is_none();
     status.observed_ssh_key_revision = Some(observed.to_string());
 
-    if first_observation || !status::may_need_another_run(status) {
+    if first_observation || !status::may_need_another_run(last_verdict) {
         return false;
     }
 
@@ -5846,14 +5858,16 @@ fn hand_back_retry_budget(status: &mut PlaybookPlanStatus) {
     status.retry_generation = status.retry_generation.saturating_add(1);
 }
 
-/// The verdict [`sync_retry_request`] judges a request by: that of the run which finished on this
-/// tick when it applied the desired revision, the plan's `phase` otherwise.
+/// The verdict both budget hand-backs, [`sync_retry_request`] and [`sync_ssh_key_revision`], judge
+/// the plan's last run by: that of the run which finished on this tick when it applied the desired
+/// revision, the plan's `phase` otherwise.
 ///
-/// A finished run's verdict only reaches `phase` in the terminal branch, after the request has been
-/// judged, so reading `phase` on that tick sees `Applying` and dismisses a request made during the
-/// run. A run of an older revision says nothing about the current one, whose budget
-/// `update_desired_hash` has already restored.
-fn retry_request_verdict(
+/// A finished run's verdict only reaches `phase` in the terminal branch, after both have been
+/// asked, so reading `phase` on that tick sees `Applying`: a retry request made during the run would
+/// be dismissed, and a key rotated during a run that then succeeded would hand back a budget. A run
+/// of an older revision says nothing about the current one, whose budget `update_desired_hash` has
+/// already restored.
+fn last_run_verdict(
     finished: Option<&FinishedRun>,
     desired_hash: &ExecutionHash,
     phase: &Phase,
@@ -12911,7 +12925,11 @@ spec:
     fn rotating_the_ssh_key_gives_a_failed_plan_its_attempts_back() {
         let mut status = rotated("old", Phase::Failed);
 
-        assert!(sync_ssh_key_revision(&mut status, Some("new")));
+        assert!(sync_ssh_key_revision(
+            &mut status,
+            Some("new"),
+            &Phase::Failed
+        ));
         assert_eq!(status.retry_count, 0);
         assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("new"));
         // A new generation, as for a retry request: the failures before the rotation no longer
@@ -12926,12 +12944,41 @@ spec:
     fn rotating_the_ssh_key_does_not_disturb_a_plan_that_succeeded() {
         let mut status = rotated("old", Phase::Succeeded);
 
-        assert!(!sync_ssh_key_revision(&mut status, Some("new")));
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            Some("new"),
+            &Phase::Succeeded
+        ));
         assert_eq!(status.retry_count, 3);
         assert_eq!(status.retry_generation, 0);
         // Still recorded: the plan has seen this key, so a *later* failure must not be credited
         // with a rotation that already happened.
         assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("new"));
+    }
+
+    /// On the tick a run finishes, `phase` still reads `Applying`, so the rotation is judged by the
+    /// verdict it is given: a key rotated during a run that then succeeded is recorded and hands
+    /// nothing back, while one rotated during a run that failed does.
+    #[test]
+    fn a_rotation_is_judged_by_the_run_that_just_finished() {
+        let mut succeeded = rotated("old", Phase::Applying);
+        assert!(!sync_ssh_key_revision(
+            &mut succeeded,
+            Some("new"),
+            &Phase::Succeeded
+        ));
+        assert_eq!(succeeded.retry_count, 3);
+        assert_eq!(succeeded.retry_generation, 0);
+        assert_eq!(succeeded.observed_ssh_key_revision.as_deref(), Some("new"));
+
+        let mut failed = rotated("old", Phase::Applying);
+        assert!(sync_ssh_key_revision(
+            &mut failed,
+            Some("new"),
+            &Phase::Failed
+        ));
+        assert_eq!(failed.retry_count, 0);
+        assert_eq!(failed.retry_generation, 1);
     }
 
     /// The upgrade case. Every plan that predates this field observes its key for the first time on
@@ -12945,7 +12992,11 @@ spec:
             ..Default::default()
         };
 
-        assert!(!sync_ssh_key_revision(&mut status, Some("first")));
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            Some("first"),
+            &Phase::Failed
+        ));
         assert_eq!(status.retry_count, 3);
         assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("first"));
     }
@@ -12957,7 +13008,7 @@ spec:
     fn an_unanswerable_key_observation_decides_nothing() {
         let mut status = rotated("old", Phase::Failed);
 
-        assert!(!sync_ssh_key_revision(&mut status, None));
+        assert!(!sync_ssh_key_revision(&mut status, None, &Phase::Failed));
         assert_eq!(status.retry_count, 3);
         assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("old"));
     }
@@ -12980,7 +13031,11 @@ spec:
             retry_generation: 0,
         });
 
-        assert!(!sync_ssh_key_revision(&mut status, Some("new")));
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            Some("new"),
+            &Phase::Applying
+        ));
         assert_eq!(
             status.observed_ssh_key_revision.as_deref(),
             Some("old"),
@@ -13000,7 +13055,11 @@ spec:
                 .unwrap(),
         );
 
-        assert!(sync_ssh_key_revision(&mut status, Some("new")));
+        assert!(sync_ssh_key_revision(
+            &mut status,
+            Some("new"),
+            &Phase::Failed
+        ));
         assert_eq!(status.retry_count, 0);
         assert_eq!(status.retry_count_slot, None);
         assert_eq!(status.retry_generation, 1);
@@ -13013,7 +13072,11 @@ spec:
     fn an_unchanged_key_is_not_a_rotation() {
         let mut status = rotated("same", Phase::Failed);
 
-        assert!(!sync_ssh_key_revision(&mut status, Some("same")));
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            Some("same"),
+            &Phase::Failed
+        ));
         assert_eq!(status.retry_count, 3);
     }
 
@@ -13173,15 +13236,15 @@ spec:
         };
 
         assert_eq!(
-            retry_request_verdict(Some(&finished("1")), &desired, &Phase::Applying),
+            last_run_verdict(Some(&finished("1")), &desired, &Phase::Applying),
             Phase::Failed
         );
         assert_eq!(
-            retry_request_verdict(Some(&finished("2")), &desired, &Phase::Applying),
+            last_run_verdict(Some(&finished("2")), &desired, &Phase::Applying),
             Phase::Applying
         );
         assert_eq!(
-            retry_request_verdict(None, &desired, &Phase::HostsUnreachable),
+            last_run_verdict(None, &desired, &Phase::HostsUnreachable),
             Phase::HostsUnreachable
         );
     }
@@ -13458,10 +13521,7 @@ spec:
         );
         // And it is not a success: a rotated SSH key still wakes such a plan, since an unreachable
         // StaticInventory host is exactly what a new key might fix.
-        assert!(status::may_need_another_run(&PlaybookPlanStatus {
-            phase: Phase::HostsUnreachable,
-            ..Default::default()
-        }));
+        assert!(status::may_need_another_run(&Phase::HostsUnreachable));
     }
 
     /// The bound on the refund, and the reason it is a bound rather than a nicety.
