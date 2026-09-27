@@ -5649,7 +5649,7 @@ fn stage_finished_run(finished: &RecordedRun, resource_status: &mut PlaybookPlan
 /// Its slot travels with it so a pruned record cannot leave an unscoped count behind.
 ///
 /// Except for a run of an older `retryGeneration`: that is a result replayed after the budget was
-/// handed back (`sync_retry_request`), because its record could not be
+/// handed back (`sync_retry_request`, `sync_ssh_key_revision`), because its record could not be
 /// acknowledged, and writing its attempt again would take back what was handed back.
 fn sync_desired_hash_after_finished_run(
     status: &mut PlaybookPlanStatus,
@@ -5761,7 +5761,8 @@ async fn observe_ssh_key_revision(
 /// failed because its hosts rejected the old key has, by then, spent every attempt it had — there is
 /// no proxy grace window in front of a `StaticInventory` host, so the tries burn in seconds — and
 /// `attempt_budget_available` refuses to start another run. Rotating the key is a fix the plan can
-/// only act on if it is also given a try to act with.
+/// only act on if it is also given a try to act with. Like a retry request, the reset starts a new
+/// `retryGeneration`, so a scheduled plan retries inside a window its failures had closed.
 ///
 /// Three cases deliberately do not reset it:
 ///
@@ -5803,7 +5804,7 @@ fn sync_ssh_key_revision(
         return false;
     }
 
-    record_retry_budget(status, 0, None);
+    hand_back_retry_budget(status);
     true
 }
 
@@ -5843,9 +5844,16 @@ fn sync_retry_request(
         return false;
     }
 
+    hand_back_retry_budget(status);
+    true
+}
+
+/// Restores the whole attempt budget from outside a run, and starts a new `retryGeneration` so that
+/// what was spent before stops counting: in the window gate ([`window_taken_by_a_record`]) and in a
+/// result replayed afterwards ([`sync_desired_hash_after_finished_run`]).
+fn hand_back_retry_budget(status: &mut PlaybookPlanStatus) {
     record_retry_budget(status, 0, None);
     status.retry_generation = status.retry_generation.saturating_add(1);
-    true
 }
 
 /// The verdict [`sync_retry_request`] judges a request by: that of the run which finished on this
@@ -12920,6 +12928,9 @@ spec:
         ));
         assert_eq!(status.retry_count, 0);
         assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("new"));
+        // A new generation, as for a retry request: the failures before the rotation no longer
+        // close an open schedule window, and a replayed result cannot spend the budget again.
+        assert_eq!(status.retry_generation, 1);
     }
 
     /// A converged plan is left alone. Rotating a key changes how the operator connects, not what it
@@ -12935,6 +12946,7 @@ spec:
             Some("new")
         ));
         assert_eq!(status.retry_count, 3);
+        assert_eq!(status.retry_generation, 0);
         // Still recorded: the plan has seen this key, so a *later* failure must not be credited
         // with a rotation that already happened.
         assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("new"));

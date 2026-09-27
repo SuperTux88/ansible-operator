@@ -254,7 +254,8 @@ rotating it is a fix. Because that plan has usually spent its [attempts](#retrie
 `StaticInventory` host has no proxy wait in front of it, so the tries burn in seconds — waking it
 alone would achieve nothing, and the rotation restores the plan's attempt budget as well. The run
 that follows still only targets the hosts that are not up to date, since `lastAppliedHash` is
-untouched.
+untouched. Like [asking a failed plan to try again](#asking-a-failed-plan-to-try-again), a rotation
+inside an open schedule window retries in that window.
 
 Two details worth knowing:
 

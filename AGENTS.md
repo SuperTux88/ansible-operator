@@ -315,6 +315,7 @@ one adopted behind a drained result) nothing is recorded, so the request waits f
 
 Resetting `retryCount` alone cannot reopen a schedule window, because `window_taken_by_a_record`
 counts the slot's failed `Play`s precisely *because* status may lag them. So each honoured request
+— and each SSH key rotation that resets the budget, through the same `hand_back_retry_budget` —
 also bumps `status.retryGeneration`, every `Play` records the generation it was prepared under
 (passed through `PlayRef` from the tick's own status, never read from the reflector's plan), and the
 window gate counts only the current generation's failures. The same number keeps a *replayed* result

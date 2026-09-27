@@ -517,8 +517,9 @@ pub struct PlaybookPlanStatus {
     /// A request made while a run is in flight waits for that run and is judged by its result.
     #[serde(default)]
     pub observed_retry_token: Option<String>,
-    /// How many retry requests this plan has acted on. Stamped onto every `Play` it prepares, so a
-    /// schedule window closed by failed runs can be reopened by a request: only the failures of the
+    /// How many times this plan's attempt budget was handed back from outside a run: retry requests
+    /// acted on, and SSH key rotations that reset it. Stamped onto every `Play` it prepares, so a
+    /// schedule window closed by failed runs can be reopened by either: only the failures of the
     /// current generation count against the window's budget.
     #[serde(default)]
     #[schemars(with = "UnsignedInt")]
