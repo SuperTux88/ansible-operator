@@ -51,6 +51,10 @@ next run. The connection variables the operator manages — `ansible_user`, the 
 options, `ansible_host`, and `ansible_port` — are rejected: they come from the `ssh` block below, and
 a plan that references an inventory setting one does not run until you remove it.
 
+Which group a host is in is not part of the hash. A host that has already been applied and then moves
+to another group or inventory is not re-run, even when the new group sets different variables — see
+[Moving a host between groups](./scheduling-and-modes.md#moving-a-host-between-groups).
+
 ## SSH credentials
 
 `spec.ssh` is mandatory — a `StaticInventory` with no way to reach its hosts is not usable:

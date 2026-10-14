@@ -233,6 +233,11 @@ affected Nodes on the next run. The connection variables the operator manages it
 `ansible_port`, `ansible_user`, and the `ansible_ssh_*` options — are rejected: they are wired from
 managed SSH, and a plan that references an inventory setting one does not run until you remove it.
 
+Which group a Node is in is not part of the hash. A Node that has already been applied and then moves
+to another group, for example after a relabel, is not re-run, even when the new group sets different
+variables — see
+[Moving a host between groups](./scheduling-and-modes.md#moving-a-host-between-groups).
+
 ## Tolerations
 
 To reach a tainted Node such as a control-plane node, the managed-SSH proxy pod for that Node must
