@@ -228,9 +228,10 @@ spec:
         ansible_python_interpreter: /usr/bin/python3
 ```
 
-Group variables are part of a plan's execution hash, so changing one re-applies the playbook to the
-affected Nodes on the next run. The connection variables the operator manages itself — `ansible_host`,
-`ansible_port`, `ansible_user`, and the `ansible_ssh_*` options — are rejected: they are wired from
+Group variables are part of the execution hash of every plan that references the inventory, so
+changing one re-applies that plan's playbook to all of its Nodes on its next run, not only to that
+group's Nodes. The connection variables the operator manages itself — `ansible_host`, `ansible_port`,
+`ansible_user`, and the `ansible_ssh_*` options — are rejected: they are wired from
 managed SSH, and a plan that references an inventory setting one does not run until you remove it.
 
 Which group a Node is in is not part of the hash. A Node that has already been applied and then moves
