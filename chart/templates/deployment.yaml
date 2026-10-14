@@ -6,7 +6,14 @@ metadata:
   labels:
     {{- include "chart.labels" . | nindent 4 }}
 spec:
+  {{- if gt (int .Values.replicaCount) 1 }}
+  {{- fail "replicaCount must be 0 or 1: the operator's SSH CA lives only in its process's memory, so it must run as a single process" }}
+  {{- end }}
   replicas: {{ .Values.replicaCount }}
+  # A rolling update would start the new pod while the old one still runs, briefly two operators
+  # with two CAs undoing each other's half-built runs. Recreate stops the old one first.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "chart.selectorLabels" . | nindent 6 }}
