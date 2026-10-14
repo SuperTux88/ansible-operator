@@ -570,8 +570,7 @@ dedicated to Ansible ops (see `THREAT_MODEL.md` §6 / T-INFO-1).
   makes replaying a step that already landed a no-op, and `transition_phase` re-reads and re-decides
   once before surfacing a conflict. Don't "fix" this to a merge patch for consistency with the bullet
   above — the two are answering different questions.
-- `examples/v1beta1/*.yaml` is the canonical CRD shape; `examples/ssh.yaml` (top-level) is the
-  only remaining older example — prefer `v1beta1/` when writing docs/examples.
+- `examples/v1beta1/*.yaml` is the canonical CRD shape; use it when writing docs/examples.
 - Deliberate `.unwrap()`/`.expect()` style: preconditions the apiserver genuinely guarantees are
   unwrapped; only things this operator must guarantee (namespace/name/generation/uid on the
   primary object) go through `ReconcileError::PreconditionFailed`. Match this — don't blanket-add
