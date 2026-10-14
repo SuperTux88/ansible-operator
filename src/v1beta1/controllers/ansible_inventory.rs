@@ -18,7 +18,7 @@ pub trait AnsibleInventory {
 /// nothing about the external one.
 ///
 /// Absent on a `ClusterInventory`'s own `status.resolvedHosts`, where the kind of the resource
-/// holding it is already the answer, and on a record written before this field existed. Absent
+/// holding it is already the answer, and on any record not written by [`flatten_hosts`]. Absent
 /// therefore reads as "not known to be a Node", which is the safe way round: every question it
 /// gates is about Node objects.
 #[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(flattened[0].hosts, vec!["node-a".to_string()]);
     }
 
-    /// Only what was *recorded* as a Node counts. A group from before the field existed answers "not
+    /// Only what was *recorded* as a Node counts. A group with no recorded connection answers "not
     /// a Node", which is the safe way round for every question this gates.
     #[test]
     fn only_groups_recorded_as_nodes_are_nodes() {
@@ -281,7 +281,7 @@ mod tests {
             connection: Some(HostConnection::Ssh),
             ..group("edge", &["ccu.fritz.box"])
         };
-        let untracked = group("legacy", &["node-c"]);
+        let untracked = group("untracked", &["node-c"]);
 
         let groups = [node_group, external, untracked];
         let hosts = node_hosts(&groups);

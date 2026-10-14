@@ -421,7 +421,7 @@ any of that namespace's ServiceAccounts' API RBAC.
   privileged the namespace's ServiceAccounts are.
 
 **T-ESC-8 — Tampering with a `Play` record to steer a run in progress.**
-A `Play` is no longer only history: recovery reads it back to decide whether an unlaunched run
+A `Play` is not only history: recovery reads it back to decide whether an unlaunched run
 may still be resumed, and to re-derive what that run executes. Anyone with `update` on `plays` in an
 enrolled namespace could therefore try to rewrite what a committed run does.
 - *Reduced attack surface:* the record stores neither the plan spec, nor the resolved inventory

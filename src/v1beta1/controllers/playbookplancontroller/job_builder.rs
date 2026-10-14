@@ -53,8 +53,8 @@ const WORKSPACE_VOLUME_NAME: &str = "playbook";
 ///
 /// Should comfortably exceed the time the operator needs to consume a finished Job's result — the
 /// reconciler reads the run's outcome from the Job's own termination message, so a Job reaped
-/// before that (e.g. across a long operator outage) loses its recap. That no longer wedges the run
-/// — `advance_active_run` treats a missing finished Job as `Unknown` and lets it retry — but it
+/// before that (e.g. across a long operator outage) loses its recap. That does not wedge the run —
+/// `advance_active_run` treats a missing finished Job as `Unknown` and lets it retry — but it
 /// costs an unnecessary retry, so keep this generous. One hour is well clear of the seconds-scale
 /// consume latency.
 const DEFAULT_JOB_TTL_SECONDS_AFTER_FINISHED: i32 = 3600;
@@ -383,9 +383,9 @@ pub(super) fn job_network_policy_name(plan_name: &str, run_id: &str) -> String {
 }
 
 /// Creates a Kubernetes Job with everything needed for basic Ansible execution, without any
-/// connection-specifics. Unlike the old chroot-based model, this Job pod needs no node-level
-/// privilege at all — hostPID/hostIPC/hostNetwork/privileged/nodeSelector all now live on the
-/// ephemeral managed-ssh proxy pods instead (see `managed_ssh.rs`).
+/// connection-specifics. This Job pod needs no node-level privilege at all —
+/// hostPID/hostIPC/hostNetwork/privileged/nodeSelector all live on the ephemeral managed-ssh proxy
+/// pods instead (see `managed_ssh.rs`).
 fn create_job_skeleton(
     plan: &v1beta1::PlaybookPlan,
     with_requirements: bool,
@@ -958,9 +958,9 @@ fn volume_name(prefix: &str, source: &str) -> String {
     }
 }
 
-/// Builds the `ansible-playbook` invocation. Connection details no longer appear here at all —
-/// each host's connection mechanism is expressed as inventory vars in the rendered
-/// `inventory.yml` instead, so there's no more per-strategy `-c`/`-l`/`--private-key` branching.
+/// Builds the `ansible-playbook` invocation. Connection details do not appear here: each host's
+/// connection mechanism is expressed as inventory vars in the rendered `inventory.yml`, so the
+/// command does not branch per connection type.
 ///
 /// **Adding `--tags`/`--skip-tags` here is not a self-contained change.** Task filtering interacts
 /// with the completion marker the operator appends to every playbook, and getting it wrong either
@@ -1779,7 +1779,7 @@ spec:
     /// operator actually mints, inside the label cap a NetworkPolicy name is held to. Growing
     /// `RUN_ID_LENGTH` has to fail here rather than at the apiserver.
     ///
-    /// The second half pins the readable half of the name. Two plans can no longer *collide* — the
+    /// The second half pins the readable half of the name. Two plans cannot *collide* — the
     /// run ID is minted per run from the plan's UID — but two names that truncate to the same
     /// text still read as each other in `kubectl get netpol`, which the plan-name hash is what
     /// prevents.

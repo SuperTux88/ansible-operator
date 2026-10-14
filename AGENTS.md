@@ -147,7 +147,7 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    recovery, so no unvalidated tenant string reaches schedule evaluation, but its result is acted on
    only after recovery and active-Job advancement. Invalid mutable scheduling fields therefore block
    new runs without preventing an existing Job from finishing or its privileged resources from being
-   recovered and released. The runtime guard covers objects that predate or bypass CRD validation.
+   recovered and released. The runtime guard covers objects that bypass CRD validation.
 4. **Steps 0 + 0b — resolve inventory, then clamp it (INV-2/3/5).**
    `resolve_authorized_inventory` runs `resolve_inventory` → `Vec<ResolvedInventoryGroup>`
    (`ClusterInventory` ⇒ `ManagedSsh`, `StaticInventory` ⇒ `Ssh`, preserving which resource each
@@ -160,9 +160,10 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    one `helm upgrade` that changes an inventory and a plan together would otherwise launch against
    the host set the edit replaced.
 5. **Execution hash.** `ExecutionHash` over the playbook text + contents of every referenced
-   Secret (variables + files), order-insensitive, with `spec.provides.version` folded in
-   (`fold_provides_version`) — so bumping a provided version re-runs the plan on every host, and a
-   plan without `provides` hashes as before; deliberately **excludes** the workspace
+   Secret (variables + files), order-insensitive, with the referenced inventories' group variables
+   (`fold_inventory_variables`) and `spec.provides.version` (`fold_provides_version`) folded in —
+   so bumping a provided version re-runs the plan on every host, while a plan without `provides`
+   or an inventory without variables leaves the hash untouched; deliberately **excludes** the workspace
    Secret (its content — proxy IPs — legitimately changes each run). Hash change ⇒
    `last_run_number` reset to 0, `last_triggered_run` cleared (so an edit can start inside the
    window its predecessor used, and a revert is just another change), and `Phase::Pending`
@@ -297,16 +298,16 @@ plan acts on the new key inside that window rather than an interval later. The b
 point: a plan whose hosts rejected the old key has spent every try by then — a `StaticInventory`
 host has no proxy grace window in front of it — so waking it alone would achieve nothing. `mappers::ssh_secret_to_playbookplans` supplies the wake-up,
 and both sides share `status::may_need_another_run` so the mapper can never wake a plan the reset
-would then decline. The first observation is recorded without acting, which is what keeps an upgrade
-from handing every failed plan a free retry at once.
+would then decline. The first observation is recorded without acting: the first key a plan
+sees is the one it starts with, not a fix for an earlier failure.
 
 A human can hand the budget back too, without editing anything a Helm or GitOps source renders: a
 new value in the `ansible.cloudbending.dev/retry` annotation (`labels::RETRY_ANNOTATION`) restores
 the whole budget of a plan whose last run failed (`sync_retry_request`), and
 `status.observedRetryToken` records it so each value is honoured once — that dedupe is what keeps
 `maxAttempts` a bound. It looks like `sync_ssh_key_revision` and deliberately differs from it in
-two places. The **first observation acts**: an annotation that appears is a request, and no plan
-carried one before the feature, so there is no upgrade to protect. And the gate is
+two places. The **first observation acts**: an annotation that appears is a request, whereas a key
+that appears is just the key the plan starts with. And the gate is
 **`is_failure_verdict`**, not `may_need_another_run`, and it needs no mapper, since the primary plan
 watch has no predicate and an annotation change already reconciles.
 
@@ -370,12 +371,13 @@ handful of decisions that are easy to undo by accident:
   running behind the write, or one whose write was lost to a conflict, cannot be trusted alone.
   `schedule_window_already_taken`/`window_taken_by_a_record` re-ask the question of the plan's own
   `Play`s (which book revision and slot before anything is created) before a new run is prepared.
-  Since `maxAttempts` the question is no longer "did a run take this slot" but "is there anything
-  left for a run to do in it": a record still `Running` closes the window, failures close it only
+  The question is not "did a run take this slot" but "is there anything left for a run to do in
+  it": a record still `Running` closes the window, failures close it only
   once they have spent the budget, and `Succeeded` records close it only once their recorded
   inventories cover every host the tick would target (`hosts_to_trigger`) — one tick, one run *per
   host*, so a host that joins after the slot's run succeeded still gets one inside the window. Do
-  not restore "any `Succeeded` record closes the window": that is the rule this replaced. A host whose
+  not reduce it to "any `Succeeded` record closes the window", which strands a late host until the
+  next slot. A host whose
   Node was re-created since a record was prepared is withdrawn from that record's coverage first
   (`withdraw_replaced_machines`). A failure the budget refunded (`returns_its_attempt`) spent nothing
   and is not counted — the refund and this count must answer from the same predicate, or the refund

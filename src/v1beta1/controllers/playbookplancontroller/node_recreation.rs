@@ -37,9 +37,9 @@ use crate::v1beta1::{PlaybookPlanStatus, ResolvedInventoryGroup};
 ///
 /// Both halves are required, and a missing one answers "no" deliberately:
 ///
-/// - **no `claimed_at`** is a record written before the claim was dated. Treating it as a
-///   replacement would re-run every plan in the fleet on the upgrade that introduced this; the next
-///   success fills the field in, and until then the record stands exactly as it was.
+/// - **no `claimed_at`** is a claim that cannot be dated, so nothing shows the Node is newer than
+///   it. Treating it as a replacement would re-run the host on no evidence; the next success fills
+///   the field in, and until then the record stands exactly as it was.
 /// - **no `creationTimestamp`** is a Node the apiserver has not stamped, which nothing but a
 ///   hand-built object can be.
 ///
@@ -232,11 +232,10 @@ mod tests {
         ));
     }
 
-    /// The upgrade path. Every record written before the claim was dated has no `appliedAt`, and
-    /// reading that as a replacement would mark every host in the fleet outdated at once — a
-    /// cluster-wide re-run triggered by nothing but installing a new operator.
+    /// A claim with no `appliedAt` cannot be dated, so nothing shows the Node is newer than it.
+    /// Reading it as a replacement would re-run the host on no evidence.
     #[test]
-    fn a_record_predating_the_field_is_left_alone() {
+    fn an_undated_record_is_left_alone() {
         assert!(!node_replaced_since(
             None,
             &node("node-a", Some("2026-01-02T00:00:00Z"))

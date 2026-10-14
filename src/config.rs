@@ -113,9 +113,7 @@ pub struct NodeLabelsConfig {
 }
 
 impl Default for NodeLabelsConfig {
-    /// On, like the chart value it is rendered from. A config written before this table existed
-    /// belongs to a release whose ClusterRole has no `nodes: patch` either, so the feature cannot
-    /// act on the default until an upgrade grants it.
+    /// On, like the chart value it is rendered from.
     fn default() -> Self {
         Self { enabled: true }
     }

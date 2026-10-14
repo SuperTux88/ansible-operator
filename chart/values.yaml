@@ -50,8 +50,8 @@ fullnameOverride: ""
 
 # Enrolled tenant namespaces (R1 / THREAT_MODEL T-INFO-1). The operator may read/write Secrets and
 # create Jobs ONLY in these namespaces plus its own (.Release.Namespace, always enrolled). This is
-# the security boundary that replaces the old cluster-wide Secret/Job/Pod grants — an operator
-# compromise is bounded to the enrolled namespaces, not the whole cluster.
+# the security boundary in place of cluster-wide Secret/Job/Pod grants — an operator compromise is
+# bounded to the enrolled namespaces, not the whole cluster.
 #
 # Fail-closed: a PlaybookPlan created in a namespace NOT listed here (and not the operator namespace)
 # is refused with status.phase = UnauthorizedNamespace. There is deliberately no "all namespaces"

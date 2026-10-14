@@ -104,8 +104,7 @@ pub struct PlaySpec {
     /// revision they never received. The run's own record is the only copy that still describes
     /// what actually ran.
     ///
-    /// Absent for a plan that provides nothing, and absent on every record written before this
-    /// field existed — no Node is ever labelled from such a record.
+    /// Absent for a plan that provides nothing — no Node is ever labelled from such a record.
     #[serde(default)]
     pub provides_version: Option<String>,
 
@@ -119,8 +118,8 @@ pub struct PlaySpec {
     /// The plan's `status.retryGeneration` when this run was prepared. A failed run counts against
     /// its schedule window's attempt budget only while the plan is still on this generation, which
     /// is how a user's retry request, or an SSH key rotation that restores the budget, reopens a
-    /// window its failures had closed. Absent (0) on records written before this field existed,
-    /// matching a plan that never had a request.
+    /// window its failures had closed. Absent reads as 0, the generation of a plan that has never
+    /// had its budget handed back.
     #[serde(default)]
     #[schemars(with = "UnsignedInt")]
     pub retry_generation: u32,

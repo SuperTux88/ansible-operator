@@ -474,8 +474,8 @@ pub async fn new(
     // Owned-Job and referenced-Secret watches are set up per enrolled namespace instead of once
     // cluster-wide: the operator holds `jobs`/`secrets` RBAC only in these namespaces (R1), so a
     // cluster-wide `Api::all` watch would 403. A Secret edit in an enrolled namespace still promptly
-    // re-triggers its plan (preserving "input changed -> reapply"); the merged effect is identical to
-    // the old single cluster-wide watch, just bounded to the allowlist.
+    // re-triggers its plan ("input changed -> reapply"); the merged effect is identical to a single
+    // cluster-wide watch, just bounded to the allowlist.
     for namespace in enrolled_namespaces.iter() {
         let jobs_api: Api<Job> = Api::namespaced(client.clone(), namespace);
         let secrets_api: Api<Secret> = Api::namespaced(client.clone(), namespace);
@@ -779,9 +779,9 @@ async fn reconcile(
     // status mirror may already have moved on — so the finalizer is kept until a tick finds neither.
     let recovered_a_run = recovered.is_some();
     if recovered_a_run {
-        // Re-asserted rather than assumed: a plan that lost the finalizer — stripped by hand, or
-        // adopted from a release that predates it — would otherwise keep the run it is holding
-        // outside the contract for as long as that run lasts.
+        // Re-asserted rather than assumed: a plan that lost the finalizer — stripped by hand, for
+        // example — would otherwise keep the run it is holding outside the contract for as long as
+        // that run lasts.
         ensure_run_cleanup_finalizer(&api, &object)
             .await
             .or_else(|error| error.is_conflict().then_some(()).ok_or(error))?;
@@ -1103,7 +1103,7 @@ async fn reconcile(
 
     // Inventory-author group variables are part of the execution hash (a change re-applies the
     // playbook to otherwise-current hosts). Keyed by group name; groups without variables
-    // contribute nothing, so inventories that set none hash exactly as before.
+    // contribute nothing, so inventories that set none do not move the hash.
     let inventory_variables: Vec<(&str, &serde_json::Value)> = target_groups
         .iter()
         .filter_map(|group| {
@@ -2597,10 +2597,9 @@ fn not_ready_proxy_grace_cap<Tz: TimeZone>(
 /// and go: with `0 * * * *` and four hours, 06:30 still reports the 03:00 slot, and once that window
 /// is taken the plan sleeps to 07:00 — 04:00, 05:00 and 06:00 never ran.
 ///
-/// It is a warning and not a rejection, because the configuration is valid and plans already exist
-/// that use it; rejecting it would break them on upgrade. A wide deadline is also what a maintenance
-/// window *is*, so the fix is a judgement the author has to make: usually a deadline shorter than
-/// the interval, occasionally a sparser schedule.
+/// It is a warning and not a rejection, because the configuration is valid: a wide deadline is what
+/// a maintenance window *is*, so the fix is a judgement the author has to make: usually a deadline
+/// shorter than the interval, occasionally a sparser schedule.
 ///
 /// Reported where a run starts for a slot rather than wherever the schedule is parsed, which is what
 /// keeps it from repeating on every tick of an open window: the plan says it at most once per run it
@@ -5815,9 +5814,10 @@ async fn observe_ssh_key_revision(
 ///
 /// Three cases deliberately do not reset it:
 ///
-/// - **the first observation.** A plan upgraded into this field has not rotated anything, and a plan
-///   that never had one has no budget to give back. Recording it without acting is what keeps the
-///   upgrade from handing every failed plan in the cluster a free retry at once.
+/// - **the first observation.** A key the plan sees for the first time — a new plan, or one that
+///   has just started referencing a `StaticInventory` — has not been rotated: the plan never
+///   connected with any other key, so no earlier failure can be this key's fault. Recording it
+///   without acting keeps that from being mistaken for a fix.
 /// - **a `Succeeded` plan.** Its hosts are converged and the key it connected with worked; a
 ///   rotation is not a reason to touch them again. This is the same rule the mapper applies, from
 ///   [`status::may_need_another_run`], so a plan can never be woken for a rotation it would then
@@ -9830,7 +9830,7 @@ mod tests {
         // follows targets only what is outdated, so the covered ones are not applied to twice.
         assert!(!taken(&ran_over_a_and_b, &["node-b", "node-c"]));
 
-        // What must not break: a window with nothing left to do is spent, exactly as before. The
+        // What must not break: a window with nothing left to do is spent. The
         // middle case is the one a lagging status produces, where the hosts still look outdated.
         assert!(taken(&ran_over_a_and_b, &["node-a"]));
         assert!(
@@ -13101,9 +13101,8 @@ spec:
         assert_eq!(failed.retry_generation, 1);
     }
 
-    /// The upgrade case. Every plan that predates this field observes its key for the first time on
-    /// the first tick after the operator is upgraded, and that is not a rotation — without this,
-    /// upgrading would hand a free retry to every failed plan in the cluster at once.
+    /// A key seen for the first time is not a rotation, even on a failed plan: the plan never
+    /// connected with any other key, so this one cannot be the fix for its failure.
     #[test]
     fn the_first_observation_of_a_key_is_recorded_but_changes_nothing() {
         let mut status = PlaybookPlanStatus {
@@ -13227,8 +13226,8 @@ spec:
         }
     }
 
-    /// Unlike an SSH key, a retry annotation seen for the first time *is* a request: nothing
-    /// carried it before this feature, so there is no upgrade to protect.
+    /// Unlike an SSH key, a retry annotation seen for the first time *is* a request: a plan has no
+    /// annotation it starts with, so any value that appears was set to ask for a retry.
     #[test]
     fn the_first_retry_request_a_plan_sees_acts() {
         let mut status = failed_with_spent_budget(Phase::Failed);

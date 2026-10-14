@@ -406,8 +406,8 @@ pub fn append_dependency_summary_clause(
     dependencies: &[InventoryDependency],
 ) {
     if let Some(summary) = status.summary.as_mut() {
-        // A loop rather than one strip, so a status already carrying several from before this was
-        // idempotent is healed on the first tick instead of shedding one clause per reconcile.
+        // A loop rather than one strip: the summary comes from the persisted status, and one
+        // carrying several clauses must be healed on the first tick rather than one per reconcile.
         while summary.ends_with(WAITING_CLAUSE_TAIL) {
             match summary.rfind(" (") {
                 Some(clause_start) => summary.truncate(clause_start),
@@ -721,10 +721,10 @@ pub fn clear_nodes_not_ready_condition(
 /// is about a run. That function reports the hosts *one run* targeted, which in `OneShot` is just the
 /// ones that were outdated when it started; this reports every host the plan is responsible for.
 /// Sharing `AllHostsSucceeded`/`SomeHostsDidNotSucceed` and "N/M hosts completed successfully"
-/// across both made the same condition change its numbers — a plan whose last run applied 2 of 10
-/// hosts and failed one read "1/2 hosts completed successfully", then "9/10 hosts completed
-/// successfully" once an unrelated input outage cleared, with nothing having run in between. Nothing
-/// *did* complete in between, which is why this no longer claims it did.
+/// across both would make the same condition change its numbers — a plan whose last run applied 2 of
+/// 10 hosts and failed one would read "1/2 hosts completed successfully", then "9/10 hosts completed
+/// successfully" once an unrelated input outage cleared, with nothing having run in between, so it
+/// would claim completions that never happened.
 fn clear_ready_overlay(
     status: &mut PlaybookPlanStatus,
     outdated_count: usize,
@@ -1183,9 +1183,9 @@ mod tests {
         assert_eq!(status.summary.as_deref(), Some("5/5 up-to-date"));
     }
 
-    /// A status written by a version that stacked them is healed on the first tick, not one clause
-    /// per reconcile — an operator upgrade must not leave a plan reporting nonsense for as long as
-    /// it takes to unwind.
+    /// The summary is read back from the persisted status, so the clause cannot assume it was handed
+    /// at most one of its own. However many it finds, one tick leaves exactly one, rather than one
+    /// fewer per reconcile.
     #[test]
     fn a_summary_that_already_stacked_clauses_is_healed_at_once() {
         let mut status = PlaybookPlanStatus {
