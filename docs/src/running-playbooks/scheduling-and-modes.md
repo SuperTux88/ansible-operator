@@ -164,7 +164,8 @@ The inventories contribute their `variables` only, keyed by group name, so a gro
 omitting the field or writing an empty `{}`, which render identically — contributes nothing at all.
 Which *hosts* a group resolves to is deliberately not part of the hash: a
 node joining or leaving changes who the plan targets, not what it applies, and a new node is already
-out of date because it has no recorded hash of its own.
+out of date because it has no recorded hash of its own. A host that only *moves* between groups is
+not re-run either — see [Moving a host between groups](#moving-a-host-between-groups).
 
 - Each host records the hash it **last succeeded on** (`.status.hostsStatus.<host>.lastAppliedHash`).
 - A host whose last-applied hash equals the current hash is **current** and is skipped (in
@@ -199,6 +200,22 @@ out of date because it has no recorded hash of its own.
 This is what makes `OneShot` idempotent and cheap: editing an unrelated field does not re-run
 everything, but a real change to the playbook or its inputs does. The current hash is visible as
 `.status.currentHash` and in the `Current hash` printer column.
+
+### Moving a host between groups
+
+Group membership is not part of what gets applied. A host that already succeeded on the current hash
+stays current when it moves to another group or inventory — for example because its Node was
+relabelled and now matches a different group's selector — and when it is listed under several groups
+at once. It runs once, not once per group, and a move does not run it again.
+
+That holds even when the move changes what the host would get: when the two groups set different
+`variables`, or when a play targets only one of them (`hosts: gpu`). The host keeps the result of the
+run it already had, until something the hash covers changes. To re-run it anyway, edit the playbook
+or, on a plan that already declares one, bump
+[`spec.provides.version`](./playbook-plans.md#declaring-what-a-plan-provides). Either moves the hash
+of the whole plan, so it re-runs every host of the plan, not only the one that moved. Adding
+`spec.provides` to a plan that has none does the same, and also starts labelling the cluster Nodes
+the plan converges with that version.
 
 ### What wakes a plan
 
