@@ -381,7 +381,7 @@ reconcile.
 
 ### The plan's inputs cannot be read
 
-Three summaries report that the operator could not read or build what the plan says it should be
+These summaries report that the operator could not read or build what the plan says it should be
 running, and so could not decide anything this tick:
 
 - **"inventory … not in sync" / "ClusterInventory … not found" / "StaticInventory … not found" /
@@ -402,6 +402,13 @@ running, and so could not decide anything this tick:
 - **"cannot read referenced Secrets: …"** — a Secret named by `spec.template.variables` or
   `spec.template.files` could not be read. `Referenced Secret "…" does not exist` means the reference
   is wrong or the Secret was deleted; anything else is an API error to retry.
+- **"playbook is not valid YAML at line … column …" / "playbook is not a list of plays"** — the
+  playbook does not parse as YAML, or it does but is not a YAML list (a single play written as a
+  mapping, without the leading `-`). The `Ready` condition carries the parser's full message,
+  prefixed with `spec.template.playbook is not a valid playbook:`. Correct the playbook; a new run
+  does not acquire host Leases or create managed-SSH proxy pods for this invalid spec. Only the YAML
+  shape is checked here: a list whose entries are not valid plays is accepted and fails when Ansible
+  runs it.
 - **"spec.template.files entry … is not usable: …"** — a file entry has an invalid mount name or
   does not describe exactly one recognized Kubernetes volume source without unknown fields. Correct
   the named entry; a new run does not acquire host Leases or create managed-SSH proxy pods for this
@@ -618,11 +625,12 @@ instead, and `.status.activeRun` names the run it is waiting on:
   of the message says what to fix, briefly for an inventory (the `InputsUnavailable` condition has
   the full error). A read that fails because the resource is simply *gone* is not
   this case; see the next message.
-- **"aborted the run because its desired inputs cannot be resolved: …"** — the same lookup failed in
-  a way that cannot be transient: a referenced `ClusterInventory`/`StaticInventory` or a referenced
-  variables/files `Secret` no longer exists, or an inventory group sets a variable the operator
-  manages. There is no executable desired state left, so the run was released and deleted; fix
-  the reference and a fresh run starts. Giving the run up rather than holding it also frees
+- **"aborted the run because its desired inputs cannot be resolved: …"** — the plan's inputs failed
+  in a way that cannot be transient: one of the forms under
+  [The plan's inputs cannot be read](#the-plans-inputs-cannot-be-read) that need an edit, such as a
+  referenced inventory or Secret that no longer exists, or a playbook that does not parse. There is
+  no executable desired state left, so the run was released and deleted; fix the input and a fresh
+  run starts. Giving the run up rather than holding it also frees
   its host locks — a run held indefinitely blocks every other plan targeting those hosts, not
   just this one. If its Job had already been created it is adopted and allowed to finish instead,
   reported as **"adopted the started run; the desired inputs cannot be resolved: …"**.
