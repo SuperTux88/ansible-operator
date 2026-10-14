@@ -415,6 +415,12 @@ running, and so could not decide anything this tick:
   finished run indefinitely. Drop the reference: the workspace is already mounted as the run's
   working directory, so a playbook reads it from there without asking for it.
 
+The forms that need an edit — all of the above except `not in sync` and the API errors — are
+rechecked as soon as the edit lands: changing the plan, or creating or changing the inventory or
+Secret it names, wakes it. Without one, a plan with no run in flight rechecks every five minutes,
+while one with a run in flight keeps retrying every 15 seconds, because those ticks are what keep
+that run's host Leases held. The other forms are retried every 15 seconds too.
+
 **"host … is both a Node and an external host"** deserves its own note, because the fix is not in one
 place. A plan reached this host through a `ClusterInventory` *and* through a `StaticInventory` — a
 cluster Node and an external machine share one name. Everything about a host is keyed by that name:

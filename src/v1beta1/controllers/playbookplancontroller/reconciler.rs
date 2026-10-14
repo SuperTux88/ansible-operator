@@ -60,6 +60,12 @@ const DEFAULT_RECURRING_ATTEMPTS: u32 = 1;
 /// How long a plan waits before making a try it still owes. Short because a scheduled retry has only
 /// the remainder of its tick's `startingDeadlineSeconds` window to start in.
 const RETRY_REQUEUE: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long an idle plan waits before re-reading a desired input that only an edit can fix.
+///
+/// A safety net, not the way such a plan recovers: the edit that fixes it — the plan itself, or a
+/// referenced inventory or Secret, which every mapper matches by name and so wakes on creation too
+/// — reconciles it straight away. See [`input_error_waits_for_an_edit`] for when it applies.
+const PERMANENT_INPUT_ERROR_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 /// How long [`new`] waits for a reflector's initial LIST before taking the process down with it.
 ///
 /// Deliberately generous, because the two ways of getting it wrong are not symmetric: too short
@@ -1012,7 +1018,7 @@ async fn reconcile(
         .and_then(|()| validate_file_entries(&object))
         .and_then(|()| validate_workspace_not_referenced(&object))
     {
-        report_desired_input_error(
+        let reported = report_desired_input_error(
             &context,
             &object,
             &api,
@@ -1022,7 +1028,7 @@ async fn reconcile(
             spec_input_failure(&object, &error),
         )
         .await?;
-        return Err(error);
+        return conclude_input_error(namespace, name, error, reported, &resource_status);
     }
 
     // Steps 0 and 0b: resolve the plan's inventories and clamp them to what NodeAccessPolicy grants
@@ -1036,7 +1042,7 @@ async fn reconcile(
     } = match resolve_authorized_inventory(&context, &object).await {
         Ok(resolved) => resolved,
         Err(error) => {
-            report_desired_input_error(
+            let reported = report_desired_input_error(
                 &context,
                 &object,
                 &api,
@@ -1046,7 +1052,7 @@ async fn reconcile(
                 inventory_input_failure(&error),
             )
             .await?;
-            return Err(error);
+            return conclude_input_error(namespace, name, error, reported, &resource_status);
         }
     };
     if !excluded_nodes.is_empty() {
@@ -1129,7 +1135,7 @@ async fn reconcile(
             // its hosts are still known-authorized and the hold is safe, but it is not free: the
             // hold renews those Leases every tick, and an indefinite one starves every other plan
             // targeting the same hosts. That is what `input_error_supersedes_unlaunched` bounds.
-            report_desired_input_error(
+            let reported = report_desired_input_error(
                 &context,
                 &object,
                 &api,
@@ -1139,7 +1145,7 @@ async fn reconcile(
                 InputFailure::same(format!("cannot read referenced Secrets: {error}")),
             )
             .await?;
-            return Err(error);
+            return conclude_input_error(namespace, name, error, reported, &resource_status);
         }
     };
 
@@ -4542,21 +4548,26 @@ fn spec_input_failure(plan: &PlaybookPlan, error: &ReconcileError) -> InputFailu
 /// does not stop a Job that is already executing, and changing its phase would contradict the
 /// `activeRun` standing right next to it.
 ///
-/// Best effort, and deliberately so: the reconcile fails on the original error either way, and a
-/// failure to report must not replace the diagnosis it was trying to surface. Same shape as
-/// [`report_failed_abandon`] and the recovery failure path in [`reconcile`].
+/// Best effort, and deliberately so: a failure to report must not replace the diagnosis it was
+/// trying to surface. Same shape as [`report_failed_abandon`] and the recovery failure path in
+/// [`reconcile`]. Returns whether the write landed, so a tick that could not report keeps retrying
+/// at the error requeue instead of waiting for an edit behind the previous verdict.
 async fn report_input_failure(
     api: &Api<PlaybookPlan>,
     object: &PlaybookPlan,
     resource_status: &mut PlaybookPlanStatus,
     failure: InputFailure,
-) {
+) -> bool {
     record_input_failure(resource_status, failure);
-    if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
-        warn!(
-            "Could not report a desired-input read failure on {:?}/{:?}: {patch_error}",
-            object.metadata.namespace, object.metadata.name
-        );
+    match patch_status(api, object, resource_status.clone()).await {
+        Ok(_) => true,
+        Err(patch_error) => {
+            warn!(
+                "Could not report a desired-input read failure on {:?}/{:?}: {patch_error}",
+                object.metadata.namespace, object.metadata.name
+            );
+            false
+        }
     }
 }
 
@@ -4651,8 +4662,11 @@ fn claim_paused_recovery_summary(
 /// same way, so the choice between the two reporting paths is made once here instead of at each
 /// call site. What differs between them is only the diagnostic, which the caller passes in.
 ///
-/// The caller still returns the original error afterwards: this reports, it does not decide the
-/// tick's outcome.
+/// This reports, it does not decide the tick's outcome: the caller hands the original error to
+/// [`conclude_input_error`] afterwards. Returns whether the outage reached the plan, which that
+/// needs before it lets an idle plan wait for an edit. Only the idle path's write can fail without
+/// failing this call — an unlaunched run that is given up writes its outcome with failures
+/// propagated, and one that is held open keeps retrying at the error requeue anyway.
 async fn report_desired_input_error(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -4661,27 +4675,23 @@ async fn report_desired_input_error(
     resource_status: &mut PlaybookPlanStatus,
     error: &ReconcileError,
     failure: InputFailure,
-) -> Result<(), ReconcileError> {
+) -> Result<bool, ReconcileError> {
     match unlaunched {
-        Some(unlaunched) => {
-            handle_unlaunched_input_error(
-                context,
-                object,
-                api,
-                unlaunched,
-                resource_status,
-                error,
-                &failure,
-            )
-            .await
-        }
+        Some(unlaunched) => handle_unlaunched_input_error(
+            context,
+            object,
+            api,
+            unlaunched,
+            resource_status,
+            error,
+            &failure,
+        )
+        .await
+        .map(|()| true),
         // Nothing in flight to hold open, but the plan still has to say why it is not running: a
         // deleted inventory or Secret would otherwise leave the last successful run's summary
         // standing while every tick fails in the log only.
-        None => {
-            report_input_failure(api, object, resource_status, failure).await;
-            Ok(())
-        }
+        None => Ok(report_input_failure(api, object, resource_status, failure).await),
     }
 }
 
@@ -4827,6 +4837,41 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         | ReconcileError::JsonSerializationError(_)
         | ReconcileError::YamlSerializationError(_) => false,
     }
+}
+
+/// Whether a tick that could not read its desired inputs may wait [`PERMANENT_INPUT_ERROR_RECHECK`]
+/// instead of retrying at the controller's error requeue.
+///
+/// Only an error no retry can clear, and only with no run in flight. A `Running` run's host Leases
+/// are renewed by the tick, and they outlive the error requeue but not the recheck, so a plan
+/// holding one keeps retrying at the error requeue whatever failed. `status` must be the tick's own
+/// status after the failure was handled — by then a superseded unlaunched run has been released and
+/// left `activeRun`, while the reflector's copy may still lack a run this controller just mirrored.
+fn input_error_waits_for_an_edit(error: &ReconcileError, status: &PlaybookPlanStatus) -> bool {
+    input_error_supersedes_unlaunched(error) && status.active_run.is_none()
+}
+
+/// Ends a tick whose desired inputs could not be read, once the failure is reported on the plan.
+///
+/// An error that only an edit can fix ends the tick as a success with a long requeue (see
+/// [`input_error_waits_for_an_edit`]), so it is logged here in place of the controller's warning.
+/// Not when `reported` is false: until the outage is on the plan, the plan still shows its previous
+/// verdict, and the error requeue is what retries the report.
+fn conclude_input_error(
+    namespace: &str,
+    name: &str,
+    error: ReconcileError,
+    reported: bool,
+    status: &PlaybookPlanStatus,
+) -> Result<Action, ReconcileError> {
+    if !reported || !input_error_waits_for_an_edit(&error, status) {
+        return Err(error);
+    }
+    warn!(
+        "PlaybookPlan {namespace}/{name}: {error}; waiting for an edit, rechecking in {}s",
+        PERMANENT_INPUT_ERROR_RECHECK.as_secs()
+    );
+    Ok(Action::requeue(PERMANENT_INPUT_ERROR_RECHECK))
 }
 
 /// Gives back a run's proxy infrastructure and then its host Leases. Cleanup failures propagate so
@@ -11001,6 +11046,70 @@ spec:
         ));
         assert!(!input_error_supersedes_unlaunched(
             &ReconcileError::RenderError(parse_error())
+        ));
+    }
+
+    /// An idle plan stuck on an error only an edit can fix stops retrying every few seconds, but a
+    /// plan with a run in flight never does: that tick is what renews the run's host Leases.
+    #[test]
+    fn only_an_idle_plan_waits_for_an_edit_to_fix_its_inputs() {
+        let permanent = || ReconcileError::InvalidFileEntry {
+            name: "files".into(),
+            reason: "test",
+        };
+        let transient = || ReconcileError::InventoryNotSynced {
+            name: "workers".into(),
+            generation: 2,
+            observed: "1".into(),
+        };
+        let idle = PlaybookPlanStatus::default();
+        let running = PlaybookPlanStatus {
+            active_run: Some(ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-1".into(),
+                job_name: "apply-plan-1-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: None,
+                retry_generation: 0,
+            }),
+            ..Default::default()
+        };
+
+        assert!(input_error_waits_for_an_edit(&permanent(), &idle));
+        assert!(!input_error_waits_for_an_edit(&permanent(), &running));
+        assert!(!input_error_waits_for_an_edit(&transient(), &idle));
+
+        assert_eq!(
+            conclude_input_error("ns", "plan", permanent(), true, &idle).ok(),
+            Some(Action::requeue(PERMANENT_INPUT_ERROR_RECHECK))
+        );
+        assert!(matches!(
+            conclude_input_error("ns", "plan", permanent(), true, &running),
+            Err(ReconcileError::InvalidFileEntry { .. })
+        ));
+    }
+
+    /// A plan whose status write failed still shows its previous verdict, so it must not go quiet
+    /// for the long recheck: the error requeue is what retries the report.
+    #[test]
+    fn an_idle_plan_that_could_not_report_its_input_error_keeps_retrying() {
+        let permanent = ReconcileError::InvalidFileEntry {
+            name: "files".into(),
+            reason: "test",
+        };
+
+        assert!(matches!(
+            conclude_input_error(
+                "ns",
+                "plan",
+                permanent,
+                false,
+                &PlaybookPlanStatus::default()
+            ),
+            Err(ReconcileError::InvalidFileEntry { .. })
         ));
     }
 

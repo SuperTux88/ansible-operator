@@ -231,7 +231,7 @@ timer. The watched inputs are:
 | A Node it is still waiting on becoming `Ready` | at once — for a scheduled plan, only while its tick's window is open |
 | A `StaticInventory`'s SSH key Secret | at once, but **only for a plan whose last run did not succeed** |
 | The run's Job finishing | at once |
-| Nothing at all | on a timer: the time until the next scheduled tick, or an hour for an unscheduled plan — a plan [held](./cluster-nodes.md#holding-instead-of-starting) for its Nodes also once when its tick's window closes |
+| Nothing at all | on a timer: the time until the next scheduled tick, or an hour for an unscheduled plan — a plan [held](./cluster-nodes.md#holding-instead-of-starting) for its Nodes also once when its tick's window closes, and one whose [inputs cannot be read](./results-and-troubleshooting.md#the-plans-inputs-cannot-be-read) every 15 seconds, or every five minutes when only an edit can fix them and no run is in flight |
 
 "Still waiting on" is narrower than "not current", and it is the same question the run's target set
 answers — so a plan is never woken for a host it would not then run. For a `Recurring` plan that is
