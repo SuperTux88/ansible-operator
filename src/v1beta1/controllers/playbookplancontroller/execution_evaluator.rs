@@ -37,8 +37,8 @@ impl ExecutionHash {
     ///
     /// Inventory variables are treated as *content*: changing one re-applies the playbook to
     /// otherwise-current hosts. The fold is order-insensitive (groups resolve in arbitrary order),
-    /// and an empty input is a no-op, so an inventory that sets no variables hashes exactly as it
-    /// did before this field existed — see [`renders_group_vars`] for what counts as setting none.
+    /// and an empty input is a no-op, so an inventory that sets no variables leaves the hash of the
+    /// playbook and Secrets untouched — see [`renders_group_vars`] for what counts as setting none.
     pub fn fold_inventory_variables<'a>(
         self,
         variables: impl IntoIterator<Item = (&'a str, &'a serde_json::Value)>,
@@ -73,9 +73,9 @@ impl ExecutionHash {
     /// change — the binary a plan installs usually lives in its `image`, which is deliberately not
     /// hashed.
     ///
-    /// `None` returns the hash untouched, so a plan without `provides` hashes exactly as it did
-    /// before this field existed and the upgrade that introduces it re-runs nothing. A plan that
-    /// *adds* `provides` re-runs once, which is what earns its first label.
+    /// `None` returns the hash untouched: a plan that provides nothing has no version for a re-run
+    /// to deliver, so the field must not move its hash. A plan that *adds* `provides` re-runs once,
+    /// which is what earns its first label.
     pub fn fold_provides_version(self, version: Option<&str>) -> ExecutionHash {
         let Some(version) = version else {
             return self;
@@ -158,8 +158,8 @@ const SLOT_MEMBERSHIP_GRACE: chrono::Duration = chrono::Duration::seconds(60);
 /// regular schedule; on an irregular one (`0 3 * * 1-5`, whose Friday tick is three days from the
 /// next and one from the last) the forward gap is the longer, so the grace can come out at its
 /// ceiling where a backward measurement would have shortened it. It errs only towards the ceiling,
-/// never below what a backward measurement would allow, so the worst case is the 60s this used to
-/// grant unconditionally.
+/// never below what a backward measurement would allow, so the worst case is the full
+/// [`SLOT_MEMBERSHIP_GRACE`].
 #[derive(Debug, Clone, Copy)]
 pub struct SlotWindow {
     slot: chrono::DateTime<chrono::FixedOffset>,
@@ -199,9 +199,8 @@ impl SlotWindow {
     /// touch or overlap can a run of the previous window land on that boundary too, and it then
     /// counts for this one: it started as close to this slot as a run of this slot could have.
     ///
-    /// An absent `appliedAt` reads as "has not run this slot": the field is only absent on a record
-    /// written before it existed (see `HostStatus::applied_at`), so the first tick after an upgrade
-    /// targets every host, exactly as it did before this function existed.
+    /// An absent `appliedAt` reads as "has not run this slot": a host without one has no recorded
+    /// success (see `HostStatus::applied_at`), so nothing shows it ran in this window.
     fn applied_within(&self, entry: &v1beta1::HostStatus) -> bool {
         entry
             .applied_at
@@ -449,7 +448,7 @@ mod tests {
     pub fn test_fold_inventory_variables_changes_hash_and_is_order_insensitive() {
         let base = calculate_execution_hash("playbook", std::iter::empty());
 
-        // No variables is a no-op, so pre-existing inventories keep their hash.
+        // No variables is a no-op, so an inventory that sets none does not move the hash.
         assert_eq!(base, base.fold_inventory_variables(std::iter::empty()));
 
         let workers = serde_json::json!({ "ansible_python_interpreter": "/usr/bin/python3" });
@@ -472,9 +471,8 @@ mod tests {
         );
     }
 
-    /// The upgrade guard. Every plan in the fleet is a plan without `provides` on the day this
-    /// ships, and a hash that moved for them would re-apply every playbook on every host at once —
-    /// triggered by nothing but installing a new operator.
+    /// A plan that provides nothing has no version to deliver, so the field must leave its hash
+    /// exactly as the playbook and inputs alone make it.
     #[test]
     fn a_plan_without_provides_hashes_as_though_the_field_did_not_exist() {
         let base = calculate_execution_hash("playbook", std::iter::empty());
@@ -832,15 +830,14 @@ mod tests {
         );
     }
 
-    /// The upgrade case: `appliedAt` is absent on a record written before the field existed, and a
-    /// host that cannot prove it ran this slot is owed it. The first tick after an upgrade
-    /// therefore targets everyone, exactly as it did before slots were tracked.
+    /// A host that cannot prove it ran this slot is owed it: one whose record carries no
+    /// `appliedAt`, and one with no record at all.
     #[test]
     fn a_host_with_no_recorded_run_is_owed_the_slot() {
         let window = nightly("2025-08-13T03:00:00Z");
-        let before_the_field = slot_status(&[("worker-1", None, "1")]);
+        let undated = slot_status(&[("worker-1", None, "1")]);
         assert_eq!(
-            find_hosts_owing_slot(&before_the_field, &ExecutionHash(1), window),
+            find_hosts_owing_slot(&undated, &ExecutionHash(1), window),
             vec!["worker-1".to_owned()]
         );
 

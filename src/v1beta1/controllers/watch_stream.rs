@@ -229,7 +229,8 @@ mod tests {
     /// The requirement this type exists for. An apiserver restart leaves every trigger stream with
     /// one dead response body and then one `410 Expired` for the watch it resumes, and the shared
     /// delay is paid once per error — so the whole recovery costs about two ceilings rather than two
-    /// per stream, and the divisor does not change that. The incident this replaced took 13m49s.
+    /// per stream, and the divisor does not change that. With the undivided ceiling shared by every
+    /// stream, the same restart took 13m49s.
     ///
     /// Up to `UNSHARED_CEILING / FLOOR` streams, that is; past there the ceiling is the floor, which
     /// [`a_large_install_buys_its_bounded_request_rate_with_recovery_time`] pays for.

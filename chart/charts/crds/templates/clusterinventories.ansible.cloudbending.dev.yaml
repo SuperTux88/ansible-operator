@@ -274,7 +274,7 @@ spec:
                         nothing about the external one.
 
                         Absent on a `ClusterInventory`'s own `status.resolvedHosts`, where the kind of the resource
-                        holding it is already the answer, and on a record written before this field existed. Absent
+                        holding it is already the answer, and on any record not written by [`flatten_hosts`]. Absent
                         therefore reads as "not known to be a Node", which is the safe way round: every question it
                         gates is about Node objects.
                       enum:

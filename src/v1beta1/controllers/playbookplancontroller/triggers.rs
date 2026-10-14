@@ -46,9 +46,10 @@ const DAY_NAMES: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 
 /// A standard cron day-of-week field as the comma-separated day names it selects.
 ///
-/// Accepts what the `cron` crate accepted before this translation existed — lists, ranges, `/step`,
-/// `*` and `?`, and its day names — so no expression that used to parse is refused, only read with
-/// standard numbering. A bare `N/step` runs from `N` to the end of the week, as in cronie.
+/// Accepts the same day-of-week syntax the `cron` crate itself parses — lists, ranges, `/step`, `*`
+/// and `?`, and its day names — so the translation refuses nothing the crate would take; it only
+/// reads numbers with standard numbering. A bare `N/step` runs from `N` to the end of the week, as
+/// in cronie.
 fn day_of_week_names(field: &str) -> Result<String, ScheduleError> {
     let invalid = || ScheduleError::DayOfWeek(field.to_string());
     let mut selected = [false; 7];

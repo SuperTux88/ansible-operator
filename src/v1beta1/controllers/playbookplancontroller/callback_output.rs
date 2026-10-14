@@ -335,8 +335,8 @@ mod tests {
     #[test]
     fn wrong_length_array_returns_none() {
         // A shape change fails to parse -> Unknown, never a silent misread. The 7-element form is
-        // what a workspace rendered before the completion marker existed emits, and it must fail
-        // this way rather than be read as a 7-counter host with the last field defaulted.
+        // the recap without its completion flag, and it must fail this way rather than be read as a
+        // host with that flag defaulted.
         assert!(parse_callback_output(r#"{"host-1":[2,0,0,1,0,0]}"#).is_none());
         assert!(parse_callback_output(r#"{"host-1":[2,0,0,1,0,0,0]}"#).is_none());
     }

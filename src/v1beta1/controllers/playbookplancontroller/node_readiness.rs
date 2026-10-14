@@ -30,8 +30,8 @@ pub fn is_ready(node: &Node) -> bool {
 /// the controller reconciles anything (`reconciler::new`), so a miss is not missing data: it says
 /// the Node does not exist, and nothing will ever report it `Ready`. Holding for one would be
 /// holding forever. A node that is genuinely gone is also not in the resolved inventory for long,
-/// and a run that targets one anyway behaves exactly as it did before this module existed: no proxy
-/// pod, grace window, reported unreachable.
+/// and a run that targets one anyway goes through the ordinary proxy wait: no proxy pod, grace
+/// window, reported unreachable.
 ///
 /// `StaticInventory` hosts are not Nodes and never appear here.
 pub fn unready_nodes(nodes: &Store<Node>, groups: &[ResolvedInventoryGroup]) -> Vec<String> {
@@ -68,11 +68,11 @@ pub fn unready_nodes(nodes: &Store<Node>, groups: &[ResolvedInventoryGroup]) -> 
 /// ahead and reach them, carrying the unreachable ones along so they are reported as such in the
 /// play result rather than silently dropped from it.
 ///
-/// The mode does not come into it. `Recurring` used to be excluded on the grounds that it re-applies
-/// at each tick against whatever exists then, so a tick that reaches nobody costs nothing to skip —
-/// but a tick is now a *window* that can still owe its hosts a run, and burning it at 03:00 because
-/// the fleet is switched off is what the window exists to prevent. The run would achieve nothing and
-/// take the full grace window to find that out, which was always the argument.
+/// The mode does not come into it. `Recurring` re-applies at each tick against whatever exists then,
+/// which makes a tick that reaches nobody look free to skip — but a tick is a *window* that can
+/// still owe its hosts a run, and burning it at 03:00 because the fleet is switched off is what the
+/// window exists to prevent. The run would achieve nothing and take the full grace window to find
+/// that out, in either mode.
 ///
 /// What bounds the hold for that mode is the caller: `reconciler::held_back_by_unready_nodes`
 /// requires a `Timing::Now`, so the hold lasts no longer than the window it is held for.
@@ -168,9 +168,9 @@ mod tests {
         assert!(!holds_for_unready_nodes(&groups, &[]));
     }
 
-    /// The 03:00 tick of a fleet that is switched on at 06:00. A `Recurring` plan used to run
-    /// anyway, reach nobody, and spend the window on a result that was knowable before the Job
-    /// existed. It now waits — and the window is still open at 06:00 for the run it owes.
+    /// The 03:00 tick of a fleet that is switched on at 06:00. Running anyway would reach nobody and
+    /// spend the window on a result that was knowable before the Job existed. A `Recurring` plan
+    /// waits instead — and the window is still open at 06:00 for the run it owes.
     #[test]
     fn a_recurring_run_waits_for_its_nodes_like_any_other() {
         let groups = vec![managed("workers", &["node-a", "node-b"])];

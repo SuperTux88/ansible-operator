@@ -230,7 +230,7 @@ pub struct LabelWrite {
 ///
 /// - it has an `appliedVersion`, which is stamped by exactly the outcome that stamps
 ///   `lastAppliedHash`. A host that failed, was unreachable, or received only part of a playbook
-///   has none, and a record written before that field existed has none either.
+///   has none, and neither does a host whose plan provides nothing.
 /// - its Node is in the cache. The Node's current labels are needed to tell a change from a no-op,
 ///   and its `creationTimestamp` is needed for the next point.
 /// - its Node is the machine the claim was recorded for. A machine rebuilt under its predecessor's
@@ -266,10 +266,10 @@ pub fn desired_labels(
             let version = record.applied_version.as_deref()?;
             // An undated claim cannot be shown to belong to the machine standing there now, so it
             // is not published. `node_replaced_since` answers `false` for one, and rightly so for
-            // the question *it* exists for — treating undated records as replacements would re-run
-            // every plan in the fleet on the upgrade that introduced the field. Publishing is the
-            // opposite trade: the cost of a wrong label is every dependent in the cluster acting on
-            // it, so an unanswerable question fails closed here.
+            // the question *it* exists for — treating an undated record as a replacement would
+            // re-run a host on no evidence. Publishing is the opposite trade: the cost of a wrong
+            // label is every dependent in the cluster acting on it, so an unanswerable question
+            // fails closed here.
             let applied_at = record.applied_at?;
             let node = nodes.get(&ObjectRef::new(host))?;
             if node_replaced_since(Some(applied_at), &node) {
@@ -310,8 +310,7 @@ pub struct LabelWrites {
 /// each time. Both ways of getting there are configuration only an administrator can fix: the
 /// `nodes: patch` grant gone while `node_labels.enabled` is still on (the chart moves the two
 /// together precisely so this cannot happen by accident), and the chart's
-/// `ValidatingAdmissionPolicy` denying the write. Those wait for the plan's ordinary requeue, which
-/// is what they did before this distinction existed.
+/// `ValidatingAdmissionPolicy` denying the write. Those wait for the plan's ordinary requeue.
 ///
 /// A conflict, a throttle, an apiserver mid-restart or a connection that failed are the opposite:
 /// nothing is wrong with the plan or the cluster's configuration, the write simply has to be made
@@ -565,8 +564,8 @@ mod tests {
     }
 
     /// A host with no version has not succeeded under a revision that declared one — it failed, was
-    /// unreachable, received only part of the playbook, or its record predates the field. Every one
-    /// of those must read as "nothing to advertise" rather than as an empty claim.
+    /// unreachable, or received only part of the playbook. Every one of those must read as "nothing
+    /// to advertise" rather than as an empty claim.
     #[test]
     fn a_host_that_has_applied_no_version_is_not_labelled() {
         let writes = desired_labels(
@@ -597,9 +596,8 @@ mod tests {
         assert!(writes.is_empty());
     }
 
-    /// A record that predates `appliedAt` cannot be dated, so it cannot be told apart from a
-    /// replacement. It is left unlabelled rather than guessed at; its next success fills the field
-    /// in.
+    /// A claim with no `appliedAt` cannot be dated, so it cannot be told apart from a replacement.
+    /// It is left unlabelled rather than guessed at; its next success fills the field in.
     #[test]
     fn a_claim_that_cannot_be_dated_is_not_labelled() {
         let writes = desired_labels(

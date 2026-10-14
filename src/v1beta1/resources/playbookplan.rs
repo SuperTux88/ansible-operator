@@ -580,10 +580,11 @@ pub struct HostStatus {
     /// drop the claim it had just written for a freshly joined Node — a success that re-runs for
     /// ever. Both sides of the comparison are now the API server's own clock.
     ///
-    /// Absent on a record written before this field existed. Such a record is never treated as a
-    /// replacement, or the upgrade that introduced the field would re-run every plan across the
-    /// fleet, and it is never published as a Node label either; the next success fills it in. See
-    /// the `#[serde(default, ...)]` note on `PlaybookPlanStatus::next_run`.
+    /// Absent while the host has no recorded success. A claim without it cannot be dated, so it is
+    /// never treated as a replacement, which would re-run the host on no evidence, and never
+    /// published as a Node label, which would advertise software nothing shows the Node has; the
+    /// next success fills it in. See the `#[serde(default, ...)]` note on
+    /// `PlaybookPlanStatus::next_run`.
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub applied_at: Option<DateTime<FixedOffset>>,
@@ -596,8 +597,8 @@ pub struct HostStatus {
     /// the new revision and some still carry the old one, and each must be labelled with what it
     /// actually has.
     ///
-    /// Absent for a plan that provides nothing, and absent on a record stamped before this field
-    /// existed. A host with no version here is never labelled — see `node_labels`.
+    /// Absent for a plan that provides nothing, and while the host has no recorded success. A host
+    /// with no version here is never labelled — see `node_labels`.
     #[serde(default)]
     pub applied_version: Option<String>,
     // See the `#[serde(default, ...)]` note on `PlaybookPlanStatus::next_run`.
@@ -993,7 +994,7 @@ spec:
 
     /// Regression test: JSON Merge Patches delete a key entirely rather than setting it null, so
     /// `nextRun`/`lastTransitionTime` are genuinely absent from the stored object when `None`.
-    /// Without `#[serde(default)]` this used to fail deserialization with "missing field".
+    /// Without `#[serde(default)]` this would fail deserialization with "missing field".
     #[test]
     fn status_deserializes_when_optional_timestamps_are_entirely_absent() {
         let json = serde_json::json!({

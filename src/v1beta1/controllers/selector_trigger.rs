@@ -31,11 +31,11 @@ pub const RECOMPUTE_DEBOUNCE: std::time::Duration = std::time::Duration::from_se
 /// and stays silent for every other update.
 ///
 /// This exists for the controllers whose status is a function of a whole *selected set*
-/// (`ClusterInventory` over Nodes, `NodeAccessPolicy` over Nodes and Namespaces). Their triggers
-/// used to map any event on a watched object to *every* object they own, which was correct and
-/// ruinously loud: kubelets repost Node status roughly every five minutes
-/// (`nodeStatusReportFrequency`) and every one of those reposts recomputed a byte-identical status,
-/// each recomputation costing a cluster-wide `list_metadata` and a status patch. The load was
+/// (`ClusterInventory` over Nodes, `NodeAccessPolicy` over Nodes and Namespaces). Mapping any event
+/// on a watched object to *every* object they own would be correct and ruinously loud: kubelets
+/// repost Node status roughly every five minutes (`nodeStatusReportFrequency`) and every one of
+/// those reposts would recompute a byte-identical status, each recomputation costing a
+/// cluster-wide `list_metadata` and a status patch. The load would be
 /// `nodes × 12/hour × (inventories + policies)`, roughly quadratic in cluster size, for zero change
 /// in output.
 ///
@@ -63,7 +63,7 @@ where
 {
     let kind = M::kind(&M::DynamicType::default()).to_string();
 
-    // The delay `Controller::watches` used to supply, and the restart that makes a failure cost one
+    // The delay `Controller::watches` would supply, and the restart that makes a failure cost one
     // error instead of a dozen — both are `restarting_watcher`'s, and a bare `watcher` has neither:
     // it re-lists on the very next poll after an error, and the retry that made that acceptable
     // belongs to the controller (`Controller::run` wraps its trigger streams in `StreamBackoff`,

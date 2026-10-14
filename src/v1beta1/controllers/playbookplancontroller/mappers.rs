@@ -38,9 +38,9 @@ pub fn node_access_policy_to_playbookplans(
 
 /// Returns a closure that maps a `ClusterInventory` to the PlaybookPlans that reference it.
 ///
-/// A plan's host set is *read* live on every tick but was *triggered* by nothing: the
+/// A plan's host set is *read* live on every tick, but reading is not a trigger: the
 /// `ClusterInventory` controller republishes `.status.resolvedHosts` within seconds of a Node
-/// joining, leaving or being relabelled, and until this watch existed that change reached the plans
+/// joining, leaving or being relabelled, and without this watch that change would reach the plans
 /// built on it only when their next requeue happened to come round — an hour for an idle
 /// `OneShot` plan, the next slot for a scheduled one.
 pub fn cluster_inventory_to_playbookplans(
@@ -153,16 +153,16 @@ pub fn node_to_playbookplans(
 /// hash, so every host is outdated) would otherwise wake it on every kubelet heartbeat of every
 /// matching Node for as long as it stayed suspended, which is an ordinary workflow.
 ///
-/// `Recurring` used to be refused outright, because nothing that mode did was started by a Node and
-/// nothing bounded the wake: `attempt_budget_available` answers `true` for it unconditionally — its
-/// budget is slot-scoped and enforced by the window gate — so a single host left `Unknown` or
-/// `Unreachable` would have woken the plan on that Node's every kubelet heartbeat for the life of
-/// the plan, at a cost of re-resolving both inventory kinds and re-reading every Secret each time.
+/// `Recurring` needs bounds of its own, because nothing else bounds the wake:
+/// `attempt_budget_available` answers `true` for it unconditionally — its budget is slot-scoped and
+/// enforced by the window gate — so without them a single host left `Unknown` or `Unreachable` would
+/// wake the plan on that Node's every kubelet heartbeat for the life of the plan, at a cost of
+/// re-resolving both inventory kinds and re-reading every Secret each time.
 ///
-/// It is woken now, because a Node returning is exactly what such a plan can be waiting for: the
-/// readiness gate holds its tick when every host it would reach is down
-/// (`node_readiness::holds_for_unready_nodes`), and the 06:00 machine inside an 03:00 window is the
-/// case the whole schedule-window feature exists for. Three bounds replace the blanket refusal, and
+/// Refusing the mode outright is not the answer either, because a Node returning is exactly what
+/// such a plan can be waiting for: the readiness gate holds its tick when every host it would reach
+/// is down (`node_readiness::holds_for_unready_nodes`), and the 06:00 machine inside an 03:00 window
+/// is the case the whole schedule-window feature exists for. So it is woken within three bounds, and
 /// each is asked of the same thing the reconcile would ask:
 ///
 ///   - **the window is open** (`reconciler::open_schedule_slot`). Outside it the tick lands in the
@@ -196,8 +196,8 @@ pub fn node_to_playbookplans(
 /// update of its Node until 03:00. Asked last, after the host has proved owed, since it parses the
 /// schedule.
 ///
-/// The budget check cannot strand a plan the readiness gate is holding, which is the trap the
-/// allow-list version of this predicate fell into: that hold is only ever asserted inside
+/// The budget check cannot strand a plan the readiness gate is holding, which an allow-list of
+/// wakeable outcomes would: that hold is only ever asserted inside
 /// `eligible_to_start`, which already requires the budget, so a held plan always has one.
 ///
 /// The outcome check is what keeps that from meaning "forever". `lastAppliedHash` is only stamped on
@@ -235,8 +235,8 @@ pub fn node_to_playbookplans(
 /// never targets, and a Node object says nothing about that machine — so asking would report a
 /// replacement the reconcile rightly refuses to act on (`node_recreation` only touches managed-ssh
 /// hosts), leaving a wake condition that every kubelet heartbeat re-triggers and nothing can ever
-/// clear. A record written before the connection was tracked answers "not a Node" and is simply not
-/// asked, which costs at most one delayed wake-up on the tick after an upgrade.
+/// clear. A record with no connection answers "not a Node" and is simply not asked, which costs at
+/// most one delayed wake-up: the plan's next reconcile rewrites `eligibleHosts` with it.
 fn plan_awaits_node(
     plan: &v1beta1::PlaybookPlan,
     node: &Node,
@@ -701,9 +701,9 @@ mod tests {
         ));
     }
 
-    /// A record written before the connection was tracked. Answering "not a Node" costs at most one
-    /// delayed wake-up after an upgrade; answering "Node" for an external host costs a wake nothing
-    /// can ever clear.
+    /// A record with no connection. Answering "not a Node" costs at most one delayed wake-up, since
+    /// the plan's next reconcile rewrites `eligibleHosts` with it; answering "Node" for an external
+    /// host costs a wake nothing can ever clear.
     #[test]
     fn a_host_whose_connection_was_never_recorded_is_not_treated_as_a_node() {
         let mut converged = host("abc", HostOutcome::Succeeded);

@@ -44,12 +44,12 @@ pub fn new(
     // Metadata-only: `node_matches` reads labels and nothing else, and so does the trigger.
     let node_metadata_api: Api<PartialObjectMeta<Node>> = Api::all(client.clone());
 
-    // Every inventory is recomputed on every tick, which is what the Node mapper this replaced did
-    // too — a `ClusterInventory`'s status is a function of the whole Node set, so there is no
-    // narrower answer to give. What changed is the *rate*: the mapper fired on every kubelet status
-    // repost, and `selector_trigger::label_changes` fires only when the labels those inventories
-    // select over actually move. `Controller::reconcile_all_on` reads the controller's own store,
-    // so the hand-rolled reflector the mapper needed is gone with it.
+    // Every inventory is recomputed on every tick — a `ClusterInventory`'s status is a function of
+    // the whole Node set, so there is no narrower answer to give. What is narrow is the *rate*: a
+    // Node mapper would fire on every kubelet status repost, while
+    // `selector_trigger::label_changes` fires only when the labels those inventories select over
+    // actually move. `Controller::reconcile_all_on` reads the controller's own store, so no
+    // hand-rolled reflector is needed either.
     Controller::new(inventories_api, watcher::Config::default())
         // Every tick recomputes every inventory against the whole Node set, so a fleet being
         // labelled by a providing plan would otherwise buy one full recompute per Node —
