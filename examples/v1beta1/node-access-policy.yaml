@@ -20,12 +20,14 @@ kind: NodeAccessPolicy
 metadata:
   name: cluster-admins
 spec:
-  # The admin's own namespace may target every node. Note there is no "match all" shortcut — an
-  # empty selector matches nothing (fail-closed), so allow-all is expressed explicitly by matching a
-  # label every node carries.
+  # The admins' own plan namespace may target every node. It is a tenant namespace like any other
+  # (enrolled through the chart's watchNamespaces), not the operator's namespace: the policy applies
+  # to the namespace a plan lives in, and plans do not belong in the operator's. Note there is no
+  # "match all" shortcut — an empty selector matches nothing (fail-closed), so allow-all is
+  # expressed explicitly by matching a label every node carries.
   namespaceSelector:
     matchLabels:
-      kubernetes.io/metadata.name: ansible-system
+      kubernetes.io/metadata.name: platform-admin
   nodeSelector:
     matchExpressions:
       - { key: kubernetes.io/hostname, operator: Exists }
