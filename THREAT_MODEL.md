@@ -516,6 +516,10 @@ This design is **only** as strong as the environment it runs in. The following a
    bounds *which nodes*, but managed-ssh on any authorized node is root on that node (T-ESC-4).
 6. **Pin the proxy image** to a digest from a registry you trust, via `managedSsh.proxyImage`.
    The chart seed is digest-pinned; preserve that property when overriding it (T-ESC-5).
+7. **Run exactly one operator process.** Each process holds its own in-memory CA (A2, INV-6), so
+   a second one mints certs the first one's proxy pods do not trust, and the two tear down each
+   other's half-built runs. The chart refuses `replicaCount` above 1 and uses the `Recreate`
+   strategy, which covers rollouts; it cannot prevent a short overlap outside one (R10).
 
 ---
 
@@ -613,6 +617,7 @@ fully implemented and carries no open tail; see T-INFO-1 and §8.)
 | R7 | Add per-tenant ResourceQuota/LimitRange guidance and optionally a max-fan-out guard. | T-DOS-1 | Low |
 | R8 | Pin host identity: replace the `@cert-authority *` wildcard with per-host known_hosts entries so host certs are bound to the intended node. | T-SPOOF-2 | Low |
 | R9 | Consider a cryptographic hash (or explicit run UID) wherever `ExecutionHash` feeds security-relevant naming/labels/principals. | T-ESC-6 | Low |
+| R10 | Single-process operation (§6 item 7) is enforced for rollouts only. A Deployment does not guarantee at most one pod: a pod on a partitioned Node is replaced after the eviction timeout while it may still run, and so is a force-deleted pod. The overlap breaks runs being built (availability), not isolation — each CA's certs are still principal-scoped. Leader election would close it and is not planned. | §6 item 7 | Low |
 
 ---
 

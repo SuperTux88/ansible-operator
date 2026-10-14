@@ -16,6 +16,14 @@ helm install --create-namespace -n ansible-system ansible-operator \
 
 For development from a checkout, replace the OCI URL and version with `./chart`.
 
+The operator must run as a **single process**. Its SSH certificate authority lives only in that
+process's memory and is never stored anywhere, so a second process would sign certificates that the
+first one's proxy pods do not trust, and the two would undo each other's runs. The chart therefore
+refuses a `replicaCount` above 1, and the Deployment uses the `Recreate` strategy so the old pod
+stops before the new one starts. See
+[how runs are isolated](./security.md#how-runs-are-isolated-from-each-other) for why the CA is kept
+in memory.
+
 Do **not** create `PlaybookPlan`s or inventories in the operator's own namespace — those belong in
 tenant namespaces. The operator namespace is where its runtime machinery lives: per-run Leases and
 the managed-SSH proxy pods, Secrets, and NetworkPolicies. (The admin-authored `NodeAccessPolicy`

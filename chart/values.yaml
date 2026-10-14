@@ -9,6 +9,10 @@ crds:
   # alone; they then have to be deleted manually. Upgrades reconcile schema changes either way.
   keep: true
 
+# The operator must run as a single process, because its SSH CA lives only in its memory and is
+# never shared: a second replica would mint certificates the first one's proxy pods do not trust.
+# Only 0 and 1 are accepted, and the Deployment uses the Recreate strategy so an upgrade never
+# overlaps the old and the new pod.
 replicaCount: 1
 
 image:
