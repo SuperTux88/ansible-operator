@@ -1,7 +1,7 @@
 apiVersion: ansible.cloudbending.dev/v1beta1
 kind: ClusterInventory
 metadata:
-  namespace: ansible-system
+  namespace: platform-admin
   name: cluster-nodes
 spec:
   tolerations:
@@ -20,7 +20,7 @@ spec:
 apiVersion: ansible.cloudbending.dev/v1beta1
 kind: PlaybookPlan
 metadata:
-  namespace: ansible-system
+  namespace: platform-admin
   name: k3s-upgrade
 spec:
   mode: OneShot

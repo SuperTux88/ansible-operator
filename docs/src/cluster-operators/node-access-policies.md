@@ -65,11 +65,16 @@ metadata:
 spec:
   namespaceSelector:
     matchLabels:
-      kubernetes.io/metadata.name: ansible-system
+      kubernetes.io/metadata.name: platform-admin
   nodeSelector:
     matchExpressions:
       - { key: kubernetes.io/hostname, operator: Exists }   # every Node has a hostname
 ```
+
+`platform-admin` here is an ordinary [enrolled](./deployment.md#enrolled-namespaces) namespace set
+aside for the administrators' own plans, not the operator's namespace. A policy applies to the
+namespace a plan lives in, and plans [do not belong](./deployment.md#install) in the operator's, so
+a policy that names it grants nothing.
 
 ## How multiple policies combine
 

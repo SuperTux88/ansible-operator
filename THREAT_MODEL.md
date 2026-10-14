@@ -500,10 +500,12 @@ This design is **only** as strong as the environment it runs in. The following a
    run's run-ID principal via `AuthorizedPrincipalsFile` (T-INFO-3) — so a non-enforcing CNI does
    not collapse it. NetworkPolicy still limits reachability to node-root proxy pods and blocks
    non-cert traffic; keep it on for multi-tenant.
-2. **Deploy a `NodeAccessPolicy` for the operator namespace when installing the operator.**
-   Enforcement is always-on and fail-closed; absent a policy, managed-ssh plans resolve to
-   zero nodes (T-DOS-2). See the `cluster-admins` doc in
-   [`examples/v1beta1/node-access-policy.yaml`](examples/v1beta1/node-access-policy.yaml).
+2. **Deploy a `NodeAccessPolicy` for every namespace that runs managed-ssh plans.**
+   Enforcement is always-on, fail-closed and keyed on the *plan's* namespace; absent a matching
+   policy, that namespace's managed-ssh plans resolve to zero nodes (T-DOS-2). Plans do not
+   belong in the operator namespace (see the deployment guide), so a policy for it grants
+   nothing useful.
+   See [`examples/v1beta1/node-access-policy.yaml`](examples/v1beta1/node-access-policy.yaml).
 3. **Lock down the operator namespace.** It runs the node-root proxy pods and the Tier-0
    operator ServiceAccount, and holds their per-host Secrets and NetworkPolicies. Per-run client
    certificates live in enrolled plan namespaces (A3), while the CA itself is in-memory only (A2).
