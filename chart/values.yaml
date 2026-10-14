@@ -120,7 +120,8 @@ nodeLabels:
   admissionPolicy: true
 
 # Optional egress NetworkPolicies. Rules use the native networking.k8s.io/v1 NetworkPolicy egress
-# schema. Disabled by default so an upgrade never broadens or changes existing network controls.
+# schema. Disabled by default because useful rules are specific to each cluster, and a wrong default
+# would break Ansible's outbound connections.
 #
 # CAUTION: these are raw NetworkPolicy egress rule arrays, so empty-vs-unrestricted follows
 # NetworkPolicy semantics, not Helm's:
