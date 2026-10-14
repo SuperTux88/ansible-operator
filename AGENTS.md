@@ -212,7 +212,9 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    treated as "retry next tick" rather than discarding the status just written.
 
 Requeue is dynamic: 3600s default, tightened to "time until next scheduled run" / 15s
-(Job-polling) / 5s (waiting on proxy readiness) as appropriate.
+(Job-polling) / 5s (waiting on proxy readiness) as appropriate. A failed tick retries after 15s,
+except an idle plan whose input only an edit can fix (`input_error_waits_for_an_edit`), which
+rechecks after 5 min — never a plan with a run in flight, whose ticks renew its host Leases.
 
 ### managed-ssh (the node-root path)
 
