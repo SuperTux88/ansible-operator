@@ -6,7 +6,17 @@ certificate authority is held in memory only and is never stored in a Secret.) D
 StaticInventories at this same namespace — those belong in your own tenant namespaces.
 
 Next steps:
-  1. Create a ClusterInventory or StaticInventory in the namespace where you want to run
-     playbooks from.
-  2. Create a PlaybookPlan referencing it.
-  3. Watch progress: kubectl get playbookplan -n <your-namespace> -w
+  1. Enroll the namespace you want to run playbooks from: add it to watchNamespaces and run
+     helm upgrade. A PlaybookPlan in a namespace that is not enrolled is refused with phase
+     UnauthorizedNamespace.
+     {{- if .Values.watchNamespaces }}
+     Enrolled now, besides this namespace: {{ join ", " .Values.watchNamespaces }}.
+     {{- else }}
+     No namespace besides this one is enrolled yet.
+     {{- end }}
+  2. To run playbooks on cluster Nodes, write a NodeAccessPolicy that grants that namespace the
+     Nodes it may reach. Without one, a plan using a ClusterInventory targets zero Nodes.
+     StaticInventory hosts need no policy.
+  3. Create a ClusterInventory or StaticInventory in that namespace.
+  4. Create a PlaybookPlan referencing it.
+  5. Watch progress: kubectl get playbookplan -n <your-namespace> -w
