@@ -198,10 +198,6 @@ waits the same — so a plan whose machines are re-imaged during a narrow
 `startingDeadlineSeconds` is worth widening. Editing the plan moves the hash, which clears the slot
 and runs immediately, if you would rather not wait.
 
-Records written before this field existed carry no `appliedAt` and are deliberately left alone
-until their next success, so upgrading the operator does not re-run every plan in the cluster. Until
-then they also publish no dependency label, because nothing dates what they describe.
-
 A host's record is removed once it has **both** left the plan's inventory and ceased to exist as a
 Node — a machine that has left the cluster for good. Both halves are required, so a host that leaves
 the inventory while its Node is still there keeps its record: a narrowed
@@ -923,10 +919,6 @@ whole playbook run, so nobody reaches the marker; a host that failed or went unr
 from later plays, so it does not either. That play is why run logs show one more `PLAY` than the
 playbook has, and its task is subtracted back out of every count the operator reports, so
 `.status.recap` describes the playbook rather than the operator.
-
-Before this existed, such a host was recorded `Succeeded` and stamped converged — permanently, since
-`OneShot` then skips a converged host on every later run. If a plan looks converged on a host that
-demonstrably never received the whole playbook, that is what happened.
 
 ### Hosts show `Unknown`
 

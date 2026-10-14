@@ -317,9 +317,8 @@ NodeAccessPolicy enforcement is **always on**. With no matching policy, managed-
 resolve to **zero** nodes and silently do nothing.
 - *Mitigation:* intentional (default-deny). `warn!` on exclusion; status shows
   `eligibleHosts`.
-- *Residual:* an operator upgrading an existing cluster without deploying an allow-all
-  policy will see all managed-ssh plans stop. This is a **breaking rollout caveat**, not a
-  vuln — see §6.
+- *Residual:* an install that deploys no `NodeAccessPolicy` runs no managed-ssh plan on any
+  node until an admin writes one. This is an operational requirement, not a vuln — see §6.
 - *Severity:* Operational, not security.
 
 ### Elevation of privilege (the core of this model)
@@ -501,7 +500,7 @@ This design is **only** as strong as the environment it runs in. The following a
    run's run-ID principal via `AuthorizedPrincipalsFile` (T-INFO-3) — so a non-enforcing CNI does
    not collapse it. NetworkPolicy still limits reachability to node-root proxy pods and blocks
    non-cert traffic; keep it on for multi-tenant.
-2. **Deploy a `NodeAccessPolicy` for the operator namespace before/at rollout.**
+2. **Deploy a `NodeAccessPolicy` for the operator namespace when installing the operator.**
    Enforcement is always-on and fail-closed; absent a policy, managed-ssh plans resolve to
    zero nodes (T-DOS-2). See the `cluster-admins` doc in
    [`examples/v1beta1/node-access-policy.yaml`](examples/v1beta1/node-access-policy.yaml).

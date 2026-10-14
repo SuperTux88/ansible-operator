@@ -276,9 +276,9 @@ inside an open schedule window retries in that window.
 
 Two details worth knowing:
 
-- **The first key a plan ever sees is not a rotation.** A plan created before this behaviour existed,
-  or one reaching a `StaticInventory` for the first time, records the key it finds without acting on
-  it. Only a *change* from a key the plan already recorded counts.
+- **The first key a plan ever sees is not a rotation.** A plan reaching a `StaticInventory` for the
+  first time records the key it finds without acting on it. Only a *change* from a key the plan
+  already recorded counts.
 - **A rotation during a run waits for it.** The run in flight finishes against the key it started
   with, and the rotation is acted on once its result is in.
 

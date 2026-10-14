@@ -296,7 +296,9 @@ policies enforce the cluster's required baseline.
 
 The per-run managed-SSH ingress policy is created when a run uses managed SSH. Optional egress
 NetworkPolicies can be enabled for the operator Deployment, Ansible Jobs, and managed-SSH proxy pods.
-They are disabled by default so an upgrade never changes or broadens existing network controls.
+They are disabled by default because useful egress rules are specific to each cluster — its API
+server address, DNS, package mirrors and the hosts playbooks reach — and a wrong default would break
+Ansible's outbound connections.
 
 These values are raw NetworkPolicy egress rule arrays, so they follow NetworkPolicy semantics rather
 than Helm's: `[{}]` — the shipped operator and playbook default — means "policy present, egress
@@ -349,15 +351,6 @@ A release using `crds.install: false` owns this step itself: apply the definitio
 new chart version *before* the operator that expects them. A field or a selector operator a plan
 author writes is rejected by the API server while an older schema is installed, and the rejection
 names the CRD rather than the chart, so it reads like an authoring mistake.
-
-A schema can also become **stricter**, and one has: a `ClusterInventory`'s `spec.hosts[]` entries no
-longer accept unknown fields. Until that change the API server kept whatever was written there and
-the operator ignored it, so a misspelt `matchExpresions` applied cleanly and left the group matching
-**every** Node in the cluster. It is now pruned with a warning, and `kubectl apply` rejects it by
-default. Anything that has been silently carrying such a field — a manifest in Git, a chart of your
-own — therefore starts failing to apply after this upgrade, on an object nobody edited. That is the
-point of the change, but it is worth knowing before the pipeline tells you: the fix is to correct the
-field name, and the group it belongs to was never selecting what it claimed to.
 
 The chart declares `kubeVersion: ">=1.25.0-0"` because two CRDs use **CRD validation rules**
 (`x-kubernetes-validations`):
