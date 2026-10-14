@@ -1008,8 +1008,9 @@ async fn reconcile(
     // cluster — it is the plan's own spec — but a spec that cannot produce a valid Job has to be
     // caught *before* a run takes its Leases and starts its proxy pods, or the rejection lands at
     // Job creation, where no retry can clear it and the plan wedges holding those Leases.
-    if let Err(error) =
-        validate_file_entries(&object).and_then(|()| validate_workspace_not_referenced(&object))
+    if let Err(error) = validate_playbook(&object)
+        .and_then(|()| validate_file_entries(&object))
+        .and_then(|()| validate_workspace_not_referenced(&object))
     {
         report_desired_input_error(
             &context,
@@ -2342,6 +2343,18 @@ fn withdraw_replaced_machines(
                 .retain(|host| !replaced_since(host, prepared_at));
         }
     }
+}
+
+/// Checks that `spec.template.playbook` parses as a playbook, through the same
+/// `ansible::render_playbook` that renders it into the run's workspace.
+///
+/// That rendering otherwise happens only when the workspace is written, after the run has taken its
+/// host Leases and started its proxy pods, and its failure there holds the run open against a spec
+/// no tick can fix.
+fn validate_playbook(plan: &PlaybookPlan) -> Result<(), ReconcileError> {
+    ansible::render_playbook(&plan.spec)
+        .map(|_| ())
+        .map_err(ReconcileError::InvalidPlaybook)
 }
 
 /// Checks that every `spec.template.files` entry can name a directory of its own under the
@@ -4774,7 +4787,8 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         ReconcileError::InventoryNotSynced { .. } => false,
         // A spec the user has to edit, exactly like the first arm above: no tick clears it, and
         // holding a run open against it would hold host Leases for as long as the plan stays wrong.
-        ReconcileError::InvalidFileEntry { .. }
+        ReconcileError::InvalidPlaybook(_)
+        | ReconcileError::InvalidFileEntry { .. }
         | ReconcileError::WorkspaceSecretReferenced { .. } => true,
         // Neither is an input read — both come from a run's own infrastructure — but the enum is
         // matched exhaustively so that a new failure has to be classified here deliberately.
@@ -10881,6 +10895,50 @@ spec:
                 name: "..".into(),
                 reason: "a name must be a single directory, not a path",
             }
+        ));
+    }
+
+    #[test]
+    fn validate_playbook_rejects_a_playbook_that_does_not_parse() {
+        let plan_with = |playbook: &str| {
+            let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+            plan.spec.template.playbook = playbook.to_string();
+            plan
+        };
+
+        assert!(validate_playbook(&plan_with("- hosts: all\n  tasks: []\n")).is_ok());
+
+        for broken in [
+            // A YAML syntax error.
+            "- hosts: all\n  tasks: [\n",
+            // Valid YAML, but a playbook is a list of plays.
+            "hosts: all\ntasks: []\n",
+        ] {
+            assert!(
+                matches!(
+                    validate_playbook(&plan_with(broken)),
+                    Err(ReconcileError::InvalidPlaybook(_))
+                ),
+                "{broken:?} must be rejected before a run starts"
+            );
+        }
+    }
+
+    /// The user's playbook is a spec error no tick can clear, while a failure of the operator's own
+    /// rendering is not, so the two must classify differently.
+    #[test]
+    fn an_invalid_playbook_supersedes_a_run_that_has_not_launched() {
+        let parse_error = || {
+            ansible::RenderError::from(
+                serde_yaml::from_str::<serde_yaml::Sequence>("hosts: all").unwrap_err(),
+            )
+        };
+
+        assert!(input_error_supersedes_unlaunched(
+            &ReconcileError::InvalidPlaybook(parse_error())
+        ));
+        assert!(!input_error_supersedes_unlaunched(
+            &ReconcileError::RenderError(parse_error())
         ));
     }
 

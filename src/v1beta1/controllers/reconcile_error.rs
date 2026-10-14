@@ -47,6 +47,11 @@ pub enum ReconcileError {
     #[error("spec.template.files entry {name:?} is not usable: {reason}")]
     InvalidFileEntry { name: String, reason: &'static str },
 
+    /// The plan's own playbook does not parse. Kept apart from [`ReconcileError::RenderError`],
+    /// which also covers the operator's own rendering, because only this one is the user's to fix.
+    #[error("spec.template.playbook is not a valid playbook: {0}")]
+    InvalidPlaybook(#[source] ansible::RenderError),
+
     #[error(
         "Secret {name:?} already exists but is not owned by this PlaybookPlan, so it cannot be used as its workspace"
     )]
