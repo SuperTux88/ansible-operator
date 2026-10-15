@@ -78,8 +78,9 @@ pub async fn record_prepared(
 
     let object = match api.get_opt(play.job_name).await? {
         Some(existing) if !same_run_record(&existing, &desired) => {
-            return Err(ReconcileError::PreconditionFailed(
-                "existing Play does not belong to the selected run",
+            return Err(ReconcileError::record_mismatch(
+                &existing,
+                "already exists for another run",
             ));
         }
         // Includes a statusless record: `same_run_record` has just proved it is *this* run's, and
@@ -91,8 +92,9 @@ pub async fn record_prepared(
             Err(err) if is_conflict(&err) => {
                 let existing = api.get(play.job_name).await?;
                 if !same_run_record(&existing, &desired) {
-                    return Err(ReconcileError::PreconditionFailed(
-                        "conflicting Play does not belong to the selected run",
+                    return Err(ReconcileError::record_mismatch(
+                        &existing,
+                        "was created concurrently for another run",
                     ));
                 }
                 existing
@@ -108,8 +110,9 @@ pub async fn record_prepared(
         ) => Ok(object),
         Some(
             PlayPhase::Succeeded | PlayPhase::Failed | PlayPhase::Unknown | PlayPhase::Aborted,
-        ) => Err(ReconcileError::PreconditionFailed(
-            "selected Play is already terminal",
+        ) => Err(ReconcileError::record_mismatch(
+            &object,
+            "is already terminal",
         )),
     }
 }
@@ -144,12 +147,9 @@ pub async fn record_running(
 ) -> Result<Play, ReconcileError> {
     let api = Api::<Play>::namespaced(client.clone(), namespace);
     let object = api.get(play_name).await?;
-    let status = object
-        .status
-        .as_ref()
-        .ok_or(ReconcileError::PreconditionFailed(
-            "prepared Play has no status",
-        ))?;
+    let status = object.status.as_ref().ok_or_else(|| {
+        ReconcileError::record_mismatch(&object, "was prepared but has no status")
+    })?;
 
     verify_play_uid(&object, play_uid)?;
     match status.phase {
@@ -162,7 +162,7 @@ pub async fn record_running(
             Ok(object)
         }
         PlayPhase::Prepared | PlayPhase::Starting | PlayPhase::Aborted => Err(
-            ReconcileError::PreconditionFailed("Play is not committed to start"),
+            ReconcileError::record_mismatch(&object, "is not committed to start"),
         ),
     }
 }
@@ -282,9 +282,10 @@ async fn transition_phase(
         let status = object
             .status
             .as_ref()
-            .ok_or(ReconcileError::PreconditionFailed("Play has no status"))?;
+            .ok_or_else(|| ReconcileError::record_mismatch(&object, "has no status"))?;
 
-        let Some(status) = decide_transition(status, &expected, next.clone(), unreachable_hosts)?
+        let Some(status) = decide_transition(status, &expected, next.clone(), unreachable_hosts)
+            .map_err(|reason| ReconcileError::record_mismatch(&object, reason))?
         else {
             return Ok(object);
         };
@@ -300,7 +301,7 @@ async fn transition_phase(
 }
 
 /// The pure decision behind [`transition_phase`]: `Some(status)` to write, `None` if the record is
-/// already there, `Err` if it moved somewhere else.
+/// already there, `Err` with the reason if it moved somewhere else.
 ///
 /// Idempotence is the point. Every caller is a step in a crash-recoverable protocol that may be
 /// replayed after the write landed but before the operator observed it, so re-running a transition
@@ -331,7 +332,7 @@ fn decide_transition(
     expected: &PlayPhase,
     next: PlayPhase,
     unreachable_hosts: Option<&[UnreachableHost]>,
-) -> Result<Option<PlayStatus>, ReconcileError> {
+) -> Result<Option<PlayStatus>, &'static str> {
     if status.phase == next {
         return Ok(match unreachable_hosts {
             Some(hosts) if hosts != status.unreachable_hosts => {
@@ -343,9 +344,7 @@ fn decide_transition(
         });
     }
     if status.phase != *expected {
-        return Err(ReconcileError::PreconditionFailed(
-            "Play phase changed before transition",
-        ));
+        return Err("phase changed before the transition");
     }
     let mut next_status = status.clone();
     next_status.phase = next;
@@ -363,7 +362,7 @@ fn decide_transition(
 /// a single value. Matching field-by-field on everything else would buy nothing and would be the
 /// same brittleness `validate_selected_job` deliberately avoids for Jobs: any server-side
 /// normalization the operator failed to predict would make the comparison fail forever, and the
-/// failure mode is an unrepairable `PreconditionFailed` on that run number.
+/// failure mode is an unrepairable `RecordMismatch` on that run number.
 fn same_run_record(existing: &Play, desired: &Play) -> bool {
     existing_owner_matches(existing, desired)
         && play_belongs_to_plan(
@@ -432,22 +431,24 @@ pub async fn acknowledge_finished(
     let object = api
         .get_opt(play_name)
         .await?
-        .ok_or(ReconcileError::PreconditionFailed(
-            "finished Play disappeared before it could be acknowledged",
-        ))?;
+        .ok_or_else(|| ReconcileError::RecordMismatch {
+            namespace: namespace.into(),
+            play: play_name.into(),
+            phase: None,
+            reason: "disappeared before its result could be acknowledged",
+        })?;
     verify_play_uid(&object, play_uid)?;
     let status = object
         .status
         .as_ref()
-        .ok_or(ReconcileError::PreconditionFailed(
-            "finished Play has no status",
-        ))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(&object, "finished but has no status"))?;
     if !matches!(
         status.phase,
         PlayPhase::Succeeded | PlayPhase::Failed | PlayPhase::Unknown
     ) {
-        return Err(ReconcileError::PreconditionFailed(
-            "cannot acknowledge a nonterminal Play",
+        return Err(ReconcileError::record_mismatch(
+            &object,
+            "cannot be acknowledged before it is terminal",
         ));
     }
     if status.plan_status_recorded {
@@ -472,7 +473,7 @@ pub async fn delete_uninitialized(
         .metadata
         .name
         .as_deref()
-        .ok_or(ReconcileError::PreconditionFailed("Play name not set"))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(play, "has no name"))?;
     let params = DeleteParams::default().preconditions(Preconditions {
         uid: play.metadata.uid.clone(),
         resource_version: play.metadata.resource_version.clone(),
@@ -505,8 +506,9 @@ pub async fn delete_aborted(
     };
     verify_play_uid(&object, play_uid)?;
     if object.status.as_ref().map(|status| &status.phase) != Some(&PlayPhase::Aborted) {
-        return Err(ReconcileError::PreconditionFailed(
-            "aborted Play changed before it could be deleted",
+        return Err(ReconcileError::record_mismatch(
+            &object,
+            "left Aborted before it could be deleted",
         ));
     }
     let params = DeleteParams::default().preconditions(Preconditions {
@@ -542,7 +544,7 @@ pub async fn record_finished(
         .metadata
         .name
         .clone()
-        .ok_or(ReconcileError::PreconditionFailed("Play name not set"))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(&object, "has no name"))?;
     // The terminal status is built fresh rather than derived from the record, so anything the run
     // wrote down about itself has to be carried across explicitly.
     let unreachable_hosts = object
@@ -557,10 +559,11 @@ pub async fn record_finished(
         }
         Some(PlayPhase::Succeeded | PlayPhase::Failed | PlayPhase::Unknown) => Ok(object),
         Some(PlayPhase::Prepared | PlayPhase::Starting | PlayPhase::Aborted) => Err(
-            ReconcileError::PreconditionFailed("cannot finish a run that did not start"),
+            ReconcileError::record_mismatch(&object, "cannot finish a run that did not start"),
         ),
-        None => Err(ReconcileError::PreconditionFailed(
-            "cannot finish an uninitialized Play",
+        None => Err(ReconcileError::record_mismatch(
+            &object,
+            "cannot finish a run that was never initialized",
         )),
     }
 }
@@ -961,7 +964,7 @@ async fn replace_status(
         .metadata
         .name
         .clone()
-        .ok_or(ReconcileError::PreconditionFailed("Play name not set"))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(&object, "has no name"))?;
     object.status = Some(status);
     Ok(api
         .replace_status(&name, &PostParams::default(), &object)
@@ -979,7 +982,10 @@ fn play_is_terminal(play: &Play) -> bool {
 
 fn verify_play_uid(play: &Play, expected_uid: &str) -> Result<(), ReconcileError> {
     if play.metadata.uid.as_deref() != Some(expected_uid) {
-        return Err(ReconcileError::PreconditionFailed("Play UID changed"));
+        return Err(ReconcileError::record_mismatch(
+            play,
+            "was replaced by another object (UID changed)",
+        ));
     }
     Ok(())
 }
