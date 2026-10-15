@@ -611,13 +611,15 @@ instead, and `.status.activeRun` names the run it is waiting on:
   looking at if the message persists, since these are node-root pods. The run's `Play` is deliberately
   kept meanwhile: it is the handle the retry works from, so do not delete it to unstick the plan.
 - **"run recovery failed: …"** — the operator could not resume the run after a restart. The rest of
-  the message is the underlying error; the operator retries every tick. If the message is
-  **"more than one Play claims to be this plan's active run"**, something outside the operator
-  created a second run record: a plan only ever has one run in flight, and the operator refuses to
-  guess which one is real rather than orphan the other's proxy pods. Look at
-  `kubectl get plays -n <ns> -l ansible.cloudbending.dev/playbookplan=<plan>`, work out which record
-  the operator wrote, and delete the stray one. The host locks of both are kept alive meanwhile, so
-  no other plan can start on those hosts while you do.
+  the message is the underlying error; the operator retries every tick. An error about a run record
+  starts with `Play <ns>/<name> (phase <phase>)`, naming the record and the phase it was in. If the
+  message is **"more than one Play in namespace … claims to be the plan's active run"**, something
+  outside the operator created a second run record: a plan only ever has one run in flight, and the
+  operator refuses to guess which one is real rather than orphan the other's proxy pods. The message
+  ends with the names of the competing records; look at each with
+  `kubectl get play -n <ns> <name> -o yaml`, work out which record the operator wrote, and delete
+  the stray one. The host locks of both are kept alive meanwhile, so no other plan can start on
+  those hosts while you do.
 - **"run recovery paused: …"** — the operator needs something it cannot currently read to decide
   what to do with the run: an inventory, `NodeAccessPolicy` or referenced Secret lookup that is
   failing for a reason that may clear on its own, such as an API error or a lost connection. The

@@ -1,4 +1,6 @@
-use crate::v1beta1::ansible;
+use kube::ResourceExt as _;
+
+use crate::v1beta1::{Play, PlayPhase, ansible};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ReconcileError {
@@ -7,6 +9,30 @@ pub enum ReconcileError {
 
     #[error("Precondition failed: {0}")]
     PreconditionFailed(&'static str),
+
+    /// A run's `Play` record is not in the state the record protocol (`play_history`) expects at
+    /// this step. Names the record and the phase it was read in: a failure here usually means a
+    /// second writer is driving the same run, and the record is the only evidence left of it.
+    #[error("Play {namespace}/{play}{}: {reason}", phase_suffix(.phase))]
+    RecordMismatch {
+        namespace: String,
+        play: String,
+        /// `None` if the record had no status, or was not there at all.
+        phase: Option<PlayPhase>,
+        /// Completes a sentence whose subject is the record, e.g. "has no status".
+        reason: &'static str,
+    },
+
+    /// More than one of a plan's `Play` records is in flight, which the record protocol never
+    /// produces. Names them all, since resolving it means deleting the stray one.
+    #[error(
+        "more than one Play in namespace {namespace} claims to be the plan's active run: {}",
+        .plays.join(", ")
+    )]
+    ConcurrentActiveRecords {
+        namespace: String,
+        plays: Vec<String>,
+    },
 
     #[error("Inventory group {group:?} sets variable {key:?}, which the operator manages")]
     ReservedInventoryVariable { group: String, key: String },
@@ -84,6 +110,13 @@ pub enum ReconcileError {
     YamlSerializationError(#[from] serde_yaml::Error),
 }
 
+fn phase_suffix(phase: &Option<PlayPhase>) -> String {
+    phase
+        .as_ref()
+        .map(|phase| format!(" (phase {phase:?})"))
+        .unwrap_or_default()
+}
+
 /// Whether a kube API error is a 409 Conflict. Covers both of the concurrency outcomes this
 /// operator treats as recoverable rather than fatal: losing an optimistic-concurrency race on a
 /// version-checked write, and an `AlreadyExists` on `create`. Callers re-read and re-decide.
@@ -100,5 +133,78 @@ impl ReconcileError {
     /// Whether this wraps a 409 Conflict — see [`is_conflict`].
     pub fn is_conflict(&self) -> bool {
         matches!(self, ReconcileError::KubeError(error) if is_conflict(error))
+    }
+
+    /// A [`ReconcileError::RecordMismatch`] naming `record` as it was read.
+    pub fn record_mismatch(record: &Play, reason: &'static str) -> Self {
+        ReconcileError::RecordMismatch {
+            namespace: record.namespace().unwrap_or_default(),
+            play: Some(record.name_any())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "<unnamed>".into()),
+            phase: record.status.as_ref().map(|status| status.phase.clone()),
+            reason,
+        }
+    }
+
+    /// A [`ReconcileError::ConcurrentActiveRecords`] naming every record in `records`.
+    pub fn concurrent_active_records(records: &[&Play]) -> Self {
+        ReconcileError::ConcurrentActiveRecords {
+            namespace: records
+                .first()
+                .and_then(|record| record.namespace())
+                .unwrap_or_default(),
+            plays: records.iter().map(|record| record.name_any()).collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v1beta1::{PlaySpec, PlayStatus};
+
+    fn record(name: &str) -> Play {
+        let mut play = Play::new(name, PlaySpec::default());
+        play.metadata.namespace = Some("ops".into());
+        play
+    }
+
+    /// A record-protocol failure is logged and written into the plan's summary with nothing else
+    /// around it, so the message itself has to say which record it was and what phase it was in.
+    #[test]
+    fn a_record_mismatch_names_the_record_and_its_phase() {
+        let mut play = record("apply-web-abc-1");
+        assert_eq!(
+            ReconcileError::record_mismatch(&play, "has no status").to_string(),
+            "Play ops/apply-web-abc-1: has no status"
+        );
+
+        play.status = Some(PlayStatus {
+            phase: PlayPhase::Running,
+            ..Default::default()
+        });
+        assert_eq!(
+            ReconcileError::record_mismatch(&play, "phase changed before the transition")
+                .to_string(),
+            "Play ops/apply-web-abc-1 (phase Running): phase changed before the transition"
+        );
+
+        assert_eq!(
+            ReconcileError::record_mismatch(&record(""), "has no name").to_string(),
+            "Play ops/<unnamed>: has no name"
+        );
+    }
+
+    /// The fix for two in-flight records is deleting the stray one, so the message has to say
+    /// which records are competing.
+    #[test]
+    fn concurrent_active_records_name_every_record() {
+        let (first, second) = (record("apply-web-abc-1"), record("apply-web-abc-2"));
+        assert_eq!(
+            ReconcileError::concurrent_active_records(&[&first, &second]).to_string(),
+            "more than one Play in namespace ops claims to be the plan's active run: \
+             apply-web-abc-1, apply-web-abc-2"
+        );
     }
 }

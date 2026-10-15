@@ -3797,9 +3797,7 @@ fn play_is_running(play: &Play) -> Result<bool, ReconcileError> {
     let status = play
         .status
         .as_ref()
-        .ok_or(ReconcileError::PreconditionFailed(
-            "active Play has no status",
-        ))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(play, "is active but has no status"))?;
     Ok(status.phase == v1beta1::PlayPhase::Running)
 }
 
@@ -3950,13 +3948,9 @@ async fn advance_active_run(
         parsed.as_ref(),
     )
     .await?;
-    let finished_status =
-        finished_play
-            .status
-            .as_ref()
-            .ok_or(ReconcileError::PreconditionFailed(
-                "finished Play has no status",
-            ))?;
+    let finished_status = finished_play.status.as_ref().ok_or_else(|| {
+        ReconcileError::record_mismatch(&finished_play, "finished but has no status")
+    })?;
     let verdict = phase_for_finished_run(finished_status);
     let failure = classify_run_failure(finished_status);
     // The overflow marker is asked of the raw message and only here, because this is the last place
@@ -4832,6 +4826,8 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         ReconcileError::ForeignProxyResource { .. }
         | ReconcileError::ForeignWorkspaceSecret { .. } => false,
         ReconcileError::PreconditionFailed(_)
+        | ReconcileError::RecordMismatch { .. }
+        | ReconcileError::ConcurrentActiveRecords { .. }
         | ReconcileError::RenderError(_)
         | ReconcileError::CaError(_)
         | ReconcileError::JsonSerializationError(_)
@@ -6106,8 +6102,9 @@ async fn recover_active_run(
         // panic takes the whole reconcile loop down for every plan.
         v1beta1::PlayPhase::Succeeded
         | v1beta1::PlayPhase::Failed
-        | v1beta1::PlayPhase::Unknown => Err(ReconcileError::PreconditionFailed(
-            "a terminal Play was classified as in flight",
+        | v1beta1::PlayPhase::Unknown => Err(ReconcileError::record_mismatch(
+            play,
+            "is terminal but was classified as in flight",
         )),
         v1beta1::PlayPhase::Aborted => Ok(Some(RecoveredRun::Aborted(run))),
     }
@@ -6332,9 +6329,7 @@ fn sole_active_record<'a>(live: &[&'a Play]) -> Result<Option<&'a Play>, Reconci
     match live {
         [] => Ok(None),
         [play] => Ok(Some(play)),
-        _ => Err(ReconcileError::PreconditionFailed(
-            "more than one Play claims to be this plan's active run",
-        )),
+        _ => Err(ReconcileError::concurrent_active_records(live)),
     }
 }
 
@@ -6382,21 +6377,19 @@ fn recoverable_plays_for_plan<'a>(plays: &'a [Play], plan: &PlaybookPlan) -> Vec
 }
 
 fn recorded_run_from_play(play: &Play) -> Result<RecordedRun, ReconcileError> {
-    let execution_hash = ExecutionHash::from_hex(&play.spec.execution_hash).ok_or(
-        ReconcileError::PreconditionFailed("active Play has an invalid execution hash"),
-    )?;
+    let execution_hash = ExecutionHash::from_hex(&play.spec.execution_hash).ok_or_else(|| {
+        ReconcileError::record_mismatch(play, "is active but has an invalid execution hash")
+    })?;
     let job_name = play
         .metadata
         .name
         .clone()
-        .ok_or(ReconcileError::PreconditionFailed(
-            "active Play has no name",
-        ))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(play, "is active but has no name"))?;
     let play_uid = play
         .metadata
         .uid
         .clone()
-        .ok_or(ReconcileError::PreconditionFailed("active Play has no UID"))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(play, "is active but has no UID"))?;
 
     Ok(RecordedRun {
         mirror: ActiveRun {
@@ -6419,9 +6412,7 @@ fn surviving_run_from_play(play: &Play) -> Result<Box<SurvivingRun>, ReconcileEr
         .status
         .as_ref()
         .map(|status| status.phase.clone())
-        .ok_or(ReconcileError::PreconditionFailed(
-            "an in-flight Play has no status",
-        ))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(play, "is in flight but has no status"))?;
     Ok(Box::new(SurvivingRun {
         run: recorded_run_from_play(play)?,
         phase,
@@ -7787,7 +7778,7 @@ fn next_run_number(claimed: &[u32]) -> Result<u32, ReconcileError> {
 /// recovered `Play`, and under the write-ahead protocol every Job this plan created has a `Play`
 /// recorded *before* it — so an active Job with no recoverable record is not this run's, and
 /// adopting it would mint a fresh `run_id` for a Job whose own record claims a different one,
-/// wedging the run on an unrepairable `PreconditionFailed`. Resuming a genuinely in-flight run
+/// wedging the run on an error no retry can repair. Resuming a genuinely in-flight run
 /// is `recover_active_run`'s job; same-run idempotency within a tick is `spawn_ansible_job`'s.
 async fn select_job(
     client: &kube::Client,
@@ -12812,17 +12803,19 @@ spec:
         play.spec.execution_hash = "not-a-hash".into();
         assert!(matches!(
             recorded_run_from_play(&play),
-            Err(ReconcileError::PreconditionFailed(
-                "active Play has an invalid execution hash"
-            ))
+            Err(ReconcileError::RecordMismatch {
+                reason: "is active but has an invalid execution hash",
+                ..
+            })
         ));
 
         play.spec.execution_hash = "00001a".into();
         assert!(matches!(
             recorded_run_from_play(&play),
-            Err(ReconcileError::PreconditionFailed(
-                "active Play has an invalid execution hash"
-            ))
+            Err(ReconcileError::RecordMismatch {
+                reason: "is active but has an invalid execution hash",
+                ..
+            })
         ));
 
         let mut job = Job {
