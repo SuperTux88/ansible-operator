@@ -163,6 +163,14 @@ pub struct PlaybookPlanSpec {
     /// operator's default.
     pub ttl_seconds_after_finished: Option<i32>,
 
+    /// The longest a run's Job may stay active, in seconds, before Kubernetes stops it — the Job's
+    /// own `activeDeadlineSeconds`, counted from when the Job starts, so it includes the time its pod
+    /// takes to start. A run stopped this way has no recap, so its hosts are reported `Unknown` and
+    /// it spends an attempt. Unset uses the operator's default, which is no limit unless the cluster
+    /// administrator configured one. Changing it does not re-run hosts that are already up to date.
+    #[schemars(with = "Option<PositiveInt>")]
+    pub active_deadline_seconds: Option<u32>,
+
     /// How many successful `Play` history records to keep for this plan before the oldest are
     /// pruned. Unlike the Job's short TTL, Plays are the durable run history. A terminal result is
     /// temporarily exempt until it reaches the plan status. Defaults to 3.
@@ -899,6 +907,7 @@ mod tests {
                 }],
                 provides: None,
                 ttl_seconds_after_finished: None,
+                active_deadline_seconds: None,
                 successful_plays_history_limit: None,
                 failed_plays_history_limit: None,
                 template: PlaybookTemplate {
