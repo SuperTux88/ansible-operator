@@ -551,11 +551,23 @@ instead, and `.status.activeRun` names the run it is waiting on:
   edited outside the operator; a very unlikely generated-name collision can produce the same symptom
   after an older `Play` was pruned while its Job was still retained. The operator will not adopt the
   Job or modify it. For a run that had already reached `Running`, it waits for that Job to finish or be
-  removed; then its locks and proxy pods are cleaned up and its hosts are reported
-  [`Unknown`](#hosts-show-unknown), since the recap of a Job the operator did not create is not this
-  run's to read, and the plan carries on. For a `Launching` run, even a finished foreign Job still
-  occupies the recorded name, so the Job must be removed; if the run is still wanted, the operator
-  then creates its own Job, otherwise it abandons the unlaunched run.
+  removed, up to the timeout below; then its locks and proxy pods are cleaned up and its hosts are
+  reported [`Unknown`](#hosts-show-unknown), since the recap of a Job the operator did not create is
+  not this run's to read, and the plan carries on. For a `Launching` run, even a finished foreign Job
+  still occupies the recorded name, so the run cannot launch under it: once the Job is removed, the
+  operator creates its own Job if the run is still wanted and otherwise abandons the unlaunched run,
+  and once the timeout below has passed it abandons the run anyway.
+
+  The wait is bounded by the operator's start timeout (`runs.startTimeoutSeconds`, ten minutes by
+  default — see [Runs whose Job never
+  starts](../cluster-operators/deployment.md#runs-whose-job-never-starts)), measured from when the
+  foreign Job was created. Once the foreign Job is older than that, the operator stops waiting on it
+  without touching it: a `Running` run is finished with its hosts `Unknown`, and a `Launching` run
+  is abandoned (**"aborted the run: Job …, which it did not create, has held its name for longer
+  than …s"**) and the next run is numbered past the taken name. Either way the operator first makes
+  sure no pod carrying the run's ID may still be executing, and keeps waiting while one may, or while
+  the unfinished foreign Job would create pods carrying that ID. Deleting
+  the foreign Job yourself, as below, resolves it sooner.
 
   An administrator should first confirm that the Job is really foreign, then delete that **exact Job**
   if it is safe to stop it. Do not delete the `Play`, its Leases, or the operator's proxy resources as

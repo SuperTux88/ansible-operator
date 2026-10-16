@@ -109,7 +109,10 @@ admission policy: only the operator ServiceAccount may create Jobs carrying the 
 `ansible.cloudbending.dev` run/component metadata or using the generated `apply-...` name convention.
 Do not grant a namespace-wide admission exception. Without this RBAC or admission boundary, a forged
 Job can be adopted as a run even though its pod template was not built by the operator, and a foreign
-Job can also hold a generated name and leave a run waiting for manual cleanup.
+Job can also hold a generated name and keep a run, with its host Leases, waiting for up to the
+operator's start timeout before the run is given up. A foreign Job whose pod template carries the
+run's ID is not given up on while it is unfinished, since it may be the run's own, so such a Job
+holds the run until it finishes or is deleted.
 
 ## Privileges the proxy pods hold
 
