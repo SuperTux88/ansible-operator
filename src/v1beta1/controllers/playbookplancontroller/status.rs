@@ -618,6 +618,21 @@ pub fn set_job_identity_mismatch_condition(status: &mut PlaybookPlanStatus, job_
     );
 }
 
+/// Withdraws `Running` while a run whose Job never started is being cancelled. `reason` is the
+/// stall the run recorded, which says what the Job was waiting on.
+pub fn set_job_did_not_start_condition(status: &mut PlaybookPlanStatus, reason: &str) {
+    upsert_condition(
+        &mut status.conditions,
+        PlaybookPlanCondition {
+            type_: "Running".into(),
+            status: "False".into(),
+            reason: Some("JobDidNotStart".into()),
+            message: Some(reason.to_string()),
+            last_transition_time: Some(chrono::Local::now().fixed_offset()),
+        },
+    );
+}
+
 /// Withdraws `Running` while a run whose `Play` record is gone is being stopped before its hosts
 /// are released.
 ///

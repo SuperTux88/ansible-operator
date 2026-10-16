@@ -44,6 +44,16 @@ managedSsh:
     aggressiveness: 2
     thresholdDays: [3, 7, 30]
 
+# Bounds on every plan's run Job.
+runs:
+  # How long a run's Job may go without starting before the operator cancels the run (its hosts are
+  # reported Unknown and it spends an attempt). Covers a pod that is never created, never scheduled,
+  # or stuck pulling its image or creating its container. The clock restarts when the Job's pod is
+  # created or scheduled and whenever one of its init containers finishes, and never runs while a
+  # container is running, so a long collection download or a long playbook is never cut off. Must
+  # cover an image pull on a cold node. Above 0.
+  startTimeoutSeconds: 600
+
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""

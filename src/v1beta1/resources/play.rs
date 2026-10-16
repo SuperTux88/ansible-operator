@@ -182,6 +182,14 @@ pub struct PlayStatus {
     /// rather than resumed, so the last write is always the one immediately before the Job that ran.
     #[serde(default)]
     pub unreachable_hosts: Vec<UnreachableHost>,
+
+    /// Why the operator cancelled this run's Job: it went the operator's start timeout without
+    /// starting the playbook, and this says what it was waiting on (an image pull, scheduling, a pod
+    /// that was never created). Written before the Job is cancelled, so the reason outlives the Job
+    /// and its pods, which are the only other place it could be read from. A run whose Job reported
+    /// its result before the cancellation landed does not keep it, since that Job did start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_reason: Option<String>,
 }
 
 /// A host excluded from a run, and the one distinction the exclusion itself does not carry.

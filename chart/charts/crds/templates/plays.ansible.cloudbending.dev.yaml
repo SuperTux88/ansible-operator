@@ -340,6 +340,15 @@ spec:
                 - skipped
                 - unreachable
                 type: object
+              stallReason:
+                description: |-
+                  Why the operator cancelled this run's Job: it went the operator's start timeout without
+                  starting the playbook, and this says what it was waiting on (an image pull, scheduling, a pod
+                  that was never created). Written before the Job is cancelled, so the reason outlives the Job
+                  and its pods, which are the only other place it could be read from. A run whose Job reported
+                  its result before the cancellation landed does not keep it, since that Job did start.
+                nullable: true
+                type: string
               unreachableHosts:
                 default: []
                 description: |-
