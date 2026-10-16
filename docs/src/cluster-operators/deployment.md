@@ -154,6 +154,30 @@ again, so a longer wait on a short schedule would make the plan miss ticks. See
 [NotReady nodes](../running-playbooks/cluster-nodes.md#notready-nodes) for what happens to such a
 Node afterwards.
 
+## Runs whose Job never starts
+
+A run's Job can exist without ever starting the playbook: its pod is refused by Pod Security
+admission, a webhook or a `ResourceQuota`, its ServiceAccount does not exist, nothing schedules it,
+or its image cannot be pulled. Kubernetes keeps such a Job active indefinitely. The operator cancels
+the run once its Job has gone `runs.startTimeoutSeconds` without starting. The run's hosts are then
+reported `Unknown`, its host Leases and proxy pods are released, and it spends one of the plan's
+attempts, so `maxAttempts` bounds how often a broken image is retried. The plan's summary says what
+the Job was waiting on (see [The plan is stuck in
+`Applying`](../running-playbooks/results-and-troubleshooting.md#the-plan-is-stuck-in-applying)).
+
+```yaml
+# values.yaml
+runs:
+  startTimeoutSeconds: 600
+```
+
+The clock only runs while nothing in the Job's pod is running and the playbook container has never
+started. It restarts when the pod is created, when it is scheduled onto a Node, and whenever one of
+its init containers finishes. A long collection download or a long playbook is therefore never cut
+off, and neither is a pod that only got a Node late, for example from a cluster autoscaler. Set the
+timeout above the time an image pull takes on a Node that does not have the image yet. Like the
+other config values, a change rolls the operator.
+
 ## Enrolled namespaces
 
 The operator's cluster-wide RBAC does **not** include `secrets`, `jobs`, or `pods`. Those verbs are
@@ -213,7 +237,9 @@ Two of those grants are wider than what the operator does with them, because RBA
 narrower rule:
 
 - **`delete` on `batch/jobs`** cancels the run of a plan that is deleted mid-run, or whose `Play` record
-  is removed, rather than leaving its pod to the deleting client's propagation policy. The operator
+  is removed, rather than leaving its pod to the deleting client's propagation policy. It also
+  cancels a run whose Job never started (see [Runs whose Job never
+  starts](#runs-whose-job-never-starts)). The operator
   deletes only a Job whose identity it has validated, and passes that Job's UID as a delete
   precondition, but the grant itself covers every Job in the namespace.
 - **`patch` on `playbookplans`** carries the `ansible.cloudbending.dev/run-cleanup` finalizer, which

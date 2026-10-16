@@ -3,7 +3,7 @@
 //! hot-reloaded: a change to the ConfigMap rolls the Deployment (via a `checksum/config` pod
 //! annotation), so the new config is picked up by the restarted process. See `R1_PLAN.md`.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, num::NonZeroU32};
 
 use k8s_openapi::api::networking::v1::NetworkPolicyEgressRule;
 use serde::Deserialize;
@@ -68,6 +68,11 @@ pub struct OperatorConfig {
     #[serde(default)]
     pub node_labels: NodeLabelsConfig,
 
+    /// Bounds on a run's Job that apply to every plan. Rendered by the Helm chart from `runs` into
+    /// the `[runs]` table; absent ⇒ all defaults.
+    #[serde(default)]
+    pub runs: RunsConfig,
+
     /// Egress rules applied to generated Ansible Job pods.
     #[serde(default, deserialize_with = "deserialize_network_policy_egress")]
     pub playbook_network_policy_egress: Option<Vec<NetworkPolicyEgressRule>>,
@@ -116,6 +121,26 @@ impl Default for NodeLabelsConfig {
     /// On, like the chart value it is rendered from.
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// The `[runs]` config table. See [`OperatorConfig::runs`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RunsConfig {
+    /// How long, in seconds, a run's Job may go without starting before the operator cancels the
+    /// run. The clock restarts when the Job's pod is created or scheduled and whenever one of its
+    /// init containers finishes, so it bounds an image pull or an unschedulable pod, never a running
+    /// playbook. Default 600; zero is rejected, since it would cancel every run before its pod could
+    /// start.
+    pub start_timeout_seconds: NonZeroU32,
+}
+
+impl Default for RunsConfig {
+    fn default() -> Self {
+        Self {
+            start_timeout_seconds: NonZeroU32::new(600).expect("600 is not zero"),
+        }
     }
 }
 
@@ -269,6 +294,26 @@ mod tests {
             toml::from_str::<OperatorConfig>("[managed_ssh]\nthreshold_days = [1, 2]\n").is_err(),
             "threshold_days of the wrong length must be rejected"
         );
+    }
+
+    #[test]
+    fn run_start_timeout_defaults_and_rejects_zero() {
+        let absent: OperatorConfig = toml::from_str("watch_namespaces = []").unwrap();
+        assert_eq!(absent.runs.start_timeout_seconds.get(), 600);
+
+        let set: OperatorConfig = toml::from_str("[runs]\nstart_timeout_seconds = 900\n").unwrap();
+        assert_eq!(set.runs.start_timeout_seconds.get(), 900);
+
+        for invalid in ["0", "-1"] {
+            assert!(
+                toml::from_str::<OperatorConfig>(&format!(
+                    "[runs]\nstart_timeout_seconds = {invalid}\n"
+                ))
+                .is_err(),
+                "start_timeout_seconds = {invalid} must be rejected"
+            );
+        }
+        assert!(toml::from_str::<OperatorConfig>("[runs]\nnope = 1\n").is_err());
     }
 
     #[test]
