@@ -591,6 +591,10 @@ instead, and `.status.activeRun` names the run it is waiting on:
   already created remain in place. The rest of the message is the underlying API, admission,
   workspace, proxy, Job, or run-record error to correct.
 
+  The form `Job <ns>/<name>: does not carry this run's identity` means a Job the run did not
+  create holds the name it recorded. It names that Job; see the "waiting for Job …" entry above for
+  how to confirm that it is foreign.
+
   The form **"Secret … already exists but is not owned by this PlaybookPlan"** has its own entry —
   see [A Secret already occupies the workspace Secret's
   name](#a-secret-already-occupies-the-workspace-secrets-name).
