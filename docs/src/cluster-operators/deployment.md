@@ -274,8 +274,10 @@ This matters for more than ordinary workload separation. The operator records a 
 its Job and later checks the Job's owner reference and run labels to identify it. A principal that can
 create Jobs in an enrolled namespace can occupy an expected Job name, or copy the operator's identity
 metadata onto a different pod template. The reconciler refuses an ordinary foreign Job and waits for
-it, but object metadata alone cannot prove which principal created a Job that carries all the expected
-fields.
+it for up to its start timeout (see [Runs whose Job never starts](#runs-whose-job-never-starts)),
+unless its pod template carries the run's ID: an unfinished Job like that may be the run's own, so
+the run waits until it finishes or is deleted. Object metadata alone cannot prove which principal
+created a Job that carries all the expected fields.
 
 Check the effective permission for the operator and for every other principal that may act in an
 enrolled namespace. Replace the ServiceAccount names with the ones used by your installation:
