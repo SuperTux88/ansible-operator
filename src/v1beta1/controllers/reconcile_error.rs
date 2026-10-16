@@ -34,6 +34,16 @@ pub enum ReconcileError {
         reason: &'static str,
     },
 
+    /// Every run name a new run could take is held by a Job or `Play` the plan did not create.
+    #[error(
+        "run names {first} to {last} in namespace {namespace} are all held by Jobs or Plays this plan did not create; delete the ones that are not the operator's"
+    )]
+    RunNamesTaken {
+        namespace: String,
+        first: String,
+        last: String,
+    },
+
     /// More than one of a plan's `Play` records is in flight, which the record protocol never
     /// produces. Names them all, since resolving it means deleting the stray one.
     #[error(
@@ -232,6 +242,20 @@ mod tests {
         assert_eq!(
             ReconcileError::job_mismatch(&job, "does not carry this run's identity").to_string(),
             "Job ops/apply-web-abc-3: does not carry this run's identity"
+        );
+    }
+
+    #[test]
+    fn taken_run_names_name_the_range() {
+        let error = ReconcileError::RunNamesTaken {
+            namespace: "ops".into(),
+            first: "apply-web-abc-4".into(),
+            last: "apply-web-abc-19".into(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "run names apply-web-abc-4 to apply-web-abc-19 in namespace ops are all held by Jobs \
+             or Plays this plan did not create; delete the ones that are not the operator's"
         );
     }
 
