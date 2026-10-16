@@ -443,6 +443,10 @@ is load-bearing: `shortid` truncates a 64-bit hash to ten symbols, so two revisi
 (same UID) can still produce the same name, and per-hash numbering would let one claim a name a
 retained record of the other still holds — `record_prepared` then rejects it as another run's on
 every tick until pruning removes it.
+What it counts is only the plan's *own* objects, so it then reads the candidate name directly and
+steps past one held by a Job or `Play` it did not count (one created outside the operator, or
+another plan colliding on the truncated name), up to `MAX_TAKEN_RUN_NAMES`. Without that, a run
+given up because a foreign Job holds its name would hand its replacement the same number again.
 The number, not the hash, is what makes the name unique; a new revision therefore does not restart at
 1. It **never adopts an already-running Job**: every Job the operator creates has
 a `Play` recorded before it, so an active Job that `recover_active_run` didn't account for isn't this
