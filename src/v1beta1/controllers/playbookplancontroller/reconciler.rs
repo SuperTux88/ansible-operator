@@ -4827,6 +4827,7 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         | ReconcileError::ForeignWorkspaceSecret { .. } => false,
         ReconcileError::PreconditionFailed(_)
         | ReconcileError::RecordMismatch { .. }
+        | ReconcileError::JobMismatch { .. }
         | ReconcileError::ConcurrentActiveRecords { .. }
         | ReconcileError::RenderError(_)
         | ReconcileError::CaError(_)
@@ -6520,15 +6521,11 @@ fn job_label<'a>(job: &'a Job, key: &str) -> Option<&'a str> {
 fn job_execution_hash(job: &Job) -> Result<ExecutionHash, ReconcileError> {
     job_label(job, labels::PLAYBOOKPLAN_HASH)
         .and_then(ExecutionHash::from_hex)
-        .ok_or(ReconcileError::PreconditionFailed(
-            "active Job has no valid execution hash",
-        ))
+        .ok_or_else(|| ReconcileError::job_mismatch(job, "has no valid execution hash"))
 }
 
 fn job_run_id(job: &Job) -> Result<&str, ReconcileError> {
-    job_label(job, labels::RUN_ID).ok_or(ReconcileError::PreconditionFailed(
-        "active Job has no run ID",
-    ))
+    job_label(job, labels::RUN_ID).ok_or_else(|| ReconcileError::job_mismatch(job, "has no run ID"))
 }
 
 fn run_number_from_job_name(job_name: &str) -> Option<u32> {
@@ -7917,7 +7914,7 @@ fn validate_selected_job(
     if !job_belongs_to_plan(job, plan_name.as_ref(), plan_uid.as_ref())
         || job_label(job, labels::PLAYBOOKPLAN_NAME) != Some(plan_name.as_ref())
         || job_label(job, labels::COMPONENT) != Some(labels::PLAYBOOK_COMPONENT)
-        || job_execution_hash(job)? != expected_hash
+        || job_execution_hash(job).ok() != Some(expected_hash)
         || actual_run_number != Some(expected_run_number)
         || job_label(job, labels::RUN_ID) != Some(expected_run_id)
         || job_template_label(job, labels::RUN_ID) != Some(expected_run_id)
@@ -7927,8 +7924,9 @@ fn validate_selected_job(
         || job_template_label(job, labels::PLAYBOOKPLAN_NAME) != Some(plan_name.as_ref())
         || job_template_label(job, labels::COMPONENT) != Some(labels::PLAYBOOK_COMPONENT)
     {
-        return Err(ReconcileError::PreconditionFailed(
-            "existing Job does not belong to the selected run",
+        return Err(ReconcileError::job_mismatch(
+            job,
+            "does not carry this run's identity",
         ));
     }
 
@@ -12838,9 +12836,10 @@ spec:
             .insert(labels::PLAYBOOKPLAN_HASH.into(), "not-a-hash".into());
         assert!(matches!(
             job_execution_hash(&job),
-            Err(ReconcileError::PreconditionFailed(
-                "active Job has no valid execution hash"
-            ))
+            Err(ReconcileError::JobMismatch {
+                reason: "has no valid execution hash",
+                ..
+            })
         ));
 
         job.metadata
@@ -12850,9 +12849,10 @@ spec:
             .insert(labels::PLAYBOOKPLAN_HASH.into(), "1A".into());
         assert!(matches!(
             job_execution_hash(&job),
-            Err(ReconcileError::PreconditionFailed(
-                "active Job has no valid execution hash"
-            ))
+            Err(ReconcileError::JobMismatch {
+                reason: "has no valid execution hash",
+                ..
+            })
         ));
     }
 
@@ -12871,9 +12871,10 @@ spec:
         // though it shares the plan, the execution hash and the run number.
         assert!(matches!(
             validate_selected_job(&job, &plan, hash, 1, "run-2", "play-uid"),
-            Err(ReconcileError::PreconditionFailed(
-                "existing Job does not belong to the selected run"
-            ))
+            Err(ReconcileError::JobMismatch {
+                reason: "does not carry this run's identity",
+                ..
+            })
         ));
 
         // The pod template's correlation has to hold too: a Job whose pods aren't tied to this Play
@@ -12893,9 +12894,10 @@ spec:
             .insert(labels::PLAY_UID_ANNOTATION.into(), "another-play".into());
         assert!(matches!(
             validate_selected_job(&tampered, &plan, hash, 1, "run-1", "play-uid"),
-            Err(ReconcileError::PreconditionFailed(
-                "existing Job does not belong to the selected run"
-            ))
+            Err(ReconcileError::JobMismatch {
+                reason: "does not carry this run's identity",
+                ..
+            })
         ));
 
         job.metadata
@@ -12905,9 +12907,10 @@ spec:
             .insert(labels::PLAY_UID_ANNOTATION.into(), "another-play".into());
         assert!(matches!(
             validate_selected_job(&job, &plan, hash, 1, "run-1", "play-uid"),
-            Err(ReconcileError::PreconditionFailed(
-                "existing Job does not belong to the selected run"
-            ))
+            Err(ReconcileError::JobMismatch {
+                reason: "does not carry this run's identity",
+                ..
+            })
         ));
     }
 

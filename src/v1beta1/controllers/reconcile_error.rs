@@ -1,3 +1,4 @@
+use k8s_openapi::api::batch::v1::Job;
 use kube::ResourceExt as _;
 
 use crate::v1beta1::{Play, PlayPhase, ansible};
@@ -20,6 +21,16 @@ pub enum ReconcileError {
         /// `None` if the record had no status, or was not there at all.
         phase: Option<PlayPhase>,
         /// Completes a sentence whose subject is the record, e.g. "has no status".
+        reason: &'static str,
+    },
+
+    /// A Job at a run's recorded name is not the Job that run expects. Names the Job, because
+    /// when it is a foreign one, deleting that exact Job is how the run is unblocked.
+    #[error("Job {namespace}/{job}: {reason}")]
+    JobMismatch {
+        namespace: String,
+        job: String,
+        /// Completes a sentence whose subject is the Job, e.g. "has no run ID".
         reason: &'static str,
     },
 
@@ -147,6 +158,17 @@ impl ReconcileError {
         }
     }
 
+    /// A [`ReconcileError::JobMismatch`] naming `job` as it was read.
+    pub fn job_mismatch(job: &Job, reason: &'static str) -> Self {
+        ReconcileError::JobMismatch {
+            namespace: job.namespace().unwrap_or_default(),
+            job: Some(job.name_any())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "<unnamed>".into()),
+            reason,
+        }
+    }
+
     /// A [`ReconcileError::ConcurrentActiveRecords`] naming every record in `records`.
     pub fn concurrent_active_records(records: &[&Play]) -> Self {
         ReconcileError::ConcurrentActiveRecords {
@@ -193,6 +215,23 @@ mod tests {
         assert_eq!(
             ReconcileError::record_mismatch(&record(""), "has no name").to_string(),
             "Play ops/<unnamed>: has no name"
+        );
+    }
+
+    /// The fix for a foreign Job at a run's name is deleting that Job, so the message has to name it.
+    #[test]
+    fn a_job_mismatch_names_the_job() {
+        let mut job = Job::default();
+        job.metadata.namespace = Some("ops".into());
+        assert_eq!(
+            ReconcileError::job_mismatch(&job, "has no run ID").to_string(),
+            "Job ops/<unnamed>: has no run ID"
+        );
+
+        job.metadata.name = Some("apply-web-abc-3".into());
+        assert_eq!(
+            ReconcileError::job_mismatch(&job, "does not carry this run's identity").to_string(),
+            "Job ops/apply-web-abc-3: does not carry this run's identity"
         );
     }
 
