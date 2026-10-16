@@ -178,6 +178,24 @@ off, and neither is a pod that only got a Node late, for example from a cluster 
 timeout above the time an image pull takes on a Node that does not have the image yet. Like the
 other config values, a change rolls the operator.
 
+## Run time limits
+
+By default a run that has started may take as long as it needs. A plan can bound its own runs with
+`spec.activeDeadlineSeconds` (see [Bounding how long a run
+takes](../running-playbooks/playbook-plans.md#bounding-how-long-a-run-takes)), and
+`runs.defaultActiveDeadlineSeconds` sets that bound for every plan that does not set its own:
+
+```yaml
+# values.yaml
+runs:
+  defaultActiveDeadlineSeconds: 7200
+```
+
+A plan's own value wins in both directions, so this is a default, not a ceiling. To enforce a
+ceiling, use an admission policy (a `ValidatingAdmissionPolicy` or a policy engine such as Kyverno)
+on `PlaybookPlan`s. Such a policy sees only what the plan itself sets, not this default, so a ceiling
+policy also has to require the field.
+
 ## Enrolled namespaces
 
 The operator's cluster-wide RBAC does **not** include `secrets`, `jobs`, or `pods`. Those verbs are

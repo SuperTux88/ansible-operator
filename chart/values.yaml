@@ -53,6 +53,11 @@ runs:
   # container is running, so a long collection download or a long playbook is never cut off. Must
   # cover an image pull on a cold node. Above 0.
   startTimeoutSeconds: 600
+  # The Job `activeDeadlineSeconds` of every plan that sets no `spec.activeDeadlineSeconds` of its
+  # own: Kubernetes stops a run that is still active after this many seconds (its hosts are reported
+  # Unknown and it spends an attempt). A plan's own value wins in both directions. Unset (the
+  # default) means no limit. Above 0.
+  defaultActiveDeadlineSeconds: null
 
 imagePullSecrets: []
 nameOverride: ""
