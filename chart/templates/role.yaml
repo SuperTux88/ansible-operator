@@ -33,8 +33,9 @@ rules:
     resources: ["secrets"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
   # `delete` is used for cancellation only: a plan deleted mid-run has its Job cancelled explicitly
-  # rather than left to the deleting client's propagation policy, which may orphan the pod. Finished
-  # Jobs are still reaped by their TTL, not by the operator. The operator deletes only a Job whose
+  # rather than left to the deleting client's propagation policy, which may orphan the pod, and a
+  # Job that never started within `runs.startTimeoutSeconds` is cancelled so its run can release its
+  # hosts. Finished Jobs are still reaped by their TTL, not by the operator. The operator deletes only a Job whose
   # identity it has validated, but that is its own restraint: RBAC cannot scope `delete` to Jobs the
   # operator created, so the grant covers every Job in an enrolled namespace.
   - apiGroups: ["batch"]

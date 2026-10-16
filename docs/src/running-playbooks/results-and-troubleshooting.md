@@ -25,7 +25,7 @@ per-host status, and the summary line.
 |---|---|
 | `Pending` | Triggers not yet evaluated — the resting state right after creation, after the inputs changed, or while unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent a plan with no run verdict from starting. |
 | `Delayed` | The plan is waiting for its scheduled time and has no result yet under the current playbook and inputs. |
-| `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has created or identified the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name, and with reason `RunRecordLost` that the run's `Play` record is gone and its Job is being stopped before its hosts are released. |
+| `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has created or identified the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name, with reason `JobDidNotStart` that its Job never started and is being cancelled, and with reason `RunRecordLost` that the run's `Play` record is gone and its Job is being stopped before its hosts are released. |
 | `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. |
 | `Failed` | The latest run did not succeed on every host, or its recap could not be read — and at least one of those hosts was *reached*, which is what separates it from `HostsUnreachable`. A `Recurring` plan keeps this result between ticks the same way. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
 | `HostsUnreachable` | The latest run applied the playbook to every host it could reach, and the only hosts left over were ones nothing could connect to. A failure, and retried like one — but nothing is wrong with the playbook, so this reads as *waiting for a machine* rather than *broken*. See [Hosts show `Unreachable`](#hosts-show-unreachable). |
@@ -526,6 +526,20 @@ recover in that case; the operator reports the error and retries normally.
 If it stays there with nothing progressing, `.status.summary` says which of the following it is
 instead, and `.status.activeRun` names the run it is waiting on:
 
+- **"cancelling run …: the Job did not start within …s: …"** — the run's Job never started the
+  playbook within the operator's start timeout (see [Runs whose Job never
+  starts](../cluster-operators/deployment.md#runs-whose-job-never-starts)), so the operator is
+  cancelling it. The rest of the message says what it was waiting on: **"no pod was created for
+  it"** (look at `kubectl describe job` for the events: Pod Security admission, an admission webhook,
+  a `ResourceQuota` or a missing ServiceAccount), **"the Job is suspended"** (something outside the
+  operator, such as a queueing controller like Kueue, suspended it; the operator never does),
+  **"pod … is not scheduled: …"**, or **"pod …:
+  container … is waiting: …"** with the reason, such as `ImagePullBackOff` for an image that does
+  not exist or cannot be pulled. Once the Job has stopped, the run finishes with every host
+  [`Unknown`](#hosts-show-unknown) and spends an attempt; the plan's summary keeps the reason in
+  parentheses, and the run's `Play` keeps it in `.status.stallReason`. Fix what the Job waited on;
+  if the plan has used up its attempts by then, [ask it to try
+  again](./scheduling-and-modes.md#asking-a-failed-plan-to-try-again).
 - **"waiting for Job … which does not carry this run's identity"** — a Job with the name this run
   expects exists, but it is not the one this run created. This normally means a Job was created or
   edited outside the operator; a very unlikely generated-name collision can produce the same symptom
@@ -954,6 +968,9 @@ If *every* host of one run shows `Unknown` at once, check these causes first:
 
   See [`python3` must be on `PATH`](./playbook-plans.md#python3-must-be-on-path) for the image
   requirement and a local verification command.
+- **The run's Job never started.** The operator cancelled it after its start timeout, and
+  `.status.summary` ends with *"(cancelled: the Job did not start within …s: …)"*, naming what it
+  waited on. See [The plan is stuck in `Applying`](#the-plan-is-stuck-in-applying).
 - **The run's `Play` was deleted while the run was still live.** That record is the only thing the
   run can be recovered from, so the operator releases the run's locks and proxy pods and reports
   the whole run as unknown rather than leaving the plan stuck. The next run reports these hosts

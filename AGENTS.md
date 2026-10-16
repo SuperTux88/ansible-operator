@@ -200,6 +200,15 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    This is also where a run whose `Play` is gone is `finalize_lost_run`'d (infra released, hosts
    `Unknown`) — not in step 0a: recovery has no record left to dispatch on, so it is the *mirror*
    in `status.activeRun` that brings the run here to be released.
+   A Job that is not terminal but never started (`job_start_stall`: no container running, the
+   playbook container never started, nothing progressed for `runs.startTimeoutSeconds`, with the
+   clock restarted by the pod's creation and scheduling and by every finished init container) is
+   cancelled here too: the reason goes onto
+   the `Play` first (`record_stalled`, `PlayStatus.stallReason`), then `cancel_run_job`, and the run
+   finishes through the normal path with hosts `Unknown`, spending an attempt. The reason has to be
+   written before the cancellation because the Job and its pods are the only other place it can be
+   read, and the finishing tick sees nothing but a missing Job. Judged by time, not by a list of
+   waiting reasons: a list cannot speak for a Job with no pod at all.
 9. **`patch_status`** — JSON **merge patch** (not `replace_status`); many async steps pass
    between read and write, so a version-checked PUT would routinely 409. It is also where the
    suspension contract is held (`suspended_advertises_no_next_run`): a tick has several ways to write
