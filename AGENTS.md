@@ -410,6 +410,14 @@ handful of decisions that are easy to undo by accident:
   deliberately does *not* second-guess a `Running` record's Job: only `advance_active_run` can tell an
   unfinished foreign Job (wait) from a finished one (finalize with no recap), and deciding it in
   recovery wedged the plan forever.
+- **A foreign Job at a run's name is waited on, but only up to the start timeout**, measured by
+  the foreign Job's own age (`foreign_job_outlasted`). Then a `Launching` run is `Displaced`
+  (abandoned, and `select_job` numbers its replacement past the name) and a `Running` one finishes
+  with no recap, in both cases only once no pod carrying the run's ID may still execute. Do not drop
+  that pod check to abandon at first sight: it is the only evidence left if the identity check ever
+  rejected a Job that was the run's own, and skipping it would release the Leases under a live run.
+  For the same reason an unfinished Job whose pod template carries the run's ID never outlasts the
+  wait: it may not have created its pod yet.
 - **`PlaybookPlanStatus.activeRun` is a thin mirror** of what *finishing* a run needs, so a run whose
   `Play` was deleted can still be released (`finalize_lost_run`) instead of wedging in `Applying`. It
   is read from the reflector cache, which lags this controller's own writes, so `finalize_lost_run`

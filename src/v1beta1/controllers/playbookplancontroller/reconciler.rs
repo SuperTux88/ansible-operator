@@ -2952,9 +2952,12 @@ enum JobPresenceAction {
     Proceed,
     /// Its Job is absent and the run is no longer wanted: release and delete it.
     Abandon,
-    /// A Job this run did not create holds its name. Neither adopted nor given up — see
+    /// A Job this run did not create holds its name. Neither adopted nor given up yet — see
     /// [`decide_job_presence`].
     Contested,
+    /// A Job this run did not create has held its name for longer than the start timeout: give the
+    /// run up, as long as nothing of its own may still be executing.
+    Displaced,
 }
 
 /// The rule [`resume_launching_run`] follows, from whether the run is still wanted and what is
@@ -2965,20 +2968,27 @@ enum JobPresenceAction {
 /// name is free does anything else get a say — which is why what is there is established with a
 /// direct apiserver read rather than a watch-cache one.
 ///
-/// **A foreign Job is neither adopted nor a reason to give up.** Name collisions are made unlikely
-/// rather than impossible (`job_builder::job_name`), so the name is a hint and the identity check is
-/// the boundary. Adopting on the strength of the name would move this run's record to `Running`
-/// for work it did not commission and later write the run off as `Unknown`. Abandoning instead may
-/// look safe — a foreign Job means this run has none of its own, since the name is deterministic
-/// — but it inverts the risk: if the identity check ever rejected a Job that genuinely *was* ours,
-/// abandoning would release the host Leases while that Job kept running, which is the double-apply
-/// the Leases exist to prevent. Waiting has no such failure mode, and it resolves on its own once
-/// the foreign Job is reaped by its `ttlSecondsAfterFinished`, after which the name is free and the
-/// run proceeds normally.
+/// **A foreign Job is never adopted, and only given up on after the start timeout.** Name
+/// collisions are made unlikely rather than impossible (`job_builder::job_name`), so the name is a
+/// hint and the identity check is the boundary. Adopting on the strength of the name would move
+/// this run's record to `Running` for work it did not commission and later write the run off as
+/// `Unknown`. Abandoning at once may look safe — a foreign Job means this run has none of its own,
+/// since the name is deterministic — but it inverts the risk: if the identity check ever rejected a
+/// Job that genuinely *was* ours, abandoning would release the host Leases while that Job kept
+/// running, which is the double-apply the Leases exist to prevent. So the run waits first, which
+/// resolves on its own when the foreign Job is reaped by its `ttlSecondsAfterFinished`.
+///
+/// Waiting for ever is not an option either: a foreign Job without a TTL, or one that never
+/// finishes, would hold this run's hosts for the life of the plan, and anybody able to create a Job
+/// at the name could do that on purpose. Once the foreign Job has held the name for longer than the
+/// start timeout the run is `Displaced`: [`resume_launching_run`] gives it up unless a pod carrying
+/// its run ID may still be executing, which is the evidence the double-apply concern above is
+/// about. [`select_job`] then numbers the replacement past the taken name.
 fn decide_job_presence(may_proceed: bool, job: RecordedJob) -> JobPresenceAction {
     match (may_proceed, job) {
         (_, RecordedJob::Own) => JobPresenceAction::Adopt,
-        (_, RecordedJob::Foreign) => JobPresenceAction::Contested,
+        (_, RecordedJob::Foreign { outlasted: false }) => JobPresenceAction::Contested,
+        (_, RecordedJob::Foreign { outlasted: true }) => JobPresenceAction::Displaced,
         (true, RecordedJob::Absent) => JobPresenceAction::Proceed,
         (false, RecordedJob::Absent) => JobPresenceAction::Abandon,
     }
@@ -2989,10 +2999,37 @@ fn decide_job_presence(may_proceed: bool, job: RecordedJob) -> JobPresenceAction
 enum RecordedJob {
     /// The Job this run created: every identity field `validate_selected_job` checks matches.
     Own,
-    /// A Job this run did not create holds the name.
-    Foreign,
+    /// A Job this run did not create holds the name. `outlasted` says it has existed for longer
+    /// than the start timeout ([`foreign_job_outlasted`]).
+    Foreign { outlasted: bool },
     /// The name is free.
     Absent,
+}
+
+/// Whether a Job that does not carry a run's identity has held the run's name for longer than the
+/// start timeout. Measured by the Job's own age, because that is how long the obstruction has
+/// existed, however long the run's setup took. A Job without a creation time is never judged
+/// outlasted.
+///
+/// Nor is an unfinished one whose pod template carries `run_id`: that may be the run's own Job with
+/// tampered metadata, which can still create a pod after the run gave its Leases up, and before it
+/// has one the pod check that guards giving up has nothing to find.
+fn foreign_job_outlasted(job: &Job, run_id: &str, now_epoch_secs: i64, timeout_secs: i64) -> bool {
+    let may_be_the_runs_own =
+        !status::job_finished(job) && job_template_label(job, labels::RUN_ID) == Some(run_id);
+    !may_be_the_runs_own
+        && job
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .is_some_and(|created| now_epoch_secs - created.0.as_second() >= timeout_secs)
+}
+
+impl ReconciliationContext {
+    /// [`ReconciliationContext::job_start_timeout`] in the epoch seconds the stall checks compare in.
+    fn job_start_timeout_secs(&self) -> i64 {
+        i64::try_from(self.job_start_timeout.as_secs()).unwrap_or(i64::MAX)
+    }
 }
 
 /// Reads what holds this run's Job name and checks whether it is the run's own Job.
@@ -3021,7 +3058,14 @@ async fn job_at_recorded_name(
             &run.mirror.play_uid,
         ) {
             Ok(()) => RecordedJob::Own,
-            Err(_) => RecordedJob::Foreign,
+            Err(_) => RecordedJob::Foreign {
+                outlasted: foreign_job_outlasted(
+                    &job,
+                    &run.mirror.run_id,
+                    Utc::now().timestamp(),
+                    context.job_start_timeout_secs(),
+                ),
+            },
         },
     )
 }
@@ -3860,8 +3904,8 @@ async fn advance_active_run(
     //     `resume_launching_run`, which keeps the mirror and asks for fifteen seconds; nothing
     //     between here and the end of the tick will set the interval again, so returning one second
     //     would poll a plan that is suspended *and* blocked once a second for as long as the
-    //     foreign Job survives — which can be indefinitely, since a contested name is never
-    //     abandoned.
+    //     foreign Job survives — up to the start timeout, after which the contested run is given
+    //     up.
     //
     // Fifteen seconds serves both: the first overrides it, and the second is exactly the cadence
     // the contested path asked for.
@@ -3904,7 +3948,26 @@ async fn advance_active_run(
             )
             .is_err() =>
         {
-            if !status::job_finished(job) {
+            // A foreign Job that has held the name past the start timeout is not waited on any
+            // longer, as long as nothing of this run may still execute. `cancel_run_job` answers
+            // exactly that: it disowns the foreign Job by the same identity check, so it never
+            // touches it, and only this run's own pods are asked — renewing the Leases while any
+            // of them may still be up. The run then finishes below with no recap, exactly as it
+            // would once the foreign Job finished.
+            let gave_up_waiting = !status::job_finished(job)
+                && foreign_job_outlasted(
+                    job,
+                    &run.mirror.run_id,
+                    Utc::now().timestamp(),
+                    context.job_start_timeout_secs(),
+                )
+                && !cancel_run_job(context, object, run).await?;
+            if gave_up_waiting {
+                warn!(
+                    "PlaybookPlan {namespace}/{name}: no longer waiting for Job {job_name}, which does not carry this run's identity and has held its name for longer than {}s; finishing the run without a recap",
+                    context.job_start_timeout_secs()
+                );
+            } else if !status::job_finished(job) {
                 // Discarded as above: this run's hosts may be occupied by a Job we do not control,
                 // so there is nothing safe left to do about a lock it no longer holds.
                 let _outcome =
@@ -3929,11 +3992,12 @@ async fn advance_active_run(
     // Still running -> renew this run's host locks so a run that outlasts the lease duration keeps
     // them (they're acquired once at start and otherwise never touched again while Applying), then
     // keep waiting.
-    if let Some(job) = &job
+    if job_is_trusted
+        && let Some(job) = &job
         && !status::job_finished(job)
     {
         let now = Utc::now().timestamp();
-        let timeout = i64::try_from(context.job_start_timeout.as_secs()).unwrap_or(i64::MAX);
+        let timeout = context.job_start_timeout_secs();
         if job_may_have_stalled(job, now, timeout) {
             let pods = run_job_pods(context, namespace, job, &run.mirror.play_uid).await?;
             if let Some(reason) = job_start_stall(job, &pods, now, timeout) {
@@ -4221,7 +4285,18 @@ async fn resume_launching_run(
     let (namespace, name) = namespace_and_name(object)?;
     let found = job_at_recorded_name(context, object, run).await?;
 
-    let action = decide_job_presence(resume_with.is_some(), found);
+    let mut action = decide_job_presence(resume_with.is_some(), found);
+    // The one thing that still holds a displaced run open: a pod carrying its run ID that may be
+    // executing, which would mean the identity check rejected a Job that was this run's after all.
+    if action == JobPresenceAction::Displaced
+        && run_pods_may_be_executing(context, namespace, run).await?
+    {
+        warn!(
+            "PlaybookPlan {namespace}/{name}: run {} is not given up although a Job it did not create has held its name past the start timeout: a pod carrying its run ID may still be executing",
+            run.mirror.job_name
+        );
+        action = JobPresenceAction::Contested;
+    }
     let requeue = match action {
         JobPresenceAction::Proceed => {
             let Some(run_groups) = resume_with else {
@@ -4283,6 +4358,27 @@ async fn resume_launching_run(
             // A short requeue, matching every other abandon path: nothing of this run is left,
             // so the replacement revision should be prepared promptly rather than after the
             // caller's Job-polling interval.
+            Some(std::time::Duration::from_secs(1))
+        }
+        JobPresenceAction::Displaced => {
+            let timeout = context.job_start_timeout_secs();
+            warn!(
+                "PlaybookPlan {namespace}/{name}: abandoning run {} — Job {}, which it did not create, has held its name for longer than {timeout}s",
+                run.mirror.job_name, run.mirror.job_name
+            );
+            abandon_unlaunched_run(
+                context,
+                object,
+                api,
+                run,
+                v1beta1::PlayPhase::Launching,
+                format!(
+                    "aborted the run: Job {}, which it did not create, has held its name for longer than {timeout}s",
+                    run.mirror.job_name
+                ),
+                resource_status,
+            )
+            .await?;
             Some(std::time::Duration::from_secs(1))
         }
         JobPresenceAction::Contested => {
@@ -4882,9 +4978,13 @@ async fn handle_unlaunched_input_error(
                     "aborted the run because its desired inputs cannot be resolved: {error}"
                 ));
             }
-            // `Contested` explained itself, and more usefully than this could. `Proceed` cannot
-            // happen: it needs inputs to converge against, and this run has none.
-            JobPresenceAction::Contested | JobPresenceAction::Proceed => {}
+            // `Contested` and `Displaced` explained themselves, and more usefully than this could:
+            // the run is waiting on, or was given up because of, a Job at its name, whatever the
+            // inputs say. `Proceed` cannot happen: it needs inputs to converge against, and this
+            // run has none.
+            JobPresenceAction::Contested
+            | JobPresenceAction::Displaced
+            | JobPresenceAction::Proceed => {}
         }
         return patch_status(api, object, resource_status.clone())
             .await
@@ -5274,6 +5374,19 @@ async fn cancel_run_job(
         );
     }
     Ok(executing)
+}
+
+/// Whether any playbook pod carrying this run's ID may still be executing, judged without its Job —
+/// for when the Job at the run's name is not the run's own.
+async fn run_pods_may_be_executing(
+    context: &ReconciliationContext,
+    namespace: &str,
+    run: &RecordedRun,
+) -> Result<bool, ReconcileError> {
+    let pods = Api::<Pod>::namespaced(context.client.clone(), namespace)
+        .list(&ListParams::default().labels(&run_pod_selector(&run.mirror.run_id)))
+        .await?;
+    Ok(run_may_be_executing(None, &pods.items))
 }
 
 /// Selects a run's *playbook* pods — the Job's — and not the proxy pods it shares its run ID
@@ -7959,7 +8072,9 @@ async fn handle_invalid_scheduling_configuration(
                 JobPresenceAction::Abandon => {
                     resource_status.summary = Some(format!("aborted the run because {summary}"));
                 }
-                JobPresenceAction::Contested | JobPresenceAction::Proceed => {}
+                JobPresenceAction::Contested
+                | JobPresenceAction::Displaced
+                | JobPresenceAction::Proceed => {}
             }
         } else {
             abandon_unlaunched_run(
@@ -12011,10 +12126,12 @@ spec:
     /// always adopted, whatever the plan now says, and only a free name may be abandoned. Getting
     /// this backwards would tear a live run's node-root infrastructure down underneath it.
     ///
-    /// A Job that is not this run's is neither, in either direction. Adopting it would put this
-    /// run's record behind work it did not commission; abandoning would release the host Leases
-    /// on the strength of an identity check, and a check that ever rejected a Job which genuinely was
-    /// ours would then let a second run start on hosts the first is still applying to.
+    /// A Job that is not this run's is never adopted, and is waited on until it has held the name
+    /// past the start timeout. Adopting it would put this run's record behind work it did not
+    /// commission; abandoning at once would release the host Leases on the strength of an identity
+    /// check, and a check that ever rejected a Job which genuinely was ours would then let a second
+    /// run start on hosts the first is still applying to. Waiting for ever would let any Job at the
+    /// name hold the run's hosts for the life of the plan.
     #[test]
     fn only_the_runs_own_job_is_adopted_and_only_a_free_name_abandoned() {
         for may_proceed in [true, false] {
@@ -12023,8 +12140,12 @@ spec:
                 JobPresenceAction::Adopt
             );
             assert_eq!(
-                decide_job_presence(may_proceed, RecordedJob::Foreign),
+                decide_job_presence(may_proceed, RecordedJob::Foreign { outlasted: false }),
                 JobPresenceAction::Contested
+            );
+            assert_eq!(
+                decide_job_presence(may_proceed, RecordedJob::Foreign { outlasted: true }),
+                JobPresenceAction::Displaced
             );
         }
         assert_eq!(
@@ -15506,6 +15627,69 @@ spec:
             );
             assert!(job_start_stall(&stall_job(None), &pods, late + 600, STALL_TIMEOUT).is_some());
         }
+    }
+
+    /// A foreign Job is judged by its own age, and one without a creation time is never judged
+    /// outlasted: missing data must not shorten the wait.
+    #[test]
+    fn a_foreign_job_outlasts_the_wait_by_its_own_age() {
+        let t0 = stall_secs(STALL_T0);
+        let job = stall_job(None);
+        assert!(!foreign_job_outlasted(
+            &job,
+            "run-1",
+            t0 + 599,
+            STALL_TIMEOUT
+        ));
+        assert!(foreign_job_outlasted(
+            &job,
+            "run-1",
+            t0 + 600,
+            STALL_TIMEOUT
+        ));
+        assert!(!foreign_job_outlasted(
+            &Job::default(),
+            "run-1",
+            t0 + 600,
+            STALL_TIMEOUT
+        ));
+    }
+
+    /// An unfinished Job whose pods would carry the run's ID may be the run's own with tampered
+    /// metadata, so it is waited on for as long as it may still create one.
+    #[test]
+    fn a_job_whose_pods_carry_the_run_id_is_waited_on_until_it_finishes() {
+        let late = stall_secs(STALL_T0) + 10 * STALL_TIMEOUT;
+        let job = |conditions: serde_json::Value| -> Job {
+            serde_json::from_value(serde_json::json!({
+                "metadata": { "name": "apply-web-abc-1", "creationTimestamp": STALL_T0 },
+                "spec": { "template": { "metadata": { "labels": { labels::RUN_ID: "run-1" } } } },
+                "status": { "conditions": conditions },
+            }))
+            .unwrap()
+        };
+
+        let unfinished = job(serde_json::json!([]));
+        assert!(!foreign_job_outlasted(
+            &unfinished,
+            "run-1",
+            late,
+            STALL_TIMEOUT
+        ));
+        assert!(foreign_job_outlasted(
+            &unfinished,
+            "run-2",
+            late,
+            STALL_TIMEOUT
+        ));
+
+        let finished = job(serde_json::json!([{ "type": "Complete", "status": "True" }]));
+        assert!(foreign_job_outlasted(
+            &finished,
+            "run-1",
+            late,
+            STALL_TIMEOUT
+        ));
     }
 
     /// Only a Job Kubernetes failed *for* its deadline is reported as having exceeded it; any other
