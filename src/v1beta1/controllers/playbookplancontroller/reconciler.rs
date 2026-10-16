@@ -4938,6 +4938,7 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         ReconcileError::PreconditionFailed(_)
         | ReconcileError::RecordMismatch { .. }
         | ReconcileError::JobMismatch { .. }
+        | ReconcileError::RunNamesTaken { .. }
         | ReconcileError::ConcurrentActiveRecords { .. }
         | ReconcileError::RenderError(_)
         | ReconcileError::CaError(_)
@@ -8124,7 +8125,8 @@ async fn select_job(
         .max()
         .unwrap_or_default();
 
-    let plays = Api::<Play>::namespaced(client.clone(), namespace.as_ref())
+    let plays_api = Api::<Play>::namespaced(client.clone(), namespace.as_ref());
+    let plays = plays_api
         .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
         .await?;
     let max_recorded_run_number = plays
@@ -8137,13 +8139,68 @@ async fn select_job(
         .max()
         .unwrap_or_default();
 
-    let run_number =
-        next_run_number(&[last_run_number, max_job_run_number, max_recorded_run_number])?;
+    let first = next_run_number(&[last_run_number, max_job_run_number, max_recorded_run_number])?;
+    let name_of = |run_number| {
+        job_builder::job_name(plan_name.as_ref(), plan_uid.as_ref(), &hash, run_number)
+    };
 
-    Ok(SelectedJob {
-        job_name: job_builder::job_name(plan_name.as_ref(), plan_uid.as_ref(), &hash, run_number),
-        run_number,
+    // Everything counted above is this plan's own. A Job or `Play` at the candidate name that was
+    // not counted belongs to something else: a Job created outside the operator, or another plan
+    // whose truncated name and short id collide with this one. Claiming that name would wedge the
+    // run (a foreign Job contests it, a foreign `Play` makes `record_prepared` refuse it on every
+    // tick), and an aborted run's replacement would pick the same number again. So the number
+    // moves past it instead.
+    let (plays_api, namespace, plan_name) = (&plays_api, &namespace, &plan_name);
+    let free = first_free_run_number(first, name_of, |job_name| async move {
+        let holder = if api.get_opt(&job_name).await?.is_some() {
+            "Job"
+        } else if plays_api.get_opt(&job_name).await?.is_some() {
+            "Play"
+        } else {
+            return Ok(false);
+        };
+        warn!(
+            "PlaybookPlan {namespace}/{plan_name}: run name {job_name} is held by a {holder} this plan did not create; numbering the run past it"
+        );
+        Ok(true)
     })
+    .await?;
+    match free {
+        Some(run_number) => Ok(SelectedJob {
+            job_name: name_of(run_number),
+            run_number,
+        }),
+        None => Err(ReconcileError::RunNamesTaken {
+            namespace: namespace.to_string(),
+            first: name_of(first),
+            last: name_of(first + (MAX_TAKEN_RUN_NAMES - 1)),
+        }),
+    }
+}
+
+/// How many consecutive run names [`select_job`] steps past before it gives up. Each step needs a
+/// foreign object at exactly the next name, so running out means something is creating them on
+/// purpose, and the error has to say so rather than keep counting.
+const MAX_TAKEN_RUN_NAMES: u32 = 16;
+
+/// The first run number from `first` on whose name `is_taken` finds nothing, or `None` once
+/// [`MAX_TAKEN_RUN_NAMES`] names in a row are taken.
+async fn first_free_run_number<Taken>(
+    first: u32,
+    name_of: impl Fn(u32) -> String,
+    mut is_taken: impl FnMut(String) -> Taken,
+) -> Result<Option<u32>, ReconcileError>
+where
+    Taken: std::future::Future<Output = Result<bool, ReconcileError>>,
+{
+    let mut run_number = first;
+    for _ in 0..MAX_TAKEN_RUN_NAMES {
+        if !is_taken(name_of(run_number)).await? {
+            return Ok(Some(run_number));
+        }
+        run_number = next_run_number(&[run_number])?;
+    }
+    Ok(None)
 }
 
 /// Creates this run's Job, tolerating the fact that it may already exist.
@@ -9119,6 +9176,32 @@ mod tests {
         assert_eq!(next_run_number(&[3, 5, 0]).unwrap(), 6);
 
         assert!(next_run_number(&[u32::MAX]).is_err());
+    }
+
+    /// A name something else holds is stepped past rather than claimed, and a run of taken names as
+    /// long as `MAX_TAKEN_RUN_NAMES` is given up on instead of counted through.
+    #[tokio::test]
+    async fn select_job_steps_past_taken_names_and_gives_up_after_a_bounded_run() {
+        let name_of = |run_number: u32| format!("apply-web-abc-{run_number}");
+        let free_from = |first: u32, taken: Vec<u32>| async move {
+            first_free_run_number(first, name_of, |name| {
+                let taken = taken.iter().any(|&number| name == name_of(number));
+                async move { Ok(taken) }
+            })
+            .await
+            .unwrap()
+        };
+
+        assert_eq!(free_from(4, vec![]).await, Some(4));
+        assert_eq!(free_from(4, vec![4, 5, 7]).await, Some(6));
+        assert_eq!(
+            free_from(4, (4..4 + MAX_TAKEN_RUN_NAMES).collect()).await,
+            None
+        );
+        assert_eq!(
+            free_from(4, (4..3 + MAX_TAKEN_RUN_NAMES).collect()).await,
+            Some(3 + MAX_TAKEN_RUN_NAMES)
+        );
     }
 
     /// Why `select_job` reserves names across *every* revision instead of only the one it is naming.

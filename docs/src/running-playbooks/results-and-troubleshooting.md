@@ -523,6 +523,12 @@ The related **"could not prepare a run: …"** summary, without a run name, mean
 the operator recorded an active run. There is no `Play`, host Lease, or managed-SSH proxy pod to
 recover in that case; the operator reports the error and retries normally.
 
+A Job or `Play` the plan did not create can hold the name a new run would take. The operator then
+numbers the run past it and logs the name it skipped. Only when sixteen names in a row are held does
+it give up with **"could not prepare a run: run names … to … in namespace … are all held by Jobs or
+Plays this plan did not create"**. Inspect those objects and delete the ones that are not the
+operator's.
+
 If it stays there with nothing progressing, `.status.summary` says which of the following it is
 instead, and `.status.activeRun` names the run it is waiting on:
 
