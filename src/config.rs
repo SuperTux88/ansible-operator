@@ -134,12 +134,17 @@ pub struct RunsConfig {
     /// playbook. Default 600; zero is rejected, since it would cancel every run before its pod could
     /// start.
     pub start_timeout_seconds: NonZeroU32,
+    /// The `activeDeadlineSeconds` of the Job of a plan that sets no `spec.activeDeadlineSeconds`.
+    /// Absent (the default) leaves such Jobs without a limit; zero is rejected, as Kubernetes would
+    /// reject it on the Job.
+    pub default_active_deadline_seconds: Option<NonZeroU32>,
 }
 
 impl Default for RunsConfig {
     fn default() -> Self {
         Self {
             start_timeout_seconds: NonZeroU32::new(600).expect("600 is not zero"),
+            default_active_deadline_seconds: None,
         }
     }
 }
@@ -314,6 +319,26 @@ mod tests {
             );
         }
         assert!(toml::from_str::<OperatorConfig>("[runs]\nnope = 1\n").is_err());
+    }
+
+    #[test]
+    fn default_active_deadline_is_absent_unless_configured() {
+        let absent: OperatorConfig = toml::from_str("watch_namespaces = []").unwrap();
+        assert_eq!(absent.runs.default_active_deadline_seconds, None);
+
+        let set: OperatorConfig =
+            toml::from_str("[runs]\ndefault_active_deadline_seconds = 7200\n").unwrap();
+        assert_eq!(
+            set.runs
+                .default_active_deadline_seconds
+                .map(NonZeroU32::get),
+            Some(7200)
+        );
+
+        assert!(
+            toml::from_str::<OperatorConfig>("[runs]\ndefault_active_deadline_seconds = 0\n")
+                .is_err()
+        );
     }
 
     #[test]

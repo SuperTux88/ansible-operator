@@ -127,6 +127,8 @@ pub struct OperatorSettings {
     pub proxy_grace: managed_ssh::ProxyGracePolicy,
     /// How long a run's Job may go without starting before the run is cancelled.
     pub job_start_timeout: std::time::Duration,
+    /// The Job deadline of a plan that sets none of its own; `None` for no limit.
+    pub default_active_deadline_seconds: Option<u32>,
     /// Whether a plan's `spec.provides` version may be published onto its Nodes.
     pub node_labels_enabled: bool,
     pub workload_egress_policies: WorkloadEgressPolicies,
@@ -179,6 +181,9 @@ struct ReconciliationContext {
     /// How long a run's Job may go without starting before the run is cancelled (see
     /// [`job_start_stall`]). From the chart's `runs.startTimeoutSeconds`.
     job_start_timeout: std::time::Duration,
+    /// The Job deadline of a plan that sets no `spec.activeDeadlineSeconds`, or `None` for no limit.
+    /// From the chart's `runs.defaultActiveDeadlineSeconds`.
+    default_active_deadline_seconds: Option<u32>,
     workload_egress_policies: WorkloadEgressPolicies,
 }
 
@@ -441,6 +446,7 @@ pub async fn new(
         proxy_image: settings.proxy_image,
         proxy_grace: settings.proxy_grace,
         job_start_timeout: settings.job_start_timeout,
+        default_active_deadline_seconds: settings.default_active_deadline_seconds,
         node_labels_enabled: settings.node_labels_enabled,
         workload_egress_policies: settings.workload_egress_policies,
     });
@@ -3611,7 +3617,14 @@ async fn ensure_infra_and_launch(
     )
     .await?;
     let jobs_api = Api::<Job>::namespaced(context.client.clone(), namespace);
-    launch_recorded_job(&jobs_api, object, run, run_groups).await?;
+    launch_recorded_job(
+        &jobs_api,
+        object,
+        run,
+        run_groups,
+        context.default_active_deadline_seconds,
+    )
+    .await?;
     play_history::record_running(
         &context.client,
         namespace,
@@ -3987,14 +4000,23 @@ async fn advance_active_run(
     // it exists: `record_finished` maps an unreadable recap of either kind to the same `Unknown`
     // hosts, so nothing downstream — including a later tick recovering this same run — can tell an
     // overflow from a crash. It takes precedence over the record-derived half because the two cannot
-    // both hold: a message that overflowed carries no counters to be empty.
-    let diagnostic = termination_message
-        .as_deref()
-        .and_then(callback_output::recap_overflowed_host_count)
-        .map_or_else(
-            || RunDiagnostic::from_play_status(finished_status),
-            |hosts| RunDiagnostic::RecapOverflowed { hosts },
-        );
+    // both hold: a message that overflowed carries no counters to be empty. A Job stopped at its
+    // deadline is asked here for the same reason: only the Job's own condition says so, and a later
+    // tick may find the Job reaped.
+    let exceeded_deadline = match (&job, job_is_trusted, &parsed) {
+        (Some(job), true, None) => exceeded_deadline_seconds(job),
+        _ => None,
+    };
+    let diagnostic = match (
+        termination_message
+            .as_deref()
+            .and_then(callback_output::recap_overflowed_host_count),
+        exceeded_deadline,
+    ) {
+        (Some(hosts), _) => RunDiagnostic::RecapOverflowed { hosts },
+        (None, Some(seconds)) => RunDiagnostic::DeadlineExceeded { seconds },
+        (None, None) => RunDiagnostic::from_play_status(finished_status),
+    };
     diagnostic.warn(namespace, name, &run.mirror.job_name);
     status::apply_terminal_play_status(
         &status::RunRecord {
@@ -4015,6 +4037,26 @@ async fn advance_active_run(
         diagnostic,
         record: TerminalRecord::Present,
     })
+}
+
+/// The `activeDeadlineSeconds` a finished Job was stopped at, when Kubernetes failed it for running
+/// past that deadline (`Failed` with reason `DeadlineExceeded`).
+fn exceeded_deadline_seconds(job: &Job) -> Option<i64> {
+    let stopped_at_deadline = job
+        .status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .any(|condition| {
+            condition.type_ == "Failed"
+                && condition.status == "True"
+                && condition.reason.as_deref() == Some("DeadlineExceeded")
+        });
+    if !stopped_at_deadline {
+        return None;
+    }
+    job.spec.as_ref()?.active_deadline_seconds
 }
 
 /// The pods of this run's own Job: created by that Job object and carrying the run's `Play` UID, so
@@ -6722,6 +6764,7 @@ async fn launch_recorded_job(
     object: &PlaybookPlan,
     run: &RecordedRun,
     run_groups: &[ResolvedInventoryGroup],
+    default_active_deadline_seconds: Option<u32>,
 ) -> Result<(), ReconcileError> {
     let mut job = job_builder::create_job_blueprint(
         &run.execution_hash,
@@ -6729,6 +6772,7 @@ async fn launch_recorded_job(
         &run.mirror.run_id,
         run_groups,
         object,
+        default_active_deadline_seconds,
     )?;
     job_builder::correlate_job_to_play(&mut job, &run.mirror.play_uid);
     let selected = SelectedJob {
@@ -6900,7 +6944,7 @@ fn plan_summary(outdated_count: usize, total_count: usize, verdict: &Phase) -> S
 ///
 /// One channel rather than a flag per reason, because they arrive at the same place, are appended to
 /// the same summary, and are mutually exclusive in fact: `NoPlaybookActivity` requires a readable
-/// recap, while `RecapOverflowed` and `JobDidNotStart` mean there was none.
+/// recap, while `RecapOverflowed`, `JobDidNotStart` and `DeadlineExceeded` mean there was none.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum RunDiagnostic {
     #[default]
@@ -6918,6 +6962,10 @@ enum RunDiagnostic {
     /// recorded it waiting on (`PlayStatus::stall_reason`). Without it the plan would report only an
     /// unreadable recap, which is what a reaped Job reports too.
     JobDidNotStart { reason: String },
+    /// Kubernetes stopped the run's Job at its `activeDeadlineSeconds` (`seconds`), so the playbook
+    /// never reached the end where its recap is written. Like `RecapOverflowed`, only the Job says
+    /// so, which is why a run recovered from its record alone reports the plain unreadable recap.
+    DeadlineExceeded { seconds: i64 },
 }
 
 impl RunDiagnostic {
@@ -6952,6 +7000,9 @@ impl RunDiagnostic {
             Self::JobDidNotStart { reason } => warn!(
                 "PlaybookPlan {namespace}/{name}: run {job_name} was cancelled because {reason}; every host is reported Unknown and the run spent an attempt. Fix what the Job waited on (its image, its ServiceAccount, the namespace's admission rules or quota), or raise runs.startTimeoutSeconds if the image only pulls slowly"
             ),
+            Self::DeadlineExceeded { seconds } => warn!(
+                "PlaybookPlan {namespace}/{name}: run {job_name} was stopped by Kubernetes after its deadline of {seconds}s (spec.activeDeadlineSeconds, or the operator's runs.defaultActiveDeadlineSeconds); every host is reported Unknown and the run spent an attempt. Raise the plan's spec.activeDeadlineSeconds if the playbook legitimately runs longer"
+            ),
         }
     }
 
@@ -6968,6 +7019,9 @@ impl RunDiagnostic {
                 " (the recap for {hosts} hosts does not fit the kubelet's termination-message limit, so no per-host result could be read; split the plan across smaller inventories)"
             )),
             Self::JobDidNotStart { reason } => Some(format!(" (cancelled: {reason})")),
+            Self::DeadlineExceeded { seconds } => {
+                Some(format!(" (the Job exceeded its deadline of {seconds}s)"))
+            }
         }
     }
 }
@@ -8954,8 +9008,9 @@ mod tests {
         let hash = ExecutionHash::from_hex("1").unwrap();
 
         let prepared =
-            job_builder::create_job_blueprint(&hash, 2, "run-1", &groups, &plan).unwrap();
-        let rebuilt = job_builder::create_job_blueprint(&hash, 2, "run-1", &groups, &plan).unwrap();
+            job_builder::create_job_blueprint(&hash, 2, "run-1", &groups, &plan, None).unwrap();
+        let rebuilt =
+            job_builder::create_job_blueprint(&hash, 2, "run-1", &groups, &plan, None).unwrap();
 
         assert_eq!(
             serde_json::to_value(&prepared).unwrap(),
@@ -10860,7 +10915,7 @@ mod tests {
         plan.metadata.namespace = Some("team".into());
         plan.metadata.uid = Some("plan-uid".into());
 
-        let job = job_builder::create_job_blueprint(&hash, 1, "run-1", &[], &plan).unwrap();
+        let job = job_builder::create_job_blueprint(&hash, 1, "run-1", &[], &plan, None).unwrap();
         let template_labels = job
             .spec
             .as_ref()
@@ -11911,7 +11966,8 @@ spec:
         plan.metadata.uid = Some("plan-uid".into());
 
         let own = || {
-            let mut job = job_builder::create_job_blueprint(&hash, 7, "run-1", &[], &plan).unwrap();
+            let mut job =
+                job_builder::create_job_blueprint(&hash, 7, "run-1", &[], &plan, None).unwrap();
             job_builder::correlate_job_to_play(&mut job, "play-uid");
             job.metadata.owner_references = Some(vec![playbookplan_owner_ref(&plan).unwrap()]);
             job
@@ -11925,7 +11981,7 @@ spec:
         other_plan.metadata.namespace = Some("team".into());
         other_plan.metadata.uid = Some("other-plan-uid".into());
         let mut foreign =
-            job_builder::create_job_blueprint(&hash, 7, "run-1", &[], &other_plan).unwrap();
+            job_builder::create_job_blueprint(&hash, 7, "run-1", &[], &other_plan, None).unwrap();
         job_builder::correlate_job_to_play(&mut foreign, "play-uid");
         foreign.metadata.owner_references =
             Some(vec![playbookplan_owner_ref(&other_plan).unwrap()]);
@@ -11936,7 +11992,7 @@ spec:
 
         // Another run of this same plan, which shares the name's readable half but not the run.
         let mut other_run =
-            job_builder::create_job_blueprint(&hash, 8, "run-2", &[], &plan).unwrap();
+            job_builder::create_job_blueprint(&hash, 8, "run-2", &[], &plan, None).unwrap();
         job_builder::correlate_job_to_play(&mut other_run, "other-play-uid");
         other_run.metadata.owner_references = Some(vec![playbookplan_owner_ref(&plan).unwrap()]);
         assert!(validate(&other_run).is_err());
@@ -13124,7 +13180,8 @@ spec:
         plan.metadata.uid = Some("plan-uid".into());
         plan.metadata.namespace = Some("default".into());
         let hash = ExecutionHash::from_hex("1a").unwrap();
-        let mut job = job_builder::create_job_blueprint(&hash, 1, "run-1", &[], &plan).unwrap();
+        let mut job =
+            job_builder::create_job_blueprint(&hash, 1, "run-1", &[], &plan, None).unwrap();
         job_builder::correlate_job_to_play(&mut job, "play-uid");
 
         assert!(validate_selected_job(&job, &plan, hash, 1, "run-1", "play-uid").is_ok());
@@ -15366,6 +15423,33 @@ spec:
             );
             assert!(job_start_stall(&stall_job(None), &pods, late + 600, STALL_TIMEOUT).is_some());
         }
+    }
+
+    /// Only a Job Kubernetes failed *for* its deadline is reported as having exceeded it; any other
+    /// failure of a Job that has a deadline keeps its own explanation.
+    #[test]
+    fn only_a_deadline_failure_reports_the_deadline() {
+        let failed = |reason: &str| -> Job {
+            serde_json::from_value(serde_json::json!({
+                "spec": { "activeDeadlineSeconds": 3600, "template": {} },
+                "status": { "conditions": [{ "type": "Failed", "status": "True", "reason": reason }] },
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            exceeded_deadline_seconds(&failed("DeadlineExceeded")),
+            Some(3600)
+        );
+        assert_eq!(
+            exceeded_deadline_seconds(&failed("BackoffLimitExceeded")),
+            None
+        );
+        assert_eq!(
+            RunDiagnostic::DeadlineExceeded { seconds: 3600 }
+                .summary_clause()
+                .as_deref(),
+            Some(" (the Job exceeded its deadline of 3600s)")
+        );
     }
 
     /// The recorded stall explains an unreadable recap, and only that: a Job that started after all

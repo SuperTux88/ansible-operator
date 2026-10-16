@@ -78,6 +78,19 @@ fn effective_job_ttl(plan: &v1beta1::PlaybookPlan) -> i32 {
     }
 }
 
+/// The Job's `activeDeadlineSeconds`: the plan's own `spec.activeDeadlineSeconds`, otherwise the
+/// operator-wide default (`runs.defaultActiveDeadlineSeconds`), otherwise no limit. The plan wins in
+/// both directions, so a plan that needs longer than the default only has to say so.
+fn effective_active_deadline(
+    plan: &v1beta1::PlaybookPlan,
+    default_seconds: Option<u32>,
+) -> Option<i64> {
+    plan.spec
+        .active_deadline_seconds
+        .or(default_seconds)
+        .map(i64::from)
+}
+
 use crate::{
     utils,
     v1beta1::{
@@ -111,6 +124,7 @@ pub fn create_job_blueprint(
     run_id: &str,
     target_groups: &[ResolvedInventoryGroup],
     object: &PlaybookPlan,
+    default_active_deadline_seconds: Option<u32>,
 ) -> Result<batch::v1::Job, ReconcileError> {
     let pb_name = object
         .metadata
@@ -131,6 +145,11 @@ pub fn create_job_blueprint(
         .ok_or(ReconcileError::PreconditionFailed("uid not set"))?;
 
     let mut job = create_job_skeleton(object, object.spec.template.requirements.is_some())?;
+    job.spec
+        .as_mut()
+        .expect("the skeleton always has a spec")
+        .active_deadline_seconds =
+        effective_active_deadline(object, default_active_deadline_seconds);
 
     if has_managed_ssh_group(target_groups) {
         let secret_name = managed_ssh::client_cert_secret_name(run_id);
@@ -1103,7 +1122,7 @@ spec:
         pp.metadata.uid = Some("plan-uid".into());
         let hash = crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash("- hosts: all", std::iter::empty());
 
-        let pod_spec = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp)
+        let pod_spec = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp, None)
             .unwrap()
             .spec
             .unwrap()
@@ -1168,7 +1187,7 @@ spec:
         pp.metadata.uid = Some("plan-uid".into());
         let hash = crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash("- hosts: all", std::iter::empty());
 
-        let pod_spec = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp)
+        let pod_spec = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp, None)
             .unwrap()
             .spec
             .unwrap()
@@ -1411,9 +1430,9 @@ spec:
         let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
 
-        let run_1 = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp).unwrap();
-        let run_2 = super::create_job_blueprint(&hash, 2, "run-2", &[], &pp).unwrap();
-        let run_1_again = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp).unwrap();
+        let run_1 = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp, None).unwrap();
+        let run_2 = super::create_job_blueprint(&hash, 2, "run-2", &[], &pp, None).unwrap();
+        let run_1_again = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp, None).unwrap();
 
         let name_1 = run_1.name().unwrap().to_string();
         let name_2 = run_2.name().unwrap().to_string();
@@ -1446,6 +1465,7 @@ spec:
             "run-1",
             &[],
             &minimal_plan(),
+            None,
         )
         .unwrap();
         super::correlate_job_to_play(&mut job, "play-uid");
@@ -1474,6 +1494,35 @@ spec:
                 .map(String::as_str),
             Some("play-uid")
         );
+    }
+
+    /// The plan's own deadline wins over the operator's default in both directions, and without
+    /// either the Job has no deadline at all.
+    #[test]
+    fn the_plan_deadline_overrides_the_operator_default() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+
+        let deadline = |plan_value: Option<u32>, default: Option<u32>| {
+            let mut plan = minimal_plan();
+            plan.spec.active_deadline_seconds = plan_value;
+            super::create_job_blueprint(
+                &calculate_execution_hash("- hosts: all", std::iter::empty()),
+                1,
+                "run-1",
+                &[],
+                &plan,
+                default,
+            )
+            .unwrap()
+            .spec
+            .unwrap()
+            .active_deadline_seconds
+        };
+
+        assert_eq!(deadline(None, None), None);
+        assert_eq!(deadline(None, Some(7200)), Some(7200));
+        assert_eq!(deadline(Some(600), Some(7200)), Some(600));
+        assert_eq!(deadline(Some(14_400), Some(7200)), Some(14_400));
     }
 
     fn minimal_plan() -> PlaybookPlan {
@@ -1513,7 +1562,7 @@ spec:
             variables: None,
         }];
 
-        let job = super::create_job_blueprint(&hash, 1, "run-1", &groups, &pp).unwrap();
+        let job = super::create_job_blueprint(&hash, 1, "run-1", &groups, &pp, None).unwrap();
         let node_affinity = job
             .spec
             .unwrap()
@@ -1567,7 +1616,7 @@ spec:
             variables: None,
         }];
 
-        let job = super::create_job_blueprint(&hash, 1, "run-1", &groups, &pp).unwrap();
+        let job = super::create_job_blueprint(&hash, 1, "run-1", &groups, &pp, None).unwrap();
         let pod_spec = job.spec.unwrap().template.spec.unwrap();
         let init_containers = pod_spec.init_containers.unwrap();
 
@@ -1623,7 +1672,7 @@ spec:
         let pp = minimal_plan();
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
 
-        let job = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp).unwrap();
+        let job = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp, None).unwrap();
         let init_containers = job.spec.unwrap().template.spec.unwrap().init_containers;
 
         assert!(
@@ -1640,7 +1689,7 @@ spec:
 
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
         let ttl = |plan: &PlaybookPlan| {
-            super::create_job_blueprint(&hash, 1, "run-1", &[], plan)
+            super::create_job_blueprint(&hash, 1, "run-1", &[], plan, None)
                 .unwrap()
                 .spec
                 .unwrap()
@@ -1688,7 +1737,7 @@ spec:
             variables: None,
         }];
 
-        let job = super::create_job_blueprint(&hash, 1, "run-1", &groups, &pp).unwrap();
+        let job = super::create_job_blueprint(&hash, 1, "run-1", &groups, &pp, None).unwrap();
         assert!(
             job.spec.unwrap().template.spec.unwrap().affinity.is_none(),
             "StaticInventory hosts aren't cluster nodes, so nothing constrains placement"
@@ -1703,7 +1752,7 @@ spec:
         assert!(pp.spec.service_account_name.is_none());
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
 
-        let pod_spec = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp)
+        let pod_spec = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp, None)
             .unwrap()
             .spec
             .unwrap()
@@ -1724,7 +1773,7 @@ spec:
         pp.spec.service_account_name = Some("playbook-sa".into());
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
 
-        let pod_spec = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp)
+        let pod_spec = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp, None)
             .unwrap()
             .spec
             .unwrap()
@@ -1749,7 +1798,7 @@ spec:
         });
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
 
-        let pod_spec = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp)
+        let pod_spec = super::create_job_blueprint(&hash, 1, "run-1", &[], &pp, None)
             .unwrap()
             .spec
             .unwrap()

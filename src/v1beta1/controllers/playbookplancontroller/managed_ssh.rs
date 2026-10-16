@@ -1427,7 +1427,7 @@ mod tests {
             crate::v1beta1::PlaybookPlan::new("web", crate::v1beta1::PlaybookPlanSpec::default());
         plan.metadata.namespace = Some("team".into());
         plan.metadata.uid = Some("plan-uid".into());
-        let job = job_builder::create_job_blueprint(&hash, 1, run_id, &[], &plan).unwrap();
+        let job = job_builder::create_job_blueprint(&hash, 1, run_id, &[], &plan, None).unwrap();
         let job_pod_labels = job
             .spec
             .as_ref()
