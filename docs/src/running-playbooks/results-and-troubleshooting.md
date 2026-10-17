@@ -519,6 +519,19 @@ normal — `.status.summary` then reads **"applying run …"**, naming the run, 
 `WaitingForNodes` conditions say whether it is waiting on a host lock or on proxy pods rather than
 executing.
 
+A run also stays `Applying`, with the summary it already had (**"applying run …"**, or **"cancelling
+run …"** below), when the Node running its Job's pod stops reporting. The pod's `Ready` condition
+then turns `False`, and after a few minutes `kubectl` shows the pod `Terminating` (`Unknown` on some
+versions). Both say the Node stopped reporting, not that the playbook stopped: a partitioned Node
+keeps running its containers, and the playbook may still be applying to its hosts. From Kubernetes
+1.31 on, the Job is not marked finished while its pod may still run, so the run keeps its host
+Leases, and every other plan that shares a host with it waits too. Recovering the Node resolves it;
+so does removing the `Node` object, after which Kubernetes deletes the pods bound to it and the run
+finishes with its hosts [`Unknown`](#hosts-show-unknown). `kubectl get pods -n <plan-namespace> -l
+ansible.cloudbending.dev/run-id=<runId> -o wide` shows which Node the pod is on, with `<runId>` from
+`.status.activeRun.runId`. A target Node going down does not cause this: Ansible gives up on that
+host and the run carries on (see [Hosts show `Unreachable`](#hosts-show-unreachable)).
+
 The related **"could not prepare a run: …"** summary, without a run name, means setup failed before
 the operator recorded an active run. There is no `Play`, host Lease, or managed-SSH proxy pod to
 recover in that case; the operator reports the error and retries normally.
