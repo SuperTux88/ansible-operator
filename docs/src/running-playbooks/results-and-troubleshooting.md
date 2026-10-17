@@ -932,6 +932,13 @@ the host is reached:
 - a **`StaticInventory` host**: it is down, not accepting connections, or rejecting the key in
   `spec.ssh.secretRef`.
 
+A host can also go away in the middle of a run: powered off, crashed or cut off from the network
+during a task. Such a host sends nothing that would close the connection, so the operator's SSH
+settings give up on it after about two minutes without an answer and report it `Unreachable`. The
+rest of the run carries on and finishes instead of waiting for it. A `reboot` task is not affected,
+since Ansible's `reboot` module reconnects on its own and fails the host after its own timeout if
+the machine does not come back.
+
 Such a run leaves the plan in the `HostsUnreachable` phase rather than `Failed`, provided *every*
 host that did not succeed was one nothing could connect to. That is the distinction the phase exists
 for: the playbook is fine and the plan is waiting for a machine. One host that ran a task and failed
