@@ -84,6 +84,7 @@ spec:
                   Orthogonal to `runNumber`, which every try advances because every try *is* a run — with its
                   own record, its own `runId` and its own Job. This says which try of its execution that run
                   was, which the run number cannot: it is reserved plan-wide and continues across editions.
+                maximum: 4294967295.0
                 minimum: 0.0
                 type: integer
               executionHash:
@@ -169,6 +170,7 @@ spec:
                   is how a user's retry request, or an SSH key rotation that restores the budget, reopens a
                   window its failures had closed. Absent reads as 0, the generation of a plan that has never
                   had its budget handed back.
+                maximum: 4294967295.0
                 minimum: 0.0
                 type: integer
               runId:
@@ -186,6 +188,7 @@ spec:
                   Not a dense count of this plan's runs: a run abandoned before its Job exists leaves its
                   number unused whenever the plan's `lastRunNumber` already recorded it. Uniqueness of the
                   name is the whole contract.
+                maximum: 4294967295.0
                 minimum: 0.0
                 type: integer
               triggeredSlot:
@@ -213,6 +216,7 @@ spec:
             properties:
               failedHostCount:
                 description: How many targeted hosts did not end `Succeeded`.
+                maximum: 4294967295.0
                 minimum: 0.0
                 type: integer
               finishedAt:
@@ -228,6 +232,7 @@ spec:
                 description: |-
                   Number of distinct hosts this run targeted (the total across `spec.inventory`, surfaced as
                   a column).
+                maximum: 4294967295.0
                 minimum: 0.0
                 type: integer
               hosts:
@@ -249,24 +254,31 @@ spec:
                         JSONPath columns and merge-patch friendliness.
                       properties:
                         changed:
+                          maximum: 4294967295.0
                           minimum: 0.0
                           type: integer
                         failed:
+                          maximum: 4294967295.0
                           minimum: 0.0
                           type: integer
                         ignored:
+                          maximum: 4294967295.0
                           minimum: 0.0
                           type: integer
                         ok:
+                          maximum: 4294967295.0
                           minimum: 0.0
                           type: integer
                         rescued:
+                          maximum: 4294967295.0
                           minimum: 0.0
                           type: integer
                         skipped:
+                          maximum: 4294967295.0
                           minimum: 0.0
                           type: integer
                         unreachable:
+                          maximum: 4294967295.0
                           minimum: 0.0
                           type: integer
                       required:
@@ -311,24 +323,31 @@ spec:
                 description: The Ansible recap, summed across every targeted host — the recap columns read from here.
                 properties:
                   changed:
+                    maximum: 4294967295.0
                     minimum: 0.0
                     type: integer
                   failed:
+                    maximum: 4294967295.0
                     minimum: 0.0
                     type: integer
                   ignored:
+                    maximum: 4294967295.0
                     minimum: 0.0
                     type: integer
                   ok:
+                    maximum: 4294967295.0
                     minimum: 0.0
                     type: integer
                   rescued:
+                    maximum: 4294967295.0
                     minimum: 0.0
                     type: integer
                   skipped:
+                    maximum: 4294967295.0
                     minimum: 0.0
                     type: integer
                   unreachable:
+                    maximum: 4294967295.0
                     minimum: 0.0
                     type: integer
                 required:

@@ -67,7 +67,7 @@ const MIN_JOB_TTL_SECONDS_AFTER_FINISHED: i32 = 60;
 /// Ceiling for `spec.verbosity`. Ansible's practically useful maximum is `-vvvv` (connection +
 /// plugin debugging); higher values add nothing, so anything larger is silently clamped rather than
 /// rejected — the same forgiving style as `MIN_JOB_TTL_SECONDS_AFTER_FINISHED`.
-const MAX_VERBOSITY: u8 = 4;
+const MAX_VERBOSITY: u32 = 4;
 
 /// Resolves the effective Job TTL for a plan: its `spec.ttlSecondsAfterFinished` clamped up to
 /// `MIN_JOB_TTL_SECONDS_AFTER_FINISHED`, or the default when unset.
