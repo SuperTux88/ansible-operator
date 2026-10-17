@@ -18,6 +18,14 @@ pub const RESERVED_HOST_VARS: &[&str] = &[
     "ansible_ssh_common_args",
 ];
 
+/// SSH options that give up on a host that stopped answering, after about two minutes. A host that
+/// dies or drops off the network mid-task sends nothing to close the connection, and with no
+/// traffic only TCP keepalive would notice, after more than two hours. Ansible waits for every host
+/// of a task, so until then the whole run, and every host Lease it holds, waits with it. Not
+/// shorter: a managed-ssh connection runs over the pod network, so a task that restarts the target
+/// Node's container runtime or network plugin interrupts its own connection for a while.
+const DEAD_HOST_SSH_ARGS: &str = "-o ServerAliveInterval=15 -o ServerAliveCountMax=8";
+
 /// Returns the first [`RESERVED_HOST_VARS`] key present in an author's group `variables`, if any.
 /// `variables` is the raw JSON object the author supplied; a non-object value has no top-level keys
 /// and so never conflicts here (the CRD schema already constrains it to an object).
@@ -125,7 +133,7 @@ fn render_managed_ssh_host_vars(hostname: &str, ctx: &RenderContext) -> Mapping 
     vars.insert(
         Value::String("ansible_ssh_common_args".into()),
         Value::String(format!(
-            "-o UserKnownHostsFile={} -o HostKeyAlias={hostname}",
+            "-o UserKnownHostsFile={} -o HostKeyAlias={hostname} {DEAD_HOST_SSH_ARGS}",
             ctx.managed_ssh_known_hosts_path
         )),
     );
@@ -153,7 +161,9 @@ fn render_ssh_host_vars(
         );
         vars.insert(
             Value::String("ansible_ssh_common_args".into()),
-            Value::String(format!("-o UserKnownHostsFile={known_hosts_path}")),
+            Value::String(format!(
+                "-o UserKnownHostsFile={known_hosts_path} {DEAD_HOST_SSH_ARGS}"
+            )),
         );
     }
 
@@ -203,6 +213,7 @@ mod tests {
         // ansible_host, so the SSH client needs HostKeyAlias to check the cert/known_hosts
         // entry against the right name.
         assert!(rendered.contains("-o HostKeyAlias=worker-1"));
+        assert!(rendered.contains(DEAD_HOST_SSH_ARGS));
     }
 
     /// An unreachable host stays a full member of its group — that membership is what a playbook
@@ -286,6 +297,7 @@ mod tests {
 
         assert!(rendered.contains("ansible_user: root"));
         assert!(rendered.contains("/run/ansible-operator/ssh/ccu/id_rsa"));
+        assert!(rendered.contains(DEAD_HOST_SSH_ARGS));
     }
 
     #[test]
