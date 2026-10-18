@@ -236,7 +236,10 @@ operator's own namespace ∪ the chart's `watchNamespaces`. `jobs: create,delete
   node-root runs" decision, authored in `watchNamespaces` (static Helm/GitOps config, no runtime
   `rolebindings` write by the operator). A plan in a non-enrolled namespace is refused with
   `status.phase = UnauthorizedNamespace` before any Secret/Job call (fail-closed; no "all namespaces"
-  escape hatch). Distroless image, no shell.
+  escape hatch). A run in flight when its namespace is un-enrolled loses its node-root proxy pods
+  and host Leases at the refusal (`release_unenrolled_run`), since they live in the operator ns; its
+  Job, `Play` and run-cleanup finalizer stay in the plan namespace until it is re-enrolled.
+  Distroless image, no shell.
 - *Residual:* within the enrolled namespaces the grant is still broad — operator compromise ⇒
   disclosure of Secrets in *those* namespaces, plus Job-`create`, Job-`delete`, Secret-`delete` and
   PlaybookPlan-`patch` write primitives *there* (the per-run client-cert Secret is created and reaped

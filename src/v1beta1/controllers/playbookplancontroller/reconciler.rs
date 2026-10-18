@@ -691,10 +691,6 @@ async fn reconcile(
     object: Arc<v1beta1::PlaybookPlan>,
     context: Arc<ReconciliationContext>,
 ) -> Result<Action, ReconcileError> {
-    if object.metadata.deletion_timestamp.is_some() {
-        return release_deleted_plan(&context, &object).await;
-    }
-
     let (namespace, name) = namespace_and_name(&object)?;
 
     let api = Api::<v1beta1::PlaybookPlan>::namespaced(context.client.clone(), namespace);
@@ -704,6 +700,9 @@ async fn reconcile(
     // (would-be-403) Secret/Job call — and report why. `await_change()`, not a timed requeue: the
     // enrolled set only changes on operator restart (a ConfigMap edit rolls the pod), so there is
     // nothing to poll for and a requeue would just busy-loop blocked plans.
+    //
+    // Ahead of the deletion branch, because `release_deleted_plan` starts with plan-namespace calls
+    // that would 403 here, and so would never reach the run's operator-namespace half.
     if !context.enrolled_namespaces.contains(namespace) {
         warn!(
             "PlaybookPlan {namespace}/{name} is in a namespace not enrolled for ansible-operator; refusing to run (add it to the chart's watchNamespaces)"
@@ -727,15 +726,34 @@ async fn reconcile(
             )
             .await;
         }
-        if object.status.as_ref().map(|s| &s.phase) != Some(&Phase::UnauthorizedNamespace) {
+        // Reported even when the release fails, so the plan says why it stopped while the release is
+        // retried at the error requeue.
+        let released = release_unenrolled_run(&context, &object).await;
+        let reported = if object.status.as_ref().map(|s| &s.phase)
+            != Some(&Phase::UnauthorizedNamespace)
+        {
             let mut status = object.status.clone().unwrap_or_default();
             status.phase = Phase::UnauthorizedNamespace;
             status.summary = Some(format!(
                 "namespace '{namespace}' is not enrolled for ansible-operator (not in watchNamespaces); an administrator must enroll it"
             ));
-            patch_status(&api, &object, status).await?;
+            patch_status(&api, &object, status).await.map(drop)
+        } else {
+            Ok(())
+        };
+        // Only one error can be returned, and the release is the one that matters.
+        if let (Err(_), Err(error)) = (&released, &reported) {
+            warn!(
+                "PlaybookPlan {namespace}/{name}: could not report that its namespace is not enrolled: {error}"
+            );
         }
+        released?;
+        reported?;
         return Ok(Action::await_change());
+    }
+
+    if object.metadata.deletion_timestamp.is_some() {
+        return release_deleted_plan(&context, &object).await;
     }
 
     // Name guard: the plan's name becomes a label value on every object a run creates, so a name the
@@ -5107,6 +5125,65 @@ async fn release_run_infrastructure(
         &holder_identity(namespace, name, run),
     )
     .await
+}
+
+/// Gives back what the in-flight run of a plan in a namespace that is no longer enrolled holds in
+/// the operator's namespace: its node-root proxy pods first, then its host Leases.
+///
+/// Such a run is never advanced again, since every step of it needs plan-namespace RBAC the operator
+/// no longer has, and nothing else ever deletes its proxy pods. Its Job, client-cert Secret and
+/// `Play` and the run-cleanup finalizer stay behind, out of reach in the plan's namespace, as does
+/// `status.activeRun`: that mirror is the only handle on the run left here, and on re-enrolment it
+/// lets recovery finish the run the usual way.
+///
+/// Not waiting for the Job is what separates this from [`release_deleted_plan`], and it costs no
+/// mutual exclusion that was still there: nothing renews these Leases any more, so they would lapse
+/// within [`locking::LEASE_DURATION_SECONDS`] either way. Deleting the proxy pods also cuts the Job's
+/// access to every managed-ssh host. Idempotent, so it runs on every pass through the guard.
+async fn release_unenrolled_run(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+) -> Result<(), ReconcileError> {
+    let (namespace, name) = namespace_and_name(object)?;
+    let Some(mirror) = object
+        .status
+        .as_ref()
+        .and_then(|status| status.active_run.clone())
+    else {
+        return Ok(());
+    };
+    let run = match RecordedRun::from_mirror(mirror) {
+        Ok(run) => run,
+        Err(error) => {
+            warn!(
+                "PlaybookPlan {namespace}/{name} has an unusable activeRun ({error}); its run cannot be released automatically"
+            );
+            return Ok(());
+        }
+    };
+
+    let deleted_pods = managed_ssh::cleanup_operator_namespace_infra(
+        &context.client,
+        &context.operator_namespace,
+        &run.execution_hash,
+        &run.mirror.run_id,
+    )
+    .await?;
+    let leases_api = Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
+    locking::release_locks(
+        &leases_api,
+        &run.mirror.hosts,
+        &holder_identity(namespace, name, &run),
+    )
+    .await?;
+    // Only when the pass cut something off: every pass already logs the refusal itself.
+    if deleted_pods > 0 {
+        info!(
+            "PlaybookPlan {namespace}/{name}: deleted {deleted_pods} proxy pod(s) of run {} and released its host Leases, because its namespace is not enrolled; its Job, Play and finalizer are left for re-enrolment",
+            run.mirror.job_name
+        );
+    }
+    Ok(())
 }
 
 /// Keeps a deleted plan around until the resources its run holds outside the plan's namespace are
