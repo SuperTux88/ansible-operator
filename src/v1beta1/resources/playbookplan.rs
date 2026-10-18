@@ -167,8 +167,9 @@ pub struct PlaybookPlanSpec {
     /// The longest a run's Job may stay active, in seconds, before Kubernetes stops it — the Job's
     /// own `activeDeadlineSeconds`, counted from when the Job starts, so it includes the time its pod
     /// takes to start. A run stopped this way has no recap, so its hosts are reported `Unknown` and
-    /// it spends an attempt. Unset uses the operator's default, which is no limit unless the cluster
-    /// administrator configured one. Changing it does not re-run hosts that are already up to date.
+    /// it spends an attempt. Unset uses the operator's default (two hours unless the cluster
+    /// administrator changed it), and any value is held to the administrator's maximum (one day by
+    /// default). Changing it does not re-run hosts that are already up to date.
     #[schemars(with = "Option<PositiveInt>")]
     pub active_deadline_seconds: Option<u32>,
 
