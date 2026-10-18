@@ -20,3 +20,6 @@ mod workspace;
 /// `main.rs` and threaded into the reconciler. Re-exported so `main.rs` can name it without exposing
 /// the rest of the (private) `managed_ssh` module.
 pub use managed_ssh::ProxyGracePolicy;
+
+/// The default and maximum run Job deadline, built from config in `main.rs` like [`ProxyGracePolicy`].
+pub use job_builder::JobDeadlines;
