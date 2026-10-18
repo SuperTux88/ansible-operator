@@ -291,12 +291,13 @@ to a single run.
 - *Residual:* an attacker who can both reach another run's proxy pod IP **and** obtain that
   run's *own* client cert (A3) is still inside its own run's authorization — no cross-run
   escalation. A leaked client cert authenticates **only** to its own run's proxy pods, and those
-  pods (plus the cert Secret) are deleted when the run completes (`cleanup_proxy_infra`); its 2h
-  `CERT_VALIDITY` is thus only exploitable while those pods are alive, and deleting them is
-  effectively immediate revocation. A proxy pod cleanup never reaches stops on its own at
-  `CERT_VALIDITY` plus 15 minutes (`activeDeadlineSeconds`, `PROXY_POD_ACTIVE_DEADLINE`), so no
-  node-root access path outlives its certificates for long. No other or future proxy accepts that
-  principal.
+  pods (plus the cert Secret) are deleted when the run completes (`cleanup_proxy_infra`); its
+  validity is thus only exploitable while those pods are alive, and deleting them is effectively
+  immediate revocation. Both the certificate validity and the proxy pods' `activeDeadlineSeconds`
+  are derived from the run's Job deadline (`ProxyLifetime::for_run`: deadline + proxy grace + 15 min
+  for the certificates, 15 min more for the pods). Every Job has a deadline, held to the chart's
+  `runs.maxActiveDeadlineSeconds` (default 24h), so a proxy pod that cleanup never reaches stops on
+  its own shortly after its run could have ended. No other or future proxy accepts that principal.
 - *Severity:* **Low** — cross-run reuse requires forging a run-ID principal (needs the CA
   key, i.e. T-INFO-2), not merely defeating NetworkPolicy. See §7 INV-4.
 
@@ -616,7 +617,7 @@ fully implemented and carries no open tail; see T-INFO-1 and §8.)
 
 | ID | Recommendation | Addresses | Priority |
 |----|----------------|-----------|----------|
-| R2 | The CA is rotated only by an operator restart. Consider periodic restarts (or an in-process rotation timer) to bound the window in which a leaked/compromised CA (T-INFO-2) can mint certs. A leaked *client* cert is already bounded by proxy-pod lifetime — principal-scoped, and the pods plus the cert Secret are deleted on completion (`cleanup_proxy_infra`) — so a shorter `CERT_VALIDITY` or a CRL adds little. | T-INFO-2 | Low |
+| R2 | The CA is rotated only by an operator restart. Consider periodic restarts (or an in-process rotation timer) to bound the window in which a leaked/compromised CA (T-INFO-2) can mint certs. A leaked *client* cert is already bounded by proxy-pod lifetime — principal-scoped, and the pods plus the cert Secret are deleted on completion (`cleanup_proxy_infra`) — so a shorter certificate validity or a CRL adds little. | T-INFO-2 | Low |
 | R3 | Bind the client-cert principal to specific *host(s)*, not just the run, for intra-run host scoping; document the CNI / defense-in-depth posture in the chart `NOTES.txt`. | T-INFO-3 | Low |
 | R4 | Ship a linter/validating admission example that rejects NodeAccessPolicies keyed on tenant-settable labels; recommend `kubernetes.io/metadata.name` in docs (already in type docs). | T-ESC-3 | Medium |
 | R5 | The default proxy image is a first-party, minimal, statically-linked sshd (`ansible-operator-sshd`, from a checksum-pinned source in `Containerfile.sshd`), built + cosign-signed in CI on `sshd-v*` tags, with each release repinning the chart default onto its `@sha256:` digest. Still open: document/ship a cluster-side admission policy (e.g. cosign/policy-controller) that *enforces* the signature at pod-create, so the digest pin is backed by verification rather than trust alone. | T-ESC-5 | Low |
@@ -645,13 +646,14 @@ fully implemented and carries no open tail; see T-INFO-1 and §8.)
 - One ephemeral **Ed25519 CA** per operator process — generated in memory at startup
   (`CertificateAuthority::generate` in `main.rs`), never persisted; a restart rotates it.
 - Per **proxy pod**: a fresh host keypair, host cert signed for principal `<hostname>`,
-  valid 2h. Presented to clients; clients trust via `@cert-authority *`.
+  valid for the run's `ProxyLifetime` (see T-INFO-3). Presented to clients; clients trust via
+  `@cert-authority *`.
 - Per **run**: one client keypair, client cert signed for principals `["root", "<run-id>"]`,
-  valid 2h, trusted by every proxy pod via `TrustedUserCAKeys`. `<run-id>` is the *enforced*
+  valid for the same lifetime, trusted by every proxy pod via `TrustedUserCAKeys`. `<run-id>` is the *enforced*
   principal (see below); `root` is retained for `PermitRootLogin yes` / the default username check.
 - Scoping of a client to "its own" proxies is **cert-level**: each proxy pod's sshd sets
   `AuthorizedPrincipalsFile` to a file containing only that run's `<run-id>`, so it accepts only
   this run's client cert. The per-run NetworkPolicy is defense in depth on top — see T-INFO-3 / R3.
 - Because the principal is run-scoped and the proxy pods (and the client-cert Secret) are deleted
   on run completion (`cleanup_proxy_infra`), a client cert is inert once its run ends — nothing on
-  the cluster will accept it, regardless of the 2h validity remaining.
+  the cluster will accept it, regardless of the validity remaining.

@@ -3563,6 +3563,12 @@ async fn ensure_infra_and_launch(
         &context.proxy_grace,
         not_ready_grace_cap_secs,
         &context.ca,
+        // From the same deadline `launch_recorded_job` gives the Job, so the run's access lasts as
+        // long as the run may.
+        managed_ssh::ProxyLifetime::for_run(
+            context.job_deadlines.for_plan(object),
+            context.proxy_grace.grace_seconds,
+        ),
         &context.proxy_image,
         context.workload_egress_policies.managed_ssh.clone(),
         // Owns the plan-namespace client-cert Secret so K8s GC reaps it if the plan is deleted
