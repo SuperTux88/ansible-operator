@@ -180,21 +180,24 @@ other config values, a change rolls the operator.
 
 ## Run time limits
 
-By default a run that has started may take as long as it needs. A plan can bound its own runs with
+Every run's Job has a deadline, after which Kubernetes stops it. A plan sets its own with
 `spec.activeDeadlineSeconds` (see [Bounding how long a run
-takes](../running-playbooks/playbook-plans.md#bounding-how-long-a-run-takes)), and
-`runs.defaultActiveDeadlineSeconds` sets that bound for every plan that does not set its own:
+takes](../running-playbooks/playbook-plans.md#bounding-how-long-a-run-takes)). Two chart values
+bound it:
 
 ```yaml
 # values.yaml
 runs:
-  defaultActiveDeadlineSeconds: 7200
+  defaultActiveDeadlineSeconds: 7200   # a plan that sets none of its own
+  maxActiveDeadlineSeconds: 86400      # the most any plan gets
 ```
 
-A plan's own value wins in both directions, so this is a default, not a ceiling. To enforce a
-ceiling, use an admission policy (a `ValidatingAdmissionPolicy` or a policy engine such as Kyverno)
-on `PlaybookPlan`s. Such a policy sees only what the plan itself sets, not this default, so a ceiling
-policy also has to require the field.
+A plan's own value wins over the default in both directions, but never past the maximum: a plan
+that asks for more is held to it. The default must lie between 1 and the maximum, otherwise the chart
+refuses to render and the operator refuses to start.
+
+On a run that reaches cluster Nodes, the deadline also decides how long the run's SSH certificates
+and proxy pods last, so the maximum is also the longest a run can have root on a Node.
 
 ## Enrolled namespaces
 

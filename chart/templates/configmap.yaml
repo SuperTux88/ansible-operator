@@ -44,13 +44,15 @@ data:
     # never started) before the operator cancels the run.
     [runs]
     start_timeout_seconds = {{ .startTimeoutSeconds | int }}
-    {{- if not (kindIs "invalid" .defaultActiveDeadlineSeconds) }}
-    {{- if or (lt (int .defaultActiveDeadlineSeconds) 1) (gt (int .defaultActiveDeadlineSeconds) 4294967295) }}
-    {{- fail "runs.defaultActiveDeadlineSeconds must be between 1 and 4294967295, or null for no limit" }}
+    {{- if or (kindIs "invalid" .maxActiveDeadlineSeconds) (lt (int .maxActiveDeadlineSeconds) 1) (gt (int .maxActiveDeadlineSeconds) 4294967295) }}
+    {{- fail "runs.maxActiveDeadlineSeconds must be between 1 and 4294967295: every run's Job has a deadline" }}
     {{- end }}
-    # The Job activeDeadlineSeconds of a plan that sets none of its own.
+    {{- if or (kindIs "invalid" .defaultActiveDeadlineSeconds) (lt (int .defaultActiveDeadlineSeconds) 1) (gt (int .defaultActiveDeadlineSeconds) (int .maxActiveDeadlineSeconds)) }}
+    {{- fail "runs.defaultActiveDeadlineSeconds must be between 1 and runs.maxActiveDeadlineSeconds: every run's Job has a deadline" }}
+    {{- end }}
+    # The Job activeDeadlineSeconds of a plan that sets none of its own, and the most any Job gets.
     default_active_deadline_seconds = {{ .defaultActiveDeadlineSeconds | int }}
-    {{- end }}
+    max_active_deadline_seconds = {{ .maxActiveDeadlineSeconds | int }}
     {{- end }}
     {{- with (.Values.managedSsh).readiness }}
 

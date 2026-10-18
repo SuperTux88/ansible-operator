@@ -1022,10 +1022,9 @@ If *every* host of one run shows `Unknown` at once, check these causes first:
 - **The run's Job never started.** The operator cancelled it after its start timeout, and
   `.status.summary` ends with *"(cancelled: the Job did not start within …s: …)"*, naming what it
   waited on. See [The plan is stuck in `Applying`](#the-plan-is-stuck-in-applying).
-- **The run's Job ran past its deadline.** Kubernetes stopped it at the plan's
-  `spec.activeDeadlineSeconds` (or the operator's default) before the playbook reached its end, and
-  `.status.summary` ends with *"(the Job exceeded its deadline of …s)"*. See [Bounding how long a run
-  takes](./playbook-plans.md#bounding-how-long-a-run-takes).
+- **The run's Job ran past its deadline.** Kubernetes stopped it before the playbook reached its
+  end, and `.status.summary` ends with *"(the Job exceeded its deadline of …s)"*. See [Bounding how
+  long a run takes](./playbook-plans.md#bounding-how-long-a-run-takes).
 - **The run's `Play` was deleted while the run was still live.** That record is the only thing the
   run can be recovered from, so the operator releases the run's locks and proxy pods and reports
   the whole run as unknown rather than leaving the plan stuck. The next run reports these hosts

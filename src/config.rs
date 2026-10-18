@@ -29,6 +29,11 @@ pub enum ConfigError {
          required and has no built-in default; set it in the operator config"
     )]
     MissingProxyImage,
+    #[error(
+        "runs.default_active_deadline_seconds ({default}) is above runs.max_active_deadline_seconds \
+         ({max}); the default must be a deadline a Job may actually get"
+    )]
+    DefaultDeadlineAboveMaximum { default: u32, max: u32 },
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -135,16 +140,21 @@ pub struct RunsConfig {
     /// start.
     pub start_timeout_seconds: NonZeroU32,
     /// The `activeDeadlineSeconds` of the Job of a plan that sets no `spec.activeDeadlineSeconds`.
-    /// Absent (the default) leaves such Jobs without a limit; zero is rejected, as Kubernetes would
-    /// reject it on the Job.
-    pub default_active_deadline_seconds: Option<NonZeroU32>,
+    /// Default 7200 (two hours); zero is rejected, as Kubernetes would reject it on the Job. At most
+    /// `max_active_deadline_seconds`.
+    pub default_active_deadline_seconds: NonZeroU32,
+    /// The longest `activeDeadlineSeconds` any run's Job gets, whatever its plan asks for. A
+    /// managed-ssh run's certificates and proxy pods are derived from its Job's deadline, so this is
+    /// also what bounds how long a run has root on its Nodes. Default 86400 (24h).
+    pub max_active_deadline_seconds: NonZeroU32,
 }
 
 impl Default for RunsConfig {
     fn default() -> Self {
         Self {
             start_timeout_seconds: NonZeroU32::new(600).expect("600 is not zero"),
-            default_active_deadline_seconds: None,
+            default_active_deadline_seconds: NonZeroU32::new(7200).expect("7200 is not zero"),
+            max_active_deadline_seconds: NonZeroU32::new(86_400).expect("86400 is not zero"),
         }
     }
 }
@@ -180,19 +190,33 @@ impl OperatorConfig {
     /// - a **missing** file is not an error — it yields an empty config, so the operator serves only
     ///   its own namespace (the safe default);
     /// - a **present but malformed** file is a hard error — a broken config must not silently widen
-    ///   or narrow the enrollment set.
+    ///   or narrow the enrollment set. So is one whose values contradict each other ([`Self::validated`]).
     pub fn load(path: &str) -> Result<Self, ConfigError> {
         match std::fs::read_to_string(path) {
-            Ok(contents) => toml::from_str(&contents).map_err(|source| ConfigError::Parse {
-                path: path.to_string(),
-                source,
-            }),
+            Ok(contents) => toml::from_str::<Self>(&contents)
+                .map_err(|source| ConfigError::Parse {
+                    path: path.to_string(),
+                    source,
+                })
+                .and_then(Self::validated),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(source) => Err(ConfigError::Read {
                 path: path.to_string(),
                 source,
             }),
         }
+    }
+
+    /// Refuses a config whose settings each parse but cannot all hold at once.
+    pub fn validated(self) -> Result<Self, ConfigError> {
+        let (default, max) = (
+            self.runs.default_active_deadline_seconds.get(),
+            self.runs.max_active_deadline_seconds.get(),
+        );
+        if default > max {
+            return Err(ConfigError::DefaultDeadlineAboveMaximum { default, max });
+        }
+        Ok(self)
     }
 
     /// The configured managed-ssh proxy image, or [`ConfigError::MissingProxyImage`] when it is absent
@@ -322,23 +346,50 @@ mod tests {
     }
 
     #[test]
-    fn default_active_deadline_is_absent_unless_configured() {
+    fn job_deadlines_default_to_two_hours_held_to_a_day() {
         let absent: OperatorConfig = toml::from_str("watch_namespaces = []").unwrap();
-        assert_eq!(absent.runs.default_active_deadline_seconds, None);
+        assert_eq!(absent.runs.default_active_deadline_seconds.get(), 7200);
+        assert_eq!(absent.runs.max_active_deadline_seconds.get(), 86_400);
 
-        let set: OperatorConfig =
-            toml::from_str("[runs]\ndefault_active_deadline_seconds = 7200\n").unwrap();
-        assert_eq!(
-            set.runs
-                .default_active_deadline_seconds
-                .map(NonZeroU32::get),
-            Some(7200)
-        );
+        let set: OperatorConfig = toml::from_str(
+            "[runs]\ndefault_active_deadline_seconds = 3600\nmax_active_deadline_seconds = 7200\n",
+        )
+        .unwrap();
+        assert_eq!(set.runs.default_active_deadline_seconds.get(), 3600);
+        assert_eq!(set.runs.max_active_deadline_seconds.get(), 7200);
 
-        assert!(
-            toml::from_str::<OperatorConfig>("[runs]\ndefault_active_deadline_seconds = 0\n")
-                .is_err()
-        );
+        for key in [
+            "default_active_deadline_seconds",
+            "max_active_deadline_seconds",
+        ] {
+            assert!(
+                toml::from_str::<OperatorConfig>(&format!("[runs]\n{key} = 0\n")).is_err(),
+                "{key} = 0 must be rejected"
+            );
+        }
+    }
+
+    /// A default above the maximum would be held to the maximum on every plan anyway, so the admin
+    /// who wrote it meant something the operator cannot do; it is refused instead of reinterpreted.
+    #[test]
+    fn a_default_deadline_above_the_maximum_is_refused() {
+        let config: OperatorConfig = toml::from_str(
+            "[runs]\ndefault_active_deadline_seconds = 7201\nmax_active_deadline_seconds = 7200\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            config.validated(),
+            Err(ConfigError::DefaultDeadlineAboveMaximum {
+                default: 7201,
+                max: 7200
+            })
+        ));
+
+        let equal: OperatorConfig = toml::from_str(
+            "[runs]\ndefault_active_deadline_seconds = 7200\nmax_active_deadline_seconds = 7200\n",
+        )
+        .unwrap();
+        assert!(equal.validated().is_ok());
     }
 
     #[test]

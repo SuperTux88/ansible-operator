@@ -30,7 +30,7 @@ validation rules, the operator refuses the plan instead and says so in `.status.
 | `template.files` | no | Files made available at runtime — see [Variables and files](./variables-and-files.md). |
 | `template.requirements` | no | An Ansible `requirements.yml` (e.g. collections) installed before the run. |
 | `ttlSecondsAfterFinished` | no | How long a finished run's Job and pod are kept before Kubernetes reaps them. Values below 60s are raised to 60. |
-| `activeDeadlineSeconds` | no (operator default, usually none) | The longest a run's Job may stay active before Kubernetes stops it — see [Bounding how long a run takes](#bounding-how-long-a-run-takes). |
+| `activeDeadlineSeconds` | no (operator default, usually two hours) | The longest a run's Job may stay active before Kubernetes stops it — see [Bounding how long a run takes](#bounding-how-long-a-run-takes). |
 | `verbosity` | no (`0`) | `ansible-playbook` verbosity, `0`–`4`, mapped to `-v`…`-vvvv`. Affects log detail only. |
 
 ## Choosing the image
@@ -297,9 +297,10 @@ starts](../cluster-operators/deployment.md#runs-whose-job-never-starts)) also en
 started, and reports it the same way: a Job stuck pulling an image that does not exist then reads as
 having exceeded its deadline. `kubectl describe job` shows what it waited on until the Job is reaped.
 
-Without the field, the operator's default applies, which is no limit unless the cluster
-administrator configured one (see [Run time limits](../cluster-operators/deployment.md#run-time-limits)).
-A plan's own value wins over that default in both directions. Changing it does not re-run hosts
+Without the field, the operator's default applies, which is two hours unless the cluster
+administrator changed it. A plan's own value wins over that default in both directions, up to a
+maximum the administrator sets, one day by default. A longer value is held to that maximum (see [Run
+time limits](../cluster-operators/deployment.md#run-time-limits)). Changing it does not re-run hosts
 that are already up to date.
 
 On a plan that targets cluster Nodes, a deadline above two hours buys little: the certificate a run

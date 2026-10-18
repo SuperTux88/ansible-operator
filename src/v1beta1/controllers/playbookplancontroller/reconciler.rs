@@ -127,8 +127,8 @@ pub struct OperatorSettings {
     pub proxy_grace: managed_ssh::ProxyGracePolicy,
     /// How long a run's Job may go without starting before the run is cancelled.
     pub job_start_timeout: std::time::Duration,
-    /// The Job deadline of a plan that sets none of its own; `None` for no limit.
-    pub default_active_deadline_seconds: Option<u32>,
+    /// The default and the maximum of every run Job's deadline.
+    pub job_deadlines: job_builder::JobDeadlines,
     /// Whether a plan's `spec.provides` version may be published onto its Nodes.
     pub node_labels_enabled: bool,
     pub workload_egress_policies: WorkloadEgressPolicies,
@@ -181,9 +181,9 @@ struct ReconciliationContext {
     /// How long a run's Job may go without starting before the run is cancelled (see
     /// [`job_start_stall`]). From the chart's `runs.startTimeoutSeconds`.
     job_start_timeout: std::time::Duration,
-    /// The Job deadline of a plan that sets no `spec.activeDeadlineSeconds`, or `None` for no limit.
-    /// From the chart's `runs.defaultActiveDeadlineSeconds`.
-    default_active_deadline_seconds: Option<u32>,
+    /// The Job deadline of a plan that sets no `spec.activeDeadlineSeconds`, and the most any Job
+    /// gets. From the chart's `runs.defaultActiveDeadlineSeconds` and `runs.maxActiveDeadlineSeconds`.
+    job_deadlines: job_builder::JobDeadlines,
     workload_egress_policies: WorkloadEgressPolicies,
 }
 
@@ -446,7 +446,7 @@ pub async fn new(
         proxy_image: settings.proxy_image,
         proxy_grace: settings.proxy_grace,
         job_start_timeout: settings.job_start_timeout,
-        default_active_deadline_seconds: settings.default_active_deadline_seconds,
+        job_deadlines: settings.job_deadlines,
         node_labels_enabled: settings.node_labels_enabled,
         workload_egress_policies: settings.workload_egress_policies,
     });
@@ -3679,14 +3679,7 @@ async fn ensure_infra_and_launch(
     )
     .await?;
     let jobs_api = Api::<Job>::namespaced(context.client.clone(), namespace);
-    launch_recorded_job(
-        &jobs_api,
-        object,
-        run,
-        run_groups,
-        context.default_active_deadline_seconds,
-    )
-    .await?;
+    launch_recorded_job(&jobs_api, object, run, run_groups, context.job_deadlines).await?;
     play_history::record_running(
         &context.client,
         namespace,
@@ -6955,7 +6948,7 @@ async fn launch_recorded_job(
     object: &PlaybookPlan,
     run: &RecordedRun,
     run_groups: &[ResolvedInventoryGroup],
-    default_active_deadline_seconds: Option<u32>,
+    job_deadlines: job_builder::JobDeadlines,
 ) -> Result<(), ReconcileError> {
     let mut job = job_builder::create_job_blueprint(
         &run.execution_hash,
@@ -6963,7 +6956,7 @@ async fn launch_recorded_job(
         &run.mirror.run_id,
         run_groups,
         object,
-        default_active_deadline_seconds,
+        job_deadlines,
     )?;
     job_builder::correlate_job_to_play(&mut job, &run.mirror.play_uid);
     let selected = SelectedJob {
@@ -7192,7 +7185,7 @@ impl RunDiagnostic {
                 "PlaybookPlan {namespace}/{name}: run {job_name} was cancelled because {reason}; every host is reported Unknown and the run spent an attempt. Fix what the Job waited on (its image, its ServiceAccount, the namespace's admission rules or quota), or raise runs.startTimeoutSeconds if the image only pulls slowly"
             ),
             Self::DeadlineExceeded { seconds } => warn!(
-                "PlaybookPlan {namespace}/{name}: run {job_name} was stopped by Kubernetes after its deadline of {seconds}s (spec.activeDeadlineSeconds, or the operator's runs.defaultActiveDeadlineSeconds); every host is reported Unknown and the run spent an attempt. Raise the plan's spec.activeDeadlineSeconds if the playbook legitimately runs longer"
+                "PlaybookPlan {namespace}/{name}: run {job_name} was stopped by Kubernetes after its deadline of {seconds}s (the plan's spec.activeDeadlineSeconds, or the operator's runs.defaultActiveDeadlineSeconds when the plan sets none, held to the operator's runs.maxActiveDeadlineSeconds either way); every host is reported Unknown and the run spent an attempt. Raise the plan's spec.activeDeadlineSeconds if the playbook legitimately runs longer; beyond runs.maxActiveDeadlineSeconds only the cluster administrator can raise the limit"
             ),
         }
     }
@@ -9256,10 +9249,24 @@ mod tests {
         let groups = vec![managed_ssh_group("nodes", &["a", "b"], None)];
         let hash = ExecutionHash::from_hex("1").unwrap();
 
-        let prepared =
-            job_builder::create_job_blueprint(&hash, 2, "run-1", &groups, &plan, None).unwrap();
-        let rebuilt =
-            job_builder::create_job_blueprint(&hash, 2, "run-1", &groups, &plan, None).unwrap();
+        let prepared = job_builder::create_job_blueprint(
+            &hash,
+            2,
+            "run-1",
+            &groups,
+            &plan,
+            job_builder::TEST_DEADLINES,
+        )
+        .unwrap();
+        let rebuilt = job_builder::create_job_blueprint(
+            &hash,
+            2,
+            "run-1",
+            &groups,
+            &plan,
+            job_builder::TEST_DEADLINES,
+        )
+        .unwrap();
 
         assert_eq!(
             serde_json::to_value(&prepared).unwrap(),
@@ -11190,7 +11197,15 @@ mod tests {
         plan.metadata.namespace = Some("team".into());
         plan.metadata.uid = Some("plan-uid".into());
 
-        let job = job_builder::create_job_blueprint(&hash, 1, "run-1", &[], &plan, None).unwrap();
+        let job = job_builder::create_job_blueprint(
+            &hash,
+            1,
+            "run-1",
+            &[],
+            &plan,
+            job_builder::TEST_DEADLINES,
+        )
+        .unwrap();
         let template_labels = job
             .spec
             .as_ref()
@@ -12247,8 +12262,15 @@ spec:
         plan.metadata.uid = Some("plan-uid".into());
 
         let own = || {
-            let mut job =
-                job_builder::create_job_blueprint(&hash, 7, "run-1", &[], &plan, None).unwrap();
+            let mut job = job_builder::create_job_blueprint(
+                &hash,
+                7,
+                "run-1",
+                &[],
+                &plan,
+                job_builder::TEST_DEADLINES,
+            )
+            .unwrap();
             job_builder::correlate_job_to_play(&mut job, "play-uid");
             job.metadata.owner_references = Some(vec![playbookplan_owner_ref(&plan).unwrap()]);
             job
@@ -12261,8 +12283,15 @@ spec:
         let mut other_plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
         other_plan.metadata.namespace = Some("team".into());
         other_plan.metadata.uid = Some("other-plan-uid".into());
-        let mut foreign =
-            job_builder::create_job_blueprint(&hash, 7, "run-1", &[], &other_plan, None).unwrap();
+        let mut foreign = job_builder::create_job_blueprint(
+            &hash,
+            7,
+            "run-1",
+            &[],
+            &other_plan,
+            job_builder::TEST_DEADLINES,
+        )
+        .unwrap();
         job_builder::correlate_job_to_play(&mut foreign, "play-uid");
         foreign.metadata.owner_references =
             Some(vec![playbookplan_owner_ref(&other_plan).unwrap()]);
@@ -12272,8 +12301,15 @@ spec:
         );
 
         // Another run of this same plan, which shares the name's readable half but not the run.
-        let mut other_run =
-            job_builder::create_job_blueprint(&hash, 8, "run-2", &[], &plan, None).unwrap();
+        let mut other_run = job_builder::create_job_blueprint(
+            &hash,
+            8,
+            "run-2",
+            &[],
+            &plan,
+            job_builder::TEST_DEADLINES,
+        )
+        .unwrap();
         job_builder::correlate_job_to_play(&mut other_run, "other-play-uid");
         other_run.metadata.owner_references = Some(vec![playbookplan_owner_ref(&plan).unwrap()]);
         assert!(validate(&other_run).is_err());
@@ -13461,8 +13497,15 @@ spec:
         plan.metadata.uid = Some("plan-uid".into());
         plan.metadata.namespace = Some("default".into());
         let hash = ExecutionHash::from_hex("1a").unwrap();
-        let mut job =
-            job_builder::create_job_blueprint(&hash, 1, "run-1", &[], &plan, None).unwrap();
+        let mut job = job_builder::create_job_blueprint(
+            &hash,
+            1,
+            "run-1",
+            &[],
+            &plan,
+            job_builder::TEST_DEADLINES,
+        )
+        .unwrap();
         job_builder::correlate_job_to_play(&mut job, "play-uid");
 
         assert!(validate_selected_job(&job, &plan, hash, 1, "run-1", "play-uid").is_ok());
