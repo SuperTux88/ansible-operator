@@ -304,7 +304,9 @@ that are already up to date.
 
 On a plan that targets cluster Nodes, a deadline above two hours buys little: the certificate a run
 uses to reach its Nodes is issued when the run is set up and is valid for two hours, so a run that
-opens a new SSH connection after that fails to authenticate anyway.
+opens a new SSH connection after that fails to authenticate anyway. Fifteen minutes later the run's
+proxy pods stop as well, which also ends the connections that are still open, so no run reaches a
+Node for longer than that.
 
 Independently of this field, the operator always cancels a run whose Job never *starts* (see [Runs
 whose Job never starts](../cluster-operators/deployment.md#runs-whose-job-never-starts)).
