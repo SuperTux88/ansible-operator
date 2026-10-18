@@ -1088,12 +1088,6 @@ pub async fn ensure_proxy_infra(
 /// PlaybookPlan is the backstop if this explicit delete never runs (operator crash / plan deleted
 /// mid-run). Deleting it is not the revocation mechanism — that is the deletion of the proxy pods,
 /// which happens first and after which the cert authenticates to nothing (INV-4 / T-INFO-3).
-///
-/// Pods use a tighter selector than the operator-ns Secrets/NetworkPolicy: the ansible Job pod
-/// carries the same `PLAYBOOKPLAN_HASH` and `RUN_ID` labels but is NOT proxy infra — it must be
-/// reaped by its own Job's `ttlSecondsAfterFinished`, never here. That only collides when the
-/// operator and the plan share a namespace, but requiring the per-host `PLAYBOOKPLAN_HOST` label
-/// (which only proxy pods carry) excludes the ansible pod cleanly.
 pub async fn cleanup_proxy_infra(
     client: &kube::Client,
     operator_namespace: &str,
@@ -1102,11 +1096,45 @@ pub async fn cleanup_proxy_infra(
     run_id: &str,
     playbookplan_name: &str,
 ) -> Result<(), ReconcileError> {
+    cleanup_operator_namespace_infra(client, operator_namespace, execution_hash, run_id).await?;
+
+    let job_secrets_api: Api<Secret> = Api::namespaced(client.clone(), job_namespace);
+    let job_netpol_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), job_namespace);
+    let dp = DeleteParams::default();
+    delete_if_exists(
+        &job_netpol_api,
+        &super::job_builder::job_network_policy_name(playbookplan_name, run_id),
+        &dp,
+    )
+    .await?;
+    // Plan-namespace client-cert Secret: by name, never by label (would catch the Job/pod). See doc.
+    delete_if_exists(&job_secrets_api, &client_cert_secret_name(run_id), &dp).await?;
+
+    Ok(())
+}
+
+/// The operator-namespace half of [`cleanup_proxy_infra`]: the run's proxy pods, their per-host
+/// Secrets and its NetworkPolicy, in that order. Returns how many proxy pods the delete reached,
+/// which includes pods that an earlier call already set terminating.
+///
+/// On its own for a plan whose namespace is no longer enrolled, where the operator holds no RBAC for
+/// the plan-namespace half. Everything left there is owned by the plan, so Kubernetes reaps it with
+/// the plan, whereas nothing but this operator can ever reach what is deleted here.
+///
+/// Pods use a tighter selector than the Secrets and the NetworkPolicy: the ansible Job pod carries
+/// the same `PLAYBOOKPLAN_HASH` and `RUN_ID` labels but is NOT proxy infra — it must be reaped by its
+/// own Job's `ttlSecondsAfterFinished`, never here. That only collides when the operator and the plan
+/// share a namespace, but requiring the per-host `PLAYBOOKPLAN_HOST` label (which only proxy pods
+/// carry) excludes the ansible pod cleanly (INV-7).
+pub async fn cleanup_operator_namespace_infra(
+    client: &kube::Client,
+    operator_namespace: &str,
+    execution_hash: &ExecutionHash,
+    run_id: &str,
+) -> Result<usize, ReconcileError> {
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), operator_namespace);
     let secrets_api: Api<Secret> = Api::namespaced(client.clone(), operator_namespace);
     let netpol_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), operator_namespace);
-    let job_secrets_api: Api<Secret> = Api::namespaced(client.clone(), job_namespace);
-    let job_netpol_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), job_namespace);
 
     let dp = DeleteParams::default();
     let run_selector = format!(
@@ -1121,19 +1149,15 @@ pub async fn cleanup_proxy_infra(
     // Hash + run ID selector: no other run shares this cleanup identity.
     let rest_lp = ListParams::default().labels(&run_selector);
 
-    pods_api.delete_collection(&dp, &pods_lp).await?;
+    let deleted_pods = pods_api
+        .delete_collection(&dp, &pods_lp)
+        .await?
+        .left()
+        .map_or(0, |pods| pods.items.len());
     secrets_api.delete_collection(&dp, &rest_lp).await?;
     netpol_api.delete_collection(&dp, &rest_lp).await?;
-    delete_if_exists(
-        &job_netpol_api,
-        &super::job_builder::job_network_policy_name(playbookplan_name, run_id),
-        &dp,
-    )
-    .await?;
-    // Plan-namespace client-cert Secret: by name, never by label (would catch the Job/pod). See doc.
-    delete_if_exists(&job_secrets_api, &client_cert_secret_name(run_id), &dp).await?;
 
-    Ok(())
+    Ok(deleted_pods)
 }
 
 async fn delete_if_exists<K>(

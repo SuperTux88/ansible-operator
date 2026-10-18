@@ -128,7 +128,10 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
 1. **Enrollment guard (R1).** If the plan's namespace isn't in the enrolled set
    (`config.rs`: operator ns ∪ `watch_namespaces`), refuse with `Phase::UnauthorizedNamespace`
    and `await_change` — before any Secret/Job call (the operator holds no Secret/Job RBAC
-   outside the enrolled set).
+   outside the enrolled set). It runs ahead of the deletion branch too, and releases the
+   operator-namespace half of a run still in flight (`release_unenrolled_run`: proxy pods, then
+   host Leases, from the `status.activeRun` mirror — the `Play`, Job and finalizer are out of
+   reach), since nothing else would ever remove those node-root pods.
    A **name guard** follows in the same shape (`plan_name_within_label_limit`): a plan name over
    `MAX_PLAN_NAME_LEN` (63, the *label value* cap — the name is written as a label onto the `Play`,
    the Job, its pod template and the run's NetworkPolicy) is refused with `Phase::Failed` and
