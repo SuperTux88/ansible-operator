@@ -20,7 +20,8 @@ Both default to deny. Neither can be skipped:
 
 1. **Namespace enrollment** bounds *where the operator itself has power*. Its cluster RBAC omits
    `secrets`/`jobs`/`pods`; those are granted per-namespace only for enrolled namespaces. A plan in an
-   un-enrolled namespace is refused (`UnauthorizedNamespace`). There is no "all namespaces" option.
+   un-enrolled namespace is refused (`UnauthorizedNamespace`), and a run it still had in flight loses
+   its access to cluster Nodes. There is no "all namespaces" option.
    → [Deployment → enrolled namespaces](./deployment.md#enrolled-namespaces)
 2. **Node access policies** bound *which Nodes a tenant may reach*. A namespace with no matching
    `NodeAccessPolicy` resolves to **zero** Nodes; an empty selector matches nothing, not everything.
@@ -51,7 +52,10 @@ Cross-run isolation is enforced at the **certificate** layer, not merely by netw
 - A per-run **NetworkPolicy** locks each proxy pod's ingress to that run's Job. This is
   defense in depth on top of the certificate isolation, not the primary control.
 - Proxy pods, their Secrets, and the NetworkPolicy are **torn down when the run ends** — there is no
-  standing SSH surface on your Nodes between runs.
+  standing SSH surface on your Nodes between runs. A run's certificates and proxy pods last only
+  slightly longer than its Job may: a proxy pod the operator never gets to delete stops on its own,
+  and the chart's `runs.maxActiveDeadlineSeconds` (one day by default) bounds them for every plan.
+  See [Deployment → run time limits](./deployment.md#run-time-limits).
 
 Run recovery has its own trust boundary. Each run is written down as a `Play` before anything is
 created for it, and a CRD validation rule freezes that record's spec for its lifetime. The record
@@ -97,17 +101,22 @@ as described in
 
 The `delete` grant exists so a plan deleted mid-run, or a run whose `Play` record was removed, has its
 Job cancelled explicitly instead of being left to the deleting client's propagation policy, which may
-orphan the pod. The operator only ever deletes a Job it has validated as its own run's, passing that
-Job's UID as a delete precondition so a replacement at the same name cannot be caught by it — but RBAC
-cannot express that restriction, so the ServiceAccount's authority covers every Job in an enrolled
-namespace. Finished Jobs are reaped by their own `ttlSecondsAfterFinished`, not by the operator.
+orphan the pod. It also cancels a run's Job that never started within the operator's start timeout,
+so the run can release its hosts. The operator only ever deletes a Job it has validated as its own
+run's, passing that Job's UID as a delete precondition so a replacement at the same name cannot be
+caught by it — but RBAC cannot express that restriction, so the ServiceAccount's authority covers
+every Job in an enrolled namespace. Finished Jobs are reaped by their own `ttlSecondsAfterFinished`,
+not by the operator.
 
 If unrelated workloads must create Jobs in an enrolled namespace, enforce the same boundary with an
 admission policy: only the operator ServiceAccount may create Jobs carrying the operator's reserved
 `ansible.cloudbending.dev` run/component metadata or using the generated `apply-...` name convention.
 Do not grant a namespace-wide admission exception. Without this RBAC or admission boundary, a forged
 Job can be adopted as a run even though its pod template was not built by the operator, and a foreign
-Job can also hold a generated name and leave a run waiting for manual cleanup.
+Job can also hold a generated name and keep a run, with its host Leases, waiting for up to the
+operator's start timeout before the run is given up. A foreign Job whose pod template carries the
+run's ID is not given up on while it is unfinished, since it may be the run's own, so such a Job
+holds the run until it finishes or is deleted.
 
 ## Privileges the proxy pods hold
 

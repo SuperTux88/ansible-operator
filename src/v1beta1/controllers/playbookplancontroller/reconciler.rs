@@ -3,7 +3,7 @@ use futures_util::{Stream, StreamExt as _};
 use k8s_openapi::api::{
     batch::v1::Job,
     coordination::v1::Lease,
-    core::v1::{Node, Pod, Secret},
+    core::v1::{ContainerStatus, Node, Pod, Secret},
     networking::v1::NetworkPolicyEgressRule,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -125,6 +125,10 @@ pub struct OperatorSettings {
     pub proxy_image: String,
     /// How long a `NotReady` node's proxy pod is waited for, scaled by heartbeat age.
     pub proxy_grace: managed_ssh::ProxyGracePolicy,
+    /// How long a run's Job may go without starting before the run is cancelled.
+    pub job_start_timeout: std::time::Duration,
+    /// The default and the maximum of every run Job's deadline.
+    pub job_deadlines: job_builder::JobDeadlines,
     /// Whether a plan's `spec.provides` version may be published onto its Nodes.
     pub node_labels_enabled: bool,
     pub workload_egress_policies: WorkloadEgressPolicies,
@@ -174,6 +178,12 @@ struct ReconciliationContext {
     /// How long to wait for a `NotReady` node's proxy pod to become Ready before treating the node as
     /// unreachable, scaled by the node's heartbeat age. From the chart's `managedSsh.readiness`.
     proxy_grace: managed_ssh::ProxyGracePolicy,
+    /// How long a run's Job may go without starting before the run is cancelled (see
+    /// [`job_start_stall`]). From the chart's `runs.startTimeoutSeconds`.
+    job_start_timeout: std::time::Duration,
+    /// The Job deadline of a plan that sets no `spec.activeDeadlineSeconds`, and the most any Job
+    /// gets. From the chart's `runs.defaultActiveDeadlineSeconds` and `runs.maxActiveDeadlineSeconds`.
+    job_deadlines: job_builder::JobDeadlines,
     workload_egress_policies: WorkloadEgressPolicies,
 }
 
@@ -435,6 +445,8 @@ pub async fn new(
         plans: Arc::clone(&playbookplan_reflector_reader),
         proxy_image: settings.proxy_image,
         proxy_grace: settings.proxy_grace,
+        job_start_timeout: settings.job_start_timeout,
+        job_deadlines: settings.job_deadlines,
         node_labels_enabled: settings.node_labels_enabled,
         workload_egress_policies: settings.workload_egress_policies,
     });
@@ -679,10 +691,6 @@ async fn reconcile(
     object: Arc<v1beta1::PlaybookPlan>,
     context: Arc<ReconciliationContext>,
 ) -> Result<Action, ReconcileError> {
-    if object.metadata.deletion_timestamp.is_some() {
-        return release_deleted_plan(&context, &object).await;
-    }
-
     let (namespace, name) = namespace_and_name(&object)?;
 
     let api = Api::<v1beta1::PlaybookPlan>::namespaced(context.client.clone(), namespace);
@@ -692,6 +700,9 @@ async fn reconcile(
     // (would-be-403) Secret/Job call — and report why. `await_change()`, not a timed requeue: the
     // enrolled set only changes on operator restart (a ConfigMap edit rolls the pod), so there is
     // nothing to poll for and a requeue would just busy-loop blocked plans.
+    //
+    // Ahead of the deletion branch, because `release_deleted_plan` starts with plan-namespace calls
+    // that would 403 here, and so would never reach the run's operator-namespace half.
     if !context.enrolled_namespaces.contains(namespace) {
         warn!(
             "PlaybookPlan {namespace}/{name} is in a namespace not enrolled for ansible-operator; refusing to run (add it to the chart's watchNamespaces)"
@@ -715,15 +726,34 @@ async fn reconcile(
             )
             .await;
         }
-        if object.status.as_ref().map(|s| &s.phase) != Some(&Phase::UnauthorizedNamespace) {
+        // Reported even when the release fails, so the plan says why it stopped while the release is
+        // retried at the error requeue.
+        let released = release_unenrolled_run(&context, &object).await;
+        let reported = if object.status.as_ref().map(|s| &s.phase)
+            != Some(&Phase::UnauthorizedNamespace)
+        {
             let mut status = object.status.clone().unwrap_or_default();
             status.phase = Phase::UnauthorizedNamespace;
             status.summary = Some(format!(
                 "namespace '{namespace}' is not enrolled for ansible-operator (not in watchNamespaces); an administrator must enroll it"
             ));
-            patch_status(&api, &object, status).await?;
+            patch_status(&api, &object, status).await.map(drop)
+        } else {
+            Ok(())
+        };
+        // Only one error can be returned, and the release is the one that matters.
+        if let (Err(_), Err(error)) = (&released, &reported) {
+            warn!(
+                "PlaybookPlan {namespace}/{name}: could not report that its namespace is not enrolled: {error}"
+            );
         }
+        released?;
+        reported?;
         return Ok(Action::await_change());
+    }
+
+    if object.metadata.deletion_timestamp.is_some() {
+        return release_deleted_plan(&context, &object).await;
     }
 
     // Name guard: the plan's name becomes a label value on every object a run creates, so a name the
@@ -1672,7 +1702,7 @@ async fn reconcile(
         &mut resource_status,
         finished_active_run
             .as_ref()
-            .map_or(RunDiagnostic::None, |finished| finished.diagnostic),
+            .map_or(RunDiagnostic::None, |finished| finished.diagnostic.clone()),
     );
 
     finish_reconcile_tick(
@@ -2940,9 +2970,12 @@ enum JobPresenceAction {
     Proceed,
     /// Its Job is absent and the run is no longer wanted: release and delete it.
     Abandon,
-    /// A Job this run did not create holds its name. Neither adopted nor given up — see
+    /// A Job this run did not create holds its name. Neither adopted nor given up yet — see
     /// [`decide_job_presence`].
     Contested,
+    /// A Job this run did not create has held its name for longer than the start timeout: give the
+    /// run up, as long as nothing of its own may still be executing.
+    Displaced,
 }
 
 /// The rule [`resume_launching_run`] follows, from whether the run is still wanted and what is
@@ -2953,20 +2986,27 @@ enum JobPresenceAction {
 /// name is free does anything else get a say — which is why what is there is established with a
 /// direct apiserver read rather than a watch-cache one.
 ///
-/// **A foreign Job is neither adopted nor a reason to give up.** Name collisions are made unlikely
-/// rather than impossible (`job_builder::job_name`), so the name is a hint and the identity check is
-/// the boundary. Adopting on the strength of the name would move this run's record to `Running`
-/// for work it did not commission and later write the run off as `Unknown`. Abandoning instead may
-/// look safe — a foreign Job means this run has none of its own, since the name is deterministic
-/// — but it inverts the risk: if the identity check ever rejected a Job that genuinely *was* ours,
-/// abandoning would release the host Leases while that Job kept running, which is the double-apply
-/// the Leases exist to prevent. Waiting has no such failure mode, and it resolves on its own once
-/// the foreign Job is reaped by its `ttlSecondsAfterFinished`, after which the name is free and the
-/// run proceeds normally.
+/// **A foreign Job is never adopted, and only given up on after the start timeout.** Name
+/// collisions are made unlikely rather than impossible (`job_builder::job_name`), so the name is a
+/// hint and the identity check is the boundary. Adopting on the strength of the name would move
+/// this run's record to `Running` for work it did not commission and later write the run off as
+/// `Unknown`. Abandoning at once may look safe — a foreign Job means this run has none of its own,
+/// since the name is deterministic — but it inverts the risk: if the identity check ever rejected a
+/// Job that genuinely *was* ours, abandoning would release the host Leases while that Job kept
+/// running, which is the double-apply the Leases exist to prevent. So the run waits first, which
+/// resolves on its own when the foreign Job is reaped by its `ttlSecondsAfterFinished`.
+///
+/// Waiting for ever is not an option either: a foreign Job without a TTL, or one that never
+/// finishes, would hold this run's hosts for the life of the plan, and anybody able to create a Job
+/// at the name could do that on purpose. Once the foreign Job has held the name for longer than the
+/// start timeout the run is `Displaced`: [`resume_launching_run`] gives it up unless a pod carrying
+/// its run ID may still be executing, which is the evidence the double-apply concern above is
+/// about. [`select_job`] then numbers the replacement past the taken name.
 fn decide_job_presence(may_proceed: bool, job: RecordedJob) -> JobPresenceAction {
     match (may_proceed, job) {
         (_, RecordedJob::Own) => JobPresenceAction::Adopt,
-        (_, RecordedJob::Foreign) => JobPresenceAction::Contested,
+        (_, RecordedJob::Foreign { outlasted: false }) => JobPresenceAction::Contested,
+        (_, RecordedJob::Foreign { outlasted: true }) => JobPresenceAction::Displaced,
         (true, RecordedJob::Absent) => JobPresenceAction::Proceed,
         (false, RecordedJob::Absent) => JobPresenceAction::Abandon,
     }
@@ -2977,10 +3017,37 @@ fn decide_job_presence(may_proceed: bool, job: RecordedJob) -> JobPresenceAction
 enum RecordedJob {
     /// The Job this run created: every identity field `validate_selected_job` checks matches.
     Own,
-    /// A Job this run did not create holds the name.
-    Foreign,
+    /// A Job this run did not create holds the name. `outlasted` says it has existed for longer
+    /// than the start timeout ([`foreign_job_outlasted`]).
+    Foreign { outlasted: bool },
     /// The name is free.
     Absent,
+}
+
+/// Whether a Job that does not carry a run's identity has held the run's name for longer than the
+/// start timeout. Measured by the Job's own age, because that is how long the obstruction has
+/// existed, however long the run's setup took. A Job without a creation time is never judged
+/// outlasted.
+///
+/// Nor is an unfinished one whose pod template carries `run_id`: that may be the run's own Job with
+/// tampered metadata, which can still create a pod after the run gave its Leases up, and before it
+/// has one the pod check that guards giving up has nothing to find.
+fn foreign_job_outlasted(job: &Job, run_id: &str, now_epoch_secs: i64, timeout_secs: i64) -> bool {
+    let may_be_the_runs_own =
+        !status::job_finished(job) && job_template_label(job, labels::RUN_ID) == Some(run_id);
+    !may_be_the_runs_own
+        && job
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .is_some_and(|created| now_epoch_secs - created.0.as_second() >= timeout_secs)
+}
+
+impl ReconciliationContext {
+    /// [`ReconciliationContext::job_start_timeout`] in the epoch seconds the stall checks compare in.
+    fn job_start_timeout_secs(&self) -> i64 {
+        i64::try_from(self.job_start_timeout.as_secs()).unwrap_or(i64::MAX)
+    }
 }
 
 /// Reads what holds this run's Job name and checks whether it is the run's own Job.
@@ -3009,7 +3076,14 @@ async fn job_at_recorded_name(
             &run.mirror.play_uid,
         ) {
             Ok(()) => RecordedJob::Own,
-            Err(_) => RecordedJob::Foreign,
+            Err(_) => RecordedJob::Foreign {
+                outlasted: foreign_job_outlasted(
+                    &job,
+                    &run.mirror.run_id,
+                    Utc::now().timestamp(),
+                    context.job_start_timeout_secs(),
+                ),
+            },
         },
     )
 }
@@ -3489,6 +3563,12 @@ async fn ensure_infra_and_launch(
         &context.proxy_grace,
         not_ready_grace_cap_secs,
         &context.ca,
+        // From the same deadline `launch_recorded_job` gives the Job, so the run's access lasts as
+        // long as the run may.
+        managed_ssh::ProxyLifetime::for_run(
+            context.job_deadlines.for_plan(object),
+            context.proxy_grace.grace_seconds,
+        ),
         &context.proxy_image,
         context.workload_egress_policies.managed_ssh.clone(),
         // Owns the plan-namespace client-cert Secret so K8s GC reaps it if the plan is deleted
@@ -3605,7 +3685,7 @@ async fn ensure_infra_and_launch(
     )
     .await?;
     let jobs_api = Api::<Job>::namespaced(context.client.clone(), namespace);
-    launch_recorded_job(&jobs_api, object, run, run_groups).await?;
+    launch_recorded_job(&jobs_api, object, run, run_groups, context.job_deadlines).await?;
     play_history::record_running(
         &context.client,
         namespace,
@@ -3797,9 +3877,7 @@ fn play_is_running(play: &Play) -> Result<bool, ReconcileError> {
     let status = play
         .status
         .as_ref()
-        .ok_or(ReconcileError::PreconditionFailed(
-            "active Play has no status",
-        ))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(play, "is active but has no status"))?;
     Ok(status.phase == v1beta1::PlayPhase::Running)
 }
 
@@ -3843,8 +3921,8 @@ async fn advance_active_run(
     //     `resume_launching_run`, which keeps the mirror and asks for fifteen seconds; nothing
     //     between here and the end of the tick will set the interval again, so returning one second
     //     would poll a plan that is suspended *and* blocked once a second for as long as the
-    //     foreign Job survives — which can be indefinitely, since a contested name is never
-    //     abandoned.
+    //     foreign Job survives — up to the start timeout, after which the contested run is given
+    //     up.
     //
     // Fifteen seconds serves both: the first overrides it, and the second is exactly the cadence
     // the contested path asked for.
@@ -3852,6 +3930,23 @@ async fn advance_active_run(
         return Ok(ActiveRunProgress::Running(std::time::Duration::from_secs(
             15,
         )));
+    }
+
+    // An earlier tick found this run's Job stalled and wrote down why. The cancellation is carried
+    // on before anything else looks at the Job, whose pods are being deleted and no longer say why
+    // it stopped. Once nothing of it may still execute, the Job is gone (or turned out to finish
+    // after all), and the run finishes below like any other.
+    if let Some(reason) = play
+        .status
+        .as_ref()
+        .and_then(|status| status.stall_reason.as_deref())
+        && cancel_run_job(context, object, run).await?
+    {
+        return Ok(report_stalled_run_cancelling(
+            resource_status,
+            &job_name,
+            reason,
+        ));
     }
 
     // Looked up by the exact recorded name, not the PLAYBOOKPLAN_HASH label — that label is
@@ -3870,7 +3965,26 @@ async fn advance_active_run(
             )
             .is_err() =>
         {
-            if !status::job_finished(job) {
+            // A foreign Job that has held the name past the start timeout is not waited on any
+            // longer, as long as nothing of this run may still execute. `cancel_run_job` answers
+            // exactly that: it disowns the foreign Job by the same identity check, so it never
+            // touches it, and only this run's own pods are asked — renewing the Leases while any
+            // of them may still be up. The run then finishes below with no recap, exactly as it
+            // would once the foreign Job finished.
+            let gave_up_waiting = !status::job_finished(job)
+                && foreign_job_outlasted(
+                    job,
+                    &run.mirror.run_id,
+                    Utc::now().timestamp(),
+                    context.job_start_timeout_secs(),
+                )
+                && !cancel_run_job(context, object, run).await?;
+            if gave_up_waiting {
+                warn!(
+                    "PlaybookPlan {namespace}/{name}: no longer waiting for Job {job_name}, which does not carry this run's identity and has held its name for longer than {}s; finishing the run without a recap",
+                    context.job_start_timeout_secs()
+                );
+            } else if !status::job_finished(job) {
                 // Discarded as above: this run's hosts may be occupied by a Job we do not control,
                 // so there is nothing safe left to do about a lock it no longer holds.
                 let _outcome =
@@ -3895,9 +4009,28 @@ async fn advance_active_run(
     // Still running -> renew this run's host locks so a run that outlasts the lease duration keeps
     // them (they're acquired once at start and otherwise never touched again while Applying), then
     // keep waiting.
-    if let Some(job) = &job
+    if job_is_trusted
+        && let Some(job) = &job
         && !status::job_finished(job)
     {
+        let now = Utc::now().timestamp();
+        let timeout = context.job_start_timeout_secs();
+        if job_may_have_stalled(job, now, timeout) {
+            let pods = run_job_pods(context, namespace, job, &run.mirror.play_uid).await?;
+            if let Some(reason) = job_start_stall(job, &pods, now, timeout) {
+                warn!("PlaybookPlan {namespace}/{name}: cancelling run {job_name}: {reason}");
+                play_history::record_stalled(&plays_api, &job_name, &run.mirror.play_uid, &reason)
+                    .await?;
+                // Whatever it answers, the run is not finished on this tick: the record now says
+                // why, and the next tick carries the cancellation on from there.
+                let _executing = cancel_run_job(context, object, run).await?;
+                return Ok(report_stalled_run_cancelling(
+                    resource_status,
+                    &job_name,
+                    &reason,
+                ));
+            }
+        }
         // As above: the Job is already running, so a lost lock is reported and nothing more.
         let _outcome =
             locking::renew_locks(&leases_api, &run.mirror.hosts, &holder_identity).await?;
@@ -3918,19 +4051,8 @@ async fn advance_active_run(
     // channel that isn't interleaved with playbook output and needs no `pods/log` access.
     let termination_message = match (&job, job_is_trusted) {
         (Some(job), true) => {
-            let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
-            let pods = pods_api
-                .list(&ListParams {
-                    label_selector: Some(format!("job-name={job_name}")),
-                    ..Default::default()
-                })
-                .await?;
-            let pods = pods.items.iter().filter(|pod| {
-                annotation_value(&pod.metadata, labels::PLAY_UID_ANNOTATION)
-                    == Some(run.mirror.play_uid.as_str())
-                    && pod_belongs_to_job(pod, job)
-            });
-            latest_termination_message(pods)
+            let pods = run_job_pods(context, namespace, job, &run.mirror.play_uid).await?;
+            latest_termination_message(pods.iter())
         }
         _ => None,
     };
@@ -3950,27 +4072,32 @@ async fn advance_active_run(
         parsed.as_ref(),
     )
     .await?;
-    let finished_status =
-        finished_play
-            .status
-            .as_ref()
-            .ok_or(ReconcileError::PreconditionFailed(
-                "finished Play has no status",
-            ))?;
+    let finished_status = finished_play.status.as_ref().ok_or_else(|| {
+        ReconcileError::record_mismatch(&finished_play, "finished but has no status")
+    })?;
     let verdict = phase_for_finished_run(finished_status);
     let failure = classify_run_failure(finished_status);
     // The overflow marker is asked of the raw message and only here, because this is the last place
     // it exists: `record_finished` maps an unreadable recap of either kind to the same `Unknown`
     // hosts, so nothing downstream — including a later tick recovering this same run — can tell an
     // overflow from a crash. It takes precedence over the record-derived half because the two cannot
-    // both hold: a message that overflowed carries no counters to be empty.
-    let diagnostic = termination_message
-        .as_deref()
-        .and_then(callback_output::recap_overflowed_host_count)
-        .map_or_else(
-            || RunDiagnostic::from_play_status(finished_status),
-            |hosts| RunDiagnostic::RecapOverflowed { hosts },
-        );
+    // both hold: a message that overflowed carries no counters to be empty. A Job stopped at its
+    // deadline is asked here for the same reason: only the Job's own condition says so, and a later
+    // tick may find the Job reaped.
+    let exceeded_deadline = match (&job, job_is_trusted, &parsed) {
+        (Some(job), true, None) => exceeded_deadline_seconds(job),
+        _ => None,
+    };
+    let diagnostic = match (
+        termination_message
+            .as_deref()
+            .and_then(callback_output::recap_overflowed_host_count),
+        exceeded_deadline,
+    ) {
+        (Some(hosts), _) => RunDiagnostic::RecapOverflowed { hosts },
+        (None, Some(seconds)) => RunDiagnostic::DeadlineExceeded { seconds },
+        (None, None) => RunDiagnostic::from_play_status(finished_status),
+    };
     diagnostic.warn(namespace, name, &run.mirror.job_name);
     status::apply_terminal_play_status(
         &status::RunRecord {
@@ -3991,6 +4118,64 @@ async fn advance_active_run(
         diagnostic,
         record: TerminalRecord::Present,
     })
+}
+
+/// The `activeDeadlineSeconds` a finished Job was stopped at, when Kubernetes failed it for running
+/// past that deadline (`Failed` with reason `DeadlineExceeded`).
+fn exceeded_deadline_seconds(job: &Job) -> Option<i64> {
+    let stopped_at_deadline = job
+        .status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .any(|condition| {
+            condition.type_ == "Failed"
+                && condition.status == "True"
+                && condition.reason.as_deref() == Some("DeadlineExceeded")
+        });
+    if !stopped_at_deadline {
+        return None;
+    }
+    job.spec.as_ref()?.active_deadline_seconds
+}
+
+/// The pods of this run's own Job: created by that Job object and carrying the run's `Play` UID, so
+/// a pod of an earlier Job at the same name is never read as this run's.
+async fn run_job_pods(
+    context: &ReconciliationContext,
+    namespace: &str,
+    job: &Job,
+    play_uid: &str,
+) -> Result<Vec<Pod>, ReconcileError> {
+    let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
+    let pods = pods_api
+        .list(
+            &ListParams::default()
+                .labels(&format!("job-name={}", kube::ResourceExt::name_any(job))),
+        )
+        .await?;
+    Ok(pods
+        .items
+        .into_iter()
+        .filter(|pod| {
+            annotation_value(&pod.metadata, labels::PLAY_UID_ANNOTATION) == Some(play_uid)
+                && pod_belongs_to_job(pod, job)
+        })
+        .collect())
+}
+
+/// Says on the plan that a stalled run's Job is being cancelled, for as many ticks as that takes.
+/// The host Leases stay renewed by `cancel_run_job` until nothing of the run may still execute.
+fn report_stalled_run_cancelling(
+    resource_status: &mut PlaybookPlanStatus,
+    job_name: &str,
+    reason: &str,
+) -> ActiveRunProgress {
+    status::clear_run_conditions(resource_status);
+    status::set_job_did_not_start_condition(resource_status, reason);
+    resource_status.summary = Some(format!("cancelling run {job_name}: {reason}"));
+    ActiveRunProgress::Running(std::time::Duration::from_secs(5))
 }
 
 /// Finalizes a run whose `Play` is gone: its Job is stopped first, then its infrastructure is
@@ -4117,7 +4302,18 @@ async fn resume_launching_run(
     let (namespace, name) = namespace_and_name(object)?;
     let found = job_at_recorded_name(context, object, run).await?;
 
-    let action = decide_job_presence(resume_with.is_some(), found);
+    let mut action = decide_job_presence(resume_with.is_some(), found);
+    // The one thing that still holds a displaced run open: a pod carrying its run ID that may be
+    // executing, which would mean the identity check rejected a Job that was this run's after all.
+    if action == JobPresenceAction::Displaced
+        && run_pods_may_be_executing(context, namespace, run).await?
+    {
+        warn!(
+            "PlaybookPlan {namespace}/{name}: run {} is not given up although a Job it did not create has held its name past the start timeout: a pod carrying its run ID may still be executing",
+            run.mirror.job_name
+        );
+        action = JobPresenceAction::Contested;
+    }
     let requeue = match action {
         JobPresenceAction::Proceed => {
             let Some(run_groups) = resume_with else {
@@ -4179,6 +4375,27 @@ async fn resume_launching_run(
             // A short requeue, matching every other abandon path: nothing of this run is left,
             // so the replacement revision should be prepared promptly rather than after the
             // caller's Job-polling interval.
+            Some(std::time::Duration::from_secs(1))
+        }
+        JobPresenceAction::Displaced => {
+            let timeout = context.job_start_timeout_secs();
+            warn!(
+                "PlaybookPlan {namespace}/{name}: abandoning run {} — Job {}, which it did not create, has held its name for longer than {timeout}s",
+                run.mirror.job_name, run.mirror.job_name
+            );
+            abandon_unlaunched_run(
+                context,
+                object,
+                api,
+                run,
+                v1beta1::PlayPhase::Launching,
+                format!(
+                    "aborted the run: Job {}, which it did not create, has held its name for longer than {timeout}s",
+                    run.mirror.job_name
+                ),
+                resource_status,
+            )
+            .await?;
             Some(std::time::Duration::from_secs(1))
         }
         JobPresenceAction::Contested => {
@@ -4750,9 +4967,13 @@ async fn handle_unlaunched_input_error(
                     "aborted the run because its desired inputs cannot be resolved: {error}"
                 ));
             }
-            // `Contested` explained itself, and more usefully than this could. `Proceed` cannot
-            // happen: it needs inputs to converge against, and this run has none.
-            JobPresenceAction::Contested | JobPresenceAction::Proceed => {}
+            // `Contested` and `Displaced` explained themselves, and more usefully than this could:
+            // the run is waiting on, or was given up because of, a Job at its name, whatever the
+            // inputs say. `Proceed` cannot happen: it needs inputs to converge against, and this
+            // run has none.
+            JobPresenceAction::Contested
+            | JobPresenceAction::Displaced
+            | JobPresenceAction::Proceed => {}
         }
         return patch_status(api, object, resource_status.clone())
             .await
@@ -4804,6 +5025,10 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         ReconcileError::ForeignProxyResource { .. }
         | ReconcileError::ForeignWorkspaceSecret { .. } => false,
         ReconcileError::PreconditionFailed(_)
+        | ReconcileError::RecordMismatch { .. }
+        | ReconcileError::JobMismatch { .. }
+        | ReconcileError::RunNamesTaken { .. }
+        | ReconcileError::ConcurrentActiveRecords { .. }
         | ReconcileError::RenderError(_)
         | ReconcileError::CaError(_)
         | ReconcileError::JsonSerializationError(_)
@@ -4871,6 +5096,65 @@ async fn release_run_infrastructure(
         &holder_identity(namespace, name, run),
     )
     .await
+}
+
+/// Gives back what the in-flight run of a plan in a namespace that is no longer enrolled holds in
+/// the operator's namespace: its node-root proxy pods first, then its host Leases.
+///
+/// Such a run is never advanced again, since every step of it needs plan-namespace RBAC the operator
+/// no longer has, and nothing else ever deletes its proxy pods. Its Job, client-cert Secret and
+/// `Play` and the run-cleanup finalizer stay behind, out of reach in the plan's namespace, as does
+/// `status.activeRun`: that mirror is the only handle on the run left here, and on re-enrolment it
+/// lets recovery finish the run the usual way.
+///
+/// Not waiting for the Job is what separates this from [`release_deleted_plan`], and it costs no
+/// mutual exclusion that was still there: nothing renews these Leases any more, so they would lapse
+/// within [`locking::LEASE_DURATION_SECONDS`] either way. Deleting the proxy pods also cuts the Job's
+/// access to every managed-ssh host. Idempotent, so it runs on every pass through the guard.
+async fn release_unenrolled_run(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+) -> Result<(), ReconcileError> {
+    let (namespace, name) = namespace_and_name(object)?;
+    let Some(mirror) = object
+        .status
+        .as_ref()
+        .and_then(|status| status.active_run.clone())
+    else {
+        return Ok(());
+    };
+    let run = match RecordedRun::from_mirror(mirror) {
+        Ok(run) => run,
+        Err(error) => {
+            warn!(
+                "PlaybookPlan {namespace}/{name} has an unusable activeRun ({error}); its run cannot be released automatically"
+            );
+            return Ok(());
+        }
+    };
+
+    let deleted_pods = managed_ssh::cleanup_operator_namespace_infra(
+        &context.client,
+        &context.operator_namespace,
+        &run.execution_hash,
+        &run.mirror.run_id,
+    )
+    .await?;
+    let leases_api = Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
+    locking::release_locks(
+        &leases_api,
+        &run.mirror.hosts,
+        &holder_identity(namespace, name, &run),
+    )
+    .await?;
+    // Only when the pass cut something off: every pass already logs the refusal itself.
+    if deleted_pods > 0 {
+        info!(
+            "PlaybookPlan {namespace}/{name}: deleted {deleted_pods} proxy pod(s) of run {} and released its host Leases, because its namespace is not enrolled; its Job, Play and finalizer are left for re-enrolment",
+            run.mirror.job_name
+        );
+    }
+    Ok(())
 }
 
 /// Keeps a deleted plan around until the resources its run holds outside the plan's namespace are
@@ -5140,6 +5424,19 @@ async fn cancel_run_job(
     Ok(executing)
 }
 
+/// Whether any playbook pod carrying this run's ID may still be executing, judged without its Job —
+/// for when the Job at the run's name is not the run's own.
+async fn run_pods_may_be_executing(
+    context: &ReconciliationContext,
+    namespace: &str,
+    run: &RecordedRun,
+) -> Result<bool, ReconcileError> {
+    let pods = Api::<Pod>::namespaced(context.client.clone(), namespace)
+        .list(&ListParams::default().labels(&run_pod_selector(&run.mirror.run_id)))
+        .await?;
+    Ok(run_may_be_executing(None, &pods.items))
+}
+
 /// Selects a run's *playbook* pods — the Job's — and not the proxy pods it shares its run ID
 /// with, which carry the managed-ssh component instead and are released with the rest of the
 /// infrastructure.
@@ -5177,6 +5474,182 @@ fn pod_may_be_executing(pod: &Pod) -> bool {
 
 fn run_may_be_executing(job: Option<&Job>, pods: &[Pod]) -> bool {
     job.is_some_and(|job| !status::job_finished(job)) || pods.iter().any(pod_may_be_executing)
+}
+
+/// Whether a run's unfinished Job is old enough, and idle enough, to be worth asking
+/// [`job_start_stall`] about. It is asked on every tick of every running run, so it avoids the pod
+/// list both while a Job is young and while its pod is ready, which covers the whole time a
+/// playbook runs.
+fn job_may_have_stalled(job: &Job, now_epoch_secs: i64, timeout_secs: i64) -> bool {
+    let ready = job
+        .status
+        .as_ref()
+        .and_then(|status| status.ready)
+        .unwrap_or(0);
+    ready == 0
+        && job
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .is_some_and(|created| now_epoch_secs - created.0.as_second() >= timeout_secs)
+}
+
+/// Why a run's unfinished Job counts as never having started, or `None` while it still may.
+///
+/// Stalled means: no container of its pods is running, the playbook container has never started,
+/// and nothing has progressed for `timeout_secs`. Progress is the Job's creation, its pod's creation
+/// and scheduling, and every init container that finished since. The pod's own milestones keep a
+/// pod that only got a Node late (a cluster autoscaler adding one, a quota freeing up) from being
+/// cut off in the middle of its image pull. The clock restarting at each finished init container is
+/// what keeps a collection download longer than the timeout from being cut off in the moment
+/// between it and the playbook container starting. A running init container is progress in itself,
+/// so the preflight gate and the download are never counted.
+///
+/// What is left is a Job that is waiting rather than working: no pod at all (refused by Pod
+/// Security admission, a webhook, a `ResourceQuota` or a missing ServiceAccount, which the Job
+/// controller retries for ever), a pod nothing schedules, or a container stuck on its image or its
+/// configuration. Deliberately judged by time rather than by a list of waiting reasons: a list
+/// cannot speak for a Job with no pod, and misses a container stuck in `ContainerCreating` on a
+/// mount that never resolves. The waiting reason only goes into the message.
+///
+/// Timestamps from the apiserver and the kubelet are compared against the operator's clock, as the
+/// proxy grace does; skew of seconds does not matter against a timeout of minutes.
+fn job_start_stall(
+    job: &Job,
+    pods: &[Pod],
+    now_epoch_secs: i64,
+    timeout_secs: i64,
+) -> Option<String> {
+    let mut last_progress = job.metadata.creation_timestamp.as_ref()?.0.as_second();
+    for pod in pods {
+        if let Some(created) = &pod.metadata.creation_timestamp {
+            last_progress = last_progress.max(created.0.as_second());
+        }
+        let Some(status) = pod.status.as_ref() else {
+            continue;
+        };
+        if matches!(
+            status.phase.as_deref(),
+            Some("Running" | "Succeeded" | "Failed")
+        ) {
+            return None;
+        }
+        let init = status.init_container_statuses.iter().flatten();
+        let main = status.container_statuses.iter().flatten();
+        if init.clone().chain(main.clone()).any(|container| {
+            container
+                .state
+                .as_ref()
+                .is_some_and(|state| state.running.is_some())
+        }) {
+            return None;
+        }
+        if main
+            .filter(|container| container.name == job_builder::ANSIBLE_CONTAINER_NAME)
+            .any(container_has_started)
+        {
+            return None;
+        }
+        let scheduled = status
+            .conditions
+            .iter()
+            .flatten()
+            .filter(|condition| condition.type_ == "PodScheduled" && condition.status == "True")
+            .filter_map(|condition| condition.last_transition_time.as_ref());
+        last_progress = init
+            .filter_map(|container| {
+                container
+                    .state
+                    .as_ref()?
+                    .terminated
+                    .as_ref()?
+                    .finished_at
+                    .as_ref()
+            })
+            .chain(scheduled)
+            .map(|time| time.0.as_second())
+            .fold(last_progress, i64::max);
+    }
+    (now_epoch_secs - last_progress >= timeout_secs).then(|| {
+        // The operator never suspends its Jobs, so a suspended one was suspended from outside, for
+        // example by a queueing controller holding it in a queue. It has no pod to describe.
+        let waiting_on = if job.spec.as_ref().and_then(|spec| spec.suspend) == Some(true) {
+            "the Job is suspended (spec.suspend), so it creates no pod; something outside the operator suspended it, such as a queueing controller".to_string()
+        } else {
+            describe_unstarted_pods(pods)
+        };
+        format!("the Job did not start within {timeout_secs}s: {waiting_on}")
+    })
+}
+
+fn container_has_started(container: &ContainerStatus) -> bool {
+    container
+        .state
+        .as_ref()
+        .is_some_and(|state| state.running.is_some() || state.terminated.is_some())
+        || container
+            .last_state
+            .as_ref()
+            .is_some_and(|state| state.terminated.is_some())
+}
+
+/// What a Job that did not start is waiting on, from its newest pod: not scheduled, or the first
+/// container that reports a waiting reason. `PodInitializing` is skipped while another container
+/// gives a better answer, because every container behind a stuck init container reports it.
+fn describe_unstarted_pods(pods: &[Pod]) -> String {
+    let Some(pod) = pods
+        .iter()
+        .max_by_key(|pod| pod.metadata.creation_timestamp.as_ref().map(|time| time.0))
+    else {
+        return "no pod was created for it; the Job's events say why (Pod Security admission, an admission webhook, a ResourceQuota or a missing ServiceAccount)".to_string();
+    };
+    let name = pod.metadata.name.as_deref().unwrap_or("<unnamed>");
+    let Some(status) = pod.status.as_ref() else {
+        return format!("pod {name} has not started a container");
+    };
+
+    if let Some(condition) = status
+        .conditions
+        .iter()
+        .flatten()
+        .find(|condition| condition.type_ == "PodScheduled" && condition.status == "False")
+    {
+        return format!(
+            "pod {name} is not scheduled{}",
+            reason_suffix(condition.reason.as_deref(), condition.message.as_deref())
+        );
+    }
+
+    let waiting: Vec<_> = status
+        .init_container_statuses
+        .iter()
+        .flatten()
+        .chain(status.container_statuses.iter().flatten())
+        .filter_map(|container| {
+            let waiting = container.state.as_ref()?.waiting.as_ref()?;
+            Some((container.name.as_str(), waiting))
+        })
+        .collect();
+    let explained = waiting
+        .iter()
+        .find(|(_, waiting)| waiting.reason.as_deref() != Some("PodInitializing"))
+        .or_else(|| waiting.first());
+    match explained {
+        Some((container, waiting)) => format!(
+            "pod {name}: container {container} is waiting{}",
+            reason_suffix(waiting.reason.as_deref(), waiting.message.as_deref())
+        ),
+        None => format!("pod {name} has not started a container"),
+    }
+}
+
+fn reason_suffix(reason: Option<&str>, message: Option<&str>) -> String {
+    [reason, message]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .map(|part| format!(": {part}"))
+        .collect()
 }
 
 fn holds_run_cleanup_finalizer(object: &PlaybookPlan) -> bool {
@@ -6078,8 +6551,9 @@ async fn recover_active_run(
         // panic takes the whole reconcile loop down for every plan.
         v1beta1::PlayPhase::Succeeded
         | v1beta1::PlayPhase::Failed
-        | v1beta1::PlayPhase::Unknown => Err(ReconcileError::PreconditionFailed(
-            "a terminal Play was classified as in flight",
+        | v1beta1::PlayPhase::Unknown => Err(ReconcileError::record_mismatch(
+            play,
+            "is terminal but was classified as in flight",
         )),
         v1beta1::PlayPhase::Aborted => Ok(Some(RecoveredRun::Aborted(run))),
     }
@@ -6304,9 +6778,7 @@ fn sole_active_record<'a>(live: &[&'a Play]) -> Result<Option<&'a Play>, Reconci
     match live {
         [] => Ok(None),
         [play] => Ok(Some(play)),
-        _ => Err(ReconcileError::PreconditionFailed(
-            "more than one Play claims to be this plan's active run",
-        )),
+        _ => Err(ReconcileError::concurrent_active_records(live)),
     }
 }
 
@@ -6354,21 +6826,19 @@ fn recoverable_plays_for_plan<'a>(plays: &'a [Play], plan: &PlaybookPlan) -> Vec
 }
 
 fn recorded_run_from_play(play: &Play) -> Result<RecordedRun, ReconcileError> {
-    let execution_hash = ExecutionHash::from_hex(&play.spec.execution_hash).ok_or(
-        ReconcileError::PreconditionFailed("active Play has an invalid execution hash"),
-    )?;
+    let execution_hash = ExecutionHash::from_hex(&play.spec.execution_hash).ok_or_else(|| {
+        ReconcileError::record_mismatch(play, "is active but has an invalid execution hash")
+    })?;
     let job_name = play
         .metadata
         .name
         .clone()
-        .ok_or(ReconcileError::PreconditionFailed(
-            "active Play has no name",
-        ))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(play, "is active but has no name"))?;
     let play_uid = play
         .metadata
         .uid
         .clone()
-        .ok_or(ReconcileError::PreconditionFailed("active Play has no UID"))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(play, "is active but has no UID"))?;
 
     Ok(RecordedRun {
         mirror: ActiveRun {
@@ -6391,9 +6861,7 @@ fn surviving_run_from_play(play: &Play) -> Result<Box<SurvivingRun>, ReconcileEr
         .status
         .as_ref()
         .map(|status| status.phase.clone())
-        .ok_or(ReconcileError::PreconditionFailed(
-            "an in-flight Play has no status",
-        ))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(play, "is in flight but has no status"))?;
     Ok(Box::new(SurvivingRun {
         run: recorded_run_from_play(play)?,
         phase,
@@ -6458,6 +6926,7 @@ async fn launch_recorded_job(
     object: &PlaybookPlan,
     run: &RecordedRun,
     run_groups: &[ResolvedInventoryGroup],
+    job_deadlines: job_builder::JobDeadlines,
 ) -> Result<(), ReconcileError> {
     let mut job = job_builder::create_job_blueprint(
         &run.execution_hash,
@@ -6465,6 +6934,7 @@ async fn launch_recorded_job(
         &run.mirror.run_id,
         run_groups,
         object,
+        job_deadlines,
     )?;
     job_builder::correlate_job_to_play(&mut job, &run.mirror.play_uid);
     let selected = SelectedJob {
@@ -6501,15 +6971,11 @@ fn job_label<'a>(job: &'a Job, key: &str) -> Option<&'a str> {
 fn job_execution_hash(job: &Job) -> Result<ExecutionHash, ReconcileError> {
     job_label(job, labels::PLAYBOOKPLAN_HASH)
         .and_then(ExecutionHash::from_hex)
-        .ok_or(ReconcileError::PreconditionFailed(
-            "active Job has no valid execution hash",
-        ))
+        .ok_or_else(|| ReconcileError::job_mismatch(job, "has no valid execution hash"))
 }
 
 fn job_run_id(job: &Job) -> Result<&str, ReconcileError> {
-    job_label(job, labels::RUN_ID).ok_or(ReconcileError::PreconditionFailed(
-        "active Job has no run ID",
-    ))
+    job_label(job, labels::RUN_ID).ok_or_else(|| ReconcileError::job_mismatch(job, "has no run ID"))
 }
 
 fn run_number_from_job_name(job_name: &str) -> Option<u32> {
@@ -6640,8 +7106,8 @@ fn plan_summary(outdated_count: usize, total_count: usize, verdict: &Phase) -> S
 ///
 /// One channel rather than a flag per reason, because they arrive at the same place, are appended to
 /// the same summary, and are mutually exclusive in fact: `NoPlaybookActivity` requires a readable
-/// recap and `RecapOverflowed` means there was none.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// recap, while `RecapOverflowed`, `JobDidNotStart` and `DeadlineExceeded` mean there was none.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum RunDiagnostic {
     #[default]
     None,
@@ -6654,18 +7120,36 @@ enum RunDiagnostic {
     /// health. Without this the plan reports only "the recap could not be read", which is what a
     /// crashed container reports too, and the operator has no way to tell them apart.
     RecapOverflowed { hosts: u32 },
+    /// The operator cancelled the run's Job because it never started; `reason` is what the run
+    /// recorded it waiting on (`PlayStatus::stall_reason`). Without it the plan would report only an
+    /// unreadable recap, which is what a reaped Job reports too.
+    JobDidNotStart { reason: String },
+    /// Kubernetes stopped the run's Job at its `activeDeadlineSeconds` (`seconds`), so the playbook
+    /// never reached the end where its recap is written. Like `RecapOverflowed`, only the Job says
+    /// so, which is why a run recovered from its record alone reports the plain unreadable recap.
+    DeadlineExceeded { seconds: i64 },
 }
 
 impl RunDiagnostic {
     /// What a finished run's own record still says, once the raw termination message is gone.
+    ///
+    /// A recorded stall counts only for a run whose recap could not be read. A Job that started
+    /// after all and finished before its cancellation landed reports its own result instead.
     fn from_play_status(status: &v1beta1::PlayStatus) -> Self {
+        if status.phase == v1beta1::PlayPhase::Unknown
+            && let Some(reason) = &status.stall_reason
+        {
+            return Self::JobDidNotStart {
+                reason: reason.clone(),
+            };
+        }
         match hosts_without_recap_activity(status) {
             Some((hosts, of)) => Self::NoPlaybookActivity { hosts, of },
             None => Self::None,
         }
     }
 
-    fn warn(self, namespace: &str, name: &str, job_name: &str) {
+    fn warn(&self, namespace: &str, name: &str, job_name: &str) {
         match self {
             Self::None => {}
             Self::NoPlaybookActivity { hosts, of } => warn!(
@@ -6675,13 +7159,19 @@ impl RunDiagnostic {
                 "PlaybookPlan {namespace}/{name}: run {job_name} reported {hosts} hosts, whose recap does not fit the kubelet's {} byte termination-message limit even compressed; every host is reported Unknown. Split the plan across smaller inventories",
                 callback_output::TERMINATION_MESSAGE_MAX_BYTES
             ),
+            Self::JobDidNotStart { reason } => warn!(
+                "PlaybookPlan {namespace}/{name}: run {job_name} was cancelled because {reason}; every host is reported Unknown and the run spent an attempt. Fix what the Job waited on (its image, its ServiceAccount, the namespace's admission rules or quota), or raise runs.startTimeoutSeconds if the image only pulls slowly"
+            ),
+            Self::DeadlineExceeded { seconds } => warn!(
+                "PlaybookPlan {namespace}/{name}: run {job_name} was stopped by Kubernetes after its deadline of {seconds}s (the plan's spec.activeDeadlineSeconds, or the operator's runs.defaultActiveDeadlineSeconds when the plan sets none, held to the operator's runs.maxActiveDeadlineSeconds either way); every host is reported Unknown and the run spent an attempt. Raise the plan's spec.activeDeadlineSeconds if the playbook legitimately runs longer; beyond runs.maxActiveDeadlineSeconds only the cluster administrator can raise the limit"
+            ),
         }
     }
 
     /// The clause appended to `.status.summary`, which is a printer column — so it states the fact
     /// and stops. What to do about it belongs in [`Self::warn`], where there is room for it and
     /// where somebody is already looking into the run.
-    fn summary_clause(self) -> Option<String> {
+    fn summary_clause(&self) -> Option<String> {
         match self {
             Self::None => None,
             Self::NoPlaybookActivity { hosts, of } => Some(format!(
@@ -6690,6 +7180,10 @@ impl RunDiagnostic {
             Self::RecapOverflowed { hosts } => Some(format!(
                 " (the recap for {hosts} hosts does not fit the kubelet's termination-message limit, so no per-host result could be read; split the plan across smaller inventories)"
             )),
+            Self::JobDidNotStart { reason } => Some(format!(" (cancelled: {reason})")),
+            Self::DeadlineExceeded { seconds } => {
+                Some(format!(" (the Job exceeded its deadline of {seconds}s)"))
+            }
         }
     }
 }
@@ -7626,7 +8120,9 @@ async fn handle_invalid_scheduling_configuration(
                 JobPresenceAction::Abandon => {
                     resource_status.summary = Some(format!("aborted the run because {summary}"));
                 }
-                JobPresenceAction::Contested | JobPresenceAction::Proceed => {}
+                JobPresenceAction::Contested
+                | JobPresenceAction::Displaced
+                | JobPresenceAction::Proceed => {}
             }
         } else {
             abandon_unlaunched_run(
@@ -7759,7 +8255,7 @@ fn next_run_number(claimed: &[u32]) -> Result<u32, ReconcileError> {
 /// recovered `Play`, and under the write-ahead protocol every Job this plan created has a `Play`
 /// recorded *before* it — so an active Job with no recoverable record is not this run's, and
 /// adopting it would mint a fresh `run_id` for a Job whose own record claims a different one,
-/// wedging the run on an unrepairable `PreconditionFailed`. Resuming a genuinely in-flight run
+/// wedging the run on an error no retry can repair. Resuming a genuinely in-flight run
 /// is `recover_active_run`'s job; same-run idempotency within a tick is `spawn_ansible_job`'s.
 async fn select_job(
     client: &kube::Client,
@@ -7792,7 +8288,8 @@ async fn select_job(
         .max()
         .unwrap_or_default();
 
-    let plays = Api::<Play>::namespaced(client.clone(), namespace.as_ref())
+    let plays_api = Api::<Play>::namespaced(client.clone(), namespace.as_ref());
+    let plays = plays_api
         .list(&ListParams::default().labels(&format!("{}={plan_name}", labels::PLAYBOOKPLAN_NAME)))
         .await?;
     let max_recorded_run_number = plays
@@ -7805,13 +8302,68 @@ async fn select_job(
         .max()
         .unwrap_or_default();
 
-    let run_number =
-        next_run_number(&[last_run_number, max_job_run_number, max_recorded_run_number])?;
+    let first = next_run_number(&[last_run_number, max_job_run_number, max_recorded_run_number])?;
+    let name_of = |run_number| {
+        job_builder::job_name(plan_name.as_ref(), plan_uid.as_ref(), &hash, run_number)
+    };
 
-    Ok(SelectedJob {
-        job_name: job_builder::job_name(plan_name.as_ref(), plan_uid.as_ref(), &hash, run_number),
-        run_number,
+    // Everything counted above is this plan's own. A Job or `Play` at the candidate name that was
+    // not counted belongs to something else: a Job created outside the operator, or another plan
+    // whose truncated name and short id collide with this one. Claiming that name would wedge the
+    // run (a foreign Job contests it, a foreign `Play` makes `record_prepared` refuse it on every
+    // tick), and an aborted run's replacement would pick the same number again. So the number
+    // moves past it instead.
+    let (plays_api, namespace, plan_name) = (&plays_api, &namespace, &plan_name);
+    let free = first_free_run_number(first, name_of, |job_name| async move {
+        let holder = if api.get_opt(&job_name).await?.is_some() {
+            "Job"
+        } else if plays_api.get_opt(&job_name).await?.is_some() {
+            "Play"
+        } else {
+            return Ok(false);
+        };
+        warn!(
+            "PlaybookPlan {namespace}/{plan_name}: run name {job_name} is held by a {holder} this plan did not create; numbering the run past it"
+        );
+        Ok(true)
     })
+    .await?;
+    match free {
+        Some(run_number) => Ok(SelectedJob {
+            job_name: name_of(run_number),
+            run_number,
+        }),
+        None => Err(ReconcileError::RunNamesTaken {
+            namespace: namespace.to_string(),
+            first: name_of(first),
+            last: name_of(first + (MAX_TAKEN_RUN_NAMES - 1)),
+        }),
+    }
+}
+
+/// How many consecutive run names [`select_job`] steps past before it gives up. Each step needs a
+/// foreign object at exactly the next name, so running out means something is creating them on
+/// purpose, and the error has to say so rather than keep counting.
+const MAX_TAKEN_RUN_NAMES: u32 = 16;
+
+/// The first run number from `first` on whose name `is_taken` finds nothing, or `None` once
+/// [`MAX_TAKEN_RUN_NAMES`] names in a row are taken.
+async fn first_free_run_number<Taken>(
+    first: u32,
+    name_of: impl Fn(u32) -> String,
+    mut is_taken: impl FnMut(String) -> Taken,
+) -> Result<Option<u32>, ReconcileError>
+where
+    Taken: std::future::Future<Output = Result<bool, ReconcileError>>,
+{
+    let mut run_number = first;
+    for _ in 0..MAX_TAKEN_RUN_NAMES {
+        if !is_taken(name_of(run_number)).await? {
+            return Ok(Some(run_number));
+        }
+        run_number = next_run_number(&[run_number])?;
+    }
+    Ok(None)
 }
 
 /// Creates this run's Job, tolerating the fact that it may already exist.
@@ -7898,7 +8450,7 @@ fn validate_selected_job(
     if !job_belongs_to_plan(job, plan_name.as_ref(), plan_uid.as_ref())
         || job_label(job, labels::PLAYBOOKPLAN_NAME) != Some(plan_name.as_ref())
         || job_label(job, labels::COMPONENT) != Some(labels::PLAYBOOK_COMPONENT)
-        || job_execution_hash(job)? != expected_hash
+        || job_execution_hash(job).ok() != Some(expected_hash)
         || actual_run_number != Some(expected_run_number)
         || job_label(job, labels::RUN_ID) != Some(expected_run_id)
         || job_template_label(job, labels::RUN_ID) != Some(expected_run_id)
@@ -7908,8 +8460,9 @@ fn validate_selected_job(
         || job_template_label(job, labels::PLAYBOOKPLAN_NAME) != Some(plan_name.as_ref())
         || job_template_label(job, labels::COMPONENT) != Some(labels::PLAYBOOK_COMPONENT)
     {
-        return Err(ReconcileError::PreconditionFailed(
-            "existing Job does not belong to the selected run",
+        return Err(ReconcileError::job_mismatch(
+            job,
+            "does not carry this run's identity",
         ));
     }
 
@@ -8674,9 +9227,24 @@ mod tests {
         let groups = vec![managed_ssh_group("nodes", &["a", "b"], None)];
         let hash = ExecutionHash::from_hex("1").unwrap();
 
-        let prepared =
-            job_builder::create_job_blueprint(&hash, 2, "run-1", &groups, &plan).unwrap();
-        let rebuilt = job_builder::create_job_blueprint(&hash, 2, "run-1", &groups, &plan).unwrap();
+        let prepared = job_builder::create_job_blueprint(
+            &hash,
+            2,
+            "run-1",
+            &groups,
+            &plan,
+            job_builder::TEST_DEADLINES,
+        )
+        .unwrap();
+        let rebuilt = job_builder::create_job_blueprint(
+            &hash,
+            2,
+            "run-1",
+            &groups,
+            &plan,
+            job_builder::TEST_DEADLINES,
+        )
+        .unwrap();
 
         assert_eq!(
             serde_json::to_value(&prepared).unwrap(),
@@ -8785,6 +9353,32 @@ mod tests {
         assert_eq!(next_run_number(&[3, 5, 0]).unwrap(), 6);
 
         assert!(next_run_number(&[u32::MAX]).is_err());
+    }
+
+    /// A name something else holds is stepped past rather than claimed, and a run of taken names as
+    /// long as `MAX_TAKEN_RUN_NAMES` is given up on instead of counted through.
+    #[tokio::test]
+    async fn select_job_steps_past_taken_names_and_gives_up_after_a_bounded_run() {
+        let name_of = |run_number: u32| format!("apply-web-abc-{run_number}");
+        let free_from = |first: u32, taken: Vec<u32>| async move {
+            first_free_run_number(first, name_of, |name| {
+                let taken = taken.iter().any(|&number| name == name_of(number));
+                async move { Ok(taken) }
+            })
+            .await
+            .unwrap()
+        };
+
+        assert_eq!(free_from(4, vec![]).await, Some(4));
+        assert_eq!(free_from(4, vec![4, 5, 7]).await, Some(6));
+        assert_eq!(
+            free_from(4, (4..4 + MAX_TAKEN_RUN_NAMES).collect()).await,
+            None
+        );
+        assert_eq!(
+            free_from(4, (4..3 + MAX_TAKEN_RUN_NAMES).collect()).await,
+            Some(3 + MAX_TAKEN_RUN_NAMES)
+        );
     }
 
     /// Why `select_job` reserves names across *every* revision instead of only the one it is naming.
@@ -10581,7 +11175,15 @@ mod tests {
         plan.metadata.namespace = Some("team".into());
         plan.metadata.uid = Some("plan-uid".into());
 
-        let job = job_builder::create_job_blueprint(&hash, 1, "run-1", &[], &plan).unwrap();
+        let job = job_builder::create_job_blueprint(
+            &hash,
+            1,
+            "run-1",
+            &[],
+            &plan,
+            job_builder::TEST_DEADLINES,
+        )
+        .unwrap();
         let template_labels = job
             .spec
             .as_ref()
@@ -11560,10 +12162,12 @@ spec:
     /// always adopted, whatever the plan now says, and only a free name may be abandoned. Getting
     /// this backwards would tear a live run's node-root infrastructure down underneath it.
     ///
-    /// A Job that is not this run's is neither, in either direction. Adopting it would put this
-    /// run's record behind work it did not commission; abandoning would release the host Leases
-    /// on the strength of an identity check, and a check that ever rejected a Job which genuinely was
-    /// ours would then let a second run start on hosts the first is still applying to.
+    /// A Job that is not this run's is never adopted, and is waited on until it has held the name
+    /// past the start timeout. Adopting it would put this run's record behind work it did not
+    /// commission; abandoning at once would release the host Leases on the strength of an identity
+    /// check, and a check that ever rejected a Job which genuinely was ours would then let a second
+    /// run start on hosts the first is still applying to. Waiting for ever would let any Job at the
+    /// name hold the run's hosts for the life of the plan.
     #[test]
     fn only_the_runs_own_job_is_adopted_and_only_a_free_name_abandoned() {
         for may_proceed in [true, false] {
@@ -11572,8 +12176,12 @@ spec:
                 JobPresenceAction::Adopt
             );
             assert_eq!(
-                decide_job_presence(may_proceed, RecordedJob::Foreign),
+                decide_job_presence(may_proceed, RecordedJob::Foreign { outlasted: false }),
                 JobPresenceAction::Contested
+            );
+            assert_eq!(
+                decide_job_presence(may_proceed, RecordedJob::Foreign { outlasted: true }),
+                JobPresenceAction::Displaced
             );
         }
         assert_eq!(
@@ -11598,7 +12206,15 @@ spec:
         plan.metadata.uid = Some("plan-uid".into());
 
         let own = || {
-            let mut job = job_builder::create_job_blueprint(&hash, 7, "run-1", &[], &plan).unwrap();
+            let mut job = job_builder::create_job_blueprint(
+                &hash,
+                7,
+                "run-1",
+                &[],
+                &plan,
+                job_builder::TEST_DEADLINES,
+            )
+            .unwrap();
             job_builder::correlate_job_to_play(&mut job, "play-uid");
             job.metadata.owner_references = Some(vec![playbookplan_owner_ref(&plan).unwrap()]);
             job
@@ -11611,8 +12227,15 @@ spec:
         let mut other_plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
         other_plan.metadata.namespace = Some("team".into());
         other_plan.metadata.uid = Some("other-plan-uid".into());
-        let mut foreign =
-            job_builder::create_job_blueprint(&hash, 7, "run-1", &[], &other_plan).unwrap();
+        let mut foreign = job_builder::create_job_blueprint(
+            &hash,
+            7,
+            "run-1",
+            &[],
+            &other_plan,
+            job_builder::TEST_DEADLINES,
+        )
+        .unwrap();
         job_builder::correlate_job_to_play(&mut foreign, "play-uid");
         foreign.metadata.owner_references =
             Some(vec![playbookplan_owner_ref(&other_plan).unwrap()]);
@@ -11622,8 +12245,15 @@ spec:
         );
 
         // Another run of this same plan, which shares the name's readable half but not the run.
-        let mut other_run =
-            job_builder::create_job_blueprint(&hash, 8, "run-2", &[], &plan).unwrap();
+        let mut other_run = job_builder::create_job_blueprint(
+            &hash,
+            8,
+            "run-2",
+            &[],
+            &plan,
+            job_builder::TEST_DEADLINES,
+        )
+        .unwrap();
         job_builder::correlate_job_to_play(&mut other_run, "other-play-uid");
         other_run.metadata.owner_references = Some(vec![playbookplan_owner_ref(&plan).unwrap()]);
         assert!(validate(&other_run).is_err());
@@ -12750,17 +13380,19 @@ spec:
         play.spec.execution_hash = "not-a-hash".into();
         assert!(matches!(
             recorded_run_from_play(&play),
-            Err(ReconcileError::PreconditionFailed(
-                "active Play has an invalid execution hash"
-            ))
+            Err(ReconcileError::RecordMismatch {
+                reason: "is active but has an invalid execution hash",
+                ..
+            })
         ));
 
         play.spec.execution_hash = "00001a".into();
         assert!(matches!(
             recorded_run_from_play(&play),
-            Err(ReconcileError::PreconditionFailed(
-                "active Play has an invalid execution hash"
-            ))
+            Err(ReconcileError::RecordMismatch {
+                reason: "is active but has an invalid execution hash",
+                ..
+            })
         ));
 
         let mut job = Job {
@@ -12783,9 +13415,10 @@ spec:
             .insert(labels::PLAYBOOKPLAN_HASH.into(), "not-a-hash".into());
         assert!(matches!(
             job_execution_hash(&job),
-            Err(ReconcileError::PreconditionFailed(
-                "active Job has no valid execution hash"
-            ))
+            Err(ReconcileError::JobMismatch {
+                reason: "has no valid execution hash",
+                ..
+            })
         ));
 
         job.metadata
@@ -12795,9 +13428,10 @@ spec:
             .insert(labels::PLAYBOOKPLAN_HASH.into(), "1A".into());
         assert!(matches!(
             job_execution_hash(&job),
-            Err(ReconcileError::PreconditionFailed(
-                "active Job has no valid execution hash"
-            ))
+            Err(ReconcileError::JobMismatch {
+                reason: "has no valid execution hash",
+                ..
+            })
         ));
     }
 
@@ -12807,7 +13441,15 @@ spec:
         plan.metadata.uid = Some("plan-uid".into());
         plan.metadata.namespace = Some("default".into());
         let hash = ExecutionHash::from_hex("1a").unwrap();
-        let mut job = job_builder::create_job_blueprint(&hash, 1, "run-1", &[], &plan).unwrap();
+        let mut job = job_builder::create_job_blueprint(
+            &hash,
+            1,
+            "run-1",
+            &[],
+            &plan,
+            job_builder::TEST_DEADLINES,
+        )
+        .unwrap();
         job_builder::correlate_job_to_play(&mut job, "play-uid");
 
         assert!(validate_selected_job(&job, &plan, hash, 1, "run-1", "play-uid").is_ok());
@@ -12816,9 +13458,10 @@ spec:
         // though it shares the plan, the execution hash and the run number.
         assert!(matches!(
             validate_selected_job(&job, &plan, hash, 1, "run-2", "play-uid"),
-            Err(ReconcileError::PreconditionFailed(
-                "existing Job does not belong to the selected run"
-            ))
+            Err(ReconcileError::JobMismatch {
+                reason: "does not carry this run's identity",
+                ..
+            })
         ));
 
         // The pod template's correlation has to hold too: a Job whose pods aren't tied to this Play
@@ -12838,9 +13481,10 @@ spec:
             .insert(labels::PLAY_UID_ANNOTATION.into(), "another-play".into());
         assert!(matches!(
             validate_selected_job(&tampered, &plan, hash, 1, "run-1", "play-uid"),
-            Err(ReconcileError::PreconditionFailed(
-                "existing Job does not belong to the selected run"
-            ))
+            Err(ReconcileError::JobMismatch {
+                reason: "does not carry this run's identity",
+                ..
+            })
         ));
 
         job.metadata
@@ -12850,9 +13494,10 @@ spec:
             .insert(labels::PLAY_UID_ANNOTATION.into(), "another-play".into());
         assert!(matches!(
             validate_selected_job(&job, &plan, hash, 1, "run-1", "play-uid"),
-            Err(ReconcileError::PreconditionFailed(
-                "existing Job does not belong to the selected run"
-            ))
+            Err(ReconcileError::JobMismatch {
+                reason: "does not carry this run's identity",
+                ..
+            })
         ));
     }
 
@@ -14816,6 +15461,350 @@ spec:
         assert!(
             may_have_published_labels(&plan),
             "a plan that declares a version may own labels from an earlier revision too"
+        );
+    }
+
+    const STALL_T0: &str = "2026-10-16T10:00:00Z";
+    const STALL_TIMEOUT: i64 = 600;
+
+    fn stall_secs(rfc3339: &str) -> i64 {
+        rfc3339
+            .parse::<k8s_openapi::jiff::Timestamp>()
+            .unwrap()
+            .as_second()
+    }
+
+    fn stall_job(ready: Option<i32>) -> Job {
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "apply-web-abc-1", "creationTimestamp": STALL_T0 },
+            "status": { "ready": ready },
+        }))
+        .unwrap()
+    }
+
+    fn stall_pod(status: serde_json::Value) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "apply-web-abc-1-x7k2p", "creationTimestamp": STALL_T0 },
+            "status": status,
+        }))
+        .unwrap()
+    }
+
+    /// The pod list is only paid for once a Job is past the timeout and has no ready pod, which
+    /// keeps it off every tick of a playbook that is actually running.
+    #[test]
+    fn only_an_old_job_without_a_ready_pod_may_have_stalled() {
+        let t0 = stall_secs(STALL_T0);
+        assert!(!job_may_have_stalled(
+            &stall_job(None),
+            t0 + 599,
+            STALL_TIMEOUT
+        ));
+        assert!(job_may_have_stalled(
+            &stall_job(None),
+            t0 + 600,
+            STALL_TIMEOUT
+        ));
+        assert!(job_may_have_stalled(
+            &stall_job(Some(0)),
+            t0 + 600,
+            STALL_TIMEOUT
+        ));
+        assert!(!job_may_have_stalled(
+            &stall_job(Some(1)),
+            t0 + 3600,
+            STALL_TIMEOUT
+        ));
+    }
+
+    /// A Job the Job controller cannot create a pod for (admission, quota, ServiceAccount) has
+    /// nothing to wait on but the clock, and the message has to say where to look instead.
+    #[test]
+    fn a_job_without_a_pod_stalls_at_the_timeout() {
+        let t0 = stall_secs(STALL_T0);
+        assert_eq!(
+            job_start_stall(&stall_job(None), &[], t0 + 599, STALL_TIMEOUT),
+            None
+        );
+        let reason = job_start_stall(&stall_job(None), &[], t0 + 600, STALL_TIMEOUT).unwrap();
+        assert!(
+            reason.starts_with("the Job did not start within 600s: no pod was created for it"),
+            "{reason}"
+        );
+
+        // A suspended Job creates no pod either, but the events would not say why.
+        let mut suspended = stall_job(None);
+        suspended.spec = Some(k8s_openapi::api::batch::v1::JobSpec {
+            suspend: Some(true),
+            ..Default::default()
+        });
+        let reason = job_start_stall(&suspended, &[], t0 + 600, STALL_TIMEOUT).unwrap();
+        assert!(
+            reason.starts_with("the Job did not start within 600s: the Job is suspended"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_stall_names_what_the_pod_is_waiting_on() {
+        let now = stall_secs(STALL_T0) + 600;
+
+        let unscheduled = stall_pod(serde_json::json!({
+            "phase": "Pending",
+            "conditions": [{
+                "type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                "message": "0/3 nodes are available",
+            }],
+        }));
+        assert_eq!(
+            job_start_stall(&stall_job(None), &[unscheduled], now, STALL_TIMEOUT).as_deref(),
+            Some(
+                "the Job did not start within 600s: pod apply-web-abc-1-x7k2p is not scheduled: \
+                 Unschedulable: 0/3 nodes are available"
+            )
+        );
+
+        // Every container behind a stuck init container reports `PodInitializing`; the one that is
+        // actually stuck is the answer.
+        let pulling = stall_pod(serde_json::json!({
+            "phase": "Pending",
+            "initContainerStatuses": [{
+                "name": "managed-ssh-preflight", "image": "i", "imageID": "", "ready": false,
+                "restartCount": 0,
+                "state": { "waiting": { "reason": "ImagePullBackOff", "message": "Back-off pulling image \"i\"" } },
+            }],
+            "containerStatuses": [{
+                "name": "ansible-playbook", "image": "i", "imageID": "", "ready": false,
+                "restartCount": 0,
+                "state": { "waiting": { "reason": "PodInitializing" } },
+            }],
+        }));
+        assert_eq!(
+            job_start_stall(&stall_job(None), &[pulling], now, STALL_TIMEOUT).as_deref(),
+            Some(
+                "the Job did not start within 600s: pod apply-web-abc-1-x7k2p: container \
+                 managed-ssh-preflight is waiting: ImagePullBackOff: Back-off pulling image \"i\""
+            )
+        );
+    }
+
+    /// Anything that is working is never a stall, however long it takes: a running init container
+    /// (the preflight gate, a collection download) or a playbook container that has started.
+    #[test]
+    fn a_job_that_is_working_never_stalls() {
+        let late = stall_secs(STALL_T0) + 10 * STALL_TIMEOUT;
+
+        let downloading = stall_pod(serde_json::json!({
+            "phase": "Pending",
+            "initContainerStatuses": [{
+                "name": "download-collections", "image": "i", "imageID": "", "ready": false,
+                "restartCount": 0,
+                "state": { "running": { "startedAt": STALL_T0 } },
+            }],
+        }));
+        assert_eq!(
+            job_start_stall(&stall_job(None), &[downloading], late, STALL_TIMEOUT),
+            None
+        );
+
+        let ran = stall_pod(serde_json::json!({
+            "phase": "Pending",
+            "containerStatuses": [{
+                "name": "ansible-playbook", "image": "i", "imageID": "", "ready": false,
+                "restartCount": 0,
+                "state": { "waiting": { "reason": "CrashLoopBackOff" } },
+                "lastState": { "terminated": { "exitCode": 1 } },
+            }],
+        }));
+        assert_eq!(
+            job_start_stall(&stall_job(None), &[ran], late, STALL_TIMEOUT),
+            None
+        );
+    }
+
+    /// The clock restarts when an init container finishes, so a download longer than the timeout
+    /// is not cut off in the moment before the playbook container starts.
+    #[test]
+    fn a_finished_init_container_restarts_the_clock() {
+        let finished = "2026-10-16T10:15:00Z";
+        let after_init = stall_pod(serde_json::json!({
+            "phase": "Pending",
+            "initContainerStatuses": [{
+                "name": "download-collections", "image": "i", "imageID": "", "ready": false,
+                "restartCount": 0,
+                "state": { "terminated": { "exitCode": 0, "finishedAt": finished } },
+            }],
+            "containerStatuses": [{
+                "name": "ansible-playbook", "image": "i", "imageID": "", "ready": false,
+                "restartCount": 0,
+                "state": { "waiting": { "reason": "CreateContainerConfigError", "message": "secret \"x\" not found" } },
+            }],
+        }));
+        let pods = [after_init];
+        let finished = stall_secs(finished);
+        assert_eq!(
+            job_start_stall(&stall_job(None), &pods, finished + 599, STALL_TIMEOUT),
+            None
+        );
+        assert_eq!(
+            job_start_stall(&stall_job(None), &pods, finished + 600, STALL_TIMEOUT).as_deref(),
+            Some(
+                "the Job did not start within 600s: pod apply-web-abc-1-x7k2p: container \
+                 ansible-playbook is waiting: CreateContainerConfigError: secret \"x\" not found"
+            )
+        );
+    }
+
+    /// A pod that was only created, or only got a Node, late (a quota freeing up, a cluster
+    /// autoscaler adding a Node) gets the whole timeout for its image pull from that moment on.
+    #[test]
+    fn a_late_pod_restarts_the_clock() {
+        let late = "2026-10-16T10:08:00Z";
+        let pulling = serde_json::json!({
+            "phase": "Pending",
+            "containerStatuses": [{
+                "name": "ansible-playbook", "image": "i", "imageID": "", "ready": false,
+                "restartCount": 0,
+                "state": { "waiting": { "reason": "ContainerCreating" } },
+            }],
+        });
+
+        let mut created_late = stall_pod(pulling.clone());
+        created_late.metadata.creation_timestamp =
+            Some(serde_json::from_value(late.into()).unwrap());
+        // A pod with no status yet counts too: its creation is all there is to go on.
+        let mut created_late_without_status = created_late.clone();
+        created_late_without_status.status = None;
+
+        let mut scheduled_late = pulling;
+        scheduled_late["conditions"] = serde_json::json!([{
+            "type": "PodScheduled", "status": "True", "lastTransitionTime": late,
+        }]);
+        let scheduled_late = stall_pod(scheduled_late);
+
+        let late = stall_secs(late);
+        for pod in [created_late, created_late_without_status, scheduled_late] {
+            let pods = [pod];
+            assert_eq!(
+                job_start_stall(&stall_job(None), &pods, late + 599, STALL_TIMEOUT),
+                None
+            );
+            assert!(job_start_stall(&stall_job(None), &pods, late + 600, STALL_TIMEOUT).is_some());
+        }
+    }
+
+    /// A foreign Job is judged by its own age, and one without a creation time is never judged
+    /// outlasted: missing data must not shorten the wait.
+    #[test]
+    fn a_foreign_job_outlasts_the_wait_by_its_own_age() {
+        let t0 = stall_secs(STALL_T0);
+        let job = stall_job(None);
+        assert!(!foreign_job_outlasted(
+            &job,
+            "run-1",
+            t0 + 599,
+            STALL_TIMEOUT
+        ));
+        assert!(foreign_job_outlasted(
+            &job,
+            "run-1",
+            t0 + 600,
+            STALL_TIMEOUT
+        ));
+        assert!(!foreign_job_outlasted(
+            &Job::default(),
+            "run-1",
+            t0 + 600,
+            STALL_TIMEOUT
+        ));
+    }
+
+    /// An unfinished Job whose pods would carry the run's ID may be the run's own with tampered
+    /// metadata, so it is waited on for as long as it may still create one.
+    #[test]
+    fn a_job_whose_pods_carry_the_run_id_is_waited_on_until_it_finishes() {
+        let late = stall_secs(STALL_T0) + 10 * STALL_TIMEOUT;
+        let job = |conditions: serde_json::Value| -> Job {
+            serde_json::from_value(serde_json::json!({
+                "metadata": { "name": "apply-web-abc-1", "creationTimestamp": STALL_T0 },
+                "spec": { "template": { "metadata": { "labels": { labels::RUN_ID: "run-1" } } } },
+                "status": { "conditions": conditions },
+            }))
+            .unwrap()
+        };
+
+        let unfinished = job(serde_json::json!([]));
+        assert!(!foreign_job_outlasted(
+            &unfinished,
+            "run-1",
+            late,
+            STALL_TIMEOUT
+        ));
+        assert!(foreign_job_outlasted(
+            &unfinished,
+            "run-2",
+            late,
+            STALL_TIMEOUT
+        ));
+
+        let finished = job(serde_json::json!([{ "type": "Complete", "status": "True" }]));
+        assert!(foreign_job_outlasted(
+            &finished,
+            "run-1",
+            late,
+            STALL_TIMEOUT
+        ));
+    }
+
+    /// Only a Job Kubernetes failed *for* its deadline is reported as having exceeded it; any other
+    /// failure of a Job that has a deadline keeps its own explanation.
+    #[test]
+    fn only_a_deadline_failure_reports_the_deadline() {
+        let failed = |reason: &str| -> Job {
+            serde_json::from_value(serde_json::json!({
+                "spec": { "activeDeadlineSeconds": 3600, "template": {} },
+                "status": { "conditions": [{ "type": "Failed", "status": "True", "reason": reason }] },
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            exceeded_deadline_seconds(&failed("DeadlineExceeded")),
+            Some(3600)
+        );
+        assert_eq!(
+            exceeded_deadline_seconds(&failed("BackoffLimitExceeded")),
+            None
+        );
+        assert_eq!(
+            RunDiagnostic::DeadlineExceeded { seconds: 3600 }
+                .summary_clause()
+                .as_deref(),
+            Some(" (the Job exceeded its deadline of 3600s)")
+        );
+    }
+
+    /// The recorded stall explains an unreadable recap, and only that: a Job that started after all
+    /// and finished before its cancellation landed reports its own result.
+    #[test]
+    fn a_recorded_stall_explains_only_an_unreadable_recap() {
+        let stalled = v1beta1::PlayStatus {
+            phase: v1beta1::PlayPhase::Unknown,
+            stall_reason: Some("the Job did not start within 600s: …".into()),
+            ..Default::default()
+        };
+        let diagnostic = RunDiagnostic::from_play_status(&stalled);
+        assert_eq!(
+            diagnostic.summary_clause().as_deref(),
+            Some(" (cancelled: the Job did not start within 600s: …)")
+        );
+
+        let finished_anyway = v1beta1::PlayStatus {
+            phase: v1beta1::PlayPhase::Failed,
+            ..stalled
+        };
+        assert_eq!(
+            RunDiagnostic::from_play_status(&finished_anyway),
+            RunDiagnostic::None
         );
     }
 }

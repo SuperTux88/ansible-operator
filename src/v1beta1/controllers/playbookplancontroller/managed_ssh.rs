@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::hash::{Hash as _, Hasher as _};
+use std::time::Duration;
 
 use k8s_openapi::{
     api::{
@@ -65,6 +66,62 @@ const SFTP_SUBSYSTEM_MARKER: &str = "ansible-operator-sftp";
 /// namespace, never the host's (an ancestor), so a session can't join it via nsenter — the pod's
 /// PID namespace has to start out as the host's.
 const HOST_PROC_MOUNT_PATH: &str = "/host/proc";
+
+/// Added on top of a run's deadline and wait, once for its certificates and once more for its pods:
+/// room for the steps between signing the certificates and the Job's clock starting that the proxy
+/// wait does not cover, and for the Job's pod to stop once the deadline is reached.
+const PROXY_LIFETIME_MARGIN: Duration = Duration::from_secs(15 * 60);
+
+/// How long a run's managed-ssh access lasts: the validity of its host and client certificates, and
+/// the `activeDeadlineSeconds` of its proxy pods. Both follow from the run's Job deadline, so a run
+/// holds credentials and node-root pods for as long as it may run and no longer.
+///
+/// The pod deadline is a backstop for a proxy pod the operator never deletes, such as one left
+/// behind when the operator was uninstalled mid-run or when a run's plan and records were removed by
+/// hand: past it, Kubernetes stops the pod whatever still refers to it. It is longer than the
+/// certificates, since sshd checks a certificate's validity only at login, so a session opened just
+/// before they expire may still be working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyLifetime {
+    /// How long the run's host and client certificates are valid from when they are signed.
+    pub certificate_validity: Duration,
+    /// The `activeDeadlineSeconds` of each of the run's proxy pods.
+    pub pod_deadline: Duration,
+}
+
+impl ProxyLifetime {
+    /// The lifetime of a run whose Job gets an `activeDeadlineSeconds` of `job_deadline_seconds`.
+    ///
+    /// The deadline is counted from the Job's start, but the certificates are signed before the
+    /// proxy pods are created, and the Job is only created once those are up. So the certificates
+    /// also cover `proxy_wait_seconds`, how long the operator waits for a proxy pod that does not
+    /// start, plus [`PROXY_LIFETIME_MARGIN`]; the pods get one margin more.
+    ///
+    /// That is not a hard bound on the time from signing to the Job's start: a `Running` pod on a
+    /// `Ready` Node is waited on without a limit, and failing ticks add to the wait. A run that set
+    /// up for that long can lose a new SSH login in its last minutes. Accepted, because a run that
+    /// close to its deadline is already at risk of exceeding it.
+    ///
+    /// The inputs are the live plan and the operator's config, never a recorded value. That is safe
+    /// for a resumed run: its preparation fingerprint covers the plan's spec, and a config change
+    /// restarts the operator, which rotates the CA and makes `reset_incomplete_run` sign afresh.
+    pub fn for_run(job_deadline_seconds: u32, proxy_wait_seconds: i64) -> Self {
+        let certificate_validity = Duration::from_secs(
+            u64::from(job_deadline_seconds) + u64::try_from(proxy_wait_seconds).unwrap_or(0),
+        ) + PROXY_LIFETIME_MARGIN;
+        Self {
+            certificate_validity,
+            pod_deadline: certificate_validity + PROXY_LIFETIME_MARGIN,
+        }
+    }
+}
+
+/// A lifetime for tests that build proxy resources without caring how long they last.
+#[cfg(test)]
+const TEST_LIFETIME: ProxyLifetime = ProxyLifetime {
+    certificate_validity: Duration::from_secs(2 * 60 * 60),
+    pod_deadline: Duration::from_secs(3 * 60 * 60),
+};
 
 /// The two taints Kubernetes automatically applies to a `NotReady`/unreachable Node. We tolerate
 /// them with an **empty `effect`** (matches every effect, i.e. both `NoSchedule` and `NoExecute`) and
@@ -586,9 +643,10 @@ fn build_secret(
     run_id: &str,
     host: &str,
     ca: &CertificateAuthority,
+    certificate_validity: Duration,
 ) -> Result<Secret, ReconcileError> {
     let host_key = crate::v1beta1::ca::generate_ephemeral_keypair()?;
-    let host_cert = ca.sign_host_cert(host_key.public_key(), host)?;
+    let host_cert = ca.sign_host_cert(host_key.public_key(), host, certificate_validity)?;
     let ca_pub = ca.public_key_openssh()?;
 
     let host_key_openssh = host_key
@@ -626,19 +684,21 @@ fn build_secret(
     })
 }
 
+/// Builds a host's proxy pod. It mounts the host's Secret, which [`resource_name`] names the same as
+/// the pod.
 fn build_pod(
     name: &str,
-    secret_name: &str,
     execution_hash: &ExecutionHash,
     run_id: &str,
     host: &str,
     tolerations: &[Toleration],
     proxy_image: &str,
+    active_deadline: Duration,
 ) -> Pod {
     let secret_volume = Volume {
         name: "sshd-config".into(),
         secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
-            secret_name: Some(secret_name.to_string()),
+            secret_name: Some(name.to_string()),
             // 0500 not 0400 — the entry script needs to be executable; sshd's host-key
             // permission check only cares about group/world access, which stays closed.
             default_mode: Some(0o0500),
@@ -719,6 +779,8 @@ fn build_pod(
             automount_service_account_token: Some(false),
             volumes: Some(vec![secret_volume, host_proc_volume]),
             restart_policy: Some("Never".into()),
+            // Kubernetes refuses a pod deadline above i32::MAX, which a Job deadline may exceed.
+            active_deadline_seconds: Some(active_deadline.as_secs().min(i32::MAX as u64) as i64),
             // Required: unlike the other host namespaces, PID can't be joined per-session via
             // nsenter (see HOST_PROC_MOUNT_PATH doc), so it must be shared from pod creation.
             host_pid: Some(true),
@@ -826,9 +888,14 @@ fn build_network_policy(
 fn render_client_cert_files(
     ca: &CertificateAuthority,
     run_id: &str,
+    certificate_validity: Duration,
 ) -> Result<BTreeMap<String, String>, ReconcileError> {
     let client_key = crate::v1beta1::ca::generate_ephemeral_keypair()?;
-    let client_cert = ca.sign_client_cert(client_key.public_key(), &["root", run_id])?;
+    let client_cert = ca.sign_client_cert(
+        client_key.public_key(),
+        &["root", run_id],
+        certificate_validity,
+    )?;
     let ca_pub = ca.public_key_openssh()?;
 
     let client_key_openssh = client_key
@@ -866,6 +933,7 @@ async fn ensure_client_cert(
     execution_hash: &ExecutionHash,
     run_id: &str,
     ca: &CertificateAuthority,
+    certificate_validity: Duration,
     plan_owner: &OwnerReference,
 ) -> Result<(), ReconcileError> {
     let name = client_cert_secret_name(run_id);
@@ -874,7 +942,7 @@ async fn ensure_client_cert(
         return Ok(());
     }
 
-    let string_data = render_client_cert_files(ca, run_id)?;
+    let string_data = render_client_cert_files(ca, run_id, certificate_validity)?;
 
     let secret = Secret {
         metadata: ObjectMeta {
@@ -916,6 +984,7 @@ pub async fn ensure_proxy_infra(
     grace_policy: &ProxyGracePolicy,
     not_ready_grace_cap_secs: Option<i64>,
     ca: &CertificateAuthority,
+    lifetime: ProxyLifetime,
     proxy_image: &str,
     network_policy_egress: Option<Vec<NetworkPolicyEgressRule>>,
     plan_owner: &OwnerReference,
@@ -947,7 +1016,15 @@ pub async fn ensure_proxy_infra(
             )
             .await?;
 
-        ensure_client_cert(&job_secrets_api, execution_hash, run_id, ca, plan_owner).await?;
+        ensure_client_cert(
+            &job_secrets_api,
+            execution_hash,
+            run_id,
+            ca,
+            lifetime.certificate_validity,
+            plan_owner,
+        )
+        .await?;
     }
 
     let now = chrono::Utc::now().timestamp();
@@ -975,7 +1052,14 @@ pub async fn ensure_proxy_infra(
                 )?;
             }
             None => {
-                let secret = build_secret(&name, execution_hash, run_id, host, ca)?;
+                let secret = build_secret(
+                    &name,
+                    execution_hash,
+                    run_id,
+                    host,
+                    ca,
+                    lifetime.certificate_validity,
+                )?;
                 secrets_api.create(&PostParams::default(), &secret).await?;
             }
         }
@@ -1003,12 +1087,12 @@ pub async fn ensure_proxy_infra(
             None => {
                 let pod = build_pod(
                     &name,
-                    &name,
                     execution_hash,
                     run_id,
                     host,
                     tolerations,
                     proxy_image,
+                    lifetime.pod_deadline,
                 );
 
                 pods_api.create(&PostParams::default(), &pod).await?
@@ -1088,12 +1172,6 @@ pub async fn ensure_proxy_infra(
 /// PlaybookPlan is the backstop if this explicit delete never runs (operator crash / plan deleted
 /// mid-run). Deleting it is not the revocation mechanism — that is the deletion of the proxy pods,
 /// which happens first and after which the cert authenticates to nothing (INV-4 / T-INFO-3).
-///
-/// Pods use a tighter selector than the operator-ns Secrets/NetworkPolicy: the ansible Job pod
-/// carries the same `PLAYBOOKPLAN_HASH` and `RUN_ID` labels but is NOT proxy infra — it must be
-/// reaped by its own Job's `ttlSecondsAfterFinished`, never here. That only collides when the
-/// operator and the plan share a namespace, but requiring the per-host `PLAYBOOKPLAN_HOST` label
-/// (which only proxy pods carry) excludes the ansible pod cleanly.
 pub async fn cleanup_proxy_infra(
     client: &kube::Client,
     operator_namespace: &str,
@@ -1102,11 +1180,45 @@ pub async fn cleanup_proxy_infra(
     run_id: &str,
     playbookplan_name: &str,
 ) -> Result<(), ReconcileError> {
+    cleanup_operator_namespace_infra(client, operator_namespace, execution_hash, run_id).await?;
+
+    let job_secrets_api: Api<Secret> = Api::namespaced(client.clone(), job_namespace);
+    let job_netpol_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), job_namespace);
+    let dp = DeleteParams::default();
+    delete_if_exists(
+        &job_netpol_api,
+        &super::job_builder::job_network_policy_name(playbookplan_name, run_id),
+        &dp,
+    )
+    .await?;
+    // Plan-namespace client-cert Secret: by name, never by label (would catch the Job/pod). See doc.
+    delete_if_exists(&job_secrets_api, &client_cert_secret_name(run_id), &dp).await?;
+
+    Ok(())
+}
+
+/// The operator-namespace half of [`cleanup_proxy_infra`]: the run's proxy pods, their per-host
+/// Secrets and its NetworkPolicy, in that order. Returns how many proxy pods the delete reached,
+/// which includes pods that an earlier call already set terminating.
+///
+/// On its own for a plan whose namespace is no longer enrolled, where the operator holds no RBAC for
+/// the plan-namespace half. Everything left there is owned by the plan, so Kubernetes reaps it with
+/// the plan, whereas nothing but this operator can ever reach what is deleted here.
+///
+/// Pods use a tighter selector than the Secrets and the NetworkPolicy: the ansible Job pod carries
+/// the same `PLAYBOOKPLAN_HASH` and `RUN_ID` labels but is NOT proxy infra — it must be reaped by its
+/// own Job's `ttlSecondsAfterFinished`, never here. That only collides when the operator and the plan
+/// share a namespace, but requiring the per-host `PLAYBOOKPLAN_HOST` label (which only proxy pods
+/// carry) excludes the ansible pod cleanly (INV-7).
+pub async fn cleanup_operator_namespace_infra(
+    client: &kube::Client,
+    operator_namespace: &str,
+    execution_hash: &ExecutionHash,
+    run_id: &str,
+) -> Result<usize, ReconcileError> {
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), operator_namespace);
     let secrets_api: Api<Secret> = Api::namespaced(client.clone(), operator_namespace);
     let netpol_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), operator_namespace);
-    let job_secrets_api: Api<Secret> = Api::namespaced(client.clone(), job_namespace);
-    let job_netpol_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), job_namespace);
 
     let dp = DeleteParams::default();
     let run_selector = format!(
@@ -1121,19 +1233,15 @@ pub async fn cleanup_proxy_infra(
     // Hash + run ID selector: no other run shares this cleanup identity.
     let rest_lp = ListParams::default().labels(&run_selector);
 
-    pods_api.delete_collection(&dp, &pods_lp).await?;
+    let deleted_pods = pods_api
+        .delete_collection(&dp, &pods_lp)
+        .await?
+        .left()
+        .map_or(0, |pods| pods.items.len());
     secrets_api.delete_collection(&dp, &rest_lp).await?;
     netpol_api.delete_collection(&dp, &rest_lp).await?;
-    delete_if_exists(
-        &job_netpol_api,
-        &super::job_builder::job_network_policy_name(playbookplan_name, run_id),
-        &dp,
-    )
-    .await?;
-    // Plan-namespace client-cert Secret: by name, never by label (would catch the Job/pod). See doc.
-    delete_if_exists(&job_secrets_api, &client_cert_secret_name(run_id), &dp).await?;
 
-    Ok(())
+    Ok(deleted_pods)
 }
 
 async fn delete_if_exists<K>(
@@ -1172,6 +1280,7 @@ mod tests {
             "run-1",
             "worker-1",
             &CertificateAuthority::generate().unwrap(),
+            TEST_LIFETIME.certificate_validity,
         )
         .unwrap();
         let ours = |metadata: &ObjectMeta| {
@@ -1238,12 +1347,12 @@ mod tests {
         let name = resource_name("worker-1", "run-1");
         let pod = build_pod(
             &name,
-            &name,
             &hash,
             "run-1",
             "worker-1",
             &[],
             "proxy:latest",
+            TEST_LIFETIME.pod_deadline,
         );
 
         assert!(proxy_pod_targets_host(&pod, "worker-1"));
@@ -1357,13 +1466,22 @@ mod tests {
 
         // Both objects, because both are what an administrator finds when looking for a node's proxy
         // infrastructure, and the label on each may be the shortened form.
-        let pod = build_pod(&name, &name, &hash, "run-1", &long, &[], "proxy:latest");
+        let pod = build_pod(
+            &name,
+            &hash,
+            "run-1",
+            &long,
+            &[],
+            "proxy:latest",
+            TEST_LIFETIME.pod_deadline,
+        );
         let secret = build_secret(
             &name,
             &hash,
             "run-1",
             &long,
             &CertificateAuthority::generate().unwrap(),
+            TEST_LIFETIME.certificate_validity,
         )
         .unwrap();
 
@@ -1427,7 +1545,15 @@ mod tests {
             crate::v1beta1::PlaybookPlan::new("web", crate::v1beta1::PlaybookPlanSpec::default());
         plan.metadata.namespace = Some("team".into());
         plan.metadata.uid = Some("plan-uid".into());
-        let job = job_builder::create_job_blueprint(&hash, 1, run_id, &[], &plan).unwrap();
+        let job = job_builder::create_job_blueprint(
+            &hash,
+            1,
+            run_id,
+            &[],
+            &plan,
+            job_builder::TEST_DEADLINES,
+        )
+        .unwrap();
         let job_pod_labels = job
             .spec
             .as_ref()
@@ -1454,12 +1580,12 @@ mod tests {
         // A proxy pod, by contrast, is matched by every part of the selector.
         let proxy = build_pod(
             "ansible-sshd-worker-1-run-1",
-            "ansible-sshd-worker-1-run-1",
             &hash,
             run_id,
             "worker-1",
             &[],
             "proxy:latest",
+            TEST_LIFETIME.pod_deadline,
         );
         let proxy_labels = proxy.metadata.labels.as_ref().unwrap();
         for key in [
@@ -1480,12 +1606,12 @@ mod tests {
         let hash = calculate_execution_hash("playbook", std::iter::empty());
         let pod = build_pod(
             "ansible-sshd-worker-1-run-1",
-            "ansible-sshd-worker-1-run-1",
             &hash,
             "run-1",
             "worker-1",
             &[],
             "proxy:latest",
+            TEST_LIFETIME.pod_deadline,
         );
         let spec = pod.spec.as_ref().unwrap();
 
@@ -1513,6 +1639,41 @@ mod tests {
         let added = security.capabilities.as_ref().unwrap().add.clone().unwrap();
         assert!(added.contains(&"SYS_ADMIN".to_string()));
         assert!(added.contains(&"SYS_PTRACE".to_string()));
+
+        // Bounded even when the operator never deletes it.
+        assert_eq!(
+            spec.active_deadline_seconds,
+            Some(TEST_LIFETIME.pod_deadline.as_secs() as i64)
+        );
+    }
+
+    /// A run's access has to outlast the run, which its Job's deadline bounds, and the Job's clock
+    /// starts only after the proxy pods are up — so the certificates cover the wait as well, and the
+    /// pod outlives the certificates for a session that logged in just before they expired.
+    #[test]
+    fn a_runs_proxy_lifetime_covers_its_deadline_and_the_wait_before_it() {
+        let wait = 600;
+        for deadline in [60, 7200, 86_400, u32::MAX] {
+            let lifetime = ProxyLifetime::for_run(deadline, wait);
+            assert!(
+                lifetime.certificate_validity.as_secs() > u64::from(deadline) + wait as u64,
+                "certificates for a {deadline}s deadline"
+            );
+            assert!(lifetime.pod_deadline > lifetime.certificate_validity);
+        }
+
+        // A one-day deadline gets slightly more than a day, not a multiple of it.
+        let day = ProxyLifetime::for_run(86_400, wait);
+        assert!(day.pod_deadline <= Duration::from_secs(86_400 + 60 * 60));
+
+        // A negative wait cannot come from config the operator accepts, but must not shorten the
+        // certificates below the deadline if it ever did.
+        assert!(
+            ProxyLifetime::for_run(7200, -1)
+                .certificate_validity
+                .as_secs()
+                > 7200
+        );
     }
 
     #[test]
@@ -1546,8 +1707,15 @@ mod tests {
         let ca = CertificateAuthority::generate().unwrap();
         let hash = calculate_execution_hash("playbook-a", std::iter::empty());
 
-        let secret =
-            build_secret("ansible-sshd-worker-1-abc", &hash, "run-1", "worker-1", &ca).unwrap();
+        let secret = build_secret(
+            "ansible-sshd-worker-1-abc",
+            &hash,
+            "run-1",
+            "worker-1",
+            &ca,
+            TEST_LIFETIME.certificate_validity,
+        )
+        .unwrap();
         let principals = secret
             .string_data
             .as_ref()
@@ -2024,10 +2192,17 @@ mod container_tests {
 
         // Server: proxy config for run B — host cert principal = HOST_NAME, and the
         // AuthorizedPrincipalsFile carries only run B's run ID.
-        let server_files = build_secret("proxy-b", &run_b, "run-b", HOST_NAME, &ca)
-            .unwrap()
-            .string_data
-            .expect("proxy secret must carry string_data");
+        let server_files = build_secret(
+            "proxy-b",
+            &run_b,
+            "run-b",
+            HOST_NAME,
+            &ca,
+            TEST_LIFETIME.certificate_validity,
+        )
+        .unwrap()
+        .string_data
+        .expect("proxy secret must carry string_data");
 
         // Clients: run B's cert (must be accepted) and run A's cert (must be rejected), both off
         // the same CA — so only the principal, not the signature, distinguishes them.
@@ -2035,11 +2210,11 @@ mod container_tests {
         let client_a = tempfile::tempdir().unwrap();
         write_client_files(
             client_b.path(),
-            &render_client_cert_files(&ca, "run-b").unwrap(),
+            &render_client_cert_files(&ca, "run-b", TEST_LIFETIME.certificate_validity).unwrap(),
         );
         write_client_files(
             client_a.path(),
-            &render_client_cert_files(&ca, "run-a").unwrap(),
+            &render_client_cert_files(&ca, "run-a", TEST_LIFETIME.certificate_validity).unwrap(),
         );
 
         // Boot the real proxy image with our rendered config injected into its own fs layer. The

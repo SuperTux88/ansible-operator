@@ -281,7 +281,9 @@ For a run targeting Nodes, the operator:
 6. Tears the proxy pods, their Secrets, and the NetworkPolicy down when the run finishes.
 
 There is **no standing agent or DaemonSet** on your Nodes: proxy pods exist only for the duration of
-a run. The security properties of this path — per-run certificate isolation, the in-memory CA,
+a run. Kubernetes stops a proxy pod even if the operator never deletes it, shortly after the run's
+deadline (see [Bounding how long a run takes](./playbook-plans.md#bounding-how-long-a-run-takes)).
+The security properties of this path — per-run certificate isolation, the in-memory CA,
 and why `NodeAccessPolicy` is mandatory — are covered in
 [Security model](../cluster-operators/security.md).
 

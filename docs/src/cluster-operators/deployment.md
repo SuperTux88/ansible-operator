@@ -154,6 +154,51 @@ again, so a longer wait on a short schedule would make the plan miss ticks. See
 [NotReady nodes](../running-playbooks/cluster-nodes.md#notready-nodes) for what happens to such a
 Node afterwards.
 
+## Runs whose Job never starts
+
+A run's Job can exist without ever starting the playbook: its pod is refused by Pod Security
+admission, a webhook or a `ResourceQuota`, its ServiceAccount does not exist, nothing schedules it,
+or its image cannot be pulled. Kubernetes keeps such a Job active indefinitely. The operator cancels
+the run once its Job has gone `runs.startTimeoutSeconds` without starting. The run's hosts are then
+reported `Unknown`, its host Leases and proxy pods are released, and it spends one of the plan's
+attempts, so `maxAttempts` bounds how often a broken image is retried. The plan's summary says what
+the Job was waiting on (see [The plan is stuck in
+`Applying`](../running-playbooks/results-and-troubleshooting.md#the-plan-is-stuck-in-applying)).
+
+```yaml
+# values.yaml
+runs:
+  startTimeoutSeconds: 600
+```
+
+The clock only runs while nothing in the Job's pod is running and the playbook container has never
+started. It restarts when the pod is created, when it is scheduled onto a Node, and whenever one of
+its init containers finishes. A long collection download or a long playbook is therefore never cut
+off, and neither is a pod that only got a Node late, for example from a cluster autoscaler. Set the
+timeout above the time an image pull takes on a Node that does not have the image yet. Like the
+other config values, a change rolls the operator.
+
+## Run time limits
+
+Every run's Job has a deadline, after which Kubernetes stops it. A plan sets its own with
+`spec.activeDeadlineSeconds` (see [Bounding how long a run
+takes](../running-playbooks/playbook-plans.md#bounding-how-long-a-run-takes)). Two chart values
+bound it:
+
+```yaml
+# values.yaml
+runs:
+  defaultActiveDeadlineSeconds: 7200   # a plan that sets none of its own
+  maxActiveDeadlineSeconds: 86400      # the most any plan gets
+```
+
+A plan's own value wins over the default in both directions, but never past the maximum: a plan
+that asks for more is held to it. The default must lie between 1 and the maximum, otherwise the chart
+refuses to render and the operator refuses to start.
+
+On a run that reaches cluster Nodes, the deadline also decides how long the run's SSH certificates
+and proxy pods last, so the maximum is also the longest a run can have root on a Node.
+
 ## Enrolled namespaces
 
 The operator's cluster-wide RBAC does **not** include `secrets`, `jobs`, or `pods`. Those verbs are
@@ -181,14 +226,18 @@ Two consequences to plan for:
   **dedicated to Ansible ops**, not general-purpose application namespaces, so this power covers as
   few unrelated Secrets as possible. See
   [Security model → the blast radius you accept](./security.md#blast-radius).
-- **Un-enrol a namespace only while its plans are idle.** A plan with a run in flight carries the
-  `ansible.cloudbending.dev/run-cleanup` finalizer, and the `patch` permission that lets the operator
-  remove it again is granted per enrolled namespace. Removing the namespace from `watchNamespaces`
-  while a run is active therefore leaves any plan deleted afterwards stuck in `Terminating`: the
-  operator can no longer release the run *or* drop its own finalizer. Recovering means re-enrolling
-  the namespace (the operator then finishes the teardown on its own), or removing the finalizer by
-  hand and cleaning the run up with the
-  [manual procedure](../running-playbooks/results-and-troubleshooting.md#the-plan-is-stuck-in-applying).
+- **Un-enrol a namespace only while its plans are idle.** A run in flight there is cut off rather
+  than finished. When the operator starts with the new set, it deletes the run's managed-ssh proxy
+  pods and releases its host Leases, because those live in the operator's namespace and nothing else
+  would ever remove them. That ends the run's access to cluster Nodes, but not the run: its Job and
+  everything else it created in the plan's namespace are out of the operator's reach, and the Job
+  goes on running against any `StaticInventory` hosts, without the host locks that keep other plans
+  off them. The plan also keeps the `ansible.cloudbending.dev/run-cleanup` finalizer, and the `patch`
+  permission that lets the operator remove it is granted per enrolled namespace, so a plan deleted
+  afterwards stays in `Terminating`. Re-enrolling the namespace lets the operator finish the run and
+  the teardown on its own. Removing the finalizer by hand is also safe once the operator has released
+  the run (`kubectl get pods -n <operator-namespace> -l ansible.cloudbending.dev/run-id=<runId>`
+  returns nothing): everything the run still holds is owned by the plan and is deleted with it.
   Check for active runs before un-enrolling:
 
   ```sh
@@ -213,7 +262,9 @@ Two of those grants are wider than what the operator does with them, because RBA
 narrower rule:
 
 - **`delete` on `batch/jobs`** cancels the run of a plan that is deleted mid-run, or whose `Play` record
-  is removed, rather than leaving its pod to the deleting client's propagation policy. The operator
+  is removed, rather than leaving its pod to the deleting client's propagation policy. It also
+  cancels a run whose Job never started (see [Runs whose Job never
+  starts](#runs-whose-job-never-starts)). The operator
   deletes only a Job whose identity it has validated, and passes that Job's UID as a delete
   precondition, but the grant itself covers every Job in the namespace.
 - **`patch` on `playbookplans`** carries the `ansible.cloudbending.dev/run-cleanup` finalizer, which
@@ -230,8 +281,10 @@ This matters for more than ordinary workload separation. The operator records a 
 its Job and later checks the Job's owner reference and run labels to identify it. A principal that can
 create Jobs in an enrolled namespace can occupy an expected Job name, or copy the operator's identity
 metadata onto a different pod template. The reconciler refuses an ordinary foreign Job and waits for
-it, but object metadata alone cannot prove which principal created a Job that carries all the expected
-fields.
+it for up to its start timeout (see [Runs whose Job never starts](#runs-whose-job-never-starts)),
+unless its pod template carries the run's ID: an unfinished Job like that may be the run's own, so
+the run waits until it finishes or is deleted. Object metadata alone cannot prove which principal
+created a Job that carries all the expected fields.
 
 Check the effective permission for the operator and for every other principal that may act in an
 enrolled namespace. Replace the ServiceAccount names with the ones used by your installation:

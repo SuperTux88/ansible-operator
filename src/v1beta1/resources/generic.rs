@@ -11,6 +11,10 @@ pub type LabelMap = BTreeMap<String, String>;
 /// of the CRD (it only knows `int32`/`int64`). This emits a plain non-negative integer
 /// (`type: integer, minimum: 0`) instead — the same value constraint, without the unrecognised
 /// format. Use `Option<UnsignedInt>` for optional `u32` fields.
+///
+/// The maximum is not decoration: the API server admits any int64 for a plain integer, and one
+/// object the operator cannot decode fails the whole LIST behind its watch, for every object of the
+/// kind.
 pub struct UnsignedInt;
 
 /// Marker type for `u32` fields whose zero value is meaningless, emitting the same
@@ -26,7 +30,8 @@ impl JsonSchema for PositiveInt {
     fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
         serde_json::from_value(serde_json::json!({
             "type": "integer",
-            "minimum": 1
+            "minimum": 1,
+            "maximum": u32::MAX
         }))
         .unwrap()
     }
@@ -40,7 +45,8 @@ impl JsonSchema for UnsignedInt {
     fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
         serde_json::from_value(serde_json::json!({
             "type": "integer",
-            "minimum": 0
+            "minimum": 0,
+            "maximum": u32::MAX
         }))
         .unwrap()
     }

@@ -92,7 +92,7 @@ pub struct PlaybookPlanSpec {
     /// above 4 are clamped to 4. Affects log detail only — it is not part of the execution hash, so
     /// changing it does not re-run the playbook on already-current hosts.
     #[schemars(with = "Option<UnsignedInt>")]
-    pub verbosity: Option<u8>,
+    pub verbosity: Option<u32>,
 
     /// Controls if a playbook is executed once or repeatedly
     #[schemars(default)]
@@ -161,7 +161,17 @@ pub struct PlaybookPlanSpec {
     /// flight when its plan is deleted, which is cancelled rather than left running; such a run
     /// never reaches this TTL. Values below 60 seconds are silently raised to 60; unset uses the
     /// operator's default.
+    #[schemars(range(min = i32::MIN, max = i32::MAX))]
     pub ttl_seconds_after_finished: Option<i32>,
+
+    /// The longest a run's Job may stay active, in seconds, before Kubernetes stops it — the Job's
+    /// own `activeDeadlineSeconds`, counted from when the Job starts, so it includes the time its pod
+    /// takes to start. A run stopped this way has no recap, so its hosts are reported `Unknown` and
+    /// it spends an attempt. Unset uses the operator's default (two hours unless the cluster
+    /// administrator changed it), and any value is held to the administrator's maximum (one day by
+    /// default). Changing it does not re-run hosts that are already up to date.
+    #[schemars(with = "Option<PositiveInt>")]
+    pub active_deadline_seconds: Option<u32>,
 
     /// How many successful `Play` history records to keep for this plan before the oldest are
     /// pruned. Unlike the Job's short TTL, Plays are the durable run history. A terminal result is
@@ -773,6 +783,61 @@ mod tests {
         );
     }
 
+    /// Every integer the CRD admits must decode into the field behind it. The API server accepts any
+    /// int64 for an unbounded integer, and a single plan the operator cannot decode fails the LIST
+    /// behind the plan watch for every plan in the cluster. Only `int64` fields may go unbounded,
+    /// since the API server itself refuses anything wider.
+    #[test]
+    fn every_integer_the_crd_admits_decodes() {
+        use kube::CustomResourceExt as _;
+
+        fn integer_fields(schema: &serde_json::Value, path: String, out: &mut Vec<String>) {
+            if schema["type"] == "integer" && schema["format"] != "int64" {
+                assert!(
+                    schema["minimum"].is_number() && schema["maximum"].is_number(),
+                    "{path} admits integers its Rust type cannot hold"
+                );
+                out.push(path.clone());
+            }
+            for (name, property) in schema["properties"].as_object().into_iter().flatten() {
+                integer_fields(property, format!("{path}.{name}"), out);
+            }
+            integer_fields_in(&schema["items"], format!("{path}[]"), out);
+            integer_fields_in(&schema["additionalProperties"], format!("{path}{{}}"), out);
+        }
+        fn integer_fields_in(schema: &serde_json::Value, path: String, out: &mut Vec<String>) {
+            if schema.is_object() {
+                integer_fields(schema, path, out);
+            }
+        }
+
+        let crd = serde_json::to_value(PlaybookPlan::crd()).unwrap();
+        let spec = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        let mut fields = Vec::new();
+        integer_fields(spec, "spec".into(), &mut fields);
+        assert!(fields.contains(&"spec.activeDeadlineSeconds".to_string()));
+
+        let mut plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+        plan.metadata.namespace = Some("team".into());
+        let plan = serde_json::to_value(plan).unwrap();
+        for field in fields {
+            let name = field
+                .strip_prefix("spec.")
+                .filter(|name| !name.contains(['.', '[', '{']))
+                .unwrap_or_else(|| panic!("{field} is nested; extend this test to set it"));
+            for bound in ["minimum", "maximum"] {
+                // The CRD types carry bounds as floats; a user writes them as integers.
+                let value = spec["properties"][name][bound].as_f64().unwrap() as i64;
+                let mut admitted = plan.clone();
+                admitted["spec"][name] = value.into();
+                assert!(
+                    serde_json::from_value::<PlaybookPlan>(admitted).is_ok(),
+                    "the {bound} the CRD admits for {field} does not decode"
+                );
+            }
+        }
+    }
+
     /// A `Recurring` plan with no `schedule` is refused at `kubectl apply`. Nothing but the clock
     /// starts a run for that mode, so such a plan is admitted, reports nothing wrong and never runs
     /// — an absence no status field is a good place to report.
@@ -899,6 +964,7 @@ mod tests {
                 }],
                 provides: None,
                 ttl_seconds_after_finished: None,
+                active_deadline_seconds: None,
                 successful_plays_history_limit: None,
                 failed_plays_history_limit: None,
                 template: PlaybookTemplate {

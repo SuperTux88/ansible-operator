@@ -68,7 +68,7 @@ src/main.rs                          entrypoint (clap `run`/`crds`), tracing, ge
 src/config.rs                        OperatorConfig (TOML): watch_namespaces (enrolled set) + proxy_image; read once at startup from the mounted ConfigMap
 src/utils.rs                         create_or_update helper, Condition trait, generate_id (k8s-like short ID)
 src/v1beta1/
-  ca.rs                              ephemeral in-memory SSH CA (Ed25519); signs host + client certs; CERT_VALIDITY = 2h (INV-6)
+  ca.rs                              ephemeral in-memory SSH CA (Ed25519); signs host + client certs for a given validity, which `managed_ssh::ProxyLifetime` derives from the run's Job deadline (INV-6)
   resources/                         CRD types (kube::CustomResource)
     playbookplan.rs                  PlaybookPlan: spec, status, Phase (incl. UnauthorizedNamespace)
     cluster_inventory.rs             ClusterInventory: hosts resolved from Node labels → managed-ssh (node-root)
@@ -128,7 +128,10 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
 1. **Enrollment guard (R1).** If the plan's namespace isn't in the enrolled set
    (`config.rs`: operator ns ∪ `watch_namespaces`), refuse with `Phase::UnauthorizedNamespace`
    and `await_change` — before any Secret/Job call (the operator holds no Secret/Job RBAC
-   outside the enrolled set).
+   outside the enrolled set). It runs ahead of the deletion branch too, and releases the
+   operator-namespace half of a run still in flight (`release_unenrolled_run`: proxy pods, then
+   host Leases, from the `status.activeRun` mirror — the `Play`, Job and finalizer are out of
+   reach), since nothing else would ever remove those node-root pods.
    A **name guard** follows in the same shape (`plan_name_within_label_limit`): a plan name over
    `MAX_PLAN_NAME_LEN` (63, the *label value* cap — the name is written as a label onto the `Play`,
    the Job, its pod template and the run's NetworkPolicy) is refused with `Phase::Failed` and
@@ -200,6 +203,15 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    This is also where a run whose `Play` is gone is `finalize_lost_run`'d (infra released, hosts
    `Unknown`) — not in step 0a: recovery has no record left to dispatch on, so it is the *mirror*
    in `status.activeRun` that brings the run here to be released.
+   A Job that is not terminal but never started (`job_start_stall`: no container running, the
+   playbook container never started, nothing progressed for `runs.startTimeoutSeconds`, with the
+   clock restarted by the pod's creation and scheduling and by every finished init container) is
+   cancelled here too: the reason goes onto
+   the `Play` first (`record_stalled`, `PlayStatus.stallReason`), then `cancel_run_job`, and the run
+   finishes through the normal path with hosts `Unknown`, spending an attempt. The reason has to be
+   written before the cancellation because the Job and its pods are the only other place it can be
+   read, and the finishing tick sees nothing but a missing Job. Judged by time, not by a list of
+   waiting reasons: a list cannot speak for a Job with no pod at all.
 9. **`patch_status`** — JSON **merge patch** (not `replace_status`); many async steps pass
    between read and write, so a version-checked PUT would routinely 409. It is also where the
    suspension contract is held (`suspended_advertises_no_next_run`): a tick has several ways to write
@@ -401,6 +413,14 @@ handful of decisions that are easy to undo by accident:
   deliberately does *not* second-guess a `Running` record's Job: only `advance_active_run` can tell an
   unfinished foreign Job (wait) from a finished one (finalize with no recap), and deciding it in
   recovery wedged the plan forever.
+- **A foreign Job at a run's name is waited on, but only up to the start timeout**, measured by
+  the foreign Job's own age (`foreign_job_outlasted`). Then a `Launching` run is `Displaced`
+  (abandoned, and `select_job` numbers its replacement past the name) and a `Running` one finishes
+  with no recap, in both cases only once no pod carrying the run's ID may still execute. Do not drop
+  that pod check to abandon at first sight: it is the only evidence left if the identity check ever
+  rejected a Job that was the run's own, and skipping it would release the Leases under a live run.
+  For the same reason an unfinished Job whose pod template carries the run's ID never outlasts the
+  wait: it may not have created its pod yet.
 - **`PlaybookPlanStatus.activeRun` is a thin mirror** of what *finishing* a run needs, so a run whose
   `Play` was deleted can still be released (`finalize_lost_run`) instead of wedging in `Applying`. It
   is read from the reflector cache, which lags this controller's own writes, so `finalize_lost_run`
@@ -434,6 +454,10 @@ is load-bearing: `shortid` truncates a 64-bit hash to ten symbols, so two revisi
 (same UID) can still produce the same name, and per-hash numbering would let one claim a name a
 retained record of the other still holds — `record_prepared` then rejects it as another run's on
 every tick until pruning removes it.
+What it counts is only the plan's *own* objects, so it then reads the candidate name directly and
+steps past one held by a Job or `Play` it did not count (one created outside the operator, or
+another plan colliding on the truncated name), up to `MAX_TAKEN_RUN_NAMES`. Without that, a run
+given up because a foreign Job holds its name would hand its replacement the same number again.
 The number, not the hash, is what makes the name unique; a new revision therefore does not restart at
 1. It **never adopts an already-running Job**: every Job the operator creates has
 a `Play` recorded before it, so an active Job that `recover_active_run` didn't account for isn't this

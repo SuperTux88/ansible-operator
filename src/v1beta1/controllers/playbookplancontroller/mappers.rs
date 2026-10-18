@@ -6,7 +6,7 @@ use kube::runtime::reflector::{ObjectRef, Store};
 use tracing::debug;
 
 use crate::v1beta1::{
-    self, ClusterInventory, ExecutionMode, HostOutcome, InventoryRef, NodeAccessPolicy,
+    self, ClusterInventory, ExecutionMode, HostOutcome, InventoryRef, NodeAccessPolicy, Phase,
     StaticInventory,
     playbookplancontroller::{
         execution_evaluator, node_readiness, node_recreation, reconciler, status,
@@ -196,6 +196,11 @@ pub fn node_to_playbookplans(
 /// update of its Node until 03:00. Asked last, after the host has proved owed, since it parses the
 /// schedule.
 ///
+/// A plan whose namespace is not enrolled cannot act on a Node at all: the enrollment guard refuses
+/// it before anything a Node could change is read. Its hosts stay owed for as long as it is refused,
+/// and a run it had in flight leaves it with budget to spare, so without this every Node event would
+/// wake it into the guard, which releases that run's infrastructure again each time.
+///
 /// The budget check cannot strand a plan the readiness gate is holding, which an allow-list of
 /// wakeable outcomes would: that hold is only ever asserted inside
 /// `eligible_to_start`, which already requires the budget, so a held plan always has one.
@@ -250,6 +255,9 @@ fn plan_awaits_node(
     let Some(status) = plan.status.as_ref() else {
         return false;
     };
+    if status.phase == Phase::UnauthorizedNamespace {
+        return false;
+    }
 
     let targeted = status
         .eligible_hosts
@@ -892,6 +900,21 @@ mod tests {
         );
 
         plan.spec.suspend = true;
+
+        assert!(!plan_awaits_node(&plan, &unreplaced_node(), "node-a"));
+    }
+
+    /// A refused plan's hosts stay owed for as long as it is refused, and each wake would cost the
+    /// guard's release of its stranded run again.
+    #[test]
+    fn a_plan_in_a_namespace_that_is_not_enrolled_awaits_nothing() {
+        let mut plan = plan_awaiting("node-a", host("", HostOutcome::Unreachable));
+        assert!(
+            plan_awaits_node(&plan, &unreplaced_node(), "node-a"),
+            "the same plan enrolled is one the watch exists for"
+        );
+
+        plan.status.as_mut().unwrap().phase = Phase::UnauthorizedNamespace;
 
         assert!(!plan_awaits_node(&plan, &unreplaced_node(), "node-a"));
     }

@@ -35,6 +35,25 @@ data:
     # refused (or hold a grant it never uses).
     [node_labels]
     enabled = {{ if .Values.nodeLabels.enabled }}true{{ else }}false{{ end }}
+    {{- with .Values.runs }}
+    {{- if or (lt (int .startTimeoutSeconds) 1) (gt (int .startTimeoutSeconds) 4294967295) }}
+    {{- fail "runs.startTimeoutSeconds must be between 1 and 4294967295: a run's Job has to be given time to start" }}
+    {{- end }}
+
+    # How long a run's Job may go without starting (no container running, the playbook container
+    # never started) before the operator cancels the run.
+    [runs]
+    start_timeout_seconds = {{ .startTimeoutSeconds | int }}
+    {{- if or (kindIs "invalid" .maxActiveDeadlineSeconds) (lt (int .maxActiveDeadlineSeconds) 1) (gt (int .maxActiveDeadlineSeconds) 4294967295) }}
+    {{- fail "runs.maxActiveDeadlineSeconds must be between 1 and 4294967295: every run's Job has a deadline" }}
+    {{- end }}
+    {{- if or (kindIs "invalid" .defaultActiveDeadlineSeconds) (lt (int .defaultActiveDeadlineSeconds) 1) (gt (int .defaultActiveDeadlineSeconds) (int .maxActiveDeadlineSeconds)) }}
+    {{- fail "runs.defaultActiveDeadlineSeconds must be between 1 and runs.maxActiveDeadlineSeconds: every run's Job has a deadline" }}
+    {{- end }}
+    # The Job activeDeadlineSeconds of a plan that sets none of its own, and the most any Job gets.
+    default_active_deadline_seconds = {{ .defaultActiveDeadlineSeconds | int }}
+    max_active_deadline_seconds = {{ .maxActiveDeadlineSeconds | int }}
+    {{- end }}
     {{- with (.Values.managedSsh).readiness }}
 
     # Adaptive readiness grace for managed-ssh proxy pods not yet Running (or Running on a node that

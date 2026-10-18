@@ -55,12 +55,25 @@ spec:
         properties:
           spec:
             properties:
+              activeDeadlineSeconds:
+                description: |-
+                  The longest a run's Job may stay active, in seconds, before Kubernetes stops it — the Job's
+                  own `activeDeadlineSeconds`, counted from when the Job starts, so it includes the time its pod
+                  takes to start. A run stopped this way has no recap, so its hosts are reported `Unknown` and
+                  it spends an attempt. Unset uses the operator's default (two hours unless the cluster
+                  administrator changed it), and any value is held to the administrator's maximum (one day by
+                  default). Changing it does not re-run hosts that are already up to date.
+                maximum: 4294967295.0
+                minimum: 1.0
+                nullable: true
+                type: integer
               failedPlaysHistoryLimit:
                 description: |-
                   How many failed (or outcome-unknown) `Play` history records to keep for this plan. Kept
                   larger than the successful limit so failures stay visible longer. A terminal result is
                   temporarily exempt until it reaches the plan status; an aborted run is deleted only
                   after its resources are cleaned up. Defaults to 10.
+                maximum: 4294967295.0
                 minimum: 0.0
                 nullable: true
                 type: integer
@@ -89,6 +102,7 @@ spec:
                   The budget covers one *execution*: for `OneShot` the current playbook and inputs, which an
                   edit resets; for `Recurring` one schedule tick, since the next tick is going to re-apply the
                   playbook anyway. Every try is a run of its own, with its own `Play` record and its own Job.
+                maximum: 4294967295.0
                 minimum: 1.0
                 nullable: true
                 type: integer
@@ -264,6 +278,7 @@ spec:
                   `Ready` before reporting that Node unreachable (half the time to the next tick caps it
                   too), so raise it for a plan whose Nodes may still be rebooting at the tick. Only affects
                   scheduled (`schedule`) plans. Defaults to 30.
+                maximum: 4294967295.0
                 minimum: 0.0
                 nullable: true
                 type: integer
@@ -272,6 +287,7 @@ spec:
                   How many successful `Play` history records to keep for this plan before the oldest are
                   pruned. Unlike the Job's short TTL, Plays are the durable run history. A terminal result is
                   temporarily exempt until it reaches the plan status. Defaults to 3.
+                maximum: 4294967295.0
                 minimum: 0.0
                 nullable: true
                 type: integer
@@ -938,6 +954,8 @@ spec:
                   never reaches this TTL. Values below 60 seconds are silently raised to 60; unset uses the
                   operator's default.
                 format: int32
+                maximum: 2147483647.0
+                minimum: -2147483648.0
                 nullable: true
                 type: integer
               verbosity:
@@ -945,6 +963,7 @@ spec:
                   Verbosity for `ansible-playbook`, mapped to `-v`…`-vvvv`. 0 (unset) adds no flag; values
                   above 4 are clamped to 4. Affects log detail only — it is not part of the execution hash, so
                   changing it does not re-run the playbook on already-current hosts.
+                maximum: 4294967295.0
                 minimum: 0.0
                 nullable: true
                 type: integer
@@ -969,6 +988,7 @@ spec:
                 properties:
                   attempt:
                     description: Which try of the current execution this run is — see `status.retryCount`.
+                    maximum: 4294967295.0
                     minimum: 0.0
                     type: integer
                   executionHash:
@@ -990,6 +1010,7 @@ spec:
                     description: |-
                       The plan's `status.retryGeneration` this run was prepared under. A result replayed after a
                       newer generation handed the budget back does not spend it again.
+                    maximum: 4294967295.0
                     minimum: 0.0
                     type: integer
                   runId:
@@ -997,6 +1018,7 @@ spec:
                     type: string
                   runNumber:
                     description: Run number represented by `jobName`.
+                    maximum: 4294967295.0
                     minimum: 0.0
                     type: integer
                   triggeredSlot:
@@ -1161,6 +1183,7 @@ spec:
 
                   A high-water mark, not a count of runs: a run abandoned before its Job existed is not
                   deducted, so its number stays reserved for as long as this field outlives its `Play`.
+                maximum: 4294967295.0
                 minimum: 0.0
                 type: integer
               lastTriggeredRun:
@@ -1219,6 +1242,7 @@ spec:
 
                   Written from the run's own `Play` record, so a status that lags a run in flight cannot hand
                   the budget back by forgetting a try that was already made.
+                maximum: 4294967295.0
                 minimum: 0.0
                 type: integer
               retryCountSlot:
@@ -1236,6 +1260,7 @@ spec:
                   acted on, and SSH key rotations that reset it. Stamped onto every `Play` it prepares, so a
                   schedule window closed by failed runs can be reopened by either: only the failures of the
                   current generation count against the window's budget.
+                maximum: 4294967295.0
                 minimum: 0.0
                 type: integer
               summary:

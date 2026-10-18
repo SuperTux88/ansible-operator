@@ -236,7 +236,10 @@ operator's own namespace ∪ the chart's `watchNamespaces`. `jobs: create,delete
   node-root runs" decision, authored in `watchNamespaces` (static Helm/GitOps config, no runtime
   `rolebindings` write by the operator). A plan in a non-enrolled namespace is refused with
   `status.phase = UnauthorizedNamespace` before any Secret/Job call (fail-closed; no "all namespaces"
-  escape hatch). Distroless image, no shell.
+  escape hatch). A run in flight when its namespace is un-enrolled loses its node-root proxy pods
+  and host Leases at the refusal (`release_unenrolled_run`), since they live in the operator ns; its
+  Job, `Play` and run-cleanup finalizer stay in the plan namespace until it is re-enrolled.
+  Distroless image, no shell.
 - *Residual:* within the enrolled namespaces the grant is still broad — operator compromise ⇒
   disclosure of Secrets in *those* namespaces, plus Job-`create`, Job-`delete`, Secret-`delete` and
   PlaybookPlan-`patch` write primitives *there* (the per-run client-cert Secret is created and reaped
@@ -288,9 +291,13 @@ to a single run.
 - *Residual:* an attacker who can both reach another run's proxy pod IP **and** obtain that
   run's *own* client cert (A3) is still inside its own run's authorization — no cross-run
   escalation. A leaked client cert authenticates **only** to its own run's proxy pods, and those
-  pods (plus the cert Secret) are deleted when the run completes (`cleanup_proxy_infra`); its 2h
-  `CERT_VALIDITY` is thus only exploitable while those pods are alive, and deleting them is
-  effectively immediate revocation. No other or future proxy accepts that principal.
+  pods (plus the cert Secret) are deleted when the run completes (`cleanup_proxy_infra`); its
+  validity is thus only exploitable while those pods are alive, and deleting them is effectively
+  immediate revocation. Both the certificate validity and the proxy pods' `activeDeadlineSeconds`
+  are derived from the run's Job deadline (`ProxyLifetime::for_run`: deadline + proxy grace + 15 min
+  for the certificates, 15 min more for the pods). Every Job has a deadline, held to the chart's
+  `runs.maxActiveDeadlineSeconds` (default 24h), so a proxy pod that cleanup never reaches stops on
+  its own shortly after its run could have ended. No other or future proxy accepts that principal.
 - *Severity:* **Low** — cross-run reuse requires forging a run-ID principal (needs the CA
   key, i.e. T-INFO-2), not merely defeating NetworkPolicy. See §7 INV-4.
 
@@ -574,7 +581,7 @@ From [`clusterrole.yaml`](chart/templates/clusterrole.yaml) (cluster-wide) and
 |----------|-------|-------|-----------|
 | secrets | get,list,watch,create,patch,delete | **enrolled ns only** | Reads/writes Secrets only in enrolled namespaces, not cluster-wide. `delete` reaps the per-run managed-ssh client-cert Secret, created in the plan namespace so the Job pod can mount it. |
 | secrets | delete,deletecollection | operator ns | Run cleanup (per-host proxy Secrets). |
-| jobs | get,list,watch,create,delete | **enrolled ns only** | One Job per run in the plan ns, not cluster-wide. `delete` cancels the run of a deleted plan or a run whose `Play` record disappeared, rather than leaving the pod to the deleting client's propagation policy; finished Jobs are reaped by their TTL. The operator deletes only a Job it has validated as its own run's (UID precondition included), but RBAC cannot scope `delete` to Jobs it created, so the grant covers every Job in an enrolled namespace. |
+| jobs | get,list,watch,create,delete | **enrolled ns only** | One Job per run in the plan ns, not cluster-wide. `delete` cancels the run of a deleted plan or a run whose `Play` record disappeared, rather than leaving the pod to the deleting client's propagation policy, and the Job of a run that never started within `runs.startTimeoutSeconds`; finished Jobs are reaped by their TTL. The operator deletes only a Job it has validated as its own run's (UID precondition included), but RBAC cannot scope `delete` to Jobs it created, so the grant covers every Job in an enrolled namespace. |
 | pods | get,list,watch | **enrolled ns only** | Read termination message, not cluster-wide. |
 | playbookplans | patch | **enrolled ns only** | Adds and removes the `ansible.cloudbending.dev/run-cleanup` finalizer, which holds a plan deleted mid-run open until its node-root proxy pods and host Leases are released (nothing else can reach them — they live in the operator ns, where an OwnerReference cannot follow). The finalizer is the only field the operator writes here, but RBAC cannot restrict `patch` to `metadata.finalizers`: the grant permits writing the spec and metadata of any plan in an enrolled namespace. Kept out of the `ClusterRole`, which stays read-only for plans, so plan writes are confined to namespaces already trusted to run node-root playbooks. |
 | plays | get,list,create,delete | **enrolled ns only** | Operator-authored recovery/history records. The spec carries plan UID, execution hash, run ID, preparation fingerprint, target inventory, run number, and schedule slot; Jobs and pod templates are correlated to the Play UID. It stores no copy of the plan spec, resolved connection configuration or the Job — those are re-derived from live cluster state. Every field is typed, so the CRD's CEL rule freezes the whole spec (T-ESC-8). Contains no Secret material. |
@@ -610,7 +617,7 @@ fully implemented and carries no open tail; see T-INFO-1 and §8.)
 
 | ID | Recommendation | Addresses | Priority |
 |----|----------------|-----------|----------|
-| R2 | The CA is rotated only by an operator restart. Consider periodic restarts (or an in-process rotation timer) to bound the window in which a leaked/compromised CA (T-INFO-2) can mint certs. A leaked *client* cert is already bounded by proxy-pod lifetime — principal-scoped, and the pods plus the cert Secret are deleted on completion (`cleanup_proxy_infra`) — so a shorter `CERT_VALIDITY` or a CRL adds little. | T-INFO-2 | Low |
+| R2 | The CA is rotated only by an operator restart. Consider periodic restarts (or an in-process rotation timer) to bound the window in which a leaked/compromised CA (T-INFO-2) can mint certs. A leaked *client* cert is already bounded by proxy-pod lifetime — principal-scoped, and the pods plus the cert Secret are deleted on completion (`cleanup_proxy_infra`) — so a shorter certificate validity or a CRL adds little. | T-INFO-2 | Low |
 | R3 | Bind the client-cert principal to specific *host(s)*, not just the run, for intra-run host scoping; document the CNI / defense-in-depth posture in the chart `NOTES.txt`. | T-INFO-3 | Low |
 | R4 | Ship a linter/validating admission example that rejects NodeAccessPolicies keyed on tenant-settable labels; recommend `kubernetes.io/metadata.name` in docs (already in type docs). | T-ESC-3 | Medium |
 | R5 | The default proxy image is a first-party, minimal, statically-linked sshd (`ansible-operator-sshd`, from a checksum-pinned source in `Containerfile.sshd`), built + cosign-signed in CI on `sshd-v*` tags, with each release repinning the chart default onto its `@sha256:` digest. Still open: document/ship a cluster-side admission policy (e.g. cosign/policy-controller) that *enforces* the signature at pod-create, so the digest pin is backed by verification rather than trust alone. | T-ESC-5 | Low |
@@ -639,13 +646,14 @@ fully implemented and carries no open tail; see T-INFO-1 and §8.)
 - One ephemeral **Ed25519 CA** per operator process — generated in memory at startup
   (`CertificateAuthority::generate` in `main.rs`), never persisted; a restart rotates it.
 - Per **proxy pod**: a fresh host keypair, host cert signed for principal `<hostname>`,
-  valid 2h. Presented to clients; clients trust via `@cert-authority *`.
+  valid for the run's `ProxyLifetime` (see T-INFO-3). Presented to clients; clients trust via
+  `@cert-authority *`.
 - Per **run**: one client keypair, client cert signed for principals `["root", "<run-id>"]`,
-  valid 2h, trusted by every proxy pod via `TrustedUserCAKeys`. `<run-id>` is the *enforced*
+  valid for the same lifetime, trusted by every proxy pod via `TrustedUserCAKeys`. `<run-id>` is the *enforced*
   principal (see below); `root` is retained for `PermitRootLogin yes` / the default username check.
 - Scoping of a client to "its own" proxies is **cert-level**: each proxy pod's sshd sets
   `AuthorizedPrincipalsFile` to a file containing only that run's `<run-id>`, so it accepts only
   this run's client cert. The per-run NetworkPolicy is defense in depth on top — see T-INFO-3 / R3.
 - Because the principal is run-scoped and the proxy pods (and the client-cert Secret) are deleted
   on run completion (`cleanup_proxy_infra`), a client cert is inert once its run ends — nothing on
-  the cluster will accept it, regardless of the 2h validity remaining.
+  the cluster will accept it, regardless of the validity remaining.

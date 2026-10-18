@@ -30,6 +30,7 @@ validation rules, the operator refuses the plan instead and says so in `.status.
 | `template.files` | no | Files made available at runtime — see [Variables and files](./variables-and-files.md). |
 | `template.requirements` | no | An Ansible `requirements.yml` (e.g. collections) installed before the run. |
 | `ttlSecondsAfterFinished` | no | How long a finished run's Job and pod are kept before Kubernetes reaps them. Values below 60s are raised to 60. |
+| `activeDeadlineSeconds` | no (operator default, usually two hours) | The longest a run's Job may stay active before Kubernetes stops it — see [Bounding how long a run takes](#bounding-how-long-a-run-takes). |
 | `verbosity` | no (`0`) | `ansible-playbook` verbosity, `0`–`4`, mapped to `-v`…`-vvvv`. Affects log detail only. |
 
 ## Choosing the image
@@ -278,6 +279,39 @@ treated as the workspace if you gave it that reference, which already means Kube
 with the plan. See
 [A Secret already occupies the workspace Secret's
 name](./results-and-troubleshooting.md#a-secret-already-occupies-the-workspace-secrets-name).
+
+## Bounding how long a run takes
+
+`spec.activeDeadlineSeconds` becomes the run Job's own `activeDeadlineSeconds`: once the Job has
+been active that long, Kubernetes stops it. Use it for a playbook that can hang, for example on a
+task waiting for something that never happens, so that a stuck run gives its hosts back instead of
+holding their locks indefinitely. The clock starts when the Job starts, so it includes the time the
+pod takes to start, and it applies to every try of the plan separately.
+
+A run stopped this way never reached the end of the playbook, where the per-host recap is written,
+so every host is reported [`Unknown`](./results-and-troubleshooting.md#hosts-show-unknown), the run
+spends an attempt, and `.status.summary` ends with *"(the Job exceeded its deadline of …s)"*.
+Choose a value well above the playbook's normal run time. A deadline shorter than the operator's
+start timeout (ten minutes by default, see [Runs whose Job never
+starts](../cluster-operators/deployment.md#runs-whose-job-never-starts)) also ends a Job that never
+started, and reports it the same way: a Job stuck pulling an image that does not exist then reads as
+having exceeded its deadline. `kubectl describe job` shows what it waited on until the Job is reaped.
+
+Without the field, the operator's default applies, which is two hours unless the cluster
+administrator changed it. A plan's own value wins over that default in both directions, up to a
+maximum the administrator sets, one day by default. A longer value is held to that maximum (see [Run
+time limits](../cluster-operators/deployment.md#run-time-limits)). Changing it does not re-run hosts
+that are already up to date.
+
+On a plan that targets cluster Nodes, the deadline also decides how long the run can reach its
+Nodes. The certificates it uses are issued when the run is set up and stay valid for the deadline
+plus the time the operator may wait for the run's proxy pods, plus a quarter of an hour. Kubernetes
+stops the proxy pods another quarter of an hour later. So a run that needs longer than two hours
+only has to raise its deadline. Only when setting the run up took unusually long can a new SSH
+connection in the run's last minutes fail on an expired certificate.
+
+Independently of this field, the operator always cancels a run whose Job never *starts* (see [Runs
+whose Job never starts](../cluster-operators/deployment.md#runs-whose-job-never-starts)).
 
 ## Lifecycle at a glance
 

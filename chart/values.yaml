@@ -44,6 +44,26 @@ managedSsh:
     aggressiveness: 2
     thresholdDays: [3, 7, 30]
 
+# Bounds on every plan's run Job.
+runs:
+  # How long a run's Job may go without starting before the operator cancels the run (its hosts are
+  # reported Unknown and it spends an attempt). Covers a pod that is never created, never scheduled,
+  # or stuck pulling its image or creating its container. The clock restarts when the Job's pod is
+  # created or scheduled and whenever one of its init containers finishes, and never runs while a
+  # container is running, so a long collection download or a long playbook is never cut off. Must
+  # cover an image pull on a cold node. Above 0.
+  startTimeoutSeconds: 600
+  # The Job `activeDeadlineSeconds` of every plan that sets no `spec.activeDeadlineSeconds` of its
+  # own: Kubernetes stops a run that is still active after this many seconds (its hosts are reported
+  # Unknown and it spends an attempt). A plan's own value wins in both directions, up to
+  # maxActiveDeadlineSeconds. Between 1 and maxActiveDeadlineSeconds.
+  defaultActiveDeadlineSeconds: 7200
+  # The longest `activeDeadlineSeconds` any run's Job gets, whatever its plan asks for; a longer
+  # `spec.activeDeadlineSeconds` is held to it. Every Job has a deadline, and a run on cluster Nodes
+  # derives its SSH certificates and proxy pods from it, so this also bounds how long a run has root
+  # on a Node. Above 0.
+  maxActiveDeadlineSeconds: 86400
+
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""

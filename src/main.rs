@@ -161,6 +161,13 @@ async fn run(args: RunArgs) {
             v1beta1::playbookplancontroller::reconciler::OperatorSettings {
                 proxy_image,
                 proxy_grace,
+                job_start_timeout: std::time::Duration::from_secs(
+                    operator_config.runs.start_timeout_seconds.get().into(),
+                ),
+                job_deadlines: v1beta1::playbookplancontroller::JobDeadlines {
+                    default_seconds: operator_config.runs.default_active_deadline_seconds.get(),
+                    max_seconds: operator_config.runs.max_active_deadline_seconds.get(),
+                },
                 node_labels_enabled,
                 workload_egress_policies:
                     v1beta1::playbookplancontroller::reconciler::WorkloadEgressPolicies {
