@@ -52,9 +52,10 @@ Cross-run isolation is enforced at the **certificate** layer, not merely by netw
 - A per-run **NetworkPolicy** locks each proxy pod's ingress to that run's Job. This is
   defense in depth on top of the certificate isolation, not the primary control.
 - Proxy pods, their Secrets, and the NetworkPolicy are **torn down when the run ends** — there is no
-  standing SSH surface on your Nodes between runs. A proxy pod the operator never gets to delete
-  stops on its own two hours and fifteen minutes after it started, shortly after its certificates
-  expired.
+  standing SSH surface on your Nodes between runs. A run's certificates and proxy pods last only
+  slightly longer than its Job may: a proxy pod the operator never gets to delete stops on its own,
+  and the chart's `runs.maxActiveDeadlineSeconds` (one day by default) bounds them for every plan.
+  See [Deployment → run time limits](./deployment.md#run-time-limits).
 
 Run recovery has its own trust boundary. Each run is written down as a `Play` before anything is
 created for it, and a CRD validation rule freezes that record's spec for its lifetime. The record

@@ -2,10 +2,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ssh_key::{Algorithm, PrivateKey, PublicKey, certificate, rand_core::OsRng};
 
-/// Validity window for host/client certs signed per run — comfortably beyond a typical
-/// playbook run, with no mid-run renewal in v1 (see agents.md/managed-ssh design notes).
-pub const CERT_VALIDITY: Duration = Duration::from_secs(2 * 60 * 60);
-
 #[derive(thiserror::Error, Debug)]
 pub enum CaError {
     #[error(transparent)]
@@ -38,21 +34,23 @@ impl CertificateAuthority {
     }
 
     /// Signs a fresh host certificate for `subject_public_key`, valid as `principal` (the
-    /// hostname proxied) for `CERT_VALIDITY` from now.
+    /// hostname proxied) for `validity` from now.
     pub fn sign_host_cert(
         &self,
         subject_public_key: &PublicKey,
         principal: &str,
+        validity: Duration,
     ) -> Result<String, CaError> {
         self.sign(
             subject_public_key,
             &[principal],
             certificate::CertType::Host,
+            validity,
         )
     }
 
     /// Signs a fresh client certificate valid for every principal in `principals`, for
-    /// `CERT_VALIDITY` from now. One client cert per run, trusted by every proxy pod via the
+    /// `validity` from now. One client cert per run, trusted by every proxy pod via the
     /// shared CA — no per-pod `authorized_keys` management needed.
     ///
     /// `principals` must include the login username the proxy pods are dialed as (e.g. `"root"`,
@@ -62,8 +60,14 @@ impl CertificateAuthority {
         &self,
         subject_public_key: &PublicKey,
         principals: &[&str],
+        validity: Duration,
     ) -> Result<String, CaError> {
-        self.sign(subject_public_key, principals, certificate::CertType::User)
+        self.sign(
+            subject_public_key,
+            principals,
+            certificate::CertType::User,
+            validity,
+        )
     }
 
     fn sign(
@@ -71,12 +75,13 @@ impl CertificateAuthority {
         subject_public_key: &PublicKey,
         principals: &[&str],
         cert_type: certificate::CertType,
+        validity: Duration,
     ) -> Result<String, CaError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| CaError::ClockError)?
             .as_secs();
-        let valid_before = now + CERT_VALIDITY.as_secs();
+        let valid_before = now + validity.as_secs();
 
         let mut builder = certificate::Builder::new_with_random_nonce(
             &mut OsRng,
@@ -105,13 +110,15 @@ pub fn generate_ephemeral_keypair() -> Result<PrivateKey, CaError> {
 mod tests {
     use super::*;
 
+    const CERT_VALIDITY: Duration = Duration::from_secs(2 * 60 * 60);
+
     #[test]
     fn sign_and_verify_host_cert() {
         let ca = CertificateAuthority::generate().unwrap();
         let host_key = generate_ephemeral_keypair().unwrap();
 
         let cert_openssh = ca
-            .sign_host_cert(host_key.public_key(), "worker-1")
+            .sign_host_cert(host_key.public_key(), "worker-1", CERT_VALIDITY)
             .unwrap();
 
         let cert = ssh_key::Certificate::from_openssh(&cert_openssh).unwrap();
@@ -129,7 +136,11 @@ mod tests {
         let client_key = generate_ephemeral_keypair().unwrap();
 
         let cert_openssh = ca
-            .sign_client_cert(client_key.public_key(), &["root", "run-deadbeef"])
+            .sign_client_cert(
+                client_key.public_key(),
+                &["root", "run-deadbeef"],
+                CERT_VALIDITY,
+            )
             .unwrap();
 
         let cert = ssh_key::Certificate::from_openssh(&cert_openssh).unwrap();
@@ -141,6 +152,26 @@ mod tests {
         cert.verify_signature().unwrap();
     }
 
+    /// A run's certificates have to last as long as the run may, which its deadline decides.
+    #[test]
+    fn a_cert_is_valid_for_exactly_the_requested_window() {
+        let ca = CertificateAuthority::generate().unwrap();
+        let key = generate_ephemeral_keypair().unwrap();
+        let validity = Duration::from_secs(5 * 60 * 60);
+
+        let host = ca
+            .sign_host_cert(key.public_key(), "worker-1", validity)
+            .unwrap();
+        let client = ca
+            .sign_client_cert(key.public_key(), &["root"], validity)
+            .unwrap();
+
+        for cert in [host, client] {
+            let cert = ssh_key::Certificate::from_openssh(&cert).unwrap();
+            assert_eq!(cert.valid_before() - cert.valid_after(), validity.as_secs());
+        }
+    }
+
     #[test]
     fn cert_signed_by_a_different_ca_fails_validation() {
         let ca = CertificateAuthority::generate().unwrap();
@@ -148,7 +179,7 @@ mod tests {
         let host_key = generate_ephemeral_keypair().unwrap();
 
         let cert_openssh = ca
-            .sign_host_cert(host_key.public_key(), "worker-1")
+            .sign_host_cert(host_key.public_key(), "worker-1", CERT_VALIDITY)
             .unwrap();
         let cert = ssh_key::Certificate::from_openssh(&cert_openssh).unwrap();
 

@@ -68,7 +68,7 @@ src/main.rs                          entrypoint (clap `run`/`crds`), tracing, ge
 src/config.rs                        OperatorConfig (TOML): watch_namespaces (enrolled set) + proxy_image; read once at startup from the mounted ConfigMap
 src/utils.rs                         create_or_update helper, Condition trait, generate_id (k8s-like short ID)
 src/v1beta1/
-  ca.rs                              ephemeral in-memory SSH CA (Ed25519); signs host + client certs; CERT_VALIDITY = 2h (INV-6)
+  ca.rs                              ephemeral in-memory SSH CA (Ed25519); signs host + client certs for a given validity, which `managed_ssh::ProxyLifetime` derives from the run's Job deadline (INV-6)
   resources/                         CRD types (kube::CustomResource)
     playbookplan.rs                  PlaybookPlan: spec, status, Phase (incl. UnauthorizedNamespace)
     cluster_inventory.rs             ClusterInventory: hosts resolved from Node labels → managed-ssh (node-root)

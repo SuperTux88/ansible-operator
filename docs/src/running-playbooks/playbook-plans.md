@@ -303,11 +303,12 @@ maximum the administrator sets, one day by default. A longer value is held to th
 time limits](../cluster-operators/deployment.md#run-time-limits)). Changing it does not re-run hosts
 that are already up to date.
 
-On a plan that targets cluster Nodes, a deadline above two hours buys little: the certificate a run
-uses to reach its Nodes is issued when the run is set up and is valid for two hours, so a run that
-opens a new SSH connection after that fails to authenticate anyway. Fifteen minutes later the run's
-proxy pods stop as well, which also ends the connections that are still open, so no run reaches a
-Node for longer than that.
+On a plan that targets cluster Nodes, the deadline also decides how long the run can reach its
+Nodes. The certificates it uses are issued when the run is set up and stay valid for the deadline
+plus the time the operator may wait for the run's proxy pods, plus a quarter of an hour. Kubernetes
+stops the proxy pods another quarter of an hour later. So a run that needs longer than two hours
+only has to raise its deadline. Only when setting the run up took unusually long can a new SSH
+connection in the run's last minutes fail on an expired certificate.
 
 Independently of this field, the operator always cancels a run whose Job never *starts* (see [Runs
 whose Job never starts](../cluster-operators/deployment.md#runs-whose-job-never-starts)).
