@@ -20,7 +20,8 @@ Both default to deny. Neither can be skipped:
 
 1. **Namespace enrollment** bounds *where the operator itself has power*. Its cluster RBAC omits
    `secrets`/`jobs`/`pods`; those are granted per-namespace only for enrolled namespaces. A plan in an
-   un-enrolled namespace is refused (`UnauthorizedNamespace`). There is no "all namespaces" option.
+   un-enrolled namespace is refused (`UnauthorizedNamespace`), and a run it still had in flight loses
+   its access to cluster Nodes. There is no "all namespaces" option.
    → [Deployment → enrolled namespaces](./deployment.md#enrolled-namespaces)
 2. **Node access policies** bound *which Nodes a tenant may reach*. A namespace with no matching
    `NodeAccessPolicy` resolves to **zero** Nodes; an empty selector matches nothing, not everything.

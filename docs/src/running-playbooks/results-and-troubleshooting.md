@@ -324,6 +324,13 @@ not something you can fix from the tenant side: an admin must add your namespace
 `watchNamespaces` and roll the operator. See
 [Deployment → enrolled namespaces](../cluster-operators/deployment.md#enrolled-namespaces).
 
+If the namespace was un-enrolled while a run was in flight, `.status.activeRun` still names that run.
+The operator has cut it off from your cluster Nodes by removing its proxy pods and released its host
+locks. A Job that was already running carries on against any `StaticInventory` hosts, and the
+cluster Nodes it had not finished with are reported `Unreachable` once the namespace is enrolled
+again and the operator collects the result. A run whose Job had not been created yet is resumed
+instead.
+
 ### A `ClusterInventory` resolves to zero hosts
 
 If Nodes clearly match your selector but the plan still targets nothing, the likely cause is that no
@@ -797,13 +804,19 @@ proxy pods and its host Leases. Normally that takes a few seconds. It lasts long
   it and the teardown finishes on its own.
 - **the operator is not running.** Nothing releases the run until it comes back; the plan waits
   rather than leaking. Restore the operator and the deletion completes on its own.
-- **the plan's namespace was un-enrolled while the run was in flight.** The operator can then neither
-  release the run nor remove its own finalizer. Re-enrol the namespace and it finishes the teardown;
-  see [Deployment → enrolled namespaces](../cluster-operators/deployment.md#enrolled-namespaces).
+- **the plan's namespace was un-enrolled while the run was in flight.** The operator then releases
+  the run's proxy pods and host Leases, but it can neither cancel the run's Job nor remove its own
+  finalizer. Re-enrol the namespace and it finishes the teardown. Removing the finalizer by hand is
+  also safe here, and needs none of the cleanup below, once the operator has released the run: what
+  is left lives in the plan's namespace and is deleted with the plan. The run is released when
+  `kubectl get pods -n <operator-namespace> -l ansible.cloudbending.dev/run-id=<runId>` returns
+  nothing, with `<runId>` from `.status.activeRun.runId`. See [Deployment → enrolled
+  namespaces](../cluster-operators/deployment.md#enrolled-namespaces).
 
-Removing the finalizer by hand ends the wait but strands the run's proxy pods and host Leases. Before
-doing it, capture the run's identity — the plan's `Play` records and its Job are owned by the plan
-and are deleted with it, and they are what the manual cleanup procedure reads those values from:
+In every other case, removing the finalizer by hand ends the wait but strands the run's proxy pods
+and host Leases. Before doing it, capture the run's identity — the plan's `Play` records and its Job
+are owned by the plan and are deleted with it, and they are what the manual cleanup procedure reads
+those values from:
 
 ```sh
 PLAN_NAMESPACE=my-team

@@ -223,14 +223,18 @@ Two consequences to plan for:
   **dedicated to Ansible ops**, not general-purpose application namespaces, so this power covers as
   few unrelated Secrets as possible. See
   [Security model → the blast radius you accept](./security.md#blast-radius).
-- **Un-enrol a namespace only while its plans are idle.** A plan with a run in flight carries the
-  `ansible.cloudbending.dev/run-cleanup` finalizer, and the `patch` permission that lets the operator
-  remove it again is granted per enrolled namespace. Removing the namespace from `watchNamespaces`
-  while a run is active therefore leaves any plan deleted afterwards stuck in `Terminating`: the
-  operator can no longer release the run *or* drop its own finalizer. Recovering means re-enrolling
-  the namespace (the operator then finishes the teardown on its own), or removing the finalizer by
-  hand and cleaning the run up with the
-  [manual procedure](../running-playbooks/results-and-troubleshooting.md#the-plan-is-stuck-in-applying).
+- **Un-enrol a namespace only while its plans are idle.** A run in flight there is cut off rather
+  than finished. When the operator starts with the new set, it deletes the run's managed-ssh proxy
+  pods and releases its host Leases, because those live in the operator's namespace and nothing else
+  would ever remove them. That ends the run's access to cluster Nodes, but not the run: its Job and
+  everything else it created in the plan's namespace are out of the operator's reach, and the Job
+  goes on running against any `StaticInventory` hosts, without the host locks that keep other plans
+  off them. The plan also keeps the `ansible.cloudbending.dev/run-cleanup` finalizer, and the `patch`
+  permission that lets the operator remove it is granted per enrolled namespace, so a plan deleted
+  afterwards stays in `Terminating`. Re-enrolling the namespace lets the operator finish the run and
+  the teardown on its own. Removing the finalizer by hand is also safe once the operator has released
+  the run (`kubectl get pods -n <operator-namespace> -l ansible.cloudbending.dev/run-id=<runId>`
+  returns nothing): everything the run still holds is owned by the plan and is deleted with it.
   Check for active runs before un-enrolling:
 
   ```sh
