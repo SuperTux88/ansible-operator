@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::hash::{Hash as _, Hasher as _};
+use std::time::Duration;
 
 use k8s_openapi::{
     api::{
@@ -25,7 +26,7 @@ use kube::{
 use super::{node_readiness, paths};
 use crate::utils;
 use crate::v1beta1::{
-    ca::CertificateAuthority,
+    ca::{CERT_VALIDITY, CertificateAuthority},
     controllers::{
         playbookplancontroller::execution_evaluator::ExecutionHash,
         reconcile_error::{ReconcileError, is_not_found},
@@ -65,6 +66,16 @@ const SFTP_SUBSYSTEM_MARKER: &str = "ansible-operator-sftp";
 /// namespace, never the host's (an ancestor), so a session can't join it via nsenter — the pod's
 /// PID namespace has to start out as the host's.
 const HOST_PROC_MOUNT_PATH: &str = "/host/proc";
+
+/// The `activeDeadlineSeconds` of every proxy pod: [`CERT_VALIDITY`] plus a margin.
+///
+/// A backstop for a proxy pod the operator never deletes, such as one left behind when the operator
+/// was uninstalled mid-run or when a run's plan and records were removed by hand: past it, Kubernetes
+/// stops the pod whatever still refers to it. The certificates are minted before the pod is created,
+/// so by then no new SSH login can succeed against it anyway. The margin is for a session that logged
+/// in just before they expired and is still working; sshd checks a certificate's validity only at
+/// login.
+const PROXY_POD_ACTIVE_DEADLINE: Duration = Duration::from_secs(CERT_VALIDITY.as_secs() + 15 * 60);
 
 /// The two taints Kubernetes automatically applies to a `NotReady`/unreachable Node. We tolerate
 /// them with an **empty `effect`** (matches every effect, i.e. both `NoSchedule` and `NoExecute`) and
@@ -719,6 +730,7 @@ fn build_pod(
             automount_service_account_token: Some(false),
             volumes: Some(vec![secret_volume, host_proc_volume]),
             restart_policy: Some("Never".into()),
+            active_deadline_seconds: Some(PROXY_POD_ACTIVE_DEADLINE.as_secs() as i64),
             // Required: unlike the other host namespaces, PID can't be joined per-session via
             // nsenter (see HOST_PROC_MOUNT_PATH doc), so it must be shared from pod creation.
             host_pid: Some(true),
@@ -1537,6 +1549,12 @@ mod tests {
         let added = security.capabilities.as_ref().unwrap().add.clone().unwrap();
         assert!(added.contains(&"SYS_ADMIN".to_string()));
         assert!(added.contains(&"SYS_PTRACE".to_string()));
+
+        // Bounded even when the operator never deletes it, and never before its certificates expire,
+        // which would cut short a run that still has every right to the Node.
+        let deadline = spec.active_deadline_seconds.unwrap();
+        assert!(deadline > CERT_VALIDITY.as_secs() as i64);
+        assert!(deadline <= (CERT_VALIDITY.as_secs() + 60 * 60) as i64);
     }
 
     #[test]

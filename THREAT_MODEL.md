@@ -293,7 +293,10 @@ to a single run.
   escalation. A leaked client cert authenticates **only** to its own run's proxy pods, and those
   pods (plus the cert Secret) are deleted when the run completes (`cleanup_proxy_infra`); its 2h
   `CERT_VALIDITY` is thus only exploitable while those pods are alive, and deleting them is
-  effectively immediate revocation. No other or future proxy accepts that principal.
+  effectively immediate revocation. A proxy pod cleanup never reaches stops on its own at
+  `CERT_VALIDITY` plus 15 minutes (`activeDeadlineSeconds`, `PROXY_POD_ACTIVE_DEADLINE`), so no
+  node-root access path outlives its certificates for long. No other or future proxy accepts that
+  principal.
 - *Severity:* **Low** — cross-run reuse requires forging a run-ID principal (needs the CA
   key, i.e. T-INFO-2), not merely defeating NetworkPolicy. See §7 INV-4.
 
