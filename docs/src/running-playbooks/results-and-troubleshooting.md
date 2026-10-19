@@ -1036,8 +1036,8 @@ If *every* host of one run shows `Unknown` at once, check these causes first:
   termination message, which Kubernetes caps at 4096 bytes. The operator compresses it when it does
   not fit, which is good for several hundred hosts, but a plan larger than that cannot report a
   per-host result at all. This case says so rather than leaving you to guess: `.status.summary`
-  reads *"the recap for N hosts does not fit the kubelet's termination-message limit"*, and the
-  operator logs the same. Split the plan across smaller inventories — each plan gets its own recap,
+  ends with *"(the recap for N hosts exceeds the termination-message limit)"*, and the operator
+  logs the same. Split the plan across smaller inventories — each plan gets its own recap,
   so two plans of 300 hosts fit where one of 600 does not.
 
   Unlike the other causes here, this one is deterministic: every retry reproduces it, so the plan
