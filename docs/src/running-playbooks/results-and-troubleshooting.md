@@ -478,8 +478,8 @@ another run.
 
 ### A Secret already occupies the workspace Secret's name
 
-The summary reads **"could not prepare run …: Secret "workspace-…" already exists but is not owned
-by this PlaybookPlan, so it cannot be used as its workspace"**.
+The summary reads **"could not prepare run …: workspace Secret "workspace-…" belongs to someone
+else"**.
 
 Every run renders its playbook, its resolved inventory and its inline variables into a generated
 **workspace Secret** named `workspace-<truncated-plan>-<id>`, owned by the plan (see
@@ -545,9 +545,9 @@ recover in that case; the operator reports the error and retries normally.
 
 A Job or `Play` the plan did not create can hold the name a new run would take. The operator then
 numbers the run past it and logs the name it skipped. Only when sixteen names in a row are held does
-it give up with **"could not prepare a run: run names … to … in namespace … are all held by Jobs or
-Plays this plan did not create"**. Inspect those objects and delete the ones that are not the
-operator's.
+it give up with **"could not prepare a run: run names up to … are all held by other objects"**. The
+operator's log names the first and last of them. Inspect those objects and delete the ones that are
+not the operator's.
 
 If it stays there with nothing progressing, `.status.summary` says which of the following it is
 instead, and `.status.activeRun` names the run it is waiting on:
@@ -646,15 +646,20 @@ instead, and `.status.activeRun` names the run it is waiting on:
   already created remain in place. The rest of the message is the underlying API, admission,
   workspace, proxy, Job, or run-record error to correct.
 
+  This and the other messages below that end with an error give it in short. An error from the
+  Kubernetes API is reduced to its reason, HTTP code and object, such as `Forbidden (403): secrets
+  "vars"`; the operator logs every one of these errors in full, with the API server's message
+  (which, for `Forbidden`, names the identity and the permission that was missing).
+
   The form `Job <ns>/<name>: does not carry this run's identity` means a Job the run did not
   create holds the name it recorded. It names that Job; see the "waiting for Job …" entry above for
   how to confirm that it is foreign.
 
-  The form **"Secret … already exists but is not owned by this PlaybookPlan"** has its own entry —
+  The form **"workspace Secret … belongs to someone else"** has its own entry —
   see [A Secret already occupies the workspace Secret's
   name](#a-secret-already-occupies-the-workspace-secrets-name).
 
-  The specific **"Pod/Secret … already exists but is not this run's managed-ssh proxy for host …"**
+  The specific **"proxy Pod/Secret … for host … is not this run's"**
   form can mean an object was planted or edited in the operator namespace. It can also mean two Node
   names produced the same shortened resource-name segment, which requires a deliberately constructed
   collision rather than an ordinary hash accident. Inspect the exact Pod or Secret named in the
@@ -672,10 +677,10 @@ instead, and `.status.activeRun` names the run it is waiting on:
 - **"run recovery failed: …"** — the operator could not resume the run after a restart. The rest of
   the message is the underlying error; the operator retries every tick. An error about a run record
   starts with `Play <ns>/<name> (phase <phase>)`, naming the record and the phase it was in. If the
-  message is **"more than one Play in namespace … claims to be the plan's active run"**, something
-  outside the operator created a second run record: a plan only ever has one run in flight, and the
-  operator refuses to guess which one is real rather than orphan the other's proxy pods. The message
-  ends with the names of the competing records; look at each with
+  message is **"N Plays claim to be the active run"**, something outside the operator created a
+  second run record: a plan only ever has one run in flight, and the operator refuses to guess which
+  one is real rather than orphan the other's proxy pods. The operator's log names the competing
+  records (`kubectl get play -n <ns>` lists them too, with their phase); look at each with
   `kubectl get play -n <ns> <name> -o yaml`, work out which record the operator wrote, and delete
   the stray one. The host locks of both are kept alive meanwhile, so no other plan can start on
   those hosts while you do.
