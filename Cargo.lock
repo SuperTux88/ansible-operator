@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "ansible-operator"
-version = "0.0.37"
+version = "0.0.38"
 dependencies = [
  "base64",
  "chrono",
