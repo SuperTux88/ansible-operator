@@ -412,15 +412,15 @@ running, and so could not decide anything this tick:
   does not acquire host Leases or create managed-SSH proxy pods for this invalid spec. Only the YAML
   shape is checked here: a list whose entries are not valid plays is accepted and fails when Ansible
   runs it.
-- **"spec.template.files entry … is not usable: …"** — a file entry has an invalid mount name or
-  does not describe exactly one recognized Kubernetes volume source without unknown fields. Correct
-  the named entry; a new run does not acquire host Leases or create managed-SSH proxy pods for this
-  invalid spec.
-- **"spec.template references Secret … which is this plan's own workspace"** — a `secretRef` names
-  the [workspace Secret](./playbook-plans.md#one-job-per-run) the operator generates for this plan.
-  It is rewritten on every run, so hashing it as an input would make the plan replace its own
-  finished run indefinitely. Drop the reference: the workspace is already mounted as the run's
-  working directory, so a playbook reads it from there without asking for it.
+- **"files entry … is not usable"** — a `spec.template.files` entry has an invalid mount name or
+  does not describe exactly one recognized Kubernetes volume source without unknown fields; the
+  `Ready` condition says which. Correct the named entry; a new run does not acquire host Leases or
+  create managed-SSH proxy pods for this invalid spec.
+- **"template references the plan's own workspace Secret"** — a `secretRef` names the [workspace
+  Secret](./playbook-plans.md#one-job-per-run) the operator generates for this plan; the `Ready`
+  condition names it. It is rewritten on every run, so hashing it as an input would make the plan
+  replace its own finished run indefinitely. Drop the reference: the workspace is already mounted as
+  the run's working directory, so a playbook reads it from there without asking for it.
 
 The forms that need an edit — all of the above except `not in sync` and the API errors — are
 rechecked as soon as the edit lands: changing the plan, or creating or changing the inventory or
