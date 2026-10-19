@@ -4724,15 +4724,33 @@ fn inventory_input_failure(error: &ReconcileError) -> InputFailure {
 
 /// How a spec the plan's own checks refused is stated in each place.
 ///
-/// A playbook that does not parse is the one whose error is too long for the column: the YAML
-/// parser names where it failed *and* what it was parsing at the time, which is a line of its own.
-/// The column says where to look, or that the YAML is fine but not a list of plays (a single play
-/// written as a mapping, the commonest form of it); the condition keeps the parser's words.
+/// The column names what to fix and stops; why it cannot be used stays in the condition. That is
+/// the whole difference for a `files` entry and for a reference to the workspace Secret, whose
+/// errors explain themselves at length. A playbook that does not parse is the one where the column
+/// needs a different answer: the YAML parser names where it failed *and* what it was parsing at the
+/// time, so the column says only where to look, or that the YAML is fine but not a list of plays (a
+/// single play written as a mapping, the commonest form of it).
 fn spec_input_failure(plan: &PlaybookPlan, error: &ReconcileError) -> InputFailure {
-    let ReconcileError::InvalidPlaybook(_) = error else {
-        return InputFailure::same(error.to_string());
+    let summary = match error {
+        ReconcileError::InvalidPlaybook(_) => {
+            invalid_playbook_summary(&plan.spec.template.playbook)
+        }
+        ReconcileError::InvalidFileEntry { name, .. } => {
+            format!("files entry {name:?} is not usable")
+        }
+        ReconcileError::WorkspaceSecretReferenced { .. } => {
+            "template references the plan's own workspace Secret".to_string()
+        }
+        _ => error.to_string(),
     };
-    let summary = match serde_yaml::from_str::<serde_yaml::Value>(&plan.spec.template.playbook) {
+    InputFailure {
+        summary,
+        detail: error.to_string(),
+    }
+}
+
+fn invalid_playbook_summary(playbook: &str) -> String {
+    match serde_yaml::from_str::<serde_yaml::Value>(playbook) {
         Err(syntax) => match syntax.location() {
             Some(at) => format!(
                 "playbook is not valid YAML at line {} column {}",
@@ -4743,10 +4761,6 @@ fn spec_input_failure(plan: &PlaybookPlan, error: &ReconcileError) -> InputFailu
         },
         Ok(serde_yaml::Value::Sequence(_)) => "playbook cannot be rendered".to_string(),
         Ok(_) => "playbook is not a list of plays".to_string(),
-    };
-    InputFailure {
-        summary,
-        detail: error.to_string(),
     }
 }
 
@@ -11666,6 +11680,31 @@ spec:
             single_play.detail,
             "spec.template.playbook is not a valid playbook: invalid type: map, expected a sequence"
         );
+    }
+
+    /// The other spec checks explain themselves at length; the column names what to fix and the
+    /// condition keeps the explanation.
+    #[test]
+    fn a_refused_spec_names_what_to_fix_in_the_summary() {
+        let plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+
+        let entry = ReconcileError::InvalidFileEntry {
+            name: "assets".into(),
+            reason: "it must contain exactly one recognized Kubernetes volume source with no unrecognized fields",
+        };
+        let failure = spec_input_failure(&plan, &entry);
+        assert_eq!(failure.summary, r#"files entry "assets" is not usable"#);
+        assert_eq!(failure.detail, entry.to_string());
+
+        let workspace = ReconcileError::WorkspaceSecretReferenced {
+            name: "workspace-plan-abcdefghij".into(),
+        };
+        let failure = spec_input_failure(&plan, &workspace);
+        assert_eq!(
+            failure.summary,
+            "template references the plan's own workspace Secret"
+        );
+        assert_eq!(failure.detail, workspace.to_string());
     }
 
     /// The user's playbook is a spec error no tick can clear, while a failure of the operator's own
