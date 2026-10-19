@@ -729,18 +729,17 @@ async fn reconcile(
         // Reported even when the release fails, so the plan says why it stopped while the release is
         // retried at the error requeue.
         let released = release_unenrolled_run(&context, &object).await;
-        let reported = if object.status.as_ref().map(|s| &s.phase)
-            != Some(&Phase::UnauthorizedNamespace)
-        {
-            let mut status = object.status.clone().unwrap_or_default();
-            status.phase = Phase::UnauthorizedNamespace;
-            status.summary = Some(format!(
-                "namespace '{namespace}' is not enrolled for ansible-operator (not in watchNamespaces); an administrator must enroll it"
-            ));
-            patch_status(&api, &object, status).await.map(drop)
-        } else {
-            Ok(())
-        };
+        let reported =
+            if object.status.as_ref().map(|s| &s.phase) != Some(&Phase::UnauthorizedNamespace) {
+                let mut status = object.status.clone().unwrap_or_default();
+                status.phase = Phase::UnauthorizedNamespace;
+                status.summary = Some(format!(
+                    "namespace '{namespace}' is not enrolled (watchNamespaces)"
+                ));
+                patch_status(&api, &object, status).await.map(drop)
+            } else {
+                Ok(())
+            };
         // Only one error can be returned, and the release is the one that matters.
         if let (Err(_), Err(error)) = (&released, &reported) {
             warn!(
@@ -763,14 +762,14 @@ async fn reconcile(
     // name never changes and there is nothing to poll for.
     if !plan_name_within_label_limit(name) {
         warn!(
-            "PlaybookPlan {namespace}/{name} has a name longer than {} characters; refusing to run",
+            "PlaybookPlan {namespace}/{name} has a name longer than {} characters, which it cannot have because the name is used as a label value on the objects each run creates; refusing to run. Recreate the plan under a shorter name",
             v1beta1::MAX_PLAN_NAME_LEN
         );
         if object.status.as_ref().map(|s| &s.phase) != Some(&Phase::Failed) {
             let mut status = object.status.clone().unwrap_or_default();
             status.phase = Phase::Failed;
             status.summary = Some(format!(
-                "name is {} characters; a PlaybookPlan name must be at most {} because it is used as a label value on the objects each run creates. Recreate the plan under a shorter name",
+                "name is {} characters, longer than the {} allowed",
                 name.chars().count(),
                 v1beta1::MAX_PLAN_NAME_LEN
             ));
@@ -912,7 +911,7 @@ async fn reconcile(
                     &api,
                     &unlaunched,
                     &mut resource_status,
-                    &error.to_string(),
+                    &summary_error(&error),
                 )
                 .await;
                 return Err(error);
@@ -1055,7 +1054,7 @@ async fn reconcile(
             unlaunched_run.as_ref(),
             &mut resource_status,
             &error,
-            InputFailure::same(error.to_string()),
+            spec_input_failure(&object, &error),
         )
         .await?;
         return conclude_input_error(namespace, name, error, reported, &resource_status);
@@ -1172,7 +1171,10 @@ async fn reconcile(
                 unlaunched_run.as_ref(),
                 &mut resource_status,
                 &error,
-                InputFailure::same(format!("cannot read referenced Secrets: {error}")),
+                InputFailure {
+                    summary: format!("cannot read referenced Secrets: {}", summary_error(&error)),
+                    detail: format!("cannot read referenced Secrets: {error}"),
+                },
             )
             .await?;
             return conclude_input_error(namespace, name, error, reported, &resource_status);
@@ -3936,16 +3938,16 @@ async fn advance_active_run(
     // on before anything else looks at the Job, whose pods are being deleted and no longer say why
     // it stopped. Once nothing of it may still execute, the Job is gone (or turned out to finish
     // after all), and the run finishes below like any other.
-    if let Some(reason) = play
+    if let Some(stall) = play
         .status
         .as_ref()
-        .and_then(|status| status.stall_reason.as_deref())
+        .and_then(play_history::JobStall::recorded)
         && cancel_run_job(context, object, run).await?
     {
         return Ok(report_stalled_run_cancelling(
             resource_status,
             &job_name,
-            reason,
+            &stall,
         ));
     }
 
@@ -4017,9 +4019,12 @@ async fn advance_active_run(
         let timeout = context.job_start_timeout_secs();
         if job_may_have_stalled(job, now, timeout) {
             let pods = run_job_pods(context, namespace, job, &run.mirror.play_uid).await?;
-            if let Some(reason) = job_start_stall(job, &pods, now, timeout) {
-                warn!("PlaybookPlan {namespace}/{name}: cancelling run {job_name}: {reason}");
-                play_history::record_stalled(&plays_api, &job_name, &run.mirror.play_uid, &reason)
+            if let Some(stall) = job_start_stall(job, &pods, now, timeout) {
+                warn!(
+                    "PlaybookPlan {namespace}/{name}: cancelling run {job_name}: {}",
+                    stall.reason
+                );
+                play_history::record_stalled(&plays_api, &job_name, &run.mirror.play_uid, &stall)
                     .await?;
                 // Whatever it answers, the run is not finished on this tick: the record now says
                 // why, and the next tick carries the cancellation on from there.
@@ -4027,7 +4032,7 @@ async fn advance_active_run(
                 return Ok(report_stalled_run_cancelling(
                     resource_status,
                     &job_name,
-                    &reason,
+                    &stall,
                 ));
             }
         }
@@ -4170,11 +4175,11 @@ async fn run_job_pods(
 fn report_stalled_run_cancelling(
     resource_status: &mut PlaybookPlanStatus,
     job_name: &str,
-    reason: &str,
+    stall: &play_history::JobStall,
 ) -> ActiveRunProgress {
     status::clear_run_conditions(resource_status);
-    status::set_job_did_not_start_condition(resource_status, reason);
-    resource_status.summary = Some(format!("cancelling run {job_name}: {reason}"));
+    status::set_job_did_not_start_condition(resource_status, &stall.reason);
+    resource_status.summary = Some(format!("cancelling run {job_name}: {}", stall.summary));
     ActiveRunProgress::Running(std::time::Duration::from_secs(5))
 }
 
@@ -4496,8 +4501,9 @@ async fn report_failed_abandon(
     error: ReconcileError,
 ) -> ReconcileError {
     resource_status.summary = Some(format!(
-        "{ABANDON_FAILURE_SUMMARY_PREFIX}{}: {error}",
-        run.mirror.job_name
+        "{ABANDON_FAILURE_SUMMARY_PREFIX}{}: {}",
+        run.mirror.job_name,
+        summary_error(&error)
     ));
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
         warn!(
@@ -4518,7 +4524,7 @@ async fn report_recovery_failure(
     resource_status: &mut PlaybookPlanStatus,
     error: ReconcileError,
 ) -> ReconcileError {
-    resource_status.summary = Some(format!("run recovery failed: {error}"));
+    resource_status.summary = Some(format!("run recovery failed: {}", summary_error(&error)));
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
         warn!(
             "Could not report the recovery failure on {:?}/{:?}: {patch_error}",
@@ -4554,8 +4560,9 @@ async fn report_failed_finalization(
     error: ReconcileError,
 ) -> ReconcileError {
     resource_status.summary = Some(format!(
-        "could not complete run {}: {error}",
-        run.mirror.job_name
+        "could not complete run {}: {}",
+        run.mirror.job_name,
+        summary_error(&error)
     ));
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
         warn!(
@@ -4613,8 +4620,12 @@ fn record_failed_run_preparation(status: &mut PlaybookPlanStatus, error: &Reconc
     }
 
     status.summary = Some(match status.active_run.as_ref() {
-        Some(run) => format!("could not prepare run {}: {error}", run.job_name),
-        None => format!("could not prepare a run: {error}"),
+        Some(run) => format!(
+            "could not prepare run {}: {}",
+            run.job_name,
+            summary_error(error)
+        ),
+        None => format!("could not prepare a run: {}", summary_error(error)),
     });
     true
 }
@@ -4676,16 +4687,6 @@ struct InputFailure {
     detail: String,
 }
 
-impl InputFailure {
-    /// One wording for both, for a read whose error text already fits a column.
-    fn same(text: String) -> Self {
-        Self {
-            summary: text.clone(),
-            detail: text,
-        }
-    }
-}
-
 /// How an inventory that would not resolve is stated in each place.
 ///
 /// The full error goes to the condition, not the column: the column is one line beside a dozen
@@ -4716,6 +4717,95 @@ fn inventory_input_failure(error: &ReconcileError) -> InputFailure {
     InputFailure {
         summary,
         detail: format!("cannot resolve the plan's inventories: {error}"),
+    }
+}
+
+/// An error as the plan's summary states it, wherever a summary carries one.
+///
+/// Short, because the summary is the `Summary` print column and these errors are the longest text
+/// that ever reaches it. An API error renders as `ApiError: <message>: <reason> (<the whole Status,
+/// message included, as Debug>)`, so a single `Forbidden` runs to several hundred characters; the
+/// column gets its reason, code and object. The operator's own errors that name every object
+/// involved and say what to do about them get a form that names the problem.
+///
+/// Nothing here is the only copy. Every path that puts one of these into a summary also hands the
+/// error back to the controller, which logs it whole, and an unreadable input is stated whole in the
+/// `Ready` condition besides.
+fn summary_error(error: &ReconcileError) -> String {
+    match error {
+        ReconcileError::KubeError(kube::Error::Api(status)) => api_error_summary(status),
+        ReconcileError::RunNamesTaken { last, .. } => {
+            format!("run names up to {last} are all held by other objects")
+        }
+        ReconcileError::ConcurrentActiveRecords { plays, .. } => {
+            format!("{} Plays claim to be the active run", plays.len())
+        }
+        ReconcileError::ForeignWorkspaceSecret { name } => {
+            format!("workspace Secret {name:?} belongs to someone else")
+        }
+        ReconcileError::ForeignProxyResource { kind, name, host } => {
+            format!("proxy {kind} {name:?} for host {host:?} is not this run's")
+        }
+        _ => error.to_string(),
+    }
+}
+
+/// `Forbidden (403): secrets "vars"`. The object comes from the `Status` details, which the
+/// apiserver fills in for an error about one named object and leaves empty otherwise.
+fn api_error_summary(status: &kube::core::Status) -> String {
+    let reason = if status.reason.is_empty() {
+        "API error"
+    } else {
+        status.reason.as_str()
+    };
+    let object = status
+        .details
+        .as_ref()
+        .filter(|details| !details.kind.is_empty() && !details.name.is_empty())
+        .map(|details| format!(": {} {:?}", details.kind, details.name))
+        .unwrap_or_default();
+    format!("{reason} ({}){object}", status.code)
+}
+
+/// How a spec the plan's own checks refused is stated in each place.
+///
+/// The column names what to fix and stops; why it cannot be used stays in the condition. That is
+/// the whole difference for a `files` entry and for a reference to the workspace Secret, whose
+/// errors explain themselves at length. A playbook that does not parse is the one where the column
+/// needs a different answer: the YAML parser names where it failed *and* what it was parsing at the
+/// time, so the column says only where to look, or that the YAML is fine but not a list of plays (a
+/// single play written as a mapping, the commonest form of it).
+fn spec_input_failure(plan: &PlaybookPlan, error: &ReconcileError) -> InputFailure {
+    let summary = match error {
+        ReconcileError::InvalidPlaybook(_) => {
+            invalid_playbook_summary(&plan.spec.template.playbook)
+        }
+        ReconcileError::InvalidFileEntry { name, .. } => {
+            format!("files entry {name:?} is not usable")
+        }
+        ReconcileError::WorkspaceSecretReferenced { .. } => {
+            "template references the plan's own workspace Secret".to_string()
+        }
+        _ => error.to_string(),
+    };
+    InputFailure {
+        summary,
+        detail: error.to_string(),
+    }
+}
+
+fn invalid_playbook_summary(playbook: &str) -> String {
+    match serde_yaml::from_str::<serde_yaml::Value>(playbook) {
+        Err(syntax) => match syntax.location() {
+            Some(at) => format!(
+                "playbook is not valid YAML at line {} column {}",
+                at.line(),
+                at.column()
+            ),
+            None => "playbook is not valid YAML".to_string(),
+        },
+        Ok(serde_yaml::Value::Sequence(_)) => "playbook cannot be rendered".to_string(),
+        Ok(_) => "playbook is not a list of plays".to_string(),
     }
 }
 
@@ -4959,12 +5049,14 @@ async fn handle_unlaunched_input_error(
         match action {
             JobPresenceAction::Adopt => {
                 resource_status.summary = Some(format!(
-                    "adopted the started run; the desired inputs cannot be resolved: {error}"
+                    "adopted the started run; the desired inputs cannot be resolved: {}",
+                    failure.summary
                 ));
             }
             JobPresenceAction::Abandon => {
                 resource_status.summary = Some(format!(
-                    "aborted the run because its desired inputs cannot be resolved: {error}"
+                    "aborted the run because its desired inputs cannot be resolved: {}",
+                    failure.summary
                 ));
             }
             // `Contested` and `Displaced` explained themselves, and more usefully than this could:
@@ -4986,7 +5078,10 @@ async fn handle_unlaunched_input_error(
         api,
         &unlaunched.run,
         unlaunched.phase.clone(),
-        format!("aborted the run because its desired inputs cannot be resolved: {error}"),
+        format!(
+            "aborted the run because its desired inputs cannot be resolved: {}",
+            failure.summary
+        ),
         resource_status,
     )
     .await
@@ -5519,7 +5614,7 @@ fn job_start_stall(
     pods: &[Pod],
     now_epoch_secs: i64,
     timeout_secs: i64,
-) -> Option<String> {
+) -> Option<play_history::JobStall> {
     let mut last_progress = job.metadata.creation_timestamp.as_ref()?.0.as_second();
     for pod in pods {
         if let Some(created) = &pod.metadata.creation_timestamp {
@@ -5573,12 +5668,19 @@ fn job_start_stall(
     (now_epoch_secs - last_progress >= timeout_secs).then(|| {
         // The operator never suspends its Jobs, so a suspended one was suspended from outside, for
         // example by a queueing controller holding it in a queue. It has no pod to describe.
-        let waiting_on = if job.spec.as_ref().and_then(|spec| spec.suspend) == Some(true) {
-            "the Job is suspended (spec.suspend), so it creates no pod; something outside the operator suspended it, such as a queueing controller".to_string()
+        let (short, waiting_on) = if job.spec.as_ref().and_then(|spec| spec.suspend) == Some(true)
+        {
+            (
+                "Job suspended".to_string(),
+                "the Job is suspended (spec.suspend), so it creates no pod; something outside the operator suspended it, such as a queueing controller".to_string(),
+            )
         } else {
             describe_unstarted_pods(pods)
         };
-        format!("the Job did not start within {timeout_secs}s: {waiting_on}")
+        play_history::JobStall {
+            summary: format!("Job did not start within {timeout_secs}s: {short}"),
+            reason: format!("the Job did not start within {timeout_secs}s: {waiting_on}"),
+        }
     })
 }
 
@@ -5596,16 +5698,26 @@ fn container_has_started(container: &ContainerStatus) -> bool {
 /// What a Job that did not start is waiting on, from its newest pod: not scheduled, or the first
 /// container that reports a waiting reason. `PodInitializing` is skipped while another container
 /// gives a better answer, because every container behind a stuck init container reports it.
-fn describe_unstarted_pods(pods: &[Pod]) -> String {
+///
+/// Returns it twice: in a word for the plan's summary (the Kubernetes reason, such as
+/// `ImagePullBackOff` or `Unschedulable`), and in full with the pod, the container and the message.
+fn describe_unstarted_pods(pods: &[Pod]) -> (String, String) {
+    const NO_CONTAINER: &str = "no container started";
     let Some(pod) = pods
         .iter()
         .max_by_key(|pod| pod.metadata.creation_timestamp.as_ref().map(|time| time.0))
     else {
-        return "no pod was created for it; the Job's events say why (Pod Security admission, an admission webhook, a ResourceQuota or a missing ServiceAccount)".to_string();
+        return (
+            "no pod created".to_string(),
+            "no pod was created for it; the Job's events say why (Pod Security admission, an admission webhook, a ResourceQuota or a missing ServiceAccount)".to_string(),
+        );
     };
     let name = pod.metadata.name.as_deref().unwrap_or("<unnamed>");
     let Some(status) = pod.status.as_ref() else {
-        return format!("pod {name} has not started a container");
+        return (
+            NO_CONTAINER.to_string(),
+            format!("pod {name} has not started a container"),
+        );
     };
 
     if let Some(condition) = status
@@ -5614,9 +5726,12 @@ fn describe_unstarted_pods(pods: &[Pod]) -> String {
         .flatten()
         .find(|condition| condition.type_ == "PodScheduled" && condition.status == "False")
     {
-        return format!(
-            "pod {name} is not scheduled{}",
-            reason_suffix(condition.reason.as_deref(), condition.message.as_deref())
+        return (
+            short_reason(condition.reason.as_deref(), "pod not scheduled"),
+            format!(
+                "pod {name} is not scheduled{}",
+                reason_suffix(condition.reason.as_deref(), condition.message.as_deref())
+            ),
         );
     }
 
@@ -5635,12 +5750,25 @@ fn describe_unstarted_pods(pods: &[Pod]) -> String {
         .find(|(_, waiting)| waiting.reason.as_deref() != Some("PodInitializing"))
         .or_else(|| waiting.first());
     match explained {
-        Some((container, waiting)) => format!(
-            "pod {name}: container {container} is waiting{}",
-            reason_suffix(waiting.reason.as_deref(), waiting.message.as_deref())
+        Some((container, waiting)) => (
+            short_reason(waiting.reason.as_deref(), "container waiting"),
+            format!(
+                "pod {name}: container {container} is waiting{}",
+                reason_suffix(waiting.reason.as_deref(), waiting.message.as_deref())
+            ),
         ),
-        None => format!("pod {name} has not started a container"),
+        None => (
+            NO_CONTAINER.to_string(),
+            format!("pod {name} has not started a container"),
+        ),
     }
+}
+
+fn short_reason(reason: Option<&str>, otherwise: &str) -> String {
+    reason
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or(otherwise)
+        .to_string()
 }
 
 fn reason_suffix(reason: Option<&str>, message: Option<&str>) -> String {
@@ -6513,7 +6641,7 @@ async fn recover_active_run(
                 .expect("a record needing recovery has a status");
             return Ok(Some(RecoveredRun::Finished {
                 finished: recorded_run_from_play(play)?,
-                status: play_status.clone(),
+                status: Box::new(play_status.clone()),
                 provides_version: play.spec.provides_version.clone(),
                 started_at: play_prepared_at(play),
                 inventory: play.spec.inventory.clone(),
@@ -6629,7 +6757,7 @@ enum RecoveredRun {
     Aborted(RecordedRun),
     Finished {
         finished: RecordedRun,
-        status: v1beta1::PlayStatus,
+        status: Box<v1beta1::PlayStatus>,
         /// The `spec.provides` version the finished run's record declared, carried beside its
         /// status because that is the only copy that still describes the revision which ran. The
         /// live plan may already advertise the next one.
@@ -7120,10 +7248,10 @@ enum RunDiagnostic {
     /// health. Without this the plan reports only "the recap could not be read", which is what a
     /// crashed container reports too, and the operator has no way to tell them apart.
     RecapOverflowed { hosts: u32 },
-    /// The operator cancelled the run's Job because it never started; `reason` is what the run
+    /// The operator cancelled the run's Job because it never started; the stall is what the run
     /// recorded it waiting on (`PlayStatus::stall_reason`). Without it the plan would report only an
     /// unreadable recap, which is what a reaped Job reports too.
-    JobDidNotStart { reason: String },
+    JobDidNotStart(play_history::JobStall),
     /// Kubernetes stopped the run's Job at its `activeDeadlineSeconds` (`seconds`), so the playbook
     /// never reached the end where its recap is written. Like `RecapOverflowed`, only the Job says
     /// so, which is why a run recovered from its record alone reports the plain unreadable recap.
@@ -7137,11 +7265,9 @@ impl RunDiagnostic {
     /// after all and finished before its cancellation landed reports its own result instead.
     fn from_play_status(status: &v1beta1::PlayStatus) -> Self {
         if status.phase == v1beta1::PlayPhase::Unknown
-            && let Some(reason) = &status.stall_reason
+            && let Some(stall) = play_history::JobStall::recorded(status)
         {
-            return Self::JobDidNotStart {
-                reason: reason.clone(),
-            };
+            return Self::JobDidNotStart(stall);
         }
         match hosts_without_recap_activity(status) {
             Some((hosts, of)) => Self::NoPlaybookActivity { hosts, of },
@@ -7159,8 +7285,9 @@ impl RunDiagnostic {
                 "PlaybookPlan {namespace}/{name}: run {job_name} reported {hosts} hosts, whose recap does not fit the kubelet's {} byte termination-message limit even compressed; every host is reported Unknown. Split the plan across smaller inventories",
                 callback_output::TERMINATION_MESSAGE_MAX_BYTES
             ),
-            Self::JobDidNotStart { reason } => warn!(
-                "PlaybookPlan {namespace}/{name}: run {job_name} was cancelled because {reason}; every host is reported Unknown and the run spent an attempt. Fix what the Job waited on (its image, its ServiceAccount, the namespace's admission rules or quota), or raise runs.startTimeoutSeconds if the image only pulls slowly"
+            Self::JobDidNotStart(stall) => warn!(
+                "PlaybookPlan {namespace}/{name}: run {job_name} was cancelled because {}; every host is reported Unknown and the run spent an attempt. Fix what the Job waited on (its image, its ServiceAccount, the namespace's admission rules or quota), or raise runs.startTimeoutSeconds if the image only pulls slowly",
+                stall.reason
             ),
             Self::DeadlineExceeded { seconds } => warn!(
                 "PlaybookPlan {namespace}/{name}: run {job_name} was stopped by Kubernetes after its deadline of {seconds}s (the plan's spec.activeDeadlineSeconds, or the operator's runs.defaultActiveDeadlineSeconds when the plan sets none, held to the operator's runs.maxActiveDeadlineSeconds either way); every host is reported Unknown and the run spent an attempt. Raise the plan's spec.activeDeadlineSeconds if the playbook legitimately runs longer; beyond runs.maxActiveDeadlineSeconds only the cluster administrator can raise the limit"
@@ -7178,9 +7305,9 @@ impl RunDiagnostic {
                 " (the playbook ran no task on {hosts} of {of} hosts)"
             )),
             Self::RecapOverflowed { hosts } => Some(format!(
-                " (the recap for {hosts} hosts does not fit the kubelet's termination-message limit, so no per-host result could be read; split the plan across smaller inventories)"
+                " (the recap for {hosts} hosts exceeds the termination-message limit)"
             )),
-            Self::JobDidNotStart { reason } => Some(format!(" (cancelled: {reason})")),
+            Self::JobDidNotStart(stall) => Some(format!(" (cancelled: {})", stall.summary)),
             Self::DeadlineExceeded { seconds } => {
                 Some(format!(" (the Job exceeded its deadline of {seconds}s)"))
             }
@@ -11571,6 +11698,152 @@ spec:
         }
     }
 
+    /// The parser's own message runs past 150 characters for an ordinary indentation mistake, so
+    /// the column gets where it failed and the condition gets the message.
+    #[test]
+    fn an_invalid_playbook_is_summarized_by_where_it_fails() {
+        let failure_for = |playbook: &str| {
+            let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+            plan.spec.template.playbook = playbook.to_string();
+            let error = validate_playbook(&plan).unwrap_err();
+            spec_input_failure(&plan, &error)
+        };
+
+        let misindented = failure_for(
+            "- hosts: all\n  tasks:\n    - name: x\n      debug: msg=hi\n     bad: indent\n",
+        );
+        assert_eq!(
+            misindented.summary,
+            "playbook is not valid YAML at line 5 column 6"
+        );
+        assert!(
+            misindented
+                .detail
+                .starts_with("spec.template.playbook is not a valid playbook: did not find"),
+            "{}",
+            misindented.detail
+        );
+
+        let single_play = failure_for("hosts: all\ntasks: []\n");
+        assert_eq!(single_play.summary, "playbook is not a list of plays");
+        assert_eq!(
+            single_play.detail,
+            "spec.template.playbook is not a valid playbook: invalid type: map, expected a sequence"
+        );
+    }
+
+    fn forbidden_secret() -> ReconcileError {
+        ReconcileError::KubeError(kube::Error::Api(Box::new(
+            kube::core::Status::failure(
+                "secrets \"vars\" is forbidden: User \"system:serviceaccount:ansible-operator:\
+                 ansible-operator\" cannot get resource \"secrets\" in API group \"\" in the \
+                 namespace \"team-a\"",
+                "Forbidden",
+            )
+            .with_code(403)
+            .with_details(
+                serde_json::from_value(serde_json::json!({ "name": "vars", "kind": "secrets" }))
+                    .unwrap(),
+            ),
+        )))
+    }
+
+    /// An API error renders its message twice and its whole `Status` besides; the summary gets
+    /// what it was and what it was about, and the error itself still carries every word of it.
+    #[test]
+    fn an_api_error_is_summarized_by_its_reason_and_object() {
+        let error = forbidden_secret();
+        assert_eq!(summary_error(&error), r#"Forbidden (403): secrets "vars""#);
+        assert!(
+            error
+                .to_string()
+                .contains(r#"cannot get resource \"secrets\" in API group \"\" in the namespace"#),
+            "{error}"
+        );
+
+        let without_details = ReconcileError::KubeError(kube::Error::Api(Box::new(
+            kube::core::Status::failure("etcdserver: request timed out", "").with_code(500),
+        )));
+        assert_eq!(summary_error(&without_details), "API error (500)");
+    }
+
+    #[test]
+    fn the_operators_own_long_errors_are_summarized_by_their_problem() {
+        let cases = [
+            (
+                ReconcileError::RunNamesTaken {
+                    namespace: "team-a".into(),
+                    first: "apply-web-abc-1".into(),
+                    last: "apply-web-abc-64".into(),
+                },
+                "run names up to apply-web-abc-64 are all held by other objects",
+            ),
+            (
+                ReconcileError::ConcurrentActiveRecords {
+                    namespace: "team-a".into(),
+                    plays: vec!["apply-web-abc-1".into(), "apply-web-abc-2".into()],
+                },
+                "2 Plays claim to be the active run",
+            ),
+            (
+                ReconcileError::ForeignWorkspaceSecret {
+                    name: "workspace-web-abc".into(),
+                },
+                r#"workspace Secret "workspace-web-abc" belongs to someone else"#,
+            ),
+            (
+                ReconcileError::ForeignProxyResource {
+                    kind: "Pod",
+                    name: "proxy-abc".into(),
+                    host: "worker-1".into(),
+                },
+                r#"proxy Pod "proxy-abc" for host "worker-1" is not this run's"#,
+            ),
+        ];
+        for (error, summary) in cases {
+            assert_eq!(summary_error(&error), summary);
+        }
+    }
+
+    /// The summaries that carry an error carry its short form.
+    #[test]
+    fn a_failed_preparation_states_the_error_briefly() {
+        let mut status = PlaybookPlanStatus::default();
+        assert!(record_failed_run_preparation(
+            &mut status,
+            &forbidden_secret()
+        ));
+        assert_eq!(
+            status.summary.as_deref(),
+            Some(r#"could not prepare a run: Forbidden (403): secrets "vars""#)
+        );
+    }
+
+    /// The other spec checks explain themselves at length; the column names what to fix and the
+    /// condition keeps the explanation.
+    #[test]
+    fn a_refused_spec_names_what_to_fix_in_the_summary() {
+        let plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+
+        let entry = ReconcileError::InvalidFileEntry {
+            name: "assets".into(),
+            reason: "it must contain exactly one recognized Kubernetes volume source with no unrecognized fields",
+        };
+        let failure = spec_input_failure(&plan, &entry);
+        assert_eq!(failure.summary, r#"files entry "assets" is not usable"#);
+        assert_eq!(failure.detail, entry.to_string());
+
+        let workspace = ReconcileError::WorkspaceSecretReferenced {
+            name: "workspace-plan-abcdefghij".into(),
+        };
+        let failure = spec_input_failure(&plan, &workspace);
+        assert_eq!(
+            failure.summary,
+            "template references the plan's own workspace Secret"
+        );
+        assert_eq!(failure.detail, workspace.to_string());
+    }
+
     /// The user's playbook is a spec error no tick can clear, while a failure of the operator's own
     /// rendering is not, so the two must classify differently.
     #[test]
@@ -12589,7 +12862,10 @@ spec:
         };
         record_input_failure(
             &mut idle,
-            InputFailure::same("cannot read referenced Secrets: nope".into()),
+            InputFailure {
+                summary: "cannot read referenced Secrets: nope".into(),
+                detail: "cannot read referenced Secrets: nope".into(),
+            },
         );
         assert_eq!(idle.phase, Phase::Succeeded);
         assert_eq!(idle.next_run, None);
@@ -12727,7 +13003,10 @@ spec:
         };
         record_input_failure(
             &mut succeeded,
-            InputFailure::same("cannot read referenced Secrets: temporary failure".into()),
+            InputFailure {
+                summary: "cannot read referenced Secrets: temporary failure".into(),
+                detail: "cannot read referenced Secrets: temporary failure".into(),
+            },
         );
         assert_eq!(succeeded.phase, Phase::Succeeded);
         assert_eq!(succeeded.next_run, None);
@@ -13149,7 +13428,7 @@ spec:
         assert_eq!(
             status.summary.as_deref(),
             Some(
-                "could not prepare run apply-plan-1-4: Pod \"managed-ssh-worker-1-run-1\" already exists but is not this run's managed-ssh proxy for host \"worker-1\""
+                "could not prepare run apply-plan-1-4: proxy Pod \"managed-ssh-worker-1-run-1\" for host \"worker-1\" is not this run's"
             )
         );
         assert_eq!(status.phase, Phase::Applying);
@@ -15526,10 +15805,17 @@ spec:
             job_start_stall(&stall_job(None), &[], t0 + 599, STALL_TIMEOUT),
             None
         );
-        let reason = job_start_stall(&stall_job(None), &[], t0 + 600, STALL_TIMEOUT).unwrap();
+        let stall = job_start_stall(&stall_job(None), &[], t0 + 600, STALL_TIMEOUT).unwrap();
+        assert_eq!(
+            stall.summary,
+            "Job did not start within 600s: no pod created"
+        );
         assert!(
-            reason.starts_with("the Job did not start within 600s: no pod was created for it"),
-            "{reason}"
+            stall
+                .reason
+                .starts_with("the Job did not start within 600s: no pod was created for it"),
+            "{}",
+            stall.reason
         );
 
         // A suspended Job creates no pod either, but the events would not say why.
@@ -15538,10 +15824,17 @@ spec:
             suspend: Some(true),
             ..Default::default()
         });
-        let reason = job_start_stall(&suspended, &[], t0 + 600, STALL_TIMEOUT).unwrap();
+        let stall = job_start_stall(&suspended, &[], t0 + 600, STALL_TIMEOUT).unwrap();
+        assert_eq!(
+            stall.summary,
+            "Job did not start within 600s: Job suspended"
+        );
         assert!(
-            reason.starts_with("the Job did not start within 600s: the Job is suspended"),
-            "{reason}"
+            stall
+                .reason
+                .starts_with("the Job did not start within 600s: the Job is suspended"),
+            "{}",
+            stall.reason
         );
     }
 
@@ -15557,11 +15850,13 @@ spec:
             }],
         }));
         assert_eq!(
-            job_start_stall(&stall_job(None), &[unscheduled], now, STALL_TIMEOUT).as_deref(),
-            Some(
-                "the Job did not start within 600s: pod apply-web-abc-1-x7k2p is not scheduled: \
-                 Unschedulable: 0/3 nodes are available"
-            )
+            job_start_stall(&stall_job(None), &[unscheduled], now, STALL_TIMEOUT),
+            Some(play_history::JobStall {
+                summary: "Job did not start within 600s: Unschedulable".into(),
+                reason: "the Job did not start within 600s: pod apply-web-abc-1-x7k2p is not \
+                         scheduled: Unschedulable: 0/3 nodes are available"
+                    .into(),
+            })
         );
 
         // Every container behind a stuck init container reports `PodInitializing`; the one that is
@@ -15580,11 +15875,14 @@ spec:
             }],
         }));
         assert_eq!(
-            job_start_stall(&stall_job(None), &[pulling], now, STALL_TIMEOUT).as_deref(),
-            Some(
-                "the Job did not start within 600s: pod apply-web-abc-1-x7k2p: container \
-                 managed-ssh-preflight is waiting: ImagePullBackOff: Back-off pulling image \"i\""
-            )
+            job_start_stall(&stall_job(None), &[pulling], now, STALL_TIMEOUT),
+            Some(play_history::JobStall {
+                summary: "Job did not start within 600s: ImagePullBackOff".into(),
+                reason: "the Job did not start within 600s: pod apply-web-abc-1-x7k2p: container \
+                         managed-ssh-preflight is waiting: ImagePullBackOff: Back-off pulling \
+                         image \"i\""
+                    .into(),
+            })
         );
     }
 
@@ -15647,7 +15945,9 @@ spec:
             None
         );
         assert_eq!(
-            job_start_stall(&stall_job(None), &pods, finished + 600, STALL_TIMEOUT).as_deref(),
+            job_start_stall(&stall_job(None), &pods, finished + 600, STALL_TIMEOUT)
+                .map(|stall| stall.reason)
+                .as_deref(),
             Some(
                 "the Job did not start within 600s: pod apply-web-abc-1-x7k2p: container \
                  ansible-playbook is waiting: CreateContainerConfigError: secret \"x\" not found"
@@ -15783,19 +16083,48 @@ spec:
         );
     }
 
+    /// The summary is a print column, so the stall goes there in its short form; the condition is
+    /// where `describe` shows the pod, the container and the kubelet's message.
+    #[test]
+    fn a_cancelled_stall_keeps_its_detail_out_of_the_summary() {
+        let stall = play_history::JobStall {
+            summary: "Job did not start within 600s: ImagePullBackOff".into(),
+            reason: "the Job did not start within 600s: pod p: container c is waiting: \
+                     ImagePullBackOff: Back-off pulling image \"i\""
+                .into(),
+        };
+        let mut status = PlaybookPlanStatus::default();
+
+        let _progress = report_stalled_run_cancelling(&mut status, "apply-web-abc-1", &stall);
+
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("cancelling run apply-web-abc-1: Job did not start within 600s: ImagePullBackOff")
+        );
+        let running = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Running")
+            .unwrap();
+        assert_eq!(running.reason.as_deref(), Some("JobDidNotStart"));
+        assert_eq!(running.message.as_ref(), Some(&stall.reason));
+    }
+
     /// The recorded stall explains an unreadable recap, and only that: a Job that started after all
-    /// and finished before its cancellation landed reports its own result.
+    /// and finished before its cancellation landed reports its own result. The summary carries the
+    /// stall's short form; the pod, container and image it names only fit the record.
     #[test]
     fn a_recorded_stall_explains_only_an_unreadable_recap() {
         let stalled = v1beta1::PlayStatus {
             phase: v1beta1::PlayPhase::Unknown,
-            stall_reason: Some("the Job did not start within 600s: …".into()),
+            stall_reason: Some("the Job did not start within 600s: pod …: container …".into()),
+            stall_summary: Some("Job did not start within 600s: ImagePullBackOff".into()),
             ..Default::default()
         };
         let diagnostic = RunDiagnostic::from_play_status(&stalled);
         assert_eq!(
             diagnostic.summary_clause().as_deref(),
-            Some(" (cancelled: the Job did not start within 600s: …)")
+            Some(" (cancelled: Job did not start within 600s: ImagePullBackOff)")
         );
 
         let finished_anyway = v1beta1::PlayStatus {

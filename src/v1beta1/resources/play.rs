@@ -190,6 +190,11 @@ pub struct PlayStatus {
     /// its result before the cancellation landed does not keep it, since that Job did start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall_reason: Option<String>,
+
+    /// The short form of `stallReason` for the plan's one-line summary: the timeout and a single
+    /// word for what the Job waited on, such as `ImagePullBackOff`. Written together with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_summary: Option<String>,
 }
 
 /// A host excluded from a run, and the one distinction the exclusion itself does not carry.
