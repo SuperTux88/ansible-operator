@@ -729,18 +729,17 @@ async fn reconcile(
         // Reported even when the release fails, so the plan says why it stopped while the release is
         // retried at the error requeue.
         let released = release_unenrolled_run(&context, &object).await;
-        let reported = if object.status.as_ref().map(|s| &s.phase)
-            != Some(&Phase::UnauthorizedNamespace)
-        {
-            let mut status = object.status.clone().unwrap_or_default();
-            status.phase = Phase::UnauthorizedNamespace;
-            status.summary = Some(format!(
-                "namespace '{namespace}' is not enrolled for ansible-operator (not in watchNamespaces); an administrator must enroll it"
-            ));
-            patch_status(&api, &object, status).await.map(drop)
-        } else {
-            Ok(())
-        };
+        let reported =
+            if object.status.as_ref().map(|s| &s.phase) != Some(&Phase::UnauthorizedNamespace) {
+                let mut status = object.status.clone().unwrap_or_default();
+                status.phase = Phase::UnauthorizedNamespace;
+                status.summary = Some(format!(
+                    "namespace '{namespace}' is not enrolled (watchNamespaces)"
+                ));
+                patch_status(&api, &object, status).await.map(drop)
+            } else {
+                Ok(())
+            };
         // Only one error can be returned, and the release is the one that matters.
         if let (Err(_), Err(error)) = (&released, &reported) {
             warn!(
@@ -763,14 +762,14 @@ async fn reconcile(
     // name never changes and there is nothing to poll for.
     if !plan_name_within_label_limit(name) {
         warn!(
-            "PlaybookPlan {namespace}/{name} has a name longer than {} characters; refusing to run",
+            "PlaybookPlan {namespace}/{name} has a name longer than {} characters, which it cannot have because the name is used as a label value on the objects each run creates; refusing to run. Recreate the plan under a shorter name",
             v1beta1::MAX_PLAN_NAME_LEN
         );
         if object.status.as_ref().map(|s| &s.phase) != Some(&Phase::Failed) {
             let mut status = object.status.clone().unwrap_or_default();
             status.phase = Phase::Failed;
             status.summary = Some(format!(
-                "name is {} characters; a PlaybookPlan name must be at most {} because it is used as a label value on the objects each run creates. Recreate the plan under a shorter name",
+                "name is {} characters, longer than the {} allowed",
                 name.chars().count(),
                 v1beta1::MAX_PLAN_NAME_LEN
             ));

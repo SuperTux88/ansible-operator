@@ -318,7 +318,8 @@ record as a first response to a stuck plan; inspect the run and Job first. See [
 
 ### The plan is stuck in `UnauthorizedNamespace`
 
-The plan's namespace has not been **enrolled** with the operator, so the operator has no RBAC to read
+The summary reads **"namespace '…' is not enrolled (watchNamespaces)"**. The plan's namespace has
+not been **enrolled** with the operator, so the operator has no RBAC to read
 its Secrets or create its Job and refuses to run it (fail-closed). This is a cluster-admin action,
 not something you can fix from the tenant side: an admin must add your namespace to the chart's
 `watchNamespaces` and roll the operator. See
@@ -350,8 +351,8 @@ closes.
 
 ### The plan's name is too long
 
-The plan is `Failed` and its summary reads **"name is N characters; a PlaybookPlan name must be at
-most 63 …"**. Applying such a plan is normally rejected outright; you only see this state on a
+The plan is `Failed` and its summary reads **"name is N characters, longer than the 63 allowed"**.
+Applying such a plan is normally rejected outright; you only see this state on a
 cluster that does not enforce CRD validation rules. Either way nothing is created for the plan.
 
 The name is used as a label value on every object a run creates, and Kubernetes label values stop at
