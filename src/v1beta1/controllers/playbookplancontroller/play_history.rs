@@ -167,6 +167,29 @@ pub async fn record_running(
     }
 }
 
+/// Why a run's Job counts as never having started, in each of the two places it is said.
+///
+/// `summary` lands in the plan's `Summary` print column, one line per plan, so it names the timeout
+/// and what the Job waited on in a word. `reason` is the whole account — the pod, the container,
+/// the image and the kubelet's message — for the `Running` condition, the record and the log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobStall {
+    pub summary: String,
+    pub reason: String,
+}
+
+impl JobStall {
+    /// The stall a run recorded, if it recorded one.
+    pub fn recorded(status: &PlayStatus) -> Option<Self> {
+        let reason = status.stall_reason.clone()?;
+        let summary = status
+            .stall_summary
+            .clone()
+            .unwrap_or_else(|| "Job did not start".to_string());
+        Some(Self { summary, reason })
+    }
+}
+
 /// Writes down why a `Running` run's Job is about to be cancelled for never starting — see
 /// [`PlayStatus::stall_reason`]. The phase stays `Running`: the run is not finished until its Job
 /// has stopped, and `record_finished` carries the reason into the terminal status.
@@ -178,7 +201,7 @@ pub async fn record_stalled(
     api: &Api<Play>,
     play_name: &str,
     play_uid: &str,
-    reason: &str,
+    stall: &JobStall,
 ) -> Result<Play, ReconcileError> {
     for attempt in 0..=TRANSITION_CONFLICT_RETRIES {
         let object = api.get(play_name).await?;
@@ -188,7 +211,7 @@ pub async fn record_stalled(
             .as_ref()
             .ok_or_else(|| ReconcileError::record_mismatch(&object, "has no status"))?;
 
-        let Some(status) = decide_stall(status, reason)
+        let Some(status) = decide_stall(status, stall)
             .map_err(|reason| ReconcileError::record_mismatch(&object, reason))?
         else {
             return Ok(object);
@@ -212,11 +235,12 @@ pub async fn record_stalled(
 /// The first reason wins. A replay after the write landed carries the reason a later tick derived
 /// from pods that are already being deleted, which describes the teardown rather than the stall.
 /// A run that finished in the meantime keeps its result, since its Job turned out to start after all.
-fn decide_stall(status: &PlayStatus, reason: &str) -> Result<Option<PlayStatus>, &'static str> {
+fn decide_stall(status: &PlayStatus, stall: &JobStall) -> Result<Option<PlayStatus>, &'static str> {
     match status.phase {
         PlayPhase::Running if status.stall_reason.is_none() => {
             let mut next = status.clone();
-            next.stall_reason = Some(reason.to_string());
+            next.stall_reason = Some(stall.reason.clone());
+            next.stall_summary = Some(stall.summary.clone());
             Ok(Some(next))
         }
         PlayPhase::Running | PlayPhase::Succeeded | PlayPhase::Failed | PlayPhase::Unknown => {
@@ -613,7 +637,7 @@ pub async fn record_finished(
         .map(|status| status.unreachable_hosts.clone())
         .unwrap_or_default();
     let mut status = terminal_status(&job_name, hosts, parsed, unreachable_hosts);
-    status.stall_reason = carried_stall_reason(recorded, &status);
+    carry_stall(recorded, &mut status);
     match object.status.as_ref().map(|status| &status.phase) {
         Some(PlayPhase::Launching | PlayPhase::Running) => {
             replace_status(api, object, status).await
@@ -629,12 +653,15 @@ pub async fn record_finished(
     }
 }
 
-/// The stall reason a finished run keeps: only when its result is `Unknown`. A Job that turned out
-/// to start and report a recap before its cancellation landed was not cancelled for never starting.
-fn carried_stall_reason(recorded: Option<&PlayStatus>, finished: &PlayStatus) -> Option<String> {
-    recorded
-        .and_then(|status| status.stall_reason.clone())
-        .filter(|_| finished.phase == PlayPhase::Unknown)
+/// Carries the recorded stall into a finished run's status, but only when its result is `Unknown`.
+/// A Job that turned out to start and report a recap before its cancellation landed was not
+/// cancelled for never starting.
+fn carry_stall(recorded: Option<&PlayStatus>, finished: &mut PlayStatus) {
+    let Some(recorded) = recorded.filter(|_| finished.phase == PlayPhase::Unknown) else {
+        return;
+    };
+    finished.stall_reason = recorded.stall_reason.clone();
+    finished.stall_summary = recorded.stall_summary.clone();
 }
 
 /// Deletes the oldest `Play`s for `plan` beyond its success/failure history limits.
@@ -856,6 +883,7 @@ fn terminal_status(
         hosts: host_results,
         unreachable_hosts,
         stall_reason: None,
+        stall_summary: None,
     }
 }
 
@@ -1781,19 +1809,24 @@ mod tests {
             ..Default::default()
         };
 
-        let stalled = decide_stall(&at(PlayPhase::Running), "first")
+        let stall = |word: &str| JobStall {
+            summary: format!("{word} in short"),
+            reason: word.to_string(),
+        };
+
+        let stalled = decide_stall(&at(PlayPhase::Running), &stall("first"))
             .unwrap()
             .expect("a running record without a reason must be written");
         assert_eq!(stalled.phase, PlayPhase::Running);
-        assert_eq!(stalled.stall_reason.as_deref(), Some("first"));
+        assert_eq!(JobStall::recorded(&stalled), Some(stall("first")));
 
-        assert!(decide_stall(&stalled, "second").unwrap().is_none());
+        assert!(decide_stall(&stalled, &stall("second")).unwrap().is_none());
         assert!(
-            decide_stall(&at(PlayPhase::Unknown), "late")
+            decide_stall(&at(PlayPhase::Unknown), &stall("late"))
                 .unwrap()
                 .is_none()
         );
-        assert!(decide_stall(&at(PlayPhase::Launching), "early").is_err());
+        assert!(decide_stall(&at(PlayPhase::Launching), &stall("early")).is_err());
     }
 
     /// The terminal status is built from scratch, so the recorded stall has to be carried into it,
@@ -1804,14 +1837,21 @@ mod tests {
         let recorded = PlayStatus {
             phase: PlayPhase::Running,
             stall_reason: Some("the Job did not start within 600s: …".into()),
+            stall_summary: Some("Job did not start within 600s: ImagePullBackOff".into()),
             ..Default::default()
+        };
+        let carried = |recorded: Option<&PlayStatus>, finished: &PlayStatus| {
+            let mut finished = finished.clone();
+            carry_stall(recorded, &mut finished);
+            JobStall::recorded(&finished)
         };
 
         let lost = terminal_status("job", &hosts, None, Vec::new());
         assert_eq!(
-            carried_stall_reason(Some(&recorded), &lost).as_deref(),
-            Some("the Job did not start within 600s: …")
+            carried(Some(&recorded), &lost),
+            JobStall::recorded(&recorded)
         );
+        assert!(carried(Some(&recorded), &lost).is_some());
 
         let recap = output(&[(
             "a",
@@ -1822,9 +1862,9 @@ mod tests {
             },
         )]);
         let reported = terminal_status("job", &hosts, Some(&recap), Vec::new());
-        assert_eq!(carried_stall_reason(Some(&recorded), &reported), None);
+        assert_eq!(carried(Some(&recorded), &reported), None);
 
-        assert_eq!(carried_stall_reason(None, &lost), None);
+        assert_eq!(carried(None, &lost), None);
     }
 
     /// Each protocol step may be replayed after its write landed but before the operator observed

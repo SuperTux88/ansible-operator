@@ -368,6 +368,12 @@ spec:
                   its result before the cancellation landed does not keep it, since that Job did start.
                 nullable: true
                 type: string
+              stallSummary:
+                description: |-
+                  The short form of `stallReason` for the plan's one-line summary: the timeout and a single
+                  word for what the Job waited on, such as `ImagePullBackOff`. Written together with it.
+                nullable: true
+                type: string
               unreachableHosts:
                 default: []
                 description: |-
