@@ -7241,7 +7241,7 @@ impl RunDiagnostic {
                 " (the playbook ran no task on {hosts} of {of} hosts)"
             )),
             Self::RecapOverflowed { hosts } => Some(format!(
-                " (the recap for {hosts} hosts does not fit the kubelet's termination-message limit, so no per-host result could be read; split the plan across smaller inventories)"
+                " (the recap for {hosts} hosts exceeds the termination-message limit)"
             )),
             Self::JobDidNotStart(stall) => Some(format!(" (cancelled: {})", stall.summary)),
             Self::DeadlineExceeded { seconds } => {
