@@ -912,7 +912,7 @@ async fn reconcile(
                     &api,
                     &unlaunched,
                     &mut resource_status,
-                    &error.to_string(),
+                    &summary_error(&error),
                 )
                 .await;
                 return Err(error);
@@ -1172,7 +1172,10 @@ async fn reconcile(
                 unlaunched_run.as_ref(),
                 &mut resource_status,
                 &error,
-                InputFailure::same(format!("cannot read referenced Secrets: {error}")),
+                InputFailure {
+                    summary: format!("cannot read referenced Secrets: {}", summary_error(&error)),
+                    detail: format!("cannot read referenced Secrets: {error}"),
+                },
             )
             .await?;
             return conclude_input_error(namespace, name, error, reported, &resource_status);
@@ -4499,8 +4502,9 @@ async fn report_failed_abandon(
     error: ReconcileError,
 ) -> ReconcileError {
     resource_status.summary = Some(format!(
-        "{ABANDON_FAILURE_SUMMARY_PREFIX}{}: {error}",
-        run.mirror.job_name
+        "{ABANDON_FAILURE_SUMMARY_PREFIX}{}: {}",
+        run.mirror.job_name,
+        summary_error(&error)
     ));
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
         warn!(
@@ -4521,7 +4525,7 @@ async fn report_recovery_failure(
     resource_status: &mut PlaybookPlanStatus,
     error: ReconcileError,
 ) -> ReconcileError {
-    resource_status.summary = Some(format!("run recovery failed: {error}"));
+    resource_status.summary = Some(format!("run recovery failed: {}", summary_error(&error)));
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
         warn!(
             "Could not report the recovery failure on {:?}/{:?}: {patch_error}",
@@ -4557,8 +4561,9 @@ async fn report_failed_finalization(
     error: ReconcileError,
 ) -> ReconcileError {
     resource_status.summary = Some(format!(
-        "could not complete run {}: {error}",
-        run.mirror.job_name
+        "could not complete run {}: {}",
+        run.mirror.job_name,
+        summary_error(&error)
     ));
     if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
         warn!(
@@ -4616,8 +4621,12 @@ fn record_failed_run_preparation(status: &mut PlaybookPlanStatus, error: &Reconc
     }
 
     status.summary = Some(match status.active_run.as_ref() {
-        Some(run) => format!("could not prepare run {}: {error}", run.job_name),
-        None => format!("could not prepare a run: {error}"),
+        Some(run) => format!(
+            "could not prepare run {}: {}",
+            run.job_name,
+            summary_error(error)
+        ),
+        None => format!("could not prepare a run: {}", summary_error(error)),
     });
     true
 }
@@ -4679,16 +4688,6 @@ struct InputFailure {
     detail: String,
 }
 
-impl InputFailure {
-    /// One wording for both, for a read whose error text already fits a column.
-    fn same(text: String) -> Self {
-        Self {
-            summary: text.clone(),
-            detail: text,
-        }
-    }
-}
-
 /// How an inventory that would not resolve is stated in each place.
 ///
 /// The full error goes to the condition, not the column: the column is one line beside a dozen
@@ -4720,6 +4719,53 @@ fn inventory_input_failure(error: &ReconcileError) -> InputFailure {
         summary,
         detail: format!("cannot resolve the plan's inventories: {error}"),
     }
+}
+
+/// An error as the plan's summary states it, wherever a summary carries one.
+///
+/// Short, because the summary is the `Summary` print column and these errors are the longest text
+/// that ever reaches it. An API error renders as `ApiError: <message>: <reason> (<the whole Status,
+/// message included, as Debug>)`, so a single `Forbidden` runs to several hundred characters; the
+/// column gets its reason, code and object. The operator's own errors that name every object
+/// involved and say what to do about them get a form that names the problem.
+///
+/// Nothing here is the only copy. Every path that puts one of these into a summary also hands the
+/// error back to the controller, which logs it whole, and an unreadable input is stated whole in the
+/// `Ready` condition besides.
+fn summary_error(error: &ReconcileError) -> String {
+    match error {
+        ReconcileError::KubeError(kube::Error::Api(status)) => api_error_summary(status),
+        ReconcileError::RunNamesTaken { last, .. } => {
+            format!("run names up to {last} are all held by other objects")
+        }
+        ReconcileError::ConcurrentActiveRecords { plays, .. } => {
+            format!("{} Plays claim to be the active run", plays.len())
+        }
+        ReconcileError::ForeignWorkspaceSecret { name } => {
+            format!("workspace Secret {name:?} belongs to someone else")
+        }
+        ReconcileError::ForeignProxyResource { kind, name, host } => {
+            format!("proxy {kind} {name:?} for host {host:?} is not this run's")
+        }
+        _ => error.to_string(),
+    }
+}
+
+/// `Forbidden (403): secrets "vars"`. The object comes from the `Status` details, which the
+/// apiserver fills in for an error about one named object and leaves empty otherwise.
+fn api_error_summary(status: &kube::core::Status) -> String {
+    let reason = if status.reason.is_empty() {
+        "API error"
+    } else {
+        status.reason.as_str()
+    };
+    let object = status
+        .details
+        .as_ref()
+        .filter(|details| !details.kind.is_empty() && !details.name.is_empty())
+        .map(|details| format!(": {} {:?}", details.kind, details.name))
+        .unwrap_or_default();
+    format!("{reason} ({}){object}", status.code)
 }
 
 /// How a spec the plan's own checks refused is stated in each place.
@@ -5004,12 +5050,14 @@ async fn handle_unlaunched_input_error(
         match action {
             JobPresenceAction::Adopt => {
                 resource_status.summary = Some(format!(
-                    "adopted the started run; the desired inputs cannot be resolved: {error}"
+                    "adopted the started run; the desired inputs cannot be resolved: {}",
+                    failure.summary
                 ));
             }
             JobPresenceAction::Abandon => {
                 resource_status.summary = Some(format!(
-                    "aborted the run because its desired inputs cannot be resolved: {error}"
+                    "aborted the run because its desired inputs cannot be resolved: {}",
+                    failure.summary
                 ));
             }
             // `Contested` and `Displaced` explained themselves, and more usefully than this could:
@@ -5031,7 +5079,10 @@ async fn handle_unlaunched_input_error(
         api,
         &unlaunched.run,
         unlaunched.phase.clone(),
-        format!("aborted the run because its desired inputs cannot be resolved: {error}"),
+        format!(
+            "aborted the run because its desired inputs cannot be resolved: {}",
+            failure.summary
+        ),
         resource_status,
     )
     .await
@@ -11682,6 +11733,93 @@ spec:
         );
     }
 
+    fn forbidden_secret() -> ReconcileError {
+        ReconcileError::KubeError(kube::Error::Api(Box::new(
+            kube::core::Status::failure(
+                "secrets \"vars\" is forbidden: User \"system:serviceaccount:ansible-operator:\
+                 ansible-operator\" cannot get resource \"secrets\" in API group \"\" in the \
+                 namespace \"team-a\"",
+                "Forbidden",
+            )
+            .with_code(403)
+            .with_details(
+                serde_json::from_value(serde_json::json!({ "name": "vars", "kind": "secrets" }))
+                    .unwrap(),
+            ),
+        )))
+    }
+
+    /// An API error renders its message twice and its whole `Status` besides; the summary gets
+    /// what it was and what it was about, and the error itself still carries every word of it.
+    #[test]
+    fn an_api_error_is_summarized_by_its_reason_and_object() {
+        let error = forbidden_secret();
+        assert_eq!(summary_error(&error), r#"Forbidden (403): secrets "vars""#);
+        assert!(
+            error
+                .to_string()
+                .contains(r#"cannot get resource \"secrets\" in API group \"\" in the namespace"#),
+            "{error}"
+        );
+
+        let without_details = ReconcileError::KubeError(kube::Error::Api(Box::new(
+            kube::core::Status::failure("etcdserver: request timed out", "").with_code(500),
+        )));
+        assert_eq!(summary_error(&without_details), "API error (500)");
+    }
+
+    #[test]
+    fn the_operators_own_long_errors_are_summarized_by_their_problem() {
+        let cases = [
+            (
+                ReconcileError::RunNamesTaken {
+                    namespace: "team-a".into(),
+                    first: "apply-web-abc-1".into(),
+                    last: "apply-web-abc-64".into(),
+                },
+                "run names up to apply-web-abc-64 are all held by other objects",
+            ),
+            (
+                ReconcileError::ConcurrentActiveRecords {
+                    namespace: "team-a".into(),
+                    plays: vec!["apply-web-abc-1".into(), "apply-web-abc-2".into()],
+                },
+                "2 Plays claim to be the active run",
+            ),
+            (
+                ReconcileError::ForeignWorkspaceSecret {
+                    name: "workspace-web-abc".into(),
+                },
+                r#"workspace Secret "workspace-web-abc" belongs to someone else"#,
+            ),
+            (
+                ReconcileError::ForeignProxyResource {
+                    kind: "Pod",
+                    name: "proxy-abc".into(),
+                    host: "worker-1".into(),
+                },
+                r#"proxy Pod "proxy-abc" for host "worker-1" is not this run's"#,
+            ),
+        ];
+        for (error, summary) in cases {
+            assert_eq!(summary_error(&error), summary);
+        }
+    }
+
+    /// The summaries that carry an error carry its short form.
+    #[test]
+    fn a_failed_preparation_states_the_error_briefly() {
+        let mut status = PlaybookPlanStatus::default();
+        assert!(record_failed_run_preparation(
+            &mut status,
+            &forbidden_secret()
+        ));
+        assert_eq!(
+            status.summary.as_deref(),
+            Some(r#"could not prepare a run: Forbidden (403): secrets "vars""#)
+        );
+    }
+
     /// The other spec checks explain themselves at length; the column names what to fix and the
     /// condition keeps the explanation.
     #[test]
@@ -12725,7 +12863,10 @@ spec:
         };
         record_input_failure(
             &mut idle,
-            InputFailure::same("cannot read referenced Secrets: nope".into()),
+            InputFailure {
+                summary: "cannot read referenced Secrets: nope".into(),
+                detail: "cannot read referenced Secrets: nope".into(),
+            },
         );
         assert_eq!(idle.phase, Phase::Succeeded);
         assert_eq!(idle.next_run, None);
@@ -12863,7 +13004,10 @@ spec:
         };
         record_input_failure(
             &mut succeeded,
-            InputFailure::same("cannot read referenced Secrets: temporary failure".into()),
+            InputFailure {
+                summary: "cannot read referenced Secrets: temporary failure".into(),
+                detail: "cannot read referenced Secrets: temporary failure".into(),
+            },
         );
         assert_eq!(succeeded.phase, Phase::Succeeded);
         assert_eq!(succeeded.next_run, None);
@@ -13285,7 +13429,7 @@ spec:
         assert_eq!(
             status.summary.as_deref(),
             Some(
-                "could not prepare run apply-plan-1-4: Pod \"managed-ssh-worker-1-run-1\" already exists but is not this run's managed-ssh proxy for host \"worker-1\""
+                "could not prepare run apply-plan-1-4: proxy Pod \"managed-ssh-worker-1-run-1\" for host \"worker-1\" is not this run's"
             )
         );
         assert_eq!(status.phase, Phase::Applying);
