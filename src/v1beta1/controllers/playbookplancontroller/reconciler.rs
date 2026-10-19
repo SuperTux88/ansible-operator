@@ -3936,16 +3936,16 @@ async fn advance_active_run(
     // on before anything else looks at the Job, whose pods are being deleted and no longer say why
     // it stopped. Once nothing of it may still execute, the Job is gone (or turned out to finish
     // after all), and the run finishes below like any other.
-    if let Some(reason) = play
+    if let Some(stall) = play
         .status
         .as_ref()
-        .and_then(|status| status.stall_reason.as_deref())
+        .and_then(play_history::JobStall::recorded)
         && cancel_run_job(context, object, run).await?
     {
         return Ok(report_stalled_run_cancelling(
             resource_status,
             &job_name,
-            reason,
+            &stall,
         ));
     }
 
@@ -4017,9 +4017,12 @@ async fn advance_active_run(
         let timeout = context.job_start_timeout_secs();
         if job_may_have_stalled(job, now, timeout) {
             let pods = run_job_pods(context, namespace, job, &run.mirror.play_uid).await?;
-            if let Some(reason) = job_start_stall(job, &pods, now, timeout) {
-                warn!("PlaybookPlan {namespace}/{name}: cancelling run {job_name}: {reason}");
-                play_history::record_stalled(&plays_api, &job_name, &run.mirror.play_uid, &reason)
+            if let Some(stall) = job_start_stall(job, &pods, now, timeout) {
+                warn!(
+                    "PlaybookPlan {namespace}/{name}: cancelling run {job_name}: {}",
+                    stall.reason
+                );
+                play_history::record_stalled(&plays_api, &job_name, &run.mirror.play_uid, &stall)
                     .await?;
                 // Whatever it answers, the run is not finished on this tick: the record now says
                 // why, and the next tick carries the cancellation on from there.
@@ -4027,7 +4030,7 @@ async fn advance_active_run(
                 return Ok(report_stalled_run_cancelling(
                     resource_status,
                     &job_name,
-                    &reason,
+                    &stall,
                 ));
             }
         }
@@ -4170,11 +4173,11 @@ async fn run_job_pods(
 fn report_stalled_run_cancelling(
     resource_status: &mut PlaybookPlanStatus,
     job_name: &str,
-    reason: &str,
+    stall: &play_history::JobStall,
 ) -> ActiveRunProgress {
     status::clear_run_conditions(resource_status);
-    status::set_job_did_not_start_condition(resource_status, reason);
-    resource_status.summary = Some(format!("cancelling run {job_name}: {reason}"));
+    status::set_job_did_not_start_condition(resource_status, &stall.reason);
+    resource_status.summary = Some(format!("cancelling run {job_name}: {}", stall.summary));
     ActiveRunProgress::Running(std::time::Duration::from_secs(5))
 }
 
@@ -5547,7 +5550,7 @@ fn job_start_stall(
     pods: &[Pod],
     now_epoch_secs: i64,
     timeout_secs: i64,
-) -> Option<String> {
+) -> Option<play_history::JobStall> {
     let mut last_progress = job.metadata.creation_timestamp.as_ref()?.0.as_second();
     for pod in pods {
         if let Some(created) = &pod.metadata.creation_timestamp {
@@ -5601,12 +5604,19 @@ fn job_start_stall(
     (now_epoch_secs - last_progress >= timeout_secs).then(|| {
         // The operator never suspends its Jobs, so a suspended one was suspended from outside, for
         // example by a queueing controller holding it in a queue. It has no pod to describe.
-        let waiting_on = if job.spec.as_ref().and_then(|spec| spec.suspend) == Some(true) {
-            "the Job is suspended (spec.suspend), so it creates no pod; something outside the operator suspended it, such as a queueing controller".to_string()
+        let (short, waiting_on) = if job.spec.as_ref().and_then(|spec| spec.suspend) == Some(true)
+        {
+            (
+                "Job suspended".to_string(),
+                "the Job is suspended (spec.suspend), so it creates no pod; something outside the operator suspended it, such as a queueing controller".to_string(),
+            )
         } else {
             describe_unstarted_pods(pods)
         };
-        format!("the Job did not start within {timeout_secs}s: {waiting_on}")
+        play_history::JobStall {
+            summary: format!("Job did not start within {timeout_secs}s: {short}"),
+            reason: format!("the Job did not start within {timeout_secs}s: {waiting_on}"),
+        }
     })
 }
 
@@ -5624,16 +5634,26 @@ fn container_has_started(container: &ContainerStatus) -> bool {
 /// What a Job that did not start is waiting on, from its newest pod: not scheduled, or the first
 /// container that reports a waiting reason. `PodInitializing` is skipped while another container
 /// gives a better answer, because every container behind a stuck init container reports it.
-fn describe_unstarted_pods(pods: &[Pod]) -> String {
+///
+/// Returns it twice: in a word for the plan's summary (the Kubernetes reason, such as
+/// `ImagePullBackOff` or `Unschedulable`), and in full with the pod, the container and the message.
+fn describe_unstarted_pods(pods: &[Pod]) -> (String, String) {
+    const NO_CONTAINER: &str = "no container started";
     let Some(pod) = pods
         .iter()
         .max_by_key(|pod| pod.metadata.creation_timestamp.as_ref().map(|time| time.0))
     else {
-        return "no pod was created for it; the Job's events say why (Pod Security admission, an admission webhook, a ResourceQuota or a missing ServiceAccount)".to_string();
+        return (
+            "no pod created".to_string(),
+            "no pod was created for it; the Job's events say why (Pod Security admission, an admission webhook, a ResourceQuota or a missing ServiceAccount)".to_string(),
+        );
     };
     let name = pod.metadata.name.as_deref().unwrap_or("<unnamed>");
     let Some(status) = pod.status.as_ref() else {
-        return format!("pod {name} has not started a container");
+        return (
+            NO_CONTAINER.to_string(),
+            format!("pod {name} has not started a container"),
+        );
     };
 
     if let Some(condition) = status
@@ -5642,9 +5662,12 @@ fn describe_unstarted_pods(pods: &[Pod]) -> String {
         .flatten()
         .find(|condition| condition.type_ == "PodScheduled" && condition.status == "False")
     {
-        return format!(
-            "pod {name} is not scheduled{}",
-            reason_suffix(condition.reason.as_deref(), condition.message.as_deref())
+        return (
+            short_reason(condition.reason.as_deref(), "pod not scheduled"),
+            format!(
+                "pod {name} is not scheduled{}",
+                reason_suffix(condition.reason.as_deref(), condition.message.as_deref())
+            ),
         );
     }
 
@@ -5663,12 +5686,25 @@ fn describe_unstarted_pods(pods: &[Pod]) -> String {
         .find(|(_, waiting)| waiting.reason.as_deref() != Some("PodInitializing"))
         .or_else(|| waiting.first());
     match explained {
-        Some((container, waiting)) => format!(
-            "pod {name}: container {container} is waiting{}",
-            reason_suffix(waiting.reason.as_deref(), waiting.message.as_deref())
+        Some((container, waiting)) => (
+            short_reason(waiting.reason.as_deref(), "container waiting"),
+            format!(
+                "pod {name}: container {container} is waiting{}",
+                reason_suffix(waiting.reason.as_deref(), waiting.message.as_deref())
+            ),
         ),
-        None => format!("pod {name} has not started a container"),
+        None => (
+            NO_CONTAINER.to_string(),
+            format!("pod {name} has not started a container"),
+        ),
     }
+}
+
+fn short_reason(reason: Option<&str>, otherwise: &str) -> String {
+    reason
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or(otherwise)
+        .to_string()
 }
 
 fn reason_suffix(reason: Option<&str>, message: Option<&str>) -> String {
@@ -6541,7 +6577,7 @@ async fn recover_active_run(
                 .expect("a record needing recovery has a status");
             return Ok(Some(RecoveredRun::Finished {
                 finished: recorded_run_from_play(play)?,
-                status: play_status.clone(),
+                status: Box::new(play_status.clone()),
                 provides_version: play.spec.provides_version.clone(),
                 started_at: play_prepared_at(play),
                 inventory: play.spec.inventory.clone(),
@@ -6657,7 +6693,7 @@ enum RecoveredRun {
     Aborted(RecordedRun),
     Finished {
         finished: RecordedRun,
-        status: v1beta1::PlayStatus,
+        status: Box<v1beta1::PlayStatus>,
         /// The `spec.provides` version the finished run's record declared, carried beside its
         /// status because that is the only copy that still describes the revision which ran. The
         /// live plan may already advertise the next one.
@@ -7148,10 +7184,10 @@ enum RunDiagnostic {
     /// health. Without this the plan reports only "the recap could not be read", which is what a
     /// crashed container reports too, and the operator has no way to tell them apart.
     RecapOverflowed { hosts: u32 },
-    /// The operator cancelled the run's Job because it never started; `reason` is what the run
+    /// The operator cancelled the run's Job because it never started; the stall is what the run
     /// recorded it waiting on (`PlayStatus::stall_reason`). Without it the plan would report only an
     /// unreadable recap, which is what a reaped Job reports too.
-    JobDidNotStart { reason: String },
+    JobDidNotStart(play_history::JobStall),
     /// Kubernetes stopped the run's Job at its `activeDeadlineSeconds` (`seconds`), so the playbook
     /// never reached the end where its recap is written. Like `RecapOverflowed`, only the Job says
     /// so, which is why a run recovered from its record alone reports the plain unreadable recap.
@@ -7165,11 +7201,9 @@ impl RunDiagnostic {
     /// after all and finished before its cancellation landed reports its own result instead.
     fn from_play_status(status: &v1beta1::PlayStatus) -> Self {
         if status.phase == v1beta1::PlayPhase::Unknown
-            && let Some(reason) = &status.stall_reason
+            && let Some(stall) = play_history::JobStall::recorded(status)
         {
-            return Self::JobDidNotStart {
-                reason: reason.clone(),
-            };
+            return Self::JobDidNotStart(stall);
         }
         match hosts_without_recap_activity(status) {
             Some((hosts, of)) => Self::NoPlaybookActivity { hosts, of },
@@ -7187,8 +7221,9 @@ impl RunDiagnostic {
                 "PlaybookPlan {namespace}/{name}: run {job_name} reported {hosts} hosts, whose recap does not fit the kubelet's {} byte termination-message limit even compressed; every host is reported Unknown. Split the plan across smaller inventories",
                 callback_output::TERMINATION_MESSAGE_MAX_BYTES
             ),
-            Self::JobDidNotStart { reason } => warn!(
-                "PlaybookPlan {namespace}/{name}: run {job_name} was cancelled because {reason}; every host is reported Unknown and the run spent an attempt. Fix what the Job waited on (its image, its ServiceAccount, the namespace's admission rules or quota), or raise runs.startTimeoutSeconds if the image only pulls slowly"
+            Self::JobDidNotStart(stall) => warn!(
+                "PlaybookPlan {namespace}/{name}: run {job_name} was cancelled because {}; every host is reported Unknown and the run spent an attempt. Fix what the Job waited on (its image, its ServiceAccount, the namespace's admission rules or quota), or raise runs.startTimeoutSeconds if the image only pulls slowly",
+                stall.reason
             ),
             Self::DeadlineExceeded { seconds } => warn!(
                 "PlaybookPlan {namespace}/{name}: run {job_name} was stopped by Kubernetes after its deadline of {seconds}s (the plan's spec.activeDeadlineSeconds, or the operator's runs.defaultActiveDeadlineSeconds when the plan sets none, held to the operator's runs.maxActiveDeadlineSeconds either way); every host is reported Unknown and the run spent an attempt. Raise the plan's spec.activeDeadlineSeconds if the playbook legitimately runs longer; beyond runs.maxActiveDeadlineSeconds only the cluster administrator can raise the limit"
@@ -7208,7 +7243,7 @@ impl RunDiagnostic {
             Self::RecapOverflowed { hosts } => Some(format!(
                 " (the recap for {hosts} hosts does not fit the kubelet's termination-message limit, so no per-host result could be read; split the plan across smaller inventories)"
             )),
-            Self::JobDidNotStart { reason } => Some(format!(" (cancelled: {reason})")),
+            Self::JobDidNotStart(stall) => Some(format!(" (cancelled: {})", stall.summary)),
             Self::DeadlineExceeded { seconds } => {
                 Some(format!(" (the Job exceeded its deadline of {seconds}s)"))
             }
@@ -15588,10 +15623,17 @@ spec:
             job_start_stall(&stall_job(None), &[], t0 + 599, STALL_TIMEOUT),
             None
         );
-        let reason = job_start_stall(&stall_job(None), &[], t0 + 600, STALL_TIMEOUT).unwrap();
+        let stall = job_start_stall(&stall_job(None), &[], t0 + 600, STALL_TIMEOUT).unwrap();
+        assert_eq!(
+            stall.summary,
+            "Job did not start within 600s: no pod created"
+        );
         assert!(
-            reason.starts_with("the Job did not start within 600s: no pod was created for it"),
-            "{reason}"
+            stall
+                .reason
+                .starts_with("the Job did not start within 600s: no pod was created for it"),
+            "{}",
+            stall.reason
         );
 
         // A suspended Job creates no pod either, but the events would not say why.
@@ -15600,10 +15642,17 @@ spec:
             suspend: Some(true),
             ..Default::default()
         });
-        let reason = job_start_stall(&suspended, &[], t0 + 600, STALL_TIMEOUT).unwrap();
+        let stall = job_start_stall(&suspended, &[], t0 + 600, STALL_TIMEOUT).unwrap();
+        assert_eq!(
+            stall.summary,
+            "Job did not start within 600s: Job suspended"
+        );
         assert!(
-            reason.starts_with("the Job did not start within 600s: the Job is suspended"),
-            "{reason}"
+            stall
+                .reason
+                .starts_with("the Job did not start within 600s: the Job is suspended"),
+            "{}",
+            stall.reason
         );
     }
 
@@ -15619,11 +15668,13 @@ spec:
             }],
         }));
         assert_eq!(
-            job_start_stall(&stall_job(None), &[unscheduled], now, STALL_TIMEOUT).as_deref(),
-            Some(
-                "the Job did not start within 600s: pod apply-web-abc-1-x7k2p is not scheduled: \
-                 Unschedulable: 0/3 nodes are available"
-            )
+            job_start_stall(&stall_job(None), &[unscheduled], now, STALL_TIMEOUT),
+            Some(play_history::JobStall {
+                summary: "Job did not start within 600s: Unschedulable".into(),
+                reason: "the Job did not start within 600s: pod apply-web-abc-1-x7k2p is not \
+                         scheduled: Unschedulable: 0/3 nodes are available"
+                    .into(),
+            })
         );
 
         // Every container behind a stuck init container reports `PodInitializing`; the one that is
@@ -15642,11 +15693,14 @@ spec:
             }],
         }));
         assert_eq!(
-            job_start_stall(&stall_job(None), &[pulling], now, STALL_TIMEOUT).as_deref(),
-            Some(
-                "the Job did not start within 600s: pod apply-web-abc-1-x7k2p: container \
-                 managed-ssh-preflight is waiting: ImagePullBackOff: Back-off pulling image \"i\""
-            )
+            job_start_stall(&stall_job(None), &[pulling], now, STALL_TIMEOUT),
+            Some(play_history::JobStall {
+                summary: "Job did not start within 600s: ImagePullBackOff".into(),
+                reason: "the Job did not start within 600s: pod apply-web-abc-1-x7k2p: container \
+                         managed-ssh-preflight is waiting: ImagePullBackOff: Back-off pulling \
+                         image \"i\""
+                    .into(),
+            })
         );
     }
 
@@ -15709,7 +15763,9 @@ spec:
             None
         );
         assert_eq!(
-            job_start_stall(&stall_job(None), &pods, finished + 600, STALL_TIMEOUT).as_deref(),
+            job_start_stall(&stall_job(None), &pods, finished + 600, STALL_TIMEOUT)
+                .map(|stall| stall.reason)
+                .as_deref(),
             Some(
                 "the Job did not start within 600s: pod apply-web-abc-1-x7k2p: container \
                  ansible-playbook is waiting: CreateContainerConfigError: secret \"x\" not found"
@@ -15845,19 +15901,48 @@ spec:
         );
     }
 
+    /// The summary is a print column, so the stall goes there in its short form; the condition is
+    /// where `describe` shows the pod, the container and the kubelet's message.
+    #[test]
+    fn a_cancelled_stall_keeps_its_detail_out_of_the_summary() {
+        let stall = play_history::JobStall {
+            summary: "Job did not start within 600s: ImagePullBackOff".into(),
+            reason: "the Job did not start within 600s: pod p: container c is waiting: \
+                     ImagePullBackOff: Back-off pulling image \"i\""
+                .into(),
+        };
+        let mut status = PlaybookPlanStatus::default();
+
+        let _progress = report_stalled_run_cancelling(&mut status, "apply-web-abc-1", &stall);
+
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("cancelling run apply-web-abc-1: Job did not start within 600s: ImagePullBackOff")
+        );
+        let running = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Running")
+            .unwrap();
+        assert_eq!(running.reason.as_deref(), Some("JobDidNotStart"));
+        assert_eq!(running.message.as_ref(), Some(&stall.reason));
+    }
+
     /// The recorded stall explains an unreadable recap, and only that: a Job that started after all
-    /// and finished before its cancellation landed reports its own result.
+    /// and finished before its cancellation landed reports its own result. The summary carries the
+    /// stall's short form; the pod, container and image it names only fit the record.
     #[test]
     fn a_recorded_stall_explains_only_an_unreadable_recap() {
         let stalled = v1beta1::PlayStatus {
             phase: v1beta1::PlayPhase::Unknown,
-            stall_reason: Some("the Job did not start within 600s: …".into()),
+            stall_reason: Some("the Job did not start within 600s: pod …: container …".into()),
+            stall_summary: Some("Job did not start within 600s: ImagePullBackOff".into()),
             ..Default::default()
         };
         let diagnostic = RunDiagnostic::from_play_status(&stalled);
         assert_eq!(
             diagnostic.summary_clause().as_deref(),
-            Some(" (cancelled: the Job did not start within 600s: …)")
+            Some(" (cancelled: Job did not start within 600s: ImagePullBackOff)")
         );
 
         let finished_anyway = v1beta1::PlayStatus {

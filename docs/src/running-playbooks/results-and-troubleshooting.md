@@ -552,18 +552,21 @@ operator's.
 If it stays there with nothing progressing, `.status.summary` says which of the following it is
 instead, and `.status.activeRun` names the run it is waiting on:
 
-- **"cancelling run …: the Job did not start within …s: …"** — the run's Job never started the
+- **"cancelling run …: Job did not start within …s: …"** — the run's Job never started the
   playbook within the operator's start timeout (see [Runs whose Job never
   starts](../cluster-operators/deployment.md#runs-whose-job-never-starts)), so the operator is
-  cancelling it. The rest of the message says what it was waiting on: **"no pod was created for
-  it"** (look at `kubectl describe job` for the events: Pod Security admission, an admission webhook,
-  a `ResourceQuota` or a missing ServiceAccount), **"the Job is suspended"** (something outside the
-  operator, such as a queueing controller like Kueue, suspended it; the operator never does),
-  **"pod … is not scheduled: …"**, or **"pod …:
-  container … is waiting: …"** with the reason, such as `ImagePullBackOff` for an image that does
-  not exist or cannot be pulled. Once the Job has stopped, the run finishes with every host
-  [`Unknown`](#hosts-show-unknown) and spends an attempt; the plan's summary keeps the reason in
-  parentheses, and the run's `Play` keeps it in `.status.stallReason`. Fix what the Job waited on;
+  cancelling it. The summary ends with what it was waiting on in a word, such as `ImagePullBackOff`
+  or `Unschedulable`; the full account, naming the pod, the container and the kubelet's message, is
+  the message of the plan's `Running` condition (reason `JobDidNotStart`, shown by `kubectl
+  describe playbookplan`). It is one of: **"no pod was created for it"** (look at `kubectl describe
+  job` for the events: Pod Security admission, an admission webhook, a `ResourceQuota` or a missing
+  ServiceAccount), **"the Job is suspended"** (something outside the operator, such as a queueing
+  controller like Kueue, suspended it; the operator never does), **"pod … is not scheduled: …"**,
+  or **"pod …: container … is waiting: …"** with the reason, such as `ImagePullBackOff` for an image
+  that does not exist or cannot be pulled. Once the Job has stopped, the run finishes with every
+  host [`Unknown`](#hosts-show-unknown) and spends an attempt; the plan's summary keeps the short
+  form in parentheses, and the run's `Play` keeps the full account in `.status.stallReason`
+  (`kubectl get play <job-name> -o jsonpath='{.status.stallReason}'`). Fix what the Job waited on;
   if the plan has used up its attempts by then, [ask it to try
   again](./scheduling-and-modes.md#asking-a-failed-plan-to-try-again).
 - **"waiting for Job … which does not carry this run's identity"** — a Job with the name this run
@@ -1020,8 +1023,8 @@ If *every* host of one run shows `Unknown` at once, check these causes first:
   See [`python3` must be on `PATH`](./playbook-plans.md#python3-must-be-on-path) for the image
   requirement and a local verification command.
 - **The run's Job never started.** The operator cancelled it after its start timeout, and
-  `.status.summary` ends with *"(cancelled: the Job did not start within …s: …)"*, naming what it
-  waited on. See [The plan is stuck in `Applying`](#the-plan-is-stuck-in-applying).
+  `.status.summary` ends with *"(cancelled: Job did not start within …s: …)"*, naming what it
+  waited on in a word; the run's `Play` has the full account in `.status.stallReason`. See [The plan is stuck in `Applying`](#the-plan-is-stuck-in-applying).
 - **The run's Job ran past its deadline.** Kubernetes stopped it before the playbook reached its
   end, and `.status.summary` ends with *"(the Job exceeded its deadline of …s)"*. See [Bounding how
   long a run takes](./playbook-plans.md#bounding-how-long-a-run-takes).
