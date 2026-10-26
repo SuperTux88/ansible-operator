@@ -132,6 +132,11 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    operator-namespace half of a run still in flight (`release_unenrolled_run`: proxy pods, then
    host Leases, from the `status.activeRun` mirror — the `Play`, Job and finalizer are out of
    reach), since nothing else would ever remove those node-root pods.
+   Once the namespace is enrolled again, `leave_unenrolled_phase` replaces the refusal on an idle
+   plan straight after the tick's starting read (`Succeeded`/`Failed`/`Pending`, from the recorded
+   hosts and budget), since no later step writes a phase for an idle plan. Keep it ahead of every
+   exit: an outage report turns `UnauthorizedNamespace` into `Pending`, which no later tick reads as
+   a refusal, so a spent plan would never read `Failed` — the verdict the retry annotation needs.
    A **name guard** follows in the same shape (`plan_name_within_label_limit`): a plan name over
    `MAX_PLAN_NAME_LEN` (63, the *label value* cap — the name is written as a label onto the `Play`,
    the Job, its pod template and the run's NetworkPolicy) is refused with `Phase::Failed` and
