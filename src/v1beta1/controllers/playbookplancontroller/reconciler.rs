@@ -1195,6 +1195,19 @@ async fn reconcile(
     if resource_status.active_run.is_some() {
         resource_status.phase = Phase::Applying;
     }
+    // Asked of the tick's starting read, because a hash change above has already reset the phase.
+    // Before both hand-backs below, which judge the phase this restores.
+    if object.status.as_ref().map(|s| &s.phase) == Some(&Phase::UnauthorizedNamespace)
+        && resource_status.active_run.is_none()
+    {
+        let outdated_count = find_outdated_hosts(&resource_status, &execution_hash).len();
+        leave_unenrolled_phase(
+            &mut resource_status,
+            &object.spec.mode,
+            max_attempts(&object.spec.mode, object.spec.max_attempts),
+            outdated_count,
+        );
+    }
 
     // Read alongside the execution hash but deliberately kept out of it — see
     // `PlaybookPlanStatus::observed_ssh_key_revision`. Placed before the start gate so a rotation
@@ -5994,6 +6007,37 @@ fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usi
     status.next_run = None;
     // Restoring the verdict of a plan that succeeded, so there is no failure to report.
     status.summary = Some(plan_summary(0, total_count, &Phase::Succeeded));
+}
+
+/// Replaces the `UnauthorizedNamespace` the enrolment guard left on an idle plan whose namespace has
+/// been enrolled again.
+///
+/// Nothing else would: the phases the rest of a tick writes all come from a run starting or
+/// finishing, or from a schedule ahead, so a suspended or converged plan would keep reporting a
+/// refusal that no longer applies. The guard overwrote the verdict, so this restates what can be
+/// derived from the budget alone — `Failed` for a `OneShot` execution that spent it, `Pending`
+/// otherwise — and leaves the rest of the tick to move on from there: a converged `OneShot` plan
+/// reads `Pending` back as `Succeeded` (`restore_idle_oneshot_status`). Whether a spent execution
+/// ended `HostsUnreachable` rather than `Failed` is not recorded anywhere else, and is lost.
+///
+/// `Failed` matters beyond the display: it is what the retry annotation asks for
+/// (`sync_retry_request`), so without it a plan that failed before its namespace was un-enrolled
+/// could not be retried afterwards.
+fn leave_unenrolled_phase(
+    status: &mut PlaybookPlanStatus,
+    mode: &ExecutionMode,
+    max_attempts: u32,
+    outdated_count: usize,
+) {
+    status.phase = if outdated_count > 0
+        && !attempt_budget_available(mode, status.retry_count, max_attempts)
+    {
+        Phase::Failed
+    } else {
+        Phase::Pending
+    };
+    let total_count = distinct_host_count(&status.eligible_hosts);
+    status.summary = Some(plan_summary(outdated_count, total_count, &status.phase));
 }
 
 /// Reports a plan holding back a run because every node it would reach is not `Ready`.
@@ -13123,6 +13167,86 @@ spec:
         assert_eq!(status.phase, Phase::Succeeded);
         assert_eq!(status.next_run, None);
         assert_eq!(status.summary.as_deref(), Some("1/1 up-to-date"));
+    }
+
+    fn unenrolled_status(
+        hash: &ExecutionHash,
+        applied_hash: &str,
+        retry_count: u32,
+    ) -> PlaybookPlanStatus {
+        PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            phase: Phase::UnauthorizedNamespace,
+            summary: Some("namespace 'tenant' is not enrolled (watchNamespaces)".into()),
+            retry_count,
+            eligible_hosts: vec![ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["worker-1".into()],
+                ..Default::default()
+            }],
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".into(),
+                v1beta1::HostStatus {
+                    last_applied_hash: applied_hash.into(),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        }
+    }
+
+    /// An idle plan that converged before its namespace was un-enrolled goes back to `Succeeded`
+    /// once it is enrolled again, through the same idle restore a reverted revision takes.
+    #[test]
+    fn a_reenrolled_converged_oneshot_plan_restores_its_verdict() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = unenrolled_status(&hash, &hash.to_string(), 1);
+
+        let outdated = find_outdated_hosts(&status, &hash);
+        leave_unenrolled_phase(&mut status, &ExecutionMode::OneShot, 3, outdated.len());
+        assert_eq!(status.phase, Phase::Pending);
+        restore_idle_oneshot_status(&mut status, 1);
+
+        assert_eq!(status.phase, Phase::Succeeded);
+        assert_eq!(status.summary.as_deref(), Some("1/1 up-to-date"));
+    }
+
+    /// A `OneShot` execution that spent its budget before the namespace was un-enrolled is `Failed`
+    /// again afterwards — which is what lets the retry annotation hand its budget back.
+    #[test]
+    fn a_reenrolled_spent_oneshot_plan_is_failed_and_can_be_retried() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = unenrolled_status(&hash, "0", 3);
+
+        let outdated = find_outdated_hosts(&status, &hash);
+        leave_unenrolled_phase(&mut status, &ExecutionMode::OneShot, 3, outdated.len());
+
+        assert_eq!(status.phase, Phase::Failed);
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("0/1 up-to-date (1 outdated, last run failed)")
+        );
+        let verdict = status.phase.clone();
+        assert!(sync_retry_request(&mut status, Some("again"), &verdict));
+        assert_eq!(status.retry_count, 0);
+    }
+
+    /// With budget left, or in `Recurring` mode where the budget belongs to a schedule slot rather
+    /// than the execution, nothing says the last run failed, so the plan only waits to run again.
+    #[test]
+    fn a_reenrolled_plan_with_nothing_spent_is_pending() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        for (mode, retry_count) in [(ExecutionMode::OneShot, 1), (ExecutionMode::Recurring, 3)] {
+            let mut status = unenrolled_status(&hash, "0", retry_count);
+
+            leave_unenrolled_phase(&mut status, &mode, 3, 1);
+
+            assert_eq!(status.phase, Phase::Pending, "{mode:?}");
+            assert_eq!(
+                status.summary.as_deref(),
+                Some("0/1 up-to-date (1 outdated)")
+            );
+        }
     }
 
     /// A plan held for down nodes has to say so without erasing what it last did: the verdict is
