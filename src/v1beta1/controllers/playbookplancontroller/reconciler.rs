@@ -1208,19 +1208,6 @@ async fn reconcile(
     if resource_status.active_run.is_some() {
         resource_status.phase = Phase::Applying;
     }
-    // Asked of the tick's starting read, because a hash change above has already reset the phase.
-    // Before both hand-backs below, which judge the phase this restores.
-    if object.status.as_ref().map(|s| &s.phase) == Some(&Phase::UnauthorizedNamespace)
-        && resource_status.active_run.is_none()
-    {
-        let outdated_count = find_outdated_hosts(&resource_status, &execution_hash).len();
-        leave_unenrolled_phase(
-            &mut resource_status,
-            &object.spec.mode,
-            max_attempts(&object.spec.mode, object.spec.max_attempts),
-            outdated_count,
-        );
-    }
 
     // Read alongside the execution hash but deliberately kept out of it — see
     // `PlaybookPlanStatus::observed_ssh_key_revision`. Placed before the start gate so a rotation
