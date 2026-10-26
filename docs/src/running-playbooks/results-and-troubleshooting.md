@@ -325,6 +325,14 @@ not something you can fix from the tenant side: an admin must add your namespace
 `watchNamespaces` and roll the operator. See
 [Deployment → enrolled namespaces](../cluster-operators/deployment.md#enrolled-namespaces).
 
+Once the namespace is enrolled again, the restarted operator moves the plan on by itself. A plan
+whose hosts are all up to date reports `Succeeded`; one with outdated hosts reports `Pending` and
+runs, or waits for its schedule or `suspend`, as usual. A `OneShot` plan that had spent all its
+attempts reports `Failed` and can be
+[retried with the retry annotation](./scheduling-and-modes.md#asking-a-failed-plan-to-try-again),
+though it no longer tells `HostsUnreachable` apart from `Failed`. A `Recurring` plan does not get
+its last verdict back: it reports `Pending` (or `Delayed`) until its next run finishes.
+
 If the namespace was un-enrolled while a run was in flight, `.status.activeRun` still names that run.
 The operator has cut it off from your cluster Nodes by removing its proxy pods and released its host
 locks. A Job that was already running carries on against any `StaticInventory` hosts, and the
