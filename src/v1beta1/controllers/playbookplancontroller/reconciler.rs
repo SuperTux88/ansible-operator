@@ -1046,6 +1046,11 @@ async fn reconcile(
         }
     };
 
+    let run_in_hand = unlaunched_run
+        .as_ref()
+        .map(RunInHand::Unlaunched)
+        .or(finished_active_run.as_ref().map(RunInHand::Finished));
+
     // Read alongside the desired inputs, and reported the same way, because it answers the same
     // question: whether there is an executable desired state at all. Nothing here touches the
     // cluster — it is the plan's own spec — but a spec that cannot produce a valid Job has to be
@@ -1059,7 +1064,7 @@ async fn reconcile(
             &context,
             &object,
             &api,
-            unlaunched_run.as_ref(),
+            run_in_hand,
             &mut resource_status,
             &error,
             spec_input_failure(&object, &error),
@@ -1083,7 +1088,7 @@ async fn reconcile(
                 &context,
                 &object,
                 &api,
-                unlaunched_run.as_ref(),
+                run_in_hand,
                 &mut resource_status,
                 &error,
                 inventory_input_failure(&error),
@@ -1176,7 +1181,7 @@ async fn reconcile(
                 &context,
                 &object,
                 &api,
-                unlaunched_run.as_ref(),
+                run_in_hand,
                 &mut resource_status,
                 &error,
                 InputFailure {
@@ -4829,7 +4834,8 @@ fn invalid_playbook_summary(playbook: &str) -> String {
 /// verdict: `Succeeded` or `Failed` still says what the plan last did, which an unreadable input does
 /// not undo. A lifecycle phase resets to `Pending`, and `nextRun` is cleared because the advertised
 /// slot cannot fire. `hostsStatus` is left alone for the same reason as the verdict: the previous
-/// run's per-host results are still true, and nothing here re-ran anything.
+/// run's per-host results are still true, and nothing here re-ran anything. A run that finished on
+/// this tick (`finished_run`) supplies that verdict itself — see [`phase_under_overlay_after_run`].
 ///
 /// A run still in flight keeps its phase, matching [`update_desired_hash`]'s guard. The read failure
 /// does not stop a Job that is already executing, and changing its phase would contradict the
@@ -4843,9 +4849,10 @@ async fn report_input_failure(
     api: &Api<PlaybookPlan>,
     object: &PlaybookPlan,
     resource_status: &mut PlaybookPlanStatus,
+    finished_run: Option<&FinishedRun>,
     failure: InputFailure,
 ) -> bool {
-    record_input_failure(resource_status, failure);
+    record_input_failure(resource_status, finished_run, failure);
     match patch_status(api, object, resource_status.clone()).await {
         Ok(_) => true,
         Err(patch_error) => {
@@ -4860,11 +4867,15 @@ async fn report_input_failure(
 
 /// The status half of [`report_input_failure`], split from the write so the guard is unit-testable
 /// without a kube client — see that function for why each field is (or is not) touched.
-fn record_input_failure(status: &mut PlaybookPlanStatus, failure: InputFailure) {
+fn record_input_failure(
+    status: &mut PlaybookPlanStatus,
+    finished_run: Option<&FinishedRun>,
+    failure: InputFailure,
+) {
     status::set_inputs_unavailable_condition(status, &failure.detail);
     status.summary = Some(failure.summary);
     if status.active_run.is_none() {
-        status.phase = phase_under_readiness_overlay(&status.phase);
+        status.phase = phase_under_overlay_after_run(status, finished_run);
         status.next_run = None;
         // The third way a hold ends, and the one the retire in `reconcile` cannot reach: that retire
         // is computed from the resolved groups, so a tick that never resolves them returns before
@@ -4958,13 +4969,13 @@ async fn report_desired_input_error(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
     api: &Api<PlaybookPlan>,
-    unlaunched: Option<&UnlaunchedRun>,
+    run: Option<RunInHand<'_>>,
     resource_status: &mut PlaybookPlanStatus,
     error: &ReconcileError,
     failure: InputFailure,
 ) -> Result<bool, ReconcileError> {
-    match unlaunched {
-        Some(unlaunched) => handle_unlaunched_input_error(
+    match run {
+        Some(RunInHand::Unlaunched(unlaunched)) => handle_unlaunched_input_error(
             context,
             object,
             api,
@@ -4978,8 +4989,23 @@ async fn report_desired_input_error(
         // Nothing in flight to hold open, but the plan still has to say why it is not running: a
         // deleted inventory or Secret would otherwise leave the last successful run's summary
         // standing while every tick fails in the log only.
-        None => Ok(report_input_failure(api, object, resource_status, failure).await),
+        Some(RunInHand::Finished(finished)) => {
+            Ok(report_input_failure(api, object, resource_status, Some(finished), failure).await)
+        }
+        None => Ok(report_input_failure(api, object, resource_status, None, failure).await),
     }
+}
+
+/// The run a tick has in hand when its desired inputs cannot be read. Never both: a run is only
+/// advanced to its finish when recovery found none waiting to launch.
+#[derive(Clone, Copy)]
+enum RunInHand<'a> {
+    /// Recovered before its Job exists, and held open, adopted or given up by
+    /// [`handle_unlaunched_input_error`].
+    Unlaunched(&'a UnlaunchedRun),
+    /// Finished on this tick, whose verdict the outage report must keep
+    /// ([`phase_under_overlay_after_run`]).
+    Finished(&'a FinishedRun),
 }
 
 /// Decides what a failed desired-input read means for a run whose Job does not exist yet, and
@@ -6169,6 +6195,31 @@ fn phase_under_readiness_overlay(current: &Phase) -> Phase {
         return current.clone();
     }
     Phase::Pending
+}
+
+/// The phase an idle plan is left with by a tick that ends in a readiness overlay before its terminal
+/// branch: the verdict of a run that finished on this tick when it applied `currentHash`, `Pending`
+/// when it applied an older revision, and [`phase_under_readiness_overlay`] when none finished.
+///
+/// A run whose `Play` is gone (`finalize_lost_run`) has no record to replay its verdict from on a
+/// later tick, so the overlay is the only write it gets. Derived from the `Applying` it leaves
+/// behind instead, the verdict would be lost for good: a spent `OneShot` plan would read `Pending`,
+/// which neither starts a run nor accepts the retry annotation, and a `Recurring` plan's open window
+/// would close with tries still left in it ([`retry_budget_closes_window`]).
+fn phase_under_overlay_after_run(
+    status: &PlaybookPlanStatus,
+    finished_run: Option<&FinishedRun>,
+) -> Phase {
+    finished_run.map_or_else(
+        || phase_under_readiness_overlay(&status.phase),
+        |finished| {
+            if finished.run.mirror.execution_hash == status.current_hash {
+                finished.verdict.clone()
+            } else {
+                Phase::Pending
+            }
+        },
+    )
 }
 
 /// Puts a recovered run back onto the plan's status: the run itself, the `Applying` phase it
@@ -8348,16 +8399,7 @@ fn record_invalid_scheduling_configuration(
     status.summary = Some(summary);
     status.next_run = None;
     if status.active_run.is_none() {
-        status.phase = finished_run.map_or_else(
-            || phase_under_readiness_overlay(&status.phase),
-            |finished| {
-                if finished.run.mirror.execution_hash == status.current_hash {
-                    finished.verdict.clone()
-                } else {
-                    Phase::Pending
-                }
-            },
-        );
+        status.phase = phase_under_overlay_after_run(status, finished_run);
     }
 }
 
@@ -12930,6 +12972,7 @@ spec:
         };
         record_input_failure(
             &mut idle,
+            None,
             InputFailure {
                 summary: "cannot read referenced Secrets: nope".into(),
                 detail: "cannot read referenced Secrets: nope".into(),
@@ -12960,7 +13003,11 @@ spec:
             next_run: Some(slot),
             ..Default::default()
         };
-        record_input_failure(&mut waiting, inventory_input_failure(&unsynced_inventory()));
+        record_input_failure(
+            &mut waiting,
+            None,
+            inventory_input_failure(&unsynced_inventory()),
+        );
         assert_eq!(waiting.phase, Phase::Pending);
         assert_eq!(waiting.next_run, None);
 
@@ -12981,6 +13028,7 @@ spec:
         };
         record_input_failure(
             &mut applying,
+            None,
             inventory_input_failure(&unsynced_inventory()),
         );
         assert_eq!(applying.phase, Phase::Applying);
@@ -12999,7 +13047,11 @@ spec:
             &mut held,
             Some(status::WaitingForNodes::NodesNotReady(&nodes)),
         );
-        record_input_failure(&mut held, inventory_input_failure(&unsynced_inventory()));
+        record_input_failure(
+            &mut held,
+            None,
+            inventory_input_failure(&unsynced_inventory()),
+        );
         assert!(
             !status::held_for_unready_nodes(&held),
             "the hold ended when the inventory that named its hosts stopped resolving"
@@ -13028,6 +13080,7 @@ spec:
         );
         record_input_failure(
             &mut waiting_on_proxies,
+            None,
             inventory_input_failure(&unsynced_inventory()),
         );
         let waiting = waiting_on_proxies
@@ -13071,6 +13124,7 @@ spec:
         };
         record_input_failure(
             &mut succeeded,
+            None,
             InputFailure {
                 summary: "cannot read referenced Secrets: temporary failure".into(),
                 detail: "cannot read referenced Secrets: temporary failure".into(),
@@ -13101,7 +13155,11 @@ spec:
             )])),
             ..Default::default()
         };
-        record_input_failure(&mut failed, inventory_input_failure(&unsynced_inventory()));
+        record_input_failure(
+            &mut failed,
+            None,
+            inventory_input_failure(&unsynced_inventory()),
+        );
         assert_eq!(failed.phase, Phase::Failed);
         assert_eq!(failed.next_run, None);
 
@@ -13321,6 +13379,7 @@ spec:
         leave_unenrolled_phase(&mut status, &ExecutionMode::OneShot, 3);
         record_input_failure(
             &mut status,
+            None,
             InputFailure {
                 summary: "cannot read referenced Secrets: not found".into(),
                 detail: "cannot read referenced Secrets: not found".into(),
@@ -13328,6 +13387,83 @@ spec:
         );
 
         assert_eq!(status.phase, Phase::Failed);
+    }
+
+    /// What a tick holds once `finalize_lost_run` has finished a run whose `Play` is gone: the mirror
+    /// cleared, the try spent, the hosts recorded, and the phase still the `Applying` the run was
+    /// mirrored with. The verdict exists only in the tick's `FinishedRun`.
+    fn after_a_lost_run(
+        run_hash: ExecutionHash,
+        attempt: u32,
+        slot: DateTime<FixedOffset>,
+    ) -> (PlaybookPlanStatus, FinishedRun) {
+        let current_hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = unenrolled_status(&current_hash, "0", attempt);
+        status.phase = Phase::Applying;
+        status.summary = Some("previous run finished; evaluating desired revision".into());
+        status.retry_count_slot = Some(slot);
+        let finished = FinishedRun {
+            run: finished_run(run_hash, attempt, attempt, slot),
+            verdict: Phase::Failed,
+            failure: RunFailure::Real,
+            diagnostic: RunDiagnostic::None,
+        };
+        (status, finished)
+    }
+
+    fn secret_outage() -> InputFailure {
+        InputFailure {
+            summary: "cannot read referenced Secrets: not found".into(),
+            detail: "cannot read referenced Secrets: not found".into(),
+        }
+    }
+
+    /// A lost run has no record to replay its verdict from, so an outage reported on the tick that
+    /// finalized it is its only write. It keeps the verdict: a spent `OneShot` plan reads `Failed`
+    /// through the outage and after it, which is what the retry annotation asks for — `Pending` would
+    /// neither start a run nor accept one.
+    #[test]
+    fn a_lost_runs_verdict_survives_an_input_outage_on_its_tick() {
+        let slot = DateTime::parse_from_rfc3339("2026-10-26T03:00:00Z").unwrap();
+        let (mut status, finished) =
+            after_a_lost_run(ExecutionHash::from_hex("1").unwrap(), 3, slot);
+
+        record_input_failure(&mut status, Some(&finished), secret_outage());
+        assert_eq!(status.phase, Phase::Failed);
+
+        clear_input_failure(&mut status, 1);
+        assert_eq!(status.phase, Phase::Failed);
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("0/1 up-to-date (1 outdated, last run failed)")
+        );
+        let verdict = status.phase.clone();
+        assert!(sync_retry_request(&mut status, Some("again"), &verdict));
+
+        // A run of a revision the plan has since moved past says nothing about the current one.
+        let (mut status, finished) =
+            after_a_lost_run(ExecutionHash::from_hex("2").unwrap(), 3, slot);
+        record_input_failure(&mut status, Some(&finished), secret_outage());
+        assert_eq!(status.phase, Phase::Pending);
+    }
+
+    /// The same verdict is what keeps a `Recurring` window open for the tries it still has: read as
+    /// `Pending`, a slot with one try spent counts as finished.
+    #[test]
+    fn a_lost_run_leaves_its_window_open_through_an_input_outage() {
+        let slot = DateTime::parse_from_rfc3339("2026-10-26T03:00:00Z").unwrap();
+        let (mut status, finished) =
+            after_a_lost_run(ExecutionHash::from_hex("1").unwrap(), 1, slot);
+
+        record_input_failure(&mut status, Some(&finished), secret_outage());
+
+        assert!(!retry_budget_closes_window(
+            &status.phase,
+            status.retry_count,
+            status.retry_count_slot,
+            Some(slot),
+            2,
+        ));
     }
 
     /// A plan held for down nodes has to say so without erasing what it last did: the verdict is

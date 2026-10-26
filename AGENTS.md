@@ -208,6 +208,12 @@ proxy pod per targeted ClusterInventory host** in the operator namespace.
    This is also where a run whose `Play` is gone is `finalize_lost_run`'d (infra released, hosts
    `Unknown`) — not in step 0a: recovery has no record left to dispatch on, so it is the *mirror*
    in `status.activeRun` that brings the run here to be released.
+   Both early exits that may follow a run finishing on a tick — an input outage and an invalid
+   schedule — write that run's verdict as the phase (`phase_under_overlay_after_run`), never the
+   overlay's `Pending`, whether its `Play` is still there or not. For a run with a record that only
+   changes what the plan shows during the outage, since the record is replayed until it can be
+   acknowledged. A lost run has no record left to replay, so this is the only write its verdict
+   gets: without it a spent `OneShot` plan would neither run nor accept the retry annotation.
    A Job that is not terminal but never started (`job_start_stall`: no container running, the
    playbook container never started, nothing progressed for `runs.startTimeoutSeconds`, with the
    clock restarted by the pod's creation and scheduling and by every finished init container) is
