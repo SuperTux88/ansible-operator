@@ -394,10 +394,8 @@ The proxy image is pulled into a **node-root** pod.
   explicit admin choice, never an implicit fallback.
 - *Residual:* signature verification is not *enforced* at admission, so an operator relies on the
   digest pin (and their trust in this repo's release pipeline) rather than a cluster-side cosign policy.
-  The pre-first-release chart seed is tag-based, not digest — only relevant before the first `sshd-v*`
-  release repins it.
-- *Severity:* **Low** once digest-pinned (the default after the first release); the residual is the
-  absence of admission-enforced signature verification. See R5.
+- *Severity:* **Low** with the digest pin the chart ships; the residual is the absence of
+  admission-enforced signature verification. See R5.
 
 **T-ESC-6 — Execution-hash collision affecting security-relevant naming/labels.**
 `ExecutionHash` (XxHash3_64, non-cryptographic) identifies desired content and contributes to the
