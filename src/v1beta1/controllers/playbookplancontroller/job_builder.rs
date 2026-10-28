@@ -624,7 +624,10 @@ fn managed_ssh_node_names(groups: &[ResolvedInventoryGroup]) -> Vec<String> {
 /// that disrupts a node (reboot/drain) is less likely to kill its own controller pod mid-run.
 /// Uses `preferredDuringScheduling…` (never `required`): a run targeting every node still schedules
 /// normally — the `NotIn` term then matches no node and the preference is simply a no-op. Skipped
-/// entirely when the run targets no managed-ssh nodes (e.g. StaticInventory-only).
+/// entirely when the run targets no managed-ssh nodes (e.g. StaticInventory-only). Matches the Node
+/// name (`metadata.name`), which `avoid_nodes` holds, not the `kubernetes.io/hostname` label, which
+/// can differ from it. The apiserver allows only one value per `matchFields` `NotIn`, so each Node
+/// gets its own requirement; requirements within a term are ANDed.
 fn configure_job_for_node_affinity(job: &mut Job, avoid_nodes: &[String]) {
     if avoid_nodes.is_empty() {
         return;
@@ -636,11 +639,16 @@ fn configure_job_for_node_affinity(job: &mut Job, avoid_nodes: &[String]) {
                 kcore::v1::PreferredSchedulingTerm {
                     weight: 100,
                     preference: kcore::v1::NodeSelectorTerm {
-                        match_expressions: Some(vec![kcore::v1::NodeSelectorRequirement {
-                            key: "kubernetes.io/hostname".into(),
-                            operator: "NotIn".into(),
-                            values: Some(avoid_nodes.to_vec()),
-                        }]),
+                        match_fields: Some(
+                            avoid_nodes
+                                .iter()
+                                .map(|node| kcore::v1::NodeSelectorRequirement {
+                                    key: "metadata.name".into(),
+                                    operator: "NotIn".into(),
+                                    values: Some(vec![node.clone()]),
+                                })
+                                .collect(),
+                        ),
                         ..Default::default()
                     },
                 },
@@ -1625,13 +1633,25 @@ spec:
             .unwrap()[0];
         assert_eq!(term.weight, 100);
 
-        let req = &term.preference.match_expressions.as_ref().unwrap()[0];
-        assert_eq!(req.key, "kubernetes.io/hostname");
-        assert_eq!(req.operator, "NotIn");
-        assert_eq!(
-            req.values.as_ref().unwrap(),
-            &vec!["node-a".to_string(), "node-b".to_string()]
-        );
+        assert_eq!(term.preference.match_expressions, None);
+        // One requirement per Node: the apiserver refuses a `matchFields` `NotIn` with more than
+        // one value, and refuses the whole Job with it.
+        let avoided: Vec<_> = term
+            .preference
+            .match_fields
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|req| {
+                assert_eq!(req.key, "metadata.name");
+                assert_eq!(req.operator, "NotIn");
+                let [node] = req.values.as_deref().unwrap() else {
+                    panic!("a node field selector takes exactly one value: {req:?}");
+                };
+                node.as_str()
+            })
+            .collect();
+        assert_eq!(avoided, ["node-a", "node-b"]);
     }
 
     /// The gate only earns its keep if it is the *last* thing before `ansible-playbook`: it has to
