@@ -63,7 +63,9 @@ is rejected on some runtimes.
 
 Everything else stays enforced:
 
-- The operator container sets `allowPrivilegeEscalation: false` by default.
+- The operator pod meets the `restricted` Pod Security Standard by default, including
+  `allowPrivilegeEscalation: false` (see [Workload security
+  contexts](./deployment.md#workload-security-contexts)).
 - Generated Ansible Jobs are compliant as soon as the plan requests it:
 
   ```yaml

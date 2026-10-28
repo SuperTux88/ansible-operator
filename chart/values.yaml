@@ -103,12 +103,22 @@ serviceAccount:
 podAnnotations: {}
 podLabels: {}
 
-podSecurityContext: {}
+# The operator's own pod needs no privilege at all — it never touches node filesystems itself, only
+# the ephemeral managed-ssh proxy pods it creates do. It binds no port and writes no files, so it
+# meets the `restricted` Pod Security Standard. It does hold the SSH CA private key in memory, which
+# is why it should not run as root even inside its container. 65532 is the image's `nonroot` user.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
 
 securityContext:
-  # The operator's own pod needs no special privilege — it never touches node filesystems
-  # itself, only the ephemeral managed-ssh proxy pods it creates do.
   allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
 
 # Node labels a PlaybookPlan publishes for other plans to depend on.
 #
