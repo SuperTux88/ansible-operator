@@ -37,12 +37,15 @@ proxy_image = "ghcr.io/webd97/ansible-operator-sshd@sha256:dfd9f3c2c1342ba30c99c
 # playbook_network_policy_egress = "[{}]"
 # managed_ssh_network_policy_egress = "[]"
 
-# How long the operator waits for a NotReady node's managed-ssh proxy pod to become Ready before it
-# gives up on that node for the run (Ansible then reports the node unreachable, and it is retried on
-# the next run). The wait applies only to a pod stuck before Running; a pod that has reached Running
-# is waited on until Ready as usual. It scales with how long the node has been silent (its last Ready
-# heartbeat): the full `grace_seconds` when the last heartbeat is within `threshold_days[0]`, divided
-# by `aggressiveness` again at each further threshold, and 0 (given up at once) past the last one.
+# How long the operator waits for a managed-ssh proxy pod to become Ready before it gives up on that
+# node for the run (Ansible then reports the node unreachable, and it is retried on the next run).
+# The wait covers a pod stuck before Running on any node (so it also bounds a slow image pull), an
+# old-credential pod still terminating after a reset, and a pod that reached Running on a node that
+# then stopped being Ready (timed from when the pod lost readiness). A pod that has reached Running
+# on a Ready node is waited on until Ready. It scales with how long the node has been silent (its
+# last Ready heartbeat): the full `grace_seconds` when the last heartbeat is within
+# `threshold_days[0]`, divided by `aggressiveness` again at each further threshold, and 0 (given up
+# at once) past the last one.
 #
 # The whole table is optional; omit it for the defaults below (600 / 300 / 150 / 0 seconds at the
 # 3 / 7 / 30 day boundaries).
