@@ -122,7 +122,8 @@ holds the run until it finishes or is deleted.
 
 Proxy pods take the **minimum** that makes `nsenter`-to-host work: `hostPID: true`, a host `/proc`
 bind-mount, `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE`, and (on SELinux nodes) the `spc_t` label. They do
-**not** set `privileged: true`, `hostNetwork`, or `hostIPC`. Each is pinned to exactly one Node. The
+**not** set `privileged: true`, `hostNetwork`, or `hostIPC`. Each is pinned to exactly one Node by
+its name, not by the `kubernetes.io/hostname` label, which a Node's own kubelet may change. The
 proxy does not mount a ServiceAccount token. It cannot set `allowPrivilegeEscalation: false` because
 Kubernetes treats the required `SYS_ADMIN` capability as privilege escalation. The
 image they run is the node-root supply-chain surface you must own — the default is the first-party

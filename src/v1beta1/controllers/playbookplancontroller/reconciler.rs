@@ -7737,10 +7737,10 @@ fn filter_groups_to_hosts(
 /// a host silently dropped from the run, with no error anywhere that names the cause.
 ///
 /// A Node reached through several inventories gets the **union** of theirs, deduplicated. Union is
-/// the safe direction here, and deliberately so: a proxy pod is pinned to one Node by its
-/// `nodeSelector`, so a toleration it did not need cannot take it anywhere else — it can only fail
-/// to have one it did need. Intersecting, the instinct that usually passes for conservative, is what
-/// would reintroduce the bug.
+/// the safe direction here, and deliberately so: a proxy pod is pinned to one Node by a required
+/// node affinity on its name, so a toleration it did not need cannot take it anywhere else — it can
+/// only fail to have one it did need. Intersecting, the instinct that usually passes for
+/// conservative, is what would reintroduce the bug.
 ///
 /// Hosts are deduplicated too, in first-seen order, so a Node named by two inventories is one proxy
 /// with one set of API calls rather than the same pod reconciled twice.

@@ -361,7 +361,10 @@ label a permissive policy's namespaceSelector matches, or influence Node labels,
 their allow-set.
 - *Mitigation:* Node labels are normally admin/kubelet-controlled; the `NodeRestriction`
   admission plugin limits a kubelet to its own node's labels; `kubernetes.io/metadata.name`
-  is server-stamped and immutable.
+  is server-stamped and immutable. Proxy pods are pinned by Node *name* (required node affinity,
+  `matchFields` on `metadata.name` — `node_name_affinity`), never by the `kubernetes.io/hostname`
+  label: `NodeRestriction` lets a kubelet set that label on its own Node, so root on one Node could
+  otherwise relabel it and draw another Node's proxy pod, with that run's sessions, onto itself.
 - *Residual:* if tenants can set arbitrary labels on their own Namespace (common) **and**
   a policy's namespaceSelector keys off a forgeable label, they self-select into a scope.
   **Admins should target namespaces by the immutable `kubernetes.io/metadata.name` label**
