@@ -167,7 +167,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Upload application binary
         uses: actions/upload-artifact@v7
