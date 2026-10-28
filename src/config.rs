@@ -1,7 +1,7 @@
 //! Startup configuration for the operator, read once from a TOML file that the Helm chart renders
 //! into a ConfigMap and mounts at [`DEFAULT_CONFIG_PATH`]. The config is deliberately *not*
 //! hot-reloaded: a change to the ConfigMap rolls the Deployment (via a `checksum/config` pod
-//! annotation), so the new config is picked up by the restarted process. See `R1_PLAN.md`.
+//! annotation), so the new config is picked up by the restarted process.
 
 use std::{collections::BTreeSet, num::NonZeroU32};
 

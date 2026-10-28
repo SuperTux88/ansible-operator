@@ -1,6 +1,7 @@
 # Threat Model — ansible-operator
 
-> Scope: the `new-arch` managed-ssh execution model. This document describes the
+> Scope: the operator's node-access model — managed-ssh proxy pods for `ClusterInventory`
+> hosts, and direct SSH for `StaticInventory` hosts. This document describes the
 > security architecture, enumerates threats against it, states the invariants the
 > design relies on, and records the residual risks and deployment assumptions that
 > operators MUST understand before running this in a multi-tenant cluster.
