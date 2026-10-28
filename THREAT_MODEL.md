@@ -200,7 +200,7 @@ Ansible group vars. An author could try to set `ansible_ssh_common_args` (weaken
 checking), `ansible_host`/`ansible_port` (redirecting the dial), or `ansible_user` to subvert the
 managed-SSH/SSH wiring.
 - *Mitigation:* the operator rejects the connection variables it renders itself
-  (`ansible::RESERVED_HOST_VARS` — `ansible_host`, `ansible_port`, `ansible_timeout`, `ansible_user`,
+  (`ansible::RESERVED_HOST_VARS` — `ansible_host`, `ansible_port`, `ansible_user`,
   `ansible_ssh_private_key_file`, `ansible_ssh_common_args`) at inventory-resolve time
   (`reject_reserved_variables`, before any proxy infra), failing the reconcile with
   `ReservedInventoryVariable`. Independently, those vars are rendered per-**host**, which outranks
