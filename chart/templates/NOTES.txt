@@ -14,6 +14,9 @@ Next steps:
      {{- else }}
      No namespace besides this one is enrolled yet.
      {{- end }}
+     Strongly recommended: enforce Pod Security baseline (or restricted) on each enrolled
+     namespace, e.g.
+     kubectl label namespace <your-namespace> pod-security.kubernetes.io/enforce=baseline
   2. To run playbooks on cluster Nodes, write a NodeAccessPolicy that grants that namespace the
      Nodes it may reach. Without one, a plan using a ClusterInventory targets zero Nodes.
      StaticInventory hosts need no policy.

@@ -424,10 +424,17 @@ running, and so could not decide anything this tick:
   does not acquire host Leases or create managed-SSH proxy pods for this invalid spec. Only the YAML
   shape is checked here: a list whose entries are not valid plays is accepted and fails when Ansible
   runs it.
-- **"files entry … is not usable"** — a `spec.template.files` entry has an invalid mount name or
-  does not describe exactly one recognized Kubernetes volume source without unknown fields; the
-  `Ready` condition says which. Correct the named entry; a new run does not acquire host Leases or
-  create managed-SSH proxy pods for this invalid spec.
+- **"files entry … is not usable"** — a `spec.template.files` entry has an invalid mount name,
+  does not describe exactly one recognized Kubernetes volume source without unknown fields, or uses
+  a volume type the operator does not mount, such as `hostPath` (see [allowed
+  types](./variables-and-files.md#from-another-kubernetes-volume)); the `Ready` condition says which.
+  Correct the named entry; a new run does not acquire host Leases or create managed-SSH proxy pods
+  for this invalid spec.
+- **"securityContext … is not allowed"** — `spec.securityContext` asks for privilege the
+  `baseline` Pod Security Standard forbids, such as `privileged: true` or an added `SYS_ADMIN`
+  capability; the summary names the setting. Remove it — see [Choosing the
+  image](./playbook-plans.md#choosing-the-image). A new run does not acquire host Leases or create
+  managed-SSH proxy pods for this spec.
 - **"template references the plan's own workspace Secret"** — a `secretRef` names the [workspace
   Secret](./playbook-plans.md#one-job-per-run) the operator generates for this plan; the `Ready`
   condition names it. It is rewritten on every run, so hashing it as an input would make the plan

@@ -121,8 +121,8 @@ so any such check is tautological (same trust domain checking itself).
 Numbered entry points where an actor injects data or makes a request:
 
 1. **PlaybookPlan spec** — playbook text (→ runs as root), inventory refs, variables,
-   files (`FilesSource::Other` = arbitrary Volume JSON), image, schedule, tolerations,
-   TTL. Tenant-controlled.
+   files (`FilesSource::Other` = a Volume of an allowed type, T-ESC-10), the Job containers'
+   security context (T-ESC-10), image, schedule, tolerations, TTL. Tenant-controlled.
 2. **ClusterInventory spec** — node label selectors → requested nodes. Tenant-controlled.
 3. **StaticInventory spec** — literal hostnames/IPs + SSH `SecretRef`. Tenant-controlled.
 4. **Referenced Secrets** — variable/file/SSH-key Secrets in the plan namespace.
@@ -498,6 +498,34 @@ other label — none of which the operator ever writes.
   the machine either way. For a NodeAccessPolicy built on such a label it is the delegation above.
 - *Severity:* Low with the policy, Medium without it.
 
+**T-ESC-10 — Plan-authored privilege on the Job pod.**
+The operator creates each run's Job in the plan namespace, built from the plan's `securityContext`
+and `template.files`. An author who may create `PlaybookPlan`s but not pods could otherwise ask for
+a privileged container or a `hostPath` volume and be root on whichever Node the Job pod lands on —
+a Node no `NodeAccessPolicy` was consulted for, through a pod the author's own RBAC would not let
+them create. Pod Security admission refuses such a pod only in a namespace that enforces `baseline`
+or `restricted`, which is not the Kubernetes default.
+- *Mitigation:* before a run takes Leases or creates proxy pods, the operator refuses any
+  `securityContext` value the `baseline` Pod Security Standard forbids — `privileged`, capabilities
+  beyond the runtime default set, SELinux types other than `container_t` and its siblings or any
+  SELinux user/role, `procMount: Unmasked`, `Unconfined` seccomp or AppArmor profiles, Windows
+  `hostProcess` (`job_builder::privileged_security_context_setting`) — and any `files` volume type
+  outside the `restricted` standard's list plus `image` (`job_builder::ALLOWED_FILE_VOLUME_SOURCES`).
+  The volume check is an allowlist, not a `hostPath` ban, because in-tree types such as `gitRepo`
+  and `flexVolume` also hand plan-supplied options to code on the Node. Values that harden the pod
+  stay allowed: the field exists so a plan can meet `restricted`.
+- *Residual:* the check is the operator's own copy of the standards; Pod Security admission on every
+  enrolled namespace (§6 item 8, recommended) is the independent second layer, follows later
+  revisions of the standards, and also covers Jobs created by anything else. Within `baseline` the
+  playbook may still run as any UID inside its own container. A `persistentVolumeClaim` volume
+  reaches the namespace's existing claims, an inline `csi` volume any driver that permits ephemeral
+  mode, and an `ephemeral` volume has a PVC created even for an author whose RBAC does not allow
+  one; CSIDriver configuration, StorageClasses and ResourceQuota bound these, as they do for pods.
+  The operator namespace must stay `privileged` for the proxy pods, so a plan created there has only
+  the operator's check.
+- *Severity:* **High if bypassed**; Low with the check, and lower with Pod Security admission too.
+  See INV-9.
+
 ---
 
 ## 6. Deployment assumptions & required controls
@@ -531,6 +559,12 @@ This design is **only** as strong as the environment it runs in. The following a
    a second one mints certs the first one's proxy pods do not trust, and the two tear down each
    other's half-built runs. The chart refuses `replicaCount` above 1 and uses the `Recreate`
    strategy, which covers rollouts; it cannot prevent a short overlap outside one (R10).
+8. **Pod Security `baseline` or `restricted` on every enrolled tenant namespace is strongly
+   recommended (defense in depth)** (`pod-security.kubernetes.io/enforce`). The operator refuses
+   privileged plan settings itself (T-ESC-10), so this is not what keeps a plan from a privileged
+   Job pod; admission is the independent second layer, and also covers Jobs created by anything
+   other than the operator. The operator namespace is the exception — it must stay `privileged` for
+   the proxy pods — which is one more reason plans do not belong there.
 
 ---
 
@@ -570,6 +604,10 @@ This design is **only** as strong as the environment it runs in. The following a
   write a Node's spec, annotations, or any label outside that form. The key being operator-derived
   is what stops a plan labelling its way past a NodeAccessPolicy ceiling (T-ESC-3/T-ESC-9); where
   the chart's `ValidatingAdmissionPolicy` is enabled, the API server enforces the same bound.
+- **INV-9 — A plan cannot make its Job pod privileged.** A plan whose `securityContext` grants more
+  than the `baseline` Pod Security Standard (`privileged_security_context_setting`), or whose
+  `files` entry uses a volume type outside `ALLOWED_FILE_VOLUME_SOURCES`, MUST be refused before any
+  Lease or proxy pod is taken (T-ESC-10).
 
 Any change touching these paths should re-verify the corresponding unit tests and this list.
 
