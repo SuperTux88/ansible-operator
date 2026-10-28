@@ -572,7 +572,9 @@ fn create_job_skeleton(
     let pod_template = kcore::v1::PodTemplateSpec {
         metadata: None,
         spec: Some(kcore::v1::PodSpec {
-            restart_policy: Some("Never".into()), // todo: maybe configurable
+            // `OnFailure`, the only other value a Job allows, would apply the playbook a second
+            // time within one run and read the recap from the restarted container.
+            restart_policy: Some("Never".into()),
             service_account_name: plan.spec.service_account_name.clone(),
             automount_service_account_token: Some(plan.spec.service_account_name.is_some()),
             volumes: Some(volumes),
@@ -583,7 +585,9 @@ fn create_job_skeleton(
     };
 
     let job_spec = batch::v1::JobSpec {
-        backoff_limit: Some(0), // todo: maybe configurable
+        // Retries belong to the operator (`spec.maxAttempts`, one `Play` per run): a Job-level
+        // retry would apply the playbook again under the same run ID, outside that accounting.
+        backoff_limit: Some(0),
         // Reaping a finished run is Kubernetes' job (the TTL controller), not the operator's — see
         // `effective_job_ttl`.
         ttl_seconds_after_finished: Some(effective_job_ttl(plan)),
