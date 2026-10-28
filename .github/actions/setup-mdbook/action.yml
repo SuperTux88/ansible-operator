@@ -1,0 +1,22 @@
+# Installs the mdBook release the guide is built with, checked against its sha256. Shared by the
+# `docs` job in build-test-push.yml and publish-docs.yml, so the pin lives in one place.
+name: Set up mdBook
+description: Install a pinned, checksummed mdBook release onto the PATH.
+
+runs:
+  using: composite
+  steps:
+    - name: Install mdBook
+      shell: bash
+      env:
+        MDBOOK_VERSION: v0.5.4
+        MDBOOK_SHA256: 5222beabd3e37dc5be0d18ff99b79058469354db5c220153a1b92db5ba12be89
+      run: |
+        set -euo pipefail
+        cd "$RUNNER_TEMP"
+        archive="mdbook-${MDBOOK_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+        curl -sSfLO "https://github.com/rust-lang/mdBook/releases/download/${MDBOOK_VERSION}/${archive}"
+        echo "${MDBOOK_SHA256}  ${archive}" | sha256sum --check
+        mkdir -p "$HOME/.local/bin"
+        tar -xzf "$archive" -C "$HOME/.local/bin" mdbook
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"

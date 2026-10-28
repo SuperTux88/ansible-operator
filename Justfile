@@ -1,8 +1,5 @@
 # ansible-operator task runner. Run `just` to list recipes.
 
-# Deny broken intra-doc links / bare URLs in the API reference (rustdoc).
-export RUSTDOCFLAGS := "-D rustdoc::broken_intra_doc_links -D rustdoc::bare_urls"
-
 # List available recipes.
 default:
     @just --list
@@ -15,9 +12,10 @@ docs:
 docs-serve:
     mdbook serve docs --open
 
-# Build the generated API reference (rustdoc) for the operator's internals.
+# Build the generated API reference (rustdoc) for the operator's internals. Every rustdoc warning
+# is an error, the same check CI runs.
 apidoc:
-    cargo doc --no-deps --document-private-items
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
 
 # Compile the operator.
 build:

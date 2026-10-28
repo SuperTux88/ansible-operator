@@ -1,5 +1,8 @@
 # ansible-operator Helm chart
 
+The [Ansible Operator Guide](https://webd97.github.io/ansible-operator/cluster-operators/deployment.html)
+covers deploying and securing the operator in more depth than this page.
+
 ## Install
 
 Install a released chart from GHCR:

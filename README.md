@@ -102,6 +102,12 @@ spec:
 
 More examples live under [`examples/v1beta1/`](examples/v1beta1/).
 
+## Documentation
+
+The [Ansible Operator Guide](https://webd97.github.io/ansible-operator/) covers writing plans and
+inventories, scheduling, results and troubleshooting, and installing and securing the operator. It
+documents the latest release; its source is under [`docs/`](docs/).
+
 ## Installation
 
 The operator ships as a Helm chart under [`chart/`](chart/) and release charts are published to

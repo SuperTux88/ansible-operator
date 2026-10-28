@@ -1,0 +1,67 @@
+# Publishes the guide to GitHub Pages on demand: a documentation fix that should not wait for a
+# release, or a release whose own workflow did not publish it. Release tags publish it on their own
+# (`publish-docs` in build-test-push.yml).
+#
+# Whatever `ref` points at is published as is, replacing the whole site. A run on main therefore
+# also documents changes that are not released yet.
+#
+# Run it from main: the `github-pages` environment admits only the default branch and `v*` tags.
+name: Publish guide
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag, branch or commit to publish. Empty publishes the branch this runs from.
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # The workflow's own ref, for the setup action: an older tag may not have it.
+      - uses: actions/checkout@v7
+
+      - name: Check out the ref to publish
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          path: source
+
+      - uses: ./.github/actions/setup-mdbook
+
+      - name: Build guide
+        run: mdbook build source/docs
+
+      - name: Upload guide for GitHub Pages
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: source/docs/book
+
+  deploy:
+    needs: [build]
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    # The same group as the release deploy in build-test-push.yml; concurrency groups span the
+    # repository, so a manual and a release deploy never run at the same time.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+
+    permissions:
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

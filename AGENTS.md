@@ -690,7 +690,17 @@ eyeball new cross-page links (or run the `mdbook-linkcheck` backend if installed
   way to sanity-check chart wiring.
 - CI (`.github/workflows/build-test-push.yml`): `cargo test` and the Python suite as separate
   parallel jobs, + `cargo build --release`, then a Containerfile distroless image (binary copied
-  in, no cargo build inside the image).
+  in, no cargo build inside the image). A `docs` job builds the guide with a pinned, checksummed
+  mdBook release, and the `test` job builds the API docs with `RUSTDOCFLAGS=-D warnings`, the same
+  check as `just apidoc`. `book.toml` sets `create-missing = false`, so a `SUMMARY.md` entry
+  whose file is missing fails the build instead of rendering an empty page. On a release tag
+  without a pre-release suffix, `publish-docs` deploys that build to GitHub Pages after
+  `publish-chart`, replacing the whole site, so it always documents the latest release. That needs
+  two repository settings no workflow can make: Pages → Source "GitHub Actions", and a `v*` tag
+  rule on the `github-pages` environment, which otherwise admits only the default branch.
+  `publish-docs.yml` publishes any ref by hand (run it from `main`); the mdBook pin both workflows
+  install lives in `.github/actions/setup-mdbook`. The checks also run weekly on `main`, so a new
+  stable toolchain's lints surface without a PR.
 - `.agents/skills/` is a vendored skill pack (rust-skills), unrelated to this project's domain —
   not something to modify as part of feature work.
 ```

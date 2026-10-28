@@ -4,6 +4,9 @@ The operator ships as a Helm chart under `chart/`. This page covers installing i
 Pod-Security requirements it imposes, the managed-SSH proxy image, and the two fail-closed knobs —
 namespace enrollment and node access — you have to open deliberately.
 
+The published guide describes the latest release. If you install an older chart version, read the
+guide's source under `docs/src/` at that version's tag instead.
+
 ## Install
 
 Install into its **own dedicated namespace**:

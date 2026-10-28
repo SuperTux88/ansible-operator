@@ -6,8 +6,13 @@ on:
     tags: ["v*.*.*"]
   pull_request:
     branches: ["main"]
-  # Manual, on-demand image build for any ref (e.g. main). Main pushes never publish an
-  # image on their own; run this to cut one when you actually want it.
+  # Weekly run of the checks on main, so a new stable Rust whose clippy or rustdoc lints fail the
+  # `-D warnings` gates is noticed without waiting for the next PR. The release jobs are gated on
+  # tags or manual runs and stay skipped.
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  # Manual, on-demand image and chart build for any ref (e.g. main). Main pushes never publish
+  # an image on their own; run this to cut one when you actually want it.
   workflow_dispatch: {}
 
 # Cancel superseded runs for the same PR, but never interrupt a release (tag) or a manual
@@ -65,6 +70,11 @@ jobs:
           rustup component add clippy
           cargo clippy -- -D warnings
 
+      - name: Build API docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --document-private-items
+
       - name: Verify generated CRDs are current
         shell: bash
         run: |
@@ -102,12 +112,30 @@ jobs:
       - name: Run Python tests
         run: python3 -m unittest discover --start-directory tests/python --verbose
 
+  # The mdBook guide under docs/. A prebuilt mdBook release, so this job needs no Rust toolchain.
+  docs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-mdbook
+
+      - name: Build guide
+        run: mdbook build docs
+
+      - name: Upload guide for GitHub Pages
+        if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/book
+
   # Release build. Only runs for real releases (v*.*.* tags) or an explicit manual build —
   # `cargo build --release` never runs on ordinary commits. Compiled in bookworm so the
   # binary's glibc matches the distroless/cc-debian12 runtime it is COPY'd into.
   compile:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    needs: [test, test-python, chart]
+    needs: [test, test-python, chart, docs]
     runs-on: ubuntu-latest
 
     container:
@@ -146,9 +174,23 @@ jobs:
       # with sigstore/fulcio when signing release tags.
       id-token: write
 
+    # The development chart's version suffix, and the image tag it defaults to through its
+    # appVersion. Computed once here so the chart can never name a tag this job did not push.
+    outputs:
+      short_sha: ${{ steps.sha.outputs.short_sha }}
+      image_tag: ${{ steps.sha.outputs.image_tag }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+
+      # The prefix keeps the tag from reading as a version: a short SHA can be all digits, and
+      # lenient SemVer parsers (image update automation) would rank `1234567` above every release.
+      - name: Shorten commit SHA
+        id: sha
+        run: |
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Download application binary
         uses: actions/download-artifact@v8
@@ -190,6 +232,7 @@ jobs:
             type=semver,pattern={{version}}
             type=ref,event=branch
             type=ref,event=pr
+            type=raw,value=${{ steps.sha.outputs.image_tag }},enable=${{ !startsWith(github.ref, 'refs/tags/v') }}
 
       # Build and push Docker image with Buildx
       # https://github.com/docker/build-push-action
@@ -221,8 +264,15 @@ jobs:
   # Publish the chart only after the matching operator image is available. Helm uses
   # appVersion as the default image tag, so publishing them independently would create
   # chart versions that cannot be installed with their defaults.
+  #
+  # A manual run on anything but a release tag publishes a development chart instead:
+  # `<committed version>+<short sha>` with `dev-<short sha>` as appVersion, set at package time
+  # and never committed. It goes to a repository of its own, `charts-dev`, because SemVer
+  # ignores build metadata when comparing: `0.1.0+abc1234` ranks equal to `0.1.0`, so a
+  # version range (Flux, Renovate, `helm install` without `--version`) could resolve to a
+  # development build if both lived side by side.
   publish-chart:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: [build, chart]
     runs-on: ubuntu-latest
 
@@ -237,6 +287,7 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
 
       - name: Verify release version
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           RELEASE_VERSION: ${{ github.ref_name }}
         run: |
@@ -262,6 +313,7 @@ jobs:
             --password-stdin
 
       - name: Package and publish Helm chart
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           RELEASE_VERSION: ${{ github.ref_name }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
@@ -273,3 +325,53 @@ jobs:
           helm package chart --destination dist
           helm push "dist/ansible-operator-${release_version}.tgz" \
             "oci://ghcr.io/${repository_owner}/charts"
+
+      # OCI tags cannot hold `+`, so the registry shows this version as `<version>_<sha>`;
+      # Helm converts in both directions, and installs take `--version <version>+<sha>`.
+      - name: Package and publish development Helm chart
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          SHORT_SHA: ${{ needs.build.outputs.short_sha }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          committed_version="$(grep -m1 '^version:' chart/Chart.yaml | cut -d ' ' -f 2)"
+          dev_version="${committed_version}+${SHORT_SHA}"
+          repository_owner="${REPOSITORY_OWNER,,}"
+
+          mkdir -p dist
+          helm package chart --destination dist \
+            --version "$dev_version" \
+            --app-version "$IMAGE_TAG"
+          helm push "dist/ansible-operator-${dev_version}.tgz" \
+            "oci://ghcr.io/${repository_owner}/charts-dev"
+
+  # Publish the guide built by `docs` to GitHub Pages, replacing the whole site, so it always
+  # documents the latest release. Only after the chart is published, so the site never describes
+  # a release that cannot be installed yet. Pre-release tags (`v1.2.0-rc.1`) are not published:
+  # the site would otherwise document a version most installations are not running.
+  publish-docs:
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    needs: [docs, publish-chart]
+    runs-on: ubuntu-latest
+
+    # The environment's deployment rules must allow `v*` tags: the one GitHub creates when Pages is
+    # switched to "GitHub Actions" admits only the default branch.
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    # Two releases tagged in quick succession must not deploy concurrently. A newer pending deploy
+    # replaces an older pending one, but never cancels one in progress.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+
+    permissions:
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
