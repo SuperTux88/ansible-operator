@@ -8,7 +8,7 @@ use crate::v1beta1::ResolvedInventoryGroup;
 /// may not set these as group `variables` — the operator owns them, and (for the host-level ones)
 /// Ansible's host-var precedence would silently override an author's group var anyway. Rejecting
 /// them at resolve time turns a silently-ignored setting into a clear error. The
-/// `reserved_vars_cover_rendered_output` test keeps this list in step with what is actually
+/// `reserved_vars_cover_every_rendered_host_var` test keeps this list in step with what is actually
 /// emitted below.
 pub const RESERVED_HOST_VARS: &[&str] = &[
     "ansible_host",
