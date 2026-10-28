@@ -352,8 +352,23 @@ excluding the whole namespace. The full list of exceptions to configure is [Admi
 policies](./admission-policies.md).
 
 Generated Ansible Jobs use the optional `securityContext` from their `PlaybookPlan`. Keeping this
-next to the plan's image allows each execution image to declare compatible settings while admission
-policies enforce the cluster's required baseline.
+next to the plan's image allows each execution image to declare compatible settings. Because the
+operator creates the Job on the plan author's behalf, it refuses any value the `baseline` Pod
+Security Standard forbids, and accepts `files` volumes only of the types the `restricted` standard
+allows plus image volumes (see [Security → the playbook pod's
+privileges](./security.md#the-playbook-pods-privileges)).
+
+The operator does not depend on admission for this, but backing the check with Pod Security
+admission on every enrolled tenant namespace is strongly recommended, so it holds independently of
+the operator and also covers Jobs created by anything else:
+
+```sh
+kubectl label namespace team-a pod-security.kubernetes.io/enforce=baseline
+```
+
+Use `restricted` where every plan in the namespace sets a compliant `securityContext`
+(`runAsNonRoot`, `allowPrivilegeEscalation: false`, dropped capabilities, `RuntimeDefault`
+seccomp). The operator namespace stays `privileged` for the proxy pods; do not create plans there.
 
 ## Network policies
 

@@ -113,7 +113,8 @@ pub(super) const TEST_DEADLINES: JobDeadlines = JobDeadlines {
 use crate::{
     utils,
     v1beta1::{
-        self, FilesSource, PlaybookPlan, PlaybookVariableSource, ResolvedInventoryGroup, SshConfig,
+        self, FilesSource, PlaybookPlan, PlaybookSecurityContext, PlaybookVariableSource,
+        ResolvedInventoryGroup, SshConfig,
         controllers::reconcile_error::ReconcileError,
         labels,
         playbookplancontroller::{
@@ -959,6 +960,140 @@ pub(super) fn file_volume_is_usable(
         .unwrap_or_default();
 
     Ok(source_count == 1 && requested == rendered)
+}
+
+/// Volume sources a `files` entry may use: those the `restricted` Pod Security Standard allows,
+/// plus `image`, which mounts an OCI image read-only.
+///
+/// An allowlist rather than a `hostPath` ban: `hostPath` is the obvious way out of the pod onto its
+/// Node, but in-tree types such as `gitRepo` (CVE-2024-10220) and `flexVolume` hand plan-supplied
+/// options to code running on the Node. The operator creates the Job, so the plan author needs no
+/// right to create pods, and no `NodeAccessPolicy` bounds which Node the pod lands on.
+pub(super) const ALLOWED_FILE_VOLUME_SOURCES: &[&str] = &[
+    "configMap",
+    "csi",
+    "downwardAPI",
+    "emptyDir",
+    "ephemeral",
+    "image",
+    "persistentVolumeClaim",
+    "projected",
+    "secret",
+];
+
+/// Whether every source in a file entry's volume is in [`ALLOWED_FILE_VOLUME_SOURCES`].
+pub(super) fn file_volume_type_allowed(volume: &Volume) -> Result<bool, serde_json::Error> {
+    Ok(serde_json::to_value(volume)?
+        .as_object()
+        .is_some_and(|fields| {
+            fields
+                .keys()
+                .filter(|field| field.as_str() != "name")
+                .all(|field| ALLOWED_FILE_VOLUME_SOURCES.contains(&field.as_str()))
+        }))
+}
+
+/// Capabilities the `baseline` Pod Security Standard lets a container add: the container runtimes'
+/// default set.
+const BASELINE_CAPABILITIES: &[&str] = &[
+    "AUDIT_WRITE",
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "FSETID",
+    "KILL",
+    "MKNOD",
+    "NET_BIND_SERVICE",
+    "SETFCAP",
+    "SETGID",
+    "SETPCAP",
+    "SETUID",
+    "SYS_CHROOT",
+];
+
+/// SELinux types the `baseline` Pod Security Standard allows a container to request.
+const BASELINE_SELINUX_TYPES: &[&str] = &[
+    "container_t",
+    "container_init_t",
+    "container_kvm_t",
+    "container_engine_t",
+];
+
+/// The first setting in a plan's `securityContext` that would give its Job containers more privilege
+/// than the `baseline` Pod Security Standard allows, if any.
+///
+/// The operator creates the Job, so a plan author needs no right to create pods, and no
+/// `NodeAccessPolicy` bounds which Node the pod lands on: a privileged playbook container would be
+/// root on whichever Node runs it. Pod Security admission refuses such a pod only in a namespace
+/// that enforces `baseline` or `restricted`, which is not the Kubernetes default, so the operator
+/// refuses it itself. Only the escalating values are refused; everything `restricted` asks for
+/// (`runAsNonRoot`, dropped capabilities, a `RuntimeDefault` seccomp profile) stays available,
+/// which is what the field exists for.
+pub(super) fn privileged_security_context_setting(
+    context: &PlaybookSecurityContext,
+) -> Option<String> {
+    if context.privileged == Some(true) {
+        return Some("privileged: true".into());
+    }
+
+    // Exact names, as Pod Security admission compares them: runtimes also accept `cap_sys_admin`,
+    // which an allowlist refuses without having to know every spelling.
+    let added = context
+        .capabilities
+        .as_ref()
+        .and_then(|capabilities| capabilities.add.as_deref())
+        .unwrap_or_default();
+    if let Some(capability) = added
+        .iter()
+        .find(|capability| !BASELINE_CAPABILITIES.contains(&capability.as_str()))
+    {
+        return Some(format!("capabilities.add {capability:?}"));
+    }
+
+    if let Some(options) = &context.se_linux_options {
+        let set = |value: &Option<String>| value.as_deref().is_some_and(|value| !value.is_empty());
+        if let Some(type_) = options.type_.as_deref().filter(|type_| !type_.is_empty())
+            && !BASELINE_SELINUX_TYPES.contains(&type_)
+        {
+            return Some(format!("seLinuxOptions.type {type_:?}"));
+        }
+        if set(&options.user) {
+            return Some("seLinuxOptions.user".into());
+        }
+        if set(&options.role) {
+            return Some("seLinuxOptions.role".into());
+        }
+    }
+
+    if let Some(proc_mount) = context
+        .proc_mount
+        .as_deref()
+        .filter(|proc_mount| *proc_mount != "Default")
+    {
+        return Some(format!("procMount {proc_mount:?}"));
+    }
+
+    let unconfined = |profile: &Option<v1beta1::SecurityProfile>| {
+        profile
+            .as_ref()
+            .is_some_and(|profile| profile.type_ == "Unconfined")
+    };
+    if unconfined(&context.seccomp_profile) {
+        return Some("seccompProfile.type: Unconfined".into());
+    }
+    if unconfined(&context.app_armor_profile) {
+        return Some("appArmorProfile.type: Unconfined".into());
+    }
+
+    if context
+        .windows_options
+        .as_ref()
+        .is_some_and(|options| options.host_process == Some(true))
+    {
+        return Some("windowsOptions.hostProcess: true".into());
+    }
+
+    None
 }
 
 /// Ten symbols matches the run-name discriminator: five has only about 14 million values, and a
@@ -1883,6 +2018,114 @@ spec:
                 .allow_privilege_escalation,
             Some(false)
         );
+    }
+
+    fn security_context(yaml: &str) -> crate::v1beta1::PlaybookSecurityContext {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    /// The field exists so an execution image can declare what it needs and a plan can satisfy the
+    /// `restricted` standard; none of that may be refused.
+    #[test]
+    fn hardening_security_context_settings_are_allowed() {
+        for yaml in [
+            "{}",
+            "allowPrivilegeEscalation: false\nrunAsNonRoot: true\nrunAsUser: 1000\nrunAsGroup: 1000\nreadOnlyRootFilesystem: true",
+            "capabilities:\n  drop: [ALL]\n  add: [NET_BIND_SERVICE]",
+            // Baseline allows running as root and adding the runtime's default capabilities.
+            "runAsUser: 0\ncapabilities:\n  add: [CHOWN, SETUID, KILL]",
+            "privileged: false\nprocMount: Default",
+            "seccompProfile:\n  type: RuntimeDefault\nappArmorProfile:\n  type: RuntimeDefault",
+            "seccompProfile:\n  type: Localhost\n  localhostProfile: profiles/ansible.json",
+            "seLinuxOptions:\n  type: container_t\n  level: s0:c123,c456",
+            "seLinuxOptions:\n  type: \"\"\n  user: \"\"",
+            "windowsOptions:\n  hostProcess: false\n  runAsUserName: ansible",
+        ] {
+            assert_eq!(
+                super::privileged_security_context_setting(&security_context(yaml)),
+                None,
+                "{yaml:?} must stay allowed"
+            );
+        }
+    }
+
+    /// Each of these makes the playbook container root on whichever Node runs it, which no
+    /// `NodeAccessPolicy` bounds.
+    #[test]
+    fn escalating_security_context_settings_are_refused() {
+        for (yaml, setting) in [
+            ("privileged: true", "privileged: true"),
+            (
+                "capabilities:\n  add: [SYS_ADMIN]",
+                r#"capabilities.add "SYS_ADMIN""#,
+            ),
+            // Runtimes accept these spellings for SYS_ADMIN too.
+            (
+                "capabilities:\n  add: [cap_sys_admin]",
+                r#"capabilities.add "cap_sys_admin""#,
+            ),
+            // Pod Security admission compares exact names, so only those pass here as well.
+            (
+                "capabilities:\n  add: [CAP_CHOWN]",
+                r#"capabilities.add "CAP_CHOWN""#,
+            ),
+            ("capabilities:\n  add: [kill]", r#"capabilities.add "kill""#),
+            ("capabilities:\n  add: [ALL]", r#"capabilities.add "ALL""#),
+            (
+                "capabilities:\n  add: [CHOWN, NET_ADMIN]",
+                r#"capabilities.add "NET_ADMIN""#,
+            ),
+            (
+                "seLinuxOptions:\n  type: spc_t",
+                r#"seLinuxOptions.type "spc_t""#,
+            ),
+            ("seLinuxOptions:\n  user: system_u", "seLinuxOptions.user"),
+            ("seLinuxOptions:\n  role: system_r", "seLinuxOptions.role"),
+            ("procMount: Unmasked", r#"procMount "Unmasked""#),
+            (
+                "seccompProfile:\n  type: Unconfined",
+                "seccompProfile.type: Unconfined",
+            ),
+            (
+                "appArmorProfile:\n  type: Unconfined",
+                "appArmorProfile.type: Unconfined",
+            ),
+            (
+                "windowsOptions:\n  hostProcess: true",
+                "windowsOptions.hostProcess: true",
+            ),
+        ] {
+            assert_eq!(
+                super::privileged_security_context_setting(&security_context(yaml)).as_deref(),
+                Some(setting),
+                "{yaml:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn only_restricted_volume_types_and_image_volumes_are_mountable_as_files() {
+        let volume = |yaml: &str| -> super::Volume { serde_yaml::from_str(yaml).unwrap() };
+
+        for source in super::ALLOWED_FILE_VOLUME_SOURCES {
+            let allowed = volume(&format!("name: files\n{source}: {{}}"));
+            assert!(
+                super::file_volume_type_allowed(&allowed).unwrap(),
+                "{source} must be mountable"
+            );
+        }
+
+        for yaml in [
+            "name: files\nhostPath:\n  path: /",
+            "name: files\ngitRepo:\n  repository: https://example.invalid/repo.git",
+            "name: files\nflexVolume:\n  driver: example/driver",
+            "name: files\nnfs:\n  server: nfs.example\n  path: /export",
+        ] {
+            assert!(
+                !super::file_volume_type_allowed(&volume(yaml)).unwrap(),
+                "{yaml:?} must not be mountable"
+            );
+        }
     }
 
     /// The budget this name has to fit: any plan name at all, against a run ID of the length the

@@ -79,7 +79,9 @@ pub struct PlaybookPlanSpec {
 
     /// Container security context applied to both the Ansible playbook container and the optional
     /// collection-installer init container. Optional for compatibility with arbitrary execution
-    /// images; cluster admission policies may require particular fields.
+    /// images; cluster admission policies may require particular fields. Values the baseline Pod
+    /// Security Standard forbids (privileged, added capabilities beyond the runtime defaults, other
+    /// SELinux types, unmasked procMount, Unconfined profiles, hostProcess) are refused.
     pub security_context: Option<PlaybookSecurityContext>,
 
     /// ServiceAccount the playbook pod runs as, letting tasks reach the Kubernetes API with that
@@ -342,7 +344,9 @@ pub struct PlaybookTemplate {
     /// Variables for the playbook
     pub variables: Option<Vec<PlaybookVariableSource>>,
 
-    /// Files for the playbook
+    /// Files for the playbook. Each entry is a `secretRef` or one Kubernetes volume source of a
+    /// type the restricted Pod Security Standard allows, or `image`; `hostPath` and other types
+    /// are refused.
     #[schemars(with = "Option<Vec<GenericMap>>")]
     pub files: Option<Vec<FilesSource>>,
 

@@ -130,6 +130,23 @@ image they run is the node-root supply-chain surface you must own — the defaul
 image published with the operator; in production pin it to a trusted digest (see
 [Deployment → the proxy image](./deployment.md#the-managed-ssh-proxy-image)).
 
+## The playbook pod's privileges
+
+The operator creates each run's Job for the plan, so a plan author needs no right to create pods —
+and no `NodeAccessPolicy` decides which Node the Job pod lands on. A privileged container or a
+`hostPath` volume there would be root on that Node. The operator therefore refuses, before a run
+starts, any `securityContext` value the `baseline` Pod Security Standard forbids (`privileged`,
+capabilities beyond the runtime defaults, SELinux types such as `spc_t`, unmasked `/proc`,
+`Unconfined` seccomp or AppArmor, Windows `hostProcess`), and accepts `files` volumes only of the
+types the `restricted` standard allows plus image volumes. Settings that make the pod stricter stay
+available.
+
+That check is the operator's own and does not depend on admission. Enforcing Pod Security
+`baseline` or `restricted` on every enrolled namespace as well (`pod-security.kubernetes.io/enforce`)
+is strongly recommended, so admission backs it independently and also covers Jobs created by
+anything else — see [Deployment → Workload security
+contexts](./deployment.md#workload-security-contexts).
+
 ## The playbook pod's Kubernetes access
 
 The pod that runs `ansible-playbook` carries **no** Kubernetes API token unless the plan sets
@@ -197,5 +214,6 @@ resumed run re-authorizes the exact set before creating proxies (INV-3b); cross-
 per-run cert principals (INV-4); the Node allow-set is a live read (INV-5); the CA private key
 never leaves the process (INV-6); proxy pods are labelled so cleanup can never sweep the ansible Job
 pod (INV-7); and the operator writes only its own dependency label keys on a Node, never a Node's
-spec, annotations or anybody else's labels (INV-8). If you are modifying the operator, do not
+spec, annotations or anybody else's labels (INV-8); and a plan cannot make its Job pod privileged,
+through its security context or a `files` volume (INV-9). If you are modifying the operator, do not
 regress these without an explicit, deliberate decision.
