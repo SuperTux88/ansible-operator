@@ -5,7 +5,8 @@ use std::time::Duration;
 use k8s_openapi::{
     api::{
         core::v1::{
-            Capabilities, Container, HostPathVolumeSource, Node, Pod, PodSpec, Probe, Secret,
+            Affinity, Capabilities, Container, HostPathVolumeSource, Node, NodeAffinity,
+            NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, Pod, PodSpec, Probe, Secret,
             SecurityContext, TCPSocketAction, Volume, VolumeMount,
         },
         networking::v1::{
@@ -519,17 +520,59 @@ fn refuse_foreign_proxy_resource(
     })
 }
 
+/// Pins a proxy pod to the Node *named* `host` — the name every other part of a run keys on (the
+/// `NodeAccessPolicy` allow-set, the host Leases, readiness).
+///
+/// Not the `kubernetes.io/hostname` label: it can differ from the Node name (kubelet
+/// `--hostname-override`), and `NodeRestriction` lets a kubelet set it on its own Node, so root on
+/// one Node could relabel it and draw another Node's proxy pod — and its run's sessions — onto
+/// itself. `matchFields` on `metadata.name` is how the DaemonSet controller pins its pods, and unlike
+/// `nodeName` it keeps normal scheduling (taints, tolerations) in force; see
+/// `merge_default_tolerations`.
+fn node_name_affinity(host: &str) -> Affinity {
+    Affinity {
+        node_affinity: Some(NodeAffinity {
+            required_during_scheduling_ignored_during_execution: Some(NodeSelector {
+                node_selector_terms: vec![NodeSelectorTerm {
+                    match_fields: Some(vec![NodeSelectorRequirement {
+                        key: "metadata.name".into(),
+                        operator: "In".into(),
+                        values: Some(vec![host.into()]),
+                    }]),
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// Whether an existing proxy pod is pinned to the Node it claims to serve.
 ///
 /// Separate from [`refuse_foreign_proxy_resource`] because it is the *pod's* half of the same
 /// question and the only one that says where node-root actually lands: metadata can be copied onto
-/// a pod running anywhere, while `nodeSelector` is what the scheduler obeyed.
+/// a pod running anywhere, while the required node affinity is what the scheduler obeys and
+/// `nodeName` is where it bound the pod. The required selector must equal [`node_name_affinity`]
+/// exactly, because its terms are ORed — one extra term would let the pod run elsewhere.
 fn proxy_pod_targets_host(pod: &Pod, host: &str) -> bool {
-    pod.spec
+    let Some(spec) = pod.spec.as_ref() else {
+        return false;
+    };
+    if spec.node_name.as_ref().is_some_and(|node| node != host) {
+        return false;
+    }
+    let required = |affinity: &Affinity| {
+        affinity.node_affinity.as_ref().and_then(|node_affinity| {
+            node_affinity
+                .required_during_scheduling_ignored_during_execution
+                .clone()
+        })
+    };
+    spec.affinity
         .as_ref()
-        .and_then(|spec| spec.node_selector.as_ref())
-        .and_then(|selector| selector.get("kubernetes.io/hostname"))
-        .is_some_and(|node| node == host)
+        .and_then(required)
+        .is_some_and(|selector| Some(selector) == required(&node_name_affinity(host)))
 }
 
 /// Name of this run's client-cert Secret, shared by `job_builder`'s mount and `ensure_client_cert`.
@@ -560,9 +603,10 @@ fn run_labels(
 ///
 /// An annotation has no length limit, so this is the one place a Node name is guaranteed to appear
 /// exactly as the cluster spells it — the label next to it may be a truncated form (`host_segment`),
-/// and the pod's `nodeSelector` is the only other verbatim copy. Deliberately written for every
-/// host, not only the truncated ones: an annotation that appears conditionally is one a reader
-/// cannot rely on, and a script that reads it should not have to know which case it is in.
+/// and the pod's required node affinity (`node_name_affinity`) is the only other verbatim copy.
+/// Deliberately written for every host, not only the truncated ones: an annotation that appears
+/// conditionally is one a reader cannot rely on, and a script that reads it should not have to know
+/// which case it is in.
 fn run_annotations(host: &str) -> BTreeMap<String, String> {
     BTreeMap::from([(labels::PLAYBOOKPLAN_HOST.to_string(), host.to_string())])
 }
@@ -784,10 +828,7 @@ fn build_pod(
             // Required: unlike the other host namespaces, PID can't be joined per-session via
             // nsenter (see HOST_PROC_MOUNT_PATH doc), so it must be shared from pod creation.
             host_pid: Some(true),
-            node_selector: Some(BTreeMap::from([(
-                "kubernetes.io/hostname".into(),
-                host.into(),
-            )])),
+            affinity: Some(node_name_affinity(host)),
             // Always tolerate the NotReady/unreachable taints (merged with the user's), so the proxy
             // pod still schedules onto a NotReady node — see `merge_default_tolerations`.
             tolerations: Some(merge_default_tolerations(tolerations)),
@@ -1337,8 +1378,9 @@ mod tests {
         );
     }
 
-    /// Metadata can say anything; `nodeSelector` is what the scheduler obeyed, and therefore the
-    /// only field that says where this pod's node-root actually lands.
+    /// Metadata can say anything; the required node affinity is what the scheduler obeys and
+    /// `nodeName` where it bound the pod, and therefore the only fields that say where this pod's
+    /// node-root actually lands.
     #[test]
     fn a_proxy_pod_is_adopted_only_while_it_is_pinned_to_its_own_node() {
         use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
@@ -1359,10 +1401,58 @@ mod tests {
         assert!(!proxy_pod_targets_host(&pod, "worker-2"));
 
         let mut unpinned = pod.clone();
-        unpinned.spec.as_mut().unwrap().node_selector = None;
+        unpinned.spec.as_mut().unwrap().affinity = None;
         assert!(
             !proxy_pod_targets_host(&unpinned, "worker-1"),
             "a pod free to run anywhere is not this host's proxy"
+        );
+
+        let mut by_label = unpinned.clone();
+        by_label.spec.as_mut().unwrap().node_selector = Some(BTreeMap::from([(
+            "kubernetes.io/hostname".into(),
+            "worker-1".into(),
+        )]));
+        assert!(
+            !proxy_pod_targets_host(&by_label, "worker-1"),
+            "a hostname label can be set by any kubelet on its own Node; it does not pin a pod"
+        );
+
+        let terms = |host| {
+            node_name_affinity(host)
+                .node_affinity
+                .and_then(|node_affinity| {
+                    node_affinity.required_during_scheduling_ignored_during_execution
+                })
+                .unwrap()
+                .node_selector_terms
+        };
+        let mut widened = pod.clone();
+        widened.spec.as_mut().unwrap().affinity = Some(Affinity {
+            node_affinity: Some(NodeAffinity {
+                required_during_scheduling_ignored_during_execution: Some(NodeSelector {
+                    node_selector_terms: [terms("worker-1"), terms("worker-2")].concat(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(
+            !proxy_pod_targets_host(&widened, "worker-1"),
+            "node selector terms are ORed, so an extra term lets the pod run elsewhere"
+        );
+
+        let mut bound_elsewhere = pod.clone();
+        bound_elsewhere.spec.as_mut().unwrap().node_name = Some("worker-2".into());
+        assert!(
+            !proxy_pod_targets_host(&bound_elsewhere, "worker-1"),
+            "nodeName is where the pod actually runs, whatever its affinity says"
+        );
+
+        let mut bound_here = pod.clone();
+        bound_here.spec.as_mut().unwrap().node_name = Some("worker-1".into());
+        assert!(
+            proxy_pod_targets_host(&bound_here, "worker-1"),
+            "the scheduler sets nodeName when it binds the pod to its own Node"
         );
     }
 
@@ -1616,12 +1706,30 @@ mod tests {
         let spec = pod.spec.as_ref().unwrap();
 
         // Scheduled onto the exact node it proxies — the pod IS the node's access path. Pinned by
-        // `nodeSelector` rather than `nodeName` so normal scheduling (taints, tolerations) still
-        // applies; see `merge_default_tolerations`.
-        assert_eq!(
-            spec.node_selector.as_ref().unwrap()["kubernetes.io/hostname"],
-            "worker-1"
-        );
+        // the Node's name through required node affinity, never by the kubelet-settable hostname
+        // label; see `node_name_affinity`.
+        let required = spec
+            .affinity
+            .as_ref()
+            .and_then(|affinity| affinity.node_affinity.as_ref())
+            .and_then(|node_affinity| {
+                node_affinity
+                    .required_during_scheduling_ignored_during_execution
+                    .as_ref()
+            })
+            .expect("a proxy pod must carry a required node affinity");
+        let [term] = required.node_selector_terms.as_slice() else {
+            panic!("exactly one node selector term, since terms are ORed");
+        };
+        assert_eq!(term.match_expressions, None);
+        let [field] = term.match_fields.as_deref().unwrap() else {
+            panic!("exactly one field requirement");
+        };
+        assert_eq!(field.key, "metadata.name");
+        assert_eq!(field.operator, "In");
+        assert_eq!(field.values.as_deref(), Some(&["worker-1".to_string()][..]));
+        assert_eq!(spec.node_selector, None);
+        assert_eq!(spec.node_name, None);
 
         // hostPID is required (nsenter needs a host process to enter); the rest must stay off.
         assert_eq!(spec.host_pid, Some(true));

@@ -421,8 +421,8 @@ pub(super) fn job_network_policy_name(plan_name: &str, run_id: &str) -> String {
 
 /// Creates a Kubernetes Job with everything needed for basic Ansible execution, without any
 /// connection-specifics. This Job pod needs no node-level privilege at all —
-/// hostPID/hostIPC/hostNetwork/privileged/nodeSelector all live on the ephemeral managed-ssh proxy
-/// pods instead (see `managed_ssh.rs`).
+/// hostPID, the node-access capabilities and the pinning to one Node all live on the ephemeral
+/// managed-ssh proxy pods instead (see `managed_ssh.rs`).
 fn create_job_skeleton(
     plan: &v1beta1::PlaybookPlan,
     with_requirements: bool,
