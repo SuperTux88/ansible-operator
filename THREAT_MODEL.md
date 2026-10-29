@@ -419,11 +419,13 @@ author who can only create `PlaybookPlan`s (not pods directly) thereby gains the
 any of that namespace's ServiceAccounts' API RBAC.
 - *Mitigation:* **fail-closed by default** — when `serviceAccountName` is unset the operator sets
   `automountServiceAccountToken: false`, so a playbook that never asked for cluster access carries no
-  API token at all (this also tightens the prior behaviour, where the namespace `default` SA token was
-  always auto-mounted). Access is opt-in and scoped to the plan namespace. The enrollment fence (R1)
-  already requires enrolled namespaces to be **dedicated to Ansible ops**, so every ServiceAccount in
-  one is inside the Ansible trust boundary; and the author already runs arbitrary node-root playbook
-  code, so this is not new capability against managed-ssh targets.
+  API token (this also tightens the prior behaviour, where the namespace `default` SA token was
+  always auto-mounted). It guards against an unintended token, not against the author: a `projected`
+  `files` entry with a `serviceAccountToken` source mounts the `default` SA's token anyway, which is
+  what `serviceAccountName: default` grants too. Access is opt-in and scoped to the plan namespace.
+  The enrollment fence (R1) already requires enrolled namespaces to be **dedicated to Ansible ops**,
+  so every ServiceAccount in one is inside the Ansible trust boundary; and the author already runs
+  arbitrary node-root playbook code, so this is not new capability against managed-ssh targets.
 - *Residual:* a tenant able to author plans in an enrolled namespace can assume any ServiceAccount
   there — keep only ServiceAccounts you would trust a playbook to run as in enrolled namespaces, and
   do not co-locate privileged ServiceAccounts with playbook authoring rights.
