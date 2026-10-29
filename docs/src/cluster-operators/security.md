@@ -149,9 +149,12 @@ contexts](./deployment.md#workload-security-contexts).
 
 ## The playbook pod's Kubernetes access
 
-The pod that runs `ansible-playbook` carries **no** Kubernetes API token unless the plan sets
-`serviceAccountName` — the operator sets `automountServiceAccountToken: false` by default, so a
-playbook that never asked for cluster access cannot reach the API at all. When a plan does set
+The pod that runs `ansible-playbook` carries **no** Kubernetes API token unless the plan asks for
+one — the operator sets `automountServiceAccountToken: false` when `serviceAccountName` is unset, so
+a playbook that never asked for cluster access holds no credential for the API. This protects
+against an unintended token, not against the author: a `projected` `files` entry with a
+`serviceAccountToken` source still mounts a token for the namespace's `default` ServiceAccount,
+which is no more than naming that account in `serviceAccountName` would give. When a plan does set
 `serviceAccountName`, the run acts with **that ServiceAccount's RBAC**. Because a plan author picks
 any ServiceAccount in the plan's namespace, this is a within-namespace escalation surface: an author
 who can create `PlaybookPlan`s can run a pod as any ServiceAccount there. It is bounded by the same
