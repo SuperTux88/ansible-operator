@@ -337,16 +337,38 @@ mount a ServiceAccount token. An Ansible Job receives a token only when its `Pla
 
 ## Workload security contexts
 
-The chart sets `allowPrivilegeEscalation: false` on the operator container. Managed-SSH proxy
-containers cannot use that setting because Kubernetes treats their required `SYS_ADMIN` capability
-as privilege escalation. The proxy receives only the capabilities and SELinux type required for
-node access. Admission policies should scope any required exception to pods labelled
-`ansible.cloudbending.dev/component=managed-ssh-proxy` instead of excluding the whole namespace. The
-full list of exceptions to configure is [Admission policies](./admission-policies.md).
+The operator pod meets the `restricted` Pod Security Standard by default: it runs as the image's
+non-root user (65532), with a read-only root filesystem, every capability dropped, the
+`RuntimeDefault` seccomp profile and `allowPrivilegeEscalation: false` (`podSecurityContext` and
+`securityContext` in the chart values). It needs no privilege — but it holds the SSH certificate
+authority's private key in memory, so it should not run as root even inside its container. If you
+override the operator image, keep a numeric non-root user in it or set `runAsUser` to match.
+
+Managed-SSH proxy containers cannot use `allowPrivilegeEscalation: false` because Kubernetes treats
+their required `SYS_ADMIN` capability as privilege escalation. The proxy receives only the
+capabilities and SELinux type required for node access. Admission policies should scope any required
+exception to pods labelled `ansible.cloudbending.dev/component=managed-ssh-proxy` instead of
+excluding the whole namespace. The full list of exceptions to configure is [Admission
+policies](./admission-policies.md).
 
 Generated Ansible Jobs use the optional `securityContext` from their `PlaybookPlan`. Keeping this
-next to the plan's image allows each execution image to declare compatible settings while admission
-policies enforce the cluster's required baseline.
+next to the plan's image allows each execution image to declare compatible settings. Because the
+operator creates the Job on the plan author's behalf, it refuses any value the `baseline` Pod
+Security Standard forbids, and accepts `files` volumes only of the types the `restricted` standard
+allows plus image volumes (see [Security → the playbook pod's
+privileges](./security.md#the-playbook-pods-privileges)).
+
+The operator does not depend on admission for this, but backing the check with Pod Security
+admission on every enrolled tenant namespace is strongly recommended, so it holds independently of
+the operator and also covers Jobs created by anything else:
+
+```sh
+kubectl label namespace team-a pod-security.kubernetes.io/enforce=baseline
+```
+
+Use `restricted` where every plan in the namespace sets a compliant `securityContext`
+(`runAsNonRoot`, `allowPrivilegeEscalation: false`, dropped capabilities, `RuntimeDefault`
+seccomp). The operator namespace stays `privileged` for the proxy pods; do not create plans there.
 
 ## Network policies
 

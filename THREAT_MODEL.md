@@ -1,6 +1,7 @@
 # Threat Model — ansible-operator
 
-> Scope: the `new-arch` managed-ssh execution model. This document describes the
+> Scope: the operator's node-access model — managed-ssh proxy pods for `ClusterInventory`
+> hosts, and direct SSH for `StaticInventory` hosts. This document describes the
 > security architecture, enumerates threats against it, states the invariants the
 > design relies on, and records the residual risks and deployment assumptions that
 > operators MUST understand before running this in a multi-tenant cluster.
@@ -120,8 +121,8 @@ so any such check is tautological (same trust domain checking itself).
 Numbered entry points where an actor injects data or makes a request:
 
 1. **PlaybookPlan spec** — playbook text (→ runs as root), inventory refs, variables,
-   files (`FilesSource::Other` = arbitrary Volume JSON), image, schedule, tolerations,
-   TTL. Tenant-controlled.
+   files (`FilesSource::Other` = a Volume of an allowed type, T-ESC-10), the Job containers'
+   security context (T-ESC-10), image, schedule, tolerations, TTL. Tenant-controlled.
 2. **ClusterInventory spec** — node label selectors → requested nodes. Tenant-controlled.
 3. **StaticInventory spec** — literal hostnames/IPs + SSH `SecretRef`. Tenant-controlled.
 4. **Referenced Secrets** — variable/file/SSH-key Secrets in the plan namespace.
@@ -199,7 +200,7 @@ Ansible group vars. An author could try to set `ansible_ssh_common_args` (weaken
 checking), `ansible_host`/`ansible_port` (redirecting the dial), or `ansible_user` to subvert the
 managed-SSH/SSH wiring.
 - *Mitigation:* the operator rejects the connection variables it renders itself
-  (`ansible::RESERVED_HOST_VARS` — `ansible_host`, `ansible_port`, `ansible_timeout`, `ansible_user`,
+  (`ansible::RESERVED_HOST_VARS` — `ansible_host`, `ansible_port`, `ansible_user`,
   `ansible_ssh_private_key_file`, `ansible_ssh_common_args`) at inventory-resolve time
   (`reject_reserved_variables`, before any proxy infra), failing the reconcile with
   `ReservedInventoryVariable`. Independently, those vars are rendered per-**host**, which outranks
@@ -239,7 +240,8 @@ operator's own namespace ∪ the chart's `watchNamespaces`. `jobs: create,delete
   escape hatch). A run in flight when its namespace is un-enrolled loses its node-root proxy pods
   and host Leases at the refusal (`release_unenrolled_run`), since they live in the operator ns; its
   Job, `Play` and run-cleanup finalizer stay in the plan namespace until it is re-enrolled.
-  Distroless image, no shell.
+  Distroless image, no shell; the operator runs as a non-root user with every capability dropped and
+  a read-only root filesystem.
 - *Residual:* within the enrolled namespaces the grant is still broad — operator compromise ⇒
   disclosure of Secrets in *those* namespaces, plus Job-`create`, Job-`delete`, Secret-`delete` and
   PlaybookPlan-`patch` write primitives *there* (the per-run client-cert Secret is created and reaped
@@ -359,7 +361,10 @@ label a permissive policy's namespaceSelector matches, or influence Node labels,
 their allow-set.
 - *Mitigation:* Node labels are normally admin/kubelet-controlled; the `NodeRestriction`
   admission plugin limits a kubelet to its own node's labels; `kubernetes.io/metadata.name`
-  is server-stamped and immutable.
+  is server-stamped and immutable. Proxy pods are pinned by Node *name* (required node affinity,
+  `matchFields` on `metadata.name` — `node_name_affinity`), never by the `kubernetes.io/hostname`
+  label: `NodeRestriction` lets a kubelet set that label on its own Node, so root on one Node could
+  otherwise relabel it and draw another Node's proxy pod, with that run's sessions, onto itself.
 - *Residual:* if tenants can set arbitrary labels on their own Namespace (common) **and**
   a policy's namespaceSelector keys off a forgeable label, they self-select into a scope.
   **Admins should target namespaces by the immutable `kubernetes.io/metadata.name` label**
@@ -393,10 +398,8 @@ The proxy image is pulled into a **node-root** pod.
   explicit admin choice, never an implicit fallback.
 - *Residual:* signature verification is not *enforced* at admission, so an operator relies on the
   digest pin (and their trust in this repo's release pipeline) rather than a cluster-side cosign policy.
-  The pre-first-release chart seed is tag-based, not digest — only relevant before the first `sshd-v*`
-  release repins it.
-- *Severity:* **Low** once digest-pinned (the default after the first release); the residual is the
-  absence of admission-enforced signature verification. See R5.
+- *Severity:* **Low** with the digest pin the chart ships; the residual is the absence of
+  admission-enforced signature verification. See R5.
 
 **T-ESC-6 — Execution-hash collision affecting security-relevant naming/labels.**
 `ExecutionHash` (XxHash3_64, non-cryptographic) identifies desired content and contributes to the
@@ -416,11 +419,13 @@ author who can only create `PlaybookPlan`s (not pods directly) thereby gains the
 any of that namespace's ServiceAccounts' API RBAC.
 - *Mitigation:* **fail-closed by default** — when `serviceAccountName` is unset the operator sets
   `automountServiceAccountToken: false`, so a playbook that never asked for cluster access carries no
-  API token at all (this also tightens the prior behaviour, where the namespace `default` SA token was
-  always auto-mounted). Access is opt-in and scoped to the plan namespace. The enrollment fence (R1)
-  already requires enrolled namespaces to be **dedicated to Ansible ops**, so every ServiceAccount in
-  one is inside the Ansible trust boundary; and the author already runs arbitrary node-root playbook
-  code, so this is not new capability against managed-ssh targets.
+  API token (this also tightens the prior behaviour, where the namespace `default` SA token was
+  always auto-mounted). It guards against an unintended token, not against the author: a `projected`
+  `files` entry with a `serviceAccountToken` source mounts the `default` SA's token anyway, which is
+  what `serviceAccountName: default` grants too. Access is opt-in and scoped to the plan namespace.
+  The enrollment fence (R1) already requires enrolled namespaces to be **dedicated to Ansible ops**,
+  so every ServiceAccount in one is inside the Ansible trust boundary; and the author already runs
+  arbitrary node-root playbook code, so this is not new capability against managed-ssh targets.
 - *Residual:* a tenant able to author plans in an enrolled namespace can assume any ServiceAccount
   there — keep only ServiceAccounts you would trust a playbook to run as in enrolled namespaces, and
   do not co-locate privileged ServiceAccounts with playbook authoring rights.
@@ -495,6 +500,34 @@ other label — none of which the operator ever writes.
   the machine either way. For a NodeAccessPolicy built on such a label it is the delegation above.
 - *Severity:* Low with the policy, Medium without it.
 
+**T-ESC-10 — Plan-authored privilege on the Job pod.**
+The operator creates each run's Job in the plan namespace, built from the plan's `securityContext`
+and `template.files`. An author who may create `PlaybookPlan`s but not pods could otherwise ask for
+a privileged container or a `hostPath` volume and be root on whichever Node the Job pod lands on —
+a Node no `NodeAccessPolicy` was consulted for, through a pod the author's own RBAC would not let
+them create. Pod Security admission refuses such a pod only in a namespace that enforces `baseline`
+or `restricted`, which is not the Kubernetes default.
+- *Mitigation:* before a run takes Leases or creates proxy pods, the operator refuses any
+  `securityContext` value the `baseline` Pod Security Standard forbids — `privileged`, capabilities
+  beyond the runtime default set, SELinux types other than `container_t` and its siblings or any
+  SELinux user/role, `procMount: Unmasked`, `Unconfined` seccomp or AppArmor profiles, Windows
+  `hostProcess` (`job_builder::privileged_security_context_setting`) — and any `files` volume type
+  outside the `restricted` standard's list plus `image` (`job_builder::ALLOWED_FILE_VOLUME_SOURCES`).
+  The volume check is an allowlist, not a `hostPath` ban, because in-tree types such as `gitRepo`
+  and `flexVolume` also hand plan-supplied options to code on the Node. Values that harden the pod
+  stay allowed: the field exists so a plan can meet `restricted`.
+- *Residual:* the check is the operator's own copy of the standards; Pod Security admission on every
+  enrolled namespace (§6 item 8, recommended) is the independent second layer, follows later
+  revisions of the standards, and also covers Jobs created by anything else. Within `baseline` the
+  playbook may still run as any UID inside its own container. A `persistentVolumeClaim` volume
+  reaches the namespace's existing claims, an inline `csi` volume any driver that permits ephemeral
+  mode, and an `ephemeral` volume has a PVC created even for an author whose RBAC does not allow
+  one; CSIDriver configuration, StorageClasses and ResourceQuota bound these, as they do for pods.
+  The operator namespace must stay `privileged` for the proxy pods, so a plan created there has only
+  the operator's check.
+- *Severity:* **High if bypassed**; Low with the check, and lower with Pod Security admission too.
+  See INV-9.
+
 ---
 
 ## 6. Deployment assumptions & required controls
@@ -528,6 +561,12 @@ This design is **only** as strong as the environment it runs in. The following a
    a second one mints certs the first one's proxy pods do not trust, and the two tear down each
    other's half-built runs. The chart refuses `replicaCount` above 1 and uses the `Recreate`
    strategy, which covers rollouts; it cannot prevent a short overlap outside one (R10).
+8. **Pod Security `baseline` or `restricted` on every enrolled tenant namespace is strongly
+   recommended (defense in depth)** (`pod-security.kubernetes.io/enforce`). The operator refuses
+   privileged plan settings itself (T-ESC-10), so this is not what keeps a plan from a privileged
+   Job pod; admission is the independent second layer, and also covers Jobs created by anything
+   other than the operator. The operator namespace is the exception — it must stay `privileged` for
+   the proxy pods — which is one more reason plans do not belong there.
 
 ---
 
@@ -567,6 +606,10 @@ This design is **only** as strong as the environment it runs in. The following a
   write a Node's spec, annotations, or any label outside that form. The key being operator-derived
   is what stops a plan labelling its way past a NodeAccessPolicy ceiling (T-ESC-3/T-ESC-9); where
   the chart's `ValidatingAdmissionPolicy` is enabled, the API server enforces the same bound.
+- **INV-9 — A plan cannot make its Job pod privileged.** A plan whose `securityContext` grants more
+  than the `baseline` Pod Security Standard (`privileged_security_context_setting`), or whose
+  `files` entry uses a volume type outside `ALLOWED_FILE_VOLUME_SOURCES`, MUST be refused before any
+  Lease or proxy pod is taken (T-ESC-10).
 
 Any change touching these paths should re-verify the corresponding unit tests and this list.
 

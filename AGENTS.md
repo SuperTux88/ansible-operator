@@ -22,6 +22,8 @@ explicit instruction — stop and surface it instead:
 - **INV-6** The CA key is in memory only: never persisted, logged, or hashed.
 - **INV-7** Proxy pods carry both `PLAYBOOKPLAN_HASH` and `PLAYBOOKPLAN_HOST`.
 - **INV-8** The only Node writes are `dependency_keys::label_key` labels from the plan's own ns/name.
+- **INV-9** A plan's `securityContext` above Pod Security `baseline`, or a `files` volume outside
+  `ALLOWED_FILE_VOLUME_SOURCES`, is refused before any Lease or proxy pod (`job_builder.rs`).
 
 Looks like cleanup, is not: `StrictModes no` in `render_sshd_config`, and the client-cert Secret
 living in the *plan* namespace (see `managed_ssh.rs`).

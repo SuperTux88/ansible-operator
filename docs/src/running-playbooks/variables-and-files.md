@@ -103,6 +103,11 @@ template:
 
 The playbook then reads them from `/run/ansible-operator/files/binary-assets/...`.
 
+Only the volume types the `restricted` Pod Security Standard allows are accepted, plus image
+volumes: `configMap`, `csi`, `downwardAPI`, `emptyDir`, `ephemeral`, `image`,
+`persistentVolumeClaim`, `projected` and `secret`. Anything else — `hostPath` above all — is refused:
+the operator creates the Job for you, and such a volume would reach into the Node the pod runs on.
+
 Each entry must name exactly one volume source that the operator's Kubernetes API version
 recognizes, and its fields must survive typed decoding intact. The operator performs this check
 before it records a new run or acquires host locks, so an unknown source or a nested typo such as

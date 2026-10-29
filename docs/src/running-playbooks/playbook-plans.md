@@ -16,7 +16,7 @@ validation rules, the operator refuses the plan instead and says so in `.status.
 | Field | Required | Meaning |
 |---|---|---|
 | `image` | yes | An OCI image that has `ansible-playbook` on `PATH`, `python3` on `PATH`, and every collection your playbook uses. The Job runs this image. |
-| `securityContext` | no | Container security context applied to the playbook and collection-installer containers. |
+| `securityContext` | no | Container security context applied to the playbook and collection-installer containers. Privileged settings are refused — see [Choosing the image](#choosing-the-image). |
 | `serviceAccountName` | no | ServiceAccount the run's pod uses, so tasks can reach the Kubernetes API. Unset means no API token is mounted — see [Managing Kubernetes resources](#managing-kubernetes-resources). |
 | `inventoryRefs` | yes | Which inventories to target — one entry per referenced `ClusterInventory` or `StaticInventory`. |
 | `provides` | no | Declares what this plan makes true on the hosts it converges, so other plans can depend on it — see [Declaring what a plan provides](#declaring-what-a-plan-provides). |
@@ -95,6 +95,15 @@ The context is applied to every container of the run: the `ansible-playbook` con
 optional `download-collections` init container, and the `managed-ssh-preflight` init container that
 plans targeting cluster Nodes get. Changing the security context affects future Jobs but does not
 itself cause hosts that already succeeded to run again.
+
+The operator creates the Job for you, so it refuses settings that would make its containers
+privileged — anything the `baseline` Pod Security Standard forbids: `privileged: true`, adding
+capabilities beyond the container runtime's defaults (`SYS_ADMIN`, `NET_ADMIN`, `ALL`, …), SELinux
+types other than `container_t` and its siblings or any SELinux `user`/`role`, `procMount:
+Unmasked`, an `Unconfined` seccomp or AppArmor profile, and Windows `hostProcess`. Such a plan
+reports `securityContext … is not allowed` and starts no run. Everything that makes the pod stricter
+stays available, and running as root inside the container remains allowed. A playbook that needs
+root on a cluster Node reaches it over managed SSH, through a [ClusterInventory](./cluster-nodes.md).
 
 ## The playbook
 
