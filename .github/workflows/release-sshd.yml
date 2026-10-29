@@ -97,7 +97,7 @@ jobs:
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+        run: echo "${TAGS}" | xargs -I {} cosign sign --yes "{}@${DIGEST}"
 
   # Open a PR that pins the chart + example config to the immutable digest just published. Kept as a PR
   # (not a direct push) so a human reviews the bump; it touches no Containerfile, so it does not
