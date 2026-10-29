@@ -1,3 +1,76 @@
+//! The PlaybookPlan controller: one `PlaybookPlan` fans out into one Kubernetes Job per run
+//! (targeting that run's hosts) plus one managed-ssh proxy pod per targeted `ClusterInventory`
+//! host in the operator namespace.
+//!
+//! `reconcile` is level-triggered and idempotent: every step re-derives what it needs from observed
+//! cluster state, and nothing persists a "current step" except the run record's own phase
+//! (`play_history`). The pipeline, in order:
+//!
+//! 1. **Enrollment guard.** A plan outside the enrolled namespaces (`config.rs`) is refused with
+//!    `Phase::UnauthorizedNamespace` and `await_change` before any Secret or Job call — the
+//!    operator holds no such RBAC there. It runs ahead of the deletion branch too, and
+//!    `release_unenrolled_run` releases the operator-namespace half of a run still in flight
+//!    (proxy pods, then host Leases, from the `status.activeRun` mirror), since nothing else would
+//!    remove those node-root pods. Once the namespace is enrolled again, `leave_unenrolled_phase`
+//!    replaces the refusal on an idle plan straight after the starting read; keep it ahead of every
+//!    exit, or a spent plan would never read `Failed`, the verdict the retry annotation needs. The
+//!    name guard (`plan_name_within_label_limit`) follows in the same shape: the plan name becomes a
+//!    label value, so it is capped at `MAX_PLAN_NAME_LEN` for clusters that skip CRD validation.
+//! 2. **Step 0a — `recover_active_run`**, before inventory is resolved: keeps the `Play`s this plan
+//!    owns (by `spec.playbookPlan` + `spec.playbookPlanUid`, not the label), deletes statusless
+//!    ones, and dispatches on `PlayPhase`: `Prepared`/`Starting`/`Launching` are deferred until
+//!    after inventory resolution (resuming them needs the clamped groups the fingerprint covers),
+//!    `Running` carries on, `Aborted` is abandoned, terminal-but-unacknowledged is applied to the
+//!    plan. A recovery failure is reported on the plan before the tick aborts.
+//! 3. **Scheduling validation.** `validate_scheduling_configuration` runs before recovery, so no
+//!    unvalidated tenant string reaches schedule evaluation, but its result is acted on only after
+//!    recovery and active-Job advancement: an invalid schedule blocks new runs without stranding a
+//!    running Job or its privileged resources.
+//! 4. **Steps 0 + 0b — `resolve_authorized_inventory`** resolves the inventories and clamps them
+//!    with `node_access::enforce` in one step, so nothing observes the unclamped result
+//!    (INV-2/3/5). A `ClusterInventory` whose `status.observedGeneration` lags its generation is
+//!    refused as `InventoryNotSynced`, a transient error that holds an unlaunched run: its
+//!    `resolvedHosts` still answer for the spec before the edit.
+//! 5. **Execution hash** (`execution_evaluator`): playbook + referenced Secrets, inventory group
+//!    variables (`fold_inventory_variables`) and `spec.provides.version` (`fold_provides_version`),
+//!    never the workspace Secret (its proxy IPs change every run). A change resets
+//!    `last_run_number` and `last_triggered_run` and sets `Phase::Pending` only when nothing is in
+//!    flight; a running run keeps its own hash, which lives in its `Play`.
+//! 6. **Step 1 — schedule and hosts to trigger.** `evaluate_schedule` in the plan's timezone; the
+//!    outdated hosts for `OneShot`, or for `Recurring` inside an open slot the hosts that slot still
+//!    owes (`find_hosts_owing_slot`). A fully served slot goes through
+//!    `update_idle_recurring_status`, which must requeue at the next slot or sub-hourly schedules
+//!    skip slots.
+//! 7. **Steps 2–5 — `try_start_run`** when eligible and nothing is active: `select_job` numbers the
+//!    run, `play_history::record_prepared` writes the record, the plan's `activeRun` mirror is
+//!    patched, then host Leases are taken and `commit_starting`. `ensure_infra_and_launch` does the
+//!    rest: re-authorize the nodes (INV-3b), `reset_incomplete_run`, `ensure_proxy_infra`, render
+//!    the workspace Secret with the live proxy IPs, `commit_launching`, create the one Job,
+//!    `record_running`. A resumed `Launching` run first checks whether its Job exists
+//!    (`resume_launching_run`): an absent one re-enters `ensure_infra_and_launch`, an existing one
+//!    is adopted without depending on the newly desired inventory.
+//! 8. **`advance_active_run`** once the Job is terminal: parse the recap from the pod's
+//!    termination message (`callback_output`), clean up proxy infra, release Leases,
+//!    `record_finished`, fold it into the plan (`status::apply_terminal_play_status`) and set the
+//!    terminal phase or reschedule. A run whose `Play` is gone is released here by
+//!    `finalize_lost_run`, brought in by the `activeRun` mirror. The early exits that may follow a
+//!    finished run (input outage, invalid schedule) write that run's verdict, not `Pending`
+//!    (`phase_under_overlay_after_run`) — for a lost run that is the only write its verdict gets. A
+//!    Job that never started (`job_start_stall`, judged by time against `runs.startTimeoutSeconds`)
+//!    is cancelled here too: `record_stalled` first, since the reason can be read nowhere else
+//!    afterwards, then `cancel_run_job`.
+//! 9. **`patch_status`** — a JSON merge patch, since a version-checked PUT would routinely 409
+//!    across the tick's async steps. It also holds the suspension contract
+//!    (`suspended_advertises_no_pending_run`), because a tick has several ways to write a status.
+//!    The `Play` acknowledgement and the version-checked finalizer write
+//!    (`drop_run_cleanup_finalizer`) come after it, conditioned on the plan `patch_status`
+//!    returned; a 409 there means somebody else wrote the plan and is retried next tick.
+//!
+//! Requeue is dynamic: an hour by default, tightened to the next scheduled run, 15 s while polling a
+//! Job, or 5 s while waiting for proxy pods. A failed tick retries after 15 s, except an idle plan
+//! whose input only an edit can fix (`input_error_waits_for_an_edit`), which rechecks after five
+//! minutes — never a plan with a run in flight, whose ticks renew its host Leases.
+
 use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 use futures_util::{Stream, StreamExt as _};
 use k8s_openapi::api::{
@@ -676,17 +749,10 @@ impl NodeWatchFailures {
     }
 }
 
-/// Reconciles one PlaybookPlan. Level-triggered/idempotent "ensure" style — every step re-derives
-/// what's needed from observed cluster state and short-circuits with a short `Action::requeue`
-/// rather than a persisted "current step" state machine. Pipeline (each step re-run every tick):
-///   0a. `recover_active_run` (what the plan's `Play` records say is in flight), 0/0b.
-///   `resolve_authorized_inventory` (resolve the inventories, then clamp them to what
-///   `NodeAccessPolicy` grants), 1. compute outdated hosts/evaluate
-///   schedule, 2-5. `try_start_run` (locks, managed-ssh proxy infra, workspace secret, the one Job),
-///   6-7. `advance_active_run` (once the Job is finished: read+record the recap, cleanup). A single
-///   tick can walk through both halves — e.g. Pending -> locks acquired -> proxy ready -> Job
-///   created -> immediately checked for completion — since the only persisted step is the run
-///   record's own phase, which exists to make the privileged steps crash-recoverable.
+/// Reconciles one PlaybookPlan through the pipeline described in the module doc. A step that has
+/// to wait short-circuits with a short `Action::requeue`; otherwise a single tick can walk through
+/// both halves — e.g. Pending -> locks acquired -> proxy ready -> Job created -> immediately checked
+/// for completion.
 async fn reconcile(
     object: Arc<v1beta1::PlaybookPlan>,
     context: Arc<ReconciliationContext>,

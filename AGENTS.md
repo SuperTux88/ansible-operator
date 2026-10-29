@@ -1,706 +1,78 @@
 # ansible-operator — agent notes
 
-Opinionated Kubernetes operator that runs Ansible playbooks against cluster
-nodes (via ephemeral **managed-ssh proxy pods**) or arbitrary external hosts
-(via `StaticInventory` + a BYO SSH key). Inspired by Rancher's
-system-upgrade-controller. Rust, built on `kube-rs` 3.x. Single binary, **three**
-controllers running concurrently in `main.rs` via `tokio::join!`
-(`playbookplancontroller`, `clusterinventorycontroller`, `nodeaccesspolicycontroller`).
+Kubernetes operator (Rust, kube-rs) that runs Ansible playbooks against cluster Nodes through
+ephemeral **managed-ssh proxy pods** (`ClusterInventory`) or external hosts with a BYO SSH key
+(`StaticInventory`). One binary, three controllers joined in `src/main.rs`: `playbookplancontroller`
+(the big one), `clusterinventorycontroller`, `nodeaccesspolicycontroller`. Modules carry their own
+`//!` docs — read those for the details; this file only lists what is easy to break by accident.
 
-> This operator is a **cluster-privileged, node-root primitive**. Before touching
-> anything under `playbookplancontroller/` (especially `managed_ssh.rs`,
-> `node_access.rs`, `ca.rs`) read `THREAT_MODEL.md` — it is the source of truth for
-> the security model. The invariants in the next section are load-bearing.
+## Security — read `THREAT_MODEL.md` first
 
-## Security invariants — do NOT regress without an explicit instruction
+A managed-ssh session is **root on the node**. Before touching `managed_ssh.rs`, `node_access.rs`,
+`node_labels.rs`, `ca.rs` or anything that decides which Nodes a run reaches, read
+`THREAT_MODEL.md`. Its §7 invariants are enforced by unit tests; do not weaken one without an
+explicit instruction — stop and surface it instead:
 
-These are the numbered invariants in `THREAT_MODEL.md` §7, enforced by unit tests. They are the
-whole point of the design. If a change would weaken one, stop and surface it; do not
-"simplify" or "clean up" past them unless the user explicitly asks.
+- **INV-1** `selector_matches_fail_closed`: an empty selector / no matching policy ⇒ zero nodes.
+- **INV-2** `node_access::enforce` only removes managed-ssh hosts; `Ssh` groups pass through.
+- **INV-3/3b** Clamping runs on every reconcile before any proxy infra, and
+  `ensure_infra_and_launch` re-authorizes the set it is about to render, never one from a record.
+- **INV-4** A proxy's `AuthorizedPrincipalsFile` lists only its own run ID (never `root`/wildcard).
+- **INV-5** The allow-set comes from a **live** Node read, never the reflector cache.
+- **INV-6** The CA key is in memory only: never persisted, logged, or hashed.
+- **INV-7** Proxy pods carry both `PLAYBOOKPLAN_HASH` and `PLAYBOOKPLAN_HOST`.
+- **INV-8** The only Node writes are `dependency_keys::label_key` labels from the plan's own ns/name.
 
-- **INV-1 — Fail-closed selectors.** `selector_matches_fail_closed` (`nodeselector.rs`)
-  treats an *empty* selector as matching **nothing**; no matching `NodeAccessPolicy`
-  ⇒ zero allowed nodes. (Opposite default from `selector_matches`/`node_matches`.)
-- **INV-2 — Enforcement is intersection-only.** `node_access::enforce` may only *remove*
-  hosts from managed-ssh groups, never add/substitute; `Ssh`/StaticInventory groups pass
-  through untouched.
-- **INV-3 — Enforcement runs before proxy infra.** NAP clamping happens at inventory
-  resolve time (reconcile "step 0b"), on **every** reconcile, before any proxy pod/Secret/
-  NetworkPolicy is created.
-- **INV-3b — Every run re-authorizes before proxy creation.** Fresh and resumed absent-Job
-  runs share `ensure_infra_and_launch`, which derives the node set from the groups it is about
-  to render and re-authorizes *that* set live before `ensure_proxy_infra`, never a set read back
-  from the record.
-- **INV-4 — Cross-run isolation is at the cert layer.** Each proxy pod's
-  `AuthorizedPrincipalsFile` lists **only its own run ID** (`build_secret`) —
-  never `root`, never a wildcard. The client cert carries that run ID as a principal. The
-  per-run `NetworkPolicy` is defense-in-depth on top, not the primary control.
-- **INV-5 — Node set is authoritative & live.** The allow-set is a **live** Node read in
-  `enforce`, never a cached one.
-- **INV-6 — CA private key never leaves the operator process.** Generated in memory at
-  startup (`ca.rs`, `CertificateAuthority::generate` in `main.rs`), never persisted to a
-  Secret/etcd, never logged, never in a workspace Secret or the execution hash. A restart
-  rotates it.
-- **INV-7 — Proxy pods carry both `PLAYBOOKPLAN_HASH` and `PLAYBOOKPLAN_HOST`** so
-  cleanup's label-scoped `delete_collection` cannot sweep the ansible Job pod (which lacks
-  `_HOST`).
-- **INV-8 — The operator writes only its own Node labels.** Every Node write is confined to
-  `<namespace>.plan.ansible.cloudbending.dev/<plan>` keys built by `dependency_keys::label_key` from the
-  plan's own namespace and name — never a tenant-supplied key, never a Node's spec or annotations.
-  A tenant-chosen key would let a plan label its way past a `NodeAccessPolicy` ceiling (T-ESC-3).
-  The chart's `ValidatingAdmissionPolicy` enforces the same bound at the API server, and a test pins
-  its CEL matcher to `dependency_keys::KEY_DOMAIN`
-  (`dependency_keys::tests::the_admission_policy_matches_the_key_this_module_builds`).
+Looks like cleanup, is not: `StrictModes no` in `render_sshd_config`, and the client-cert Secret
+living in the *plan* namespace (see `managed_ssh.rs`).
 
-Two recent load-bearing fixes that look like "cleanups" but MUST NOT be reverted:
-- **`StrictModes no` in `render_sshd_config`** — required so sshd will read the
-  `AuthorizedPrincipalsFile` off the Kubernetes Secret tmpfs mount; without it every
-  managed-ssh login fails with `Permission denied (publickey)`. (See its doc comment.)
-- **The client-cert Secret is created in the *plan* namespace** (owner-referenced to the
-  PlaybookPlan, deleted by name at run completion), because a pod can only mount Secrets
-  from its own namespace. Moving it back to the operator namespace breaks any plan whose
-  namespace ≠ the operator namespace.
+The reconcile pipeline is described in the module doc of `playbookplancontroller/reconciler.rs`;
+the `Play` record protocol in `play_history.rs`.
 
-## Layout
+## Decisions that are easy to undo by accident
 
-```
-src/main.rs                          entrypoint (clap `run`/`crds`), tracing, generates the in-memory SSH CA, joins the 3 controllers
-src/config.rs                        OperatorConfig (TOML): watch_namespaces (enrolled set) + proxy_image; read once at startup from the mounted ConfigMap
-src/utils.rs                         create_or_update helper, Condition trait, generate_id (k8s-like short ID)
-src/v1beta1/
-  ca.rs                              ephemeral in-memory SSH CA (Ed25519); signs host + client certs for a given validity, which `managed_ssh::ProxyLifetime` derives from the run's Job deadline (INV-6)
-  resources/                         CRD types (kube::CustomResource)
-    playbookplan.rs                  PlaybookPlan: spec, status, Phase (incl. UnauthorizedNamespace)
-    cluster_inventory.rs             ClusterInventory: hosts resolved from Node labels → managed-ssh (node-root)
-    static_inventory.rs              StaticInventory: literal names/IPs + embedded SSH config (BYO key); no controller/status
-    node_access_policy.rs            NodeAccessPolicy: admin-authored namespace→node ceiling (cluster-scoped CRD; enforcement reads all policies)
-    play.rs                          Play: immutable per-run recovery/history record; recovery source of truth
-    generic.rs                       NodeSelectorTerm/SelectorExpression, LabelSelector, GenericMap
-    custom_rfc3339.rs                RFC3339 serialization for optional resource timestamps
-  controllers/
-    playbookplancontroller/          the big one — see below
-    clusterinventorycontroller/      resolves Node → hosts, watches Nodes, writes ClusterInventoryStatus
-      dependencies.rs                pure: splits a group's selector into its terms and counts, per positive requirement on an operator-owned key (`dependency_keys`), how many of the group's Nodes it is holding back. "The group's Nodes" are the ones passing every term that is *not* a dependency — that is what separates "not ready yet" from "not this group's Node", which is the whole diagnostic. Judges every term with `nodeselector`'s own evaluator; a second implementation would let the reported waits disagree with the hosts the inventory resolves to
-    nodeaccesspolicycontroller/      writes NodeAccessPolicyStatus (matched namespaces / allowed nodes) for observability; watches ns + nodes
-    selector_trigger.rs              label_changes: the set-valued controllers' watch trigger — ticks only on a label change, an appearance or a disappearance; must stay in lockstep with what nodeselector.rs reads. Also owns RECOMPUTE_DEBOUNCE, which both controllers pass to `Controller::with_config`: every tick fans out through `reconcile_all_on` to *every* object, each listing the whole Node set, so a plan labelling a fleet one Node at a time (`node_labels.rs`) would otherwise buy `writes × objects` full recomputes. Keep it short — it delays every trigger of those controllers, and an inventory slow to publish `observedGeneration` holds the plans that reference it
-    ansible_inventory.rs             ResolvedInventoryGroup (ManagedSsh | Ssh) + ResolvedHosts; AnsibleInventory trait (get_hosts); distinct_hosts/_count (every host-population count, in both controllers); `flatten_hosts` is the **only** writer of `ResolvedHosts.connection`, which carries the group's variant into the records that outlive it (`status.eligibleHosts`, `PlaySpec.inventory`) so a reader can still ask whether a host is a cluster Node — `node_hosts` is that question
-    nodeselector.rs                  node_matches / selector_matches / selector_matches_fail_closed (INV-1)
-    dependency_keys.rs               the `<namespace>.plan.ansible.cloudbending.dev/<plan>` Node label key, and its inverse. Shared vocabulary, not a detail of either side: the plan controller writes the key (`node_labels.rs`), the inventory controller recognises it in a tenant's selector to tell a dependency on another plan from an ordinary label term. One end recognising a key the other would not produce is a dependency nobody is told about (INV-8)
-    version.rs                       parses a label or selector value as a version for the ordered operators (`Gt`/`Ge`/`Lt`/`Le`), which Kubernetes' own integer-only `Gt`/`Lt` cannot express. Lenient on the way in (optional `v`, one to three components, `_` build metadata as Helm writes it), SemVer on the way out, and `None` for anything else — an unanswerable comparison is a non-match, so a dependency selector waits instead of running
-    reconcile_error.rs               shared ReconcileError (thiserror)
-  controllers/playbookplancontroller/
-    reconciler.rs                    the reconcile pipeline (below); patch_status via JSON merge patch
-    mappers.rs                       maps Secret, NodeAccessPolicy, ClusterInventory and StaticInventory changes to affected plans; the Secret watch asks two rules (named in `variables`/`files`, or holding a StaticInventory's SSH key)
-    node_access.rs                   NodeAccessPolicy enforcement: fail-closed intersection clamp (INV-2/3/5)
-    node_labels.rs                   publishes a plan's `spec.provides` version onto the Nodes it converged, as `<ns>.plan.ansible.cloudbending.dev/<plan>`, so other plans can gate their own inventories on it. Three load-bearing rules: **status first, labels after** (a label may lag the record, never lead it — a crash between the two must not leave a claim with no evidence); the diff reads the **resolved managed-ssh groups**, never `hostsStatus` alone (which is keyed by name, so a StaticInventory host would otherwise label a same-named Node); and it writes **only on a real change of value**, since every Node label change is broadcast to every Node watcher in the cluster. The key is derived from the plan's namespace and name, never from tenant input (INV-8)
-    node_readiness.rs                Node Ready-condition predicates + the "hold instead of starting" gate (both modes); readiness only, never authorization
-    node_recreation.rs               drops a host's recorded application when its Node is newer than `appliedAt` (the time the run that claimed it was *prepared*) — a rebuilt machine inherits the name, never the claim. Both sides are apiserver-stamped on purpose: the run's finish time comes from the operator pod, and comparing clocks would re-run a freshly joined Node for ever. Level-triggered too: a deletion the operator was down for leaves no event to react to, and `status::apply_terminal_play_status` asks the same question once more before recording a claim at all
-    departed_hosts.rs                prunes `hostsStatus` rows for hosts that left the inventory **and** no longer exist as Nodes (housekeeping; `hostsStatus` otherwise only ever grows). Requiring both is what stops a narrowed NodeAccessPolicy from dropping live machines' records and re-running them when it widens again. Deletion needs an explicit `null` per key — a merge patch cannot delete by omission
-    managed_ssh.rs                   proxy pods (hostPID + nsenter = NODE ROOT), per-run sshd config/certs/principals, NetworkPolicy, cleanup (INV-4/7)
-    locking.rs                       per-host Leases (operator ns) for run mutual-exclusion
-    play_history.rs                  writes/prunes the immutable Play run records; its module doc is the authoritative PlayPhase state machine
-    job_builder.rs                   builds the one Job per run (volumes, client-cert mount, callback env, node anti-affinity)
-    workspace.rs                     renders the per-plan workspace Secret (playbook.yml/inventory.yml/recap plugin/vars), owner-ref'd to the plan, named `workspace-{plan}-{uid shortid}` so it cannot land on a user's Secret
-    execution_evaluator.rs           ExecutionHash over playbook + referenced Secrets (excludes the self-rendered workspace Secret)
-    callback_output.rs               parses the recap the callback wrote to the pod termination message
-    triggers.rs                      validated 5-field Schedule newtype + total evaluate_schedule / forecast_next_run, timezone-aware
-    status.rs                        folds a terminal Play's per-host results into PlaybookPlanStatus conditions (the only place run outcomes reach the plan)
-                                     `Phase::HostsUnreachable` splits a failed run in two: everything reachable was applied and only unreachable hosts are left. A failure everywhere the mechanics ask (`is_failure_verdict` — retries, schedule window, summary wording) and differs from `Failed` only in what it tells a human, so a plan parked on a dead machine does not read as a broken playbook. Decided by `phase_for_finished_run`, which needs the per-host results and so runs where the terminal `PlayStatus` is still in hand; `FinishedRun` carries the resulting verdict rather than the run's own `PlayPhase`.
-    paths.rs                         shared mount-path conventions between workspace/inventory_renderer/job_builder
-  ansible/
-    playbook_renderer.rs             round-trips spec.template.playbook YAML (validation)
-    inventory_renderer.rs            ResolvedInventoryGroup → Ansible YAML inventory (managed-ssh: proxy IP + HostKeyAlias; ssh: BYO key)
-    render_error.rs                  shared YAML rendering error type
-    ansible_operator_preflight.py    managed-ssh preflight gate; waits for every reachable proxy SSH banner
-    ansible_operator_recap.py        Ansible callback plugin: writes per-host recap to /dev/termination-log
-  labels.rs                          PLAYBOOKPLAN_NAME / _HASH / _HOST / RUN_ID label keys, plus PLAY_UID_ANNOTATION (an annotation, never selectable) and RETRY_ANNOTATION (user-set retry request)
-```
+Each is explained at the code it names; read that before changing it.
 
-The managed-SSH preflight script is covered by `tests/python/test_preflight.py` and `just test-python`.
+- Plan status is a JSON **merge patch**; `Play` writes go through `replace_status` with a
+  `resourceVersion` precondition. Different questions — don't unify them.
+- The complete result reaches the plan **before** the `Play` is acknowledged or prunable.
+- `activeRun` is mirrored onto the plan **before** Leases or proxy pods are taken.
+- No snapshots of plan spec / Job blueprint in `Play`; `preparationFingerprint` covers them.
+- The run ID is recorded, not derived (`reconciler::run_id`); `select_job` never adopts a Job and
+  numbers past every Job *and* retained `Play` of the plan.
+- `locking::renew_locks`: `Lost` ≠ `Unconfirmed`; only `Lost` may abandon a run.
+- Schedule windows are judged from records (`window_taken_by_a_record`), per host; refunds
+  (`returns_its_attempt`) and the window count must use the same predicate. `retryGeneration` must
+  not be replaced by the retry token, a timestamp or a run-number cutoff.
+- `spec.suspend` is decided before the inventory read (`resolve_unlaunched_before_inputs`).
+- Node readiness gate and the unreachable-host refund are a matched pair (`node_readiness.rs`).
+- Node labels: status first, labels after; only on a real value change (`node_labels.rs`).
+- Unsynced `Store`s answer wrongly rather than failing: the initial cache waits are bounded and
+  fatal, and the controllers are `join!`ed, not spawned.
+- Raw cron strings go only through `triggers::Schedule::parse`; schedule evaluation stays total.
+- New `watcher` streams use `watch_stream::restarting_watcher`, not `.default_backoff()`.
+- The completion-marker task name is duplicated in `playbook_renderer.rs` and
+  `ansible_operator_recap.py`, pinned by a test.
+- `unwrap`/`expect` only for apiserver-guaranteed invariants; what the operator must guarantee goes
+  through `ReconcileError::PreconditionFailed`.
 
-## Core reconcile flow (playbookplancontroller/reconciler.rs)
+## User guide (`docs/` mdBook) is part of the change surface
 
-Level-triggered / idempotent "ensure" style — every step re-derives what's needed from
-observed cluster state; there is no persisted "current step". One `PlaybookPlan` fans out
-into **one Kubernetes Job per run** (targeting that run's hosts), plus **one managed-ssh
-proxy pod per targeted ClusterInventory host** in the operator namespace.
+A behaviour, CRD, chart or security change is not done until its page is updated:
+`docs/src/running-playbooks/` (one page per resource/topic) and `docs/src/cluster-operators/`
+(deployment, NodeAccessPolicies, security). `security.md` summarises `THREAT_MODEL.md`; update
+both. Prose, not field tables; relative links with mdBook slug anchors; new pages need a
+`SUMMARY.md` entry. `examples/v1beta1/*.yaml` is the canonical CRD shape.
 
-1. **Enrollment guard (R1).** If the plan's namespace isn't in the enrolled set
-   (`config.rs`: operator ns ∪ `watch_namespaces`), refuse with `Phase::UnauthorizedNamespace`
-   and `await_change` — before any Secret/Job call (the operator holds no Secret/Job RBAC
-   outside the enrolled set). It runs ahead of the deletion branch too, and releases the
-   operator-namespace half of a run still in flight (`release_unenrolled_run`: proxy pods, then
-   host Leases, from the `status.activeRun` mirror — the `Play`, Job and finalizer are out of
-   reach), since nothing else would ever remove those node-root pods.
-   Once the namespace is enrolled again, `leave_unenrolled_phase` replaces the refusal on an idle
-   plan straight after the tick's starting read (`Succeeded`/`Failed`/`Pending`, from the recorded
-   hosts and budget), since no later step writes a phase for an idle plan. Keep it ahead of every
-   exit: an outage report turns `UnauthorizedNamespace` into `Pending`, which no later tick reads as
-   a refusal, so a spent plan would never read `Failed` — the verdict the retry annotation needs.
-   A **name guard** follows in the same shape (`plan_name_within_label_limit`): a plan name over
-   `MAX_PLAN_NAME_LEN` (63, the *label value* cap — the name is written as a label onto the `Play`,
-   the Job, its pod template and the run's NetworkPolicy) is refused with `Phase::Failed` and
-   `await_change`. The CRD rejects it at admission too; the reconciler re-checks it for clusters
-   that don't evaluate validation rules.
-2. **Step 0a — `recover_active_run`.** Runs *first*, before inventory is even resolved: lists
-   this plan's `Play`s, keeps the ones it owns (`spec.playbookPlan` + `spec.playbookPlanUid`,
-   not the label), deletes any statusless record (it never crossed the operator-owned status
-   boundary, so nothing may be derived from it), and dispatches on `PlayPhase` —
-   `Prepared`/`Starting`/`Launching` ⇒ **deferred** to after inventory resolution (deciding
-   whether they may still be resumed needs the resolved, policy-clamped groups the fingerprint
-   covers), `Running` ⇒ carry on, `Aborted` ⇒ `abandon_run`, terminal-but-unacknowledged ⇒
-   apply its result to the plan.
-   A recovery failure is reported on the plan (`summary`) *before* the tick aborts.
-3. **Scheduling validation boundary.** `validate_scheduling_configuration` is evaluated before
-   recovery, so no unvalidated tenant string reaches schedule evaluation, but its result is acted on
-   only after recovery and active-Job advancement. Invalid mutable scheduling fields therefore block
-   new runs without preventing an existing Job from finishing or its privileged resources from being
-   recovered and released. The runtime guard covers objects that bypass CRD validation.
-4. **Steps 0 + 0b — resolve inventory, then clamp it (INV-2/3/5).**
-   `resolve_authorized_inventory` runs `resolve_inventory` → `Vec<ResolvedInventoryGroup>`
-   (`ClusterInventory` ⇒ `ManagedSsh`, `StaticInventory` ⇒ `Ssh`, preserving which resource each
-   group came from) and then `node_access::enforce`, which clamps managed-ssh nodes to the
-   fail-closed intersection of the plan namespace's allowed nodes. One step on purpose: nothing may
-   observe the unclamped result. `warn!`s excluded nodes; sets `status.eligible_hosts`.
-   A `ClusterInventory` whose `status.observedGeneration` is behind its `metadata.generation` is
-   refused here (`InventoryNotSynced`, classified transient so it *holds* an unlaunched run rather
-   than superseding it): its published `resolvedHosts` still answer for the spec before the edit, and
-   one `helm upgrade` that changes an inventory and a plan together would otherwise launch against
-   the host set the edit replaced.
-5. **Execution hash.** `ExecutionHash` over the playbook text + contents of every referenced
-   Secret (variables + files), order-insensitive, with the referenced inventories' group variables
-   (`fold_inventory_variables`) and `spec.provides.version` (`fold_provides_version`) folded in —
-   so bumping a provided version re-runs the plan on every host, while a plan without `provides`
-   or an inventory without variables leaves the hash untouched; deliberately **excludes** the workspace
-   Secret (its content — proxy IPs — legitimately changes each run). Hash change ⇒
-   `last_run_number` reset to 0, `last_triggered_run` cleared (so an edit can start inside the
-   window its predecessor used, and a revert is just another change), and `Phase::Pending`
-   **only when there is no `active_run`** — an in-flight run keeps `Applying` and its own hash
-   (which lives in its `Play`), and the new revision waits for it.
-6. **Step 1 — schedule + outdated hosts.** `triggers::evaluate_schedule` in the plan's
-   timezone within a 15s window; `hosts_to_trigger` = outdated hosts (`OneShot`) or, for
-   `Recurring` inside an open slot, the hosts that slot still owes
-   (`execution_evaluator::find_hosts_owing_slot`: no success of this slot per `appliedAt`, or not
-   on the current hash). A `Recurring` slot whose every host is served goes through
-   `update_idle_recurring_status`, which must set the requeue to the next slot — without it the
-   tick keeps the 1h default and sub-hourly schedules skip slots.
-7. **`try_start_run` (steps 2–5)** when eligible and nothing is active: `select_job` numbers
-   the run one past everything still claiming a name (Jobs *and* retained `Play`s — it
-   never adopts a running Job, see below), `play_history::record_prepared` writes the
-   immutable record, then acquire per-host **Leases** (`locking.rs`) and `commit_starting`.
-   From there `ensure_infra_and_launch` does the rest: re-authorize the nodes (INV-3b),
-   `reset_incomplete_run` (drops half-built infra the current CA can't authenticate against),
-   ensure **managed-ssh proxy infra** is Ready (`managed_ssh::ensure_proxy_infra`: proxy pods
-   + per-host Secrets + NetworkPolicy in the operator ns, client-cert Secret in the plan ns),
-   render the **workspace Secret** with the live proxy pod IPs, `commit_launching`, create the
-   **one Job** and `record_running`. A resumed `Prepared`/`Starting` run re-enters
-   `try_start_run` with its recorded identity. A `Launching` run first checks whether the Job
-   already exists; an absent Job re-enters `ensure_infra_and_launch`, while an existing one is
-   adopted without depending on the newly desired inventory.
-8. **`advance_active_run`** once the Job is terminal: parse the per-host recap
-   from the pod's **termination message** (`callback_output.rs`, written by the callback
-   plugin — not from logs, no `pods/log` access), `cleanup_proxy_infra`, release Leases,
-   `record_finished` on the `Play`, fold it into the plan via
-   `status::apply_terminal_play_status`, stage the finished record, and set the terminal `Phase`
-   (or reschedule for `Recurring`). The complete status is persisted before the `Play` is
-   acknowledged and eligible for pruning, so a failure anywhere before that write replays the
-   result instead of stranding a provisional status.
-   This is also where a run whose `Play` is gone is `finalize_lost_run`'d (infra released, hosts
-   `Unknown`) — not in step 0a: recovery has no record left to dispatch on, so it is the *mirror*
-   in `status.activeRun` that brings the run here to be released.
-   Both early exits that may follow a run finishing on a tick — an input outage and an invalid
-   schedule — write that run's verdict as the phase (`phase_under_overlay_after_run`), never the
-   overlay's `Pending`, whether its `Play` is still there or not. For a run with a record that only
-   changes what the plan shows during the outage, since the record is replayed until it can be
-   acknowledged. A lost run has no record left to replay, so this is the only write its verdict
-   gets: without it a spent `OneShot` plan would neither run nor accept the retry annotation.
-   A Job that is not terminal but never started (`job_start_stall`: no container running, the
-   playbook container never started, nothing progressed for `runs.startTimeoutSeconds`, with the
-   clock restarted by the pod's creation and scheduling and by every finished init container) is
-   cancelled here too: the reason goes onto
-   the `Play` first (`record_stalled`, `PlayStatus.stallReason`), then `cancel_run_job`, and the run
-   finishes through the normal path with hosts `Unknown`, spending an attempt. The reason has to be
-   written before the cancellation because the Job and its pods are the only other place it can be
-   read, and the finishing tick sees nothing but a missing Job. Judged by time, not by a list of
-   waiting reasons: a list cannot speak for a Job with no pod at all.
-9. **`patch_status`** — JSON **merge patch** (not `replace_status`); many async steps pass
-   between read and write, so a version-checked PUT would routinely 409. It is also where the
-   suspension contract is held (`suspended_advertises_no_next_run`): a tick has several ways to write
-   a status and only one way to reach the end of the pipeline, so "a suspended plan advertises no
-   `nextRun`" belongs at the write, not at the end. Terminal `Play` acknowledgement and the
-   version-checked *finalizer* write (`drop_run_cleanup_finalizer`) come **after** it. That write is
-   conditioned on the plan `patch_status` *returned*, not on the tick's starting read — the status
-   patch moves the `resourceVersion`, so the starting read's copy would fail the precondition against
-   nothing but this tick's own write. A 409 therefore means somebody else wrote the plan, and is
-   treated as "retry next tick" rather than discarding the status just written.
+## Workflow
 
-Requeue is dynamic: 3600s default, tightened to "time until next scheduled run" / 15s
-(Job-polling) / 5s (waiting on proxy readiness) as appropriate. A failed tick retries after 15s,
-except an idle plan whose input only an edit can fix (`input_error_waits_for_an_edit`), which
-rechecks after 5 min — never a plan with a run in flight, whose ticks renew its host Leases.
-
-### managed-ssh (the node-root path)
-
-A `ClusterInventory` host is reached by scheduling an ephemeral **proxy pod onto that node**
-(`hostPID: true`, host `/proc` bind-mount, `CAP_SYS_ADMIN`+`CAP_SYS_PTRACE`, SELinux `spc_t`);
-every SSH session is wrapped in `nsenter` into the host namespaces (`enter-host.sh`). So a
-managed-ssh session is **root on the node** — that is the feature, and the reason
-`NodeAccessPolicy` exists. Certs are minted per run from the in-memory CA; cross-run isolation
-is the per-run `AuthorizedPrincipalsFile` run-ID principal (INV-4). See `managed_ssh.rs` doc
-comments (they encode hard-won runtime facts: BusyBox `nsenter` short-option quirks, the sftp
-`ForceCommand` trick, `StrictModes no`, why `hostPID` can't be joined per-session).
-
-### Execution modes (`ExecutionMode`)
-
-- `OneShot` (default): only outdated hosts run; once every host is current, `Succeeded`/`Failed`
-  and it goes quiet until the hash changes.
-- `Recurring`: *every* host runs once per schedule tick — a tick is a window
-  (`startingDeadlineSeconds`) that keeps starting runs for the hosts it still owes, so a machine
-  switched on late in the window still gets its run and one that already succeeded in it does not;
-  keeps the finished run's `Succeeded`/`Failed` and forecasts the next slot into `next_run` via
-  `forecast_next_run`.
-
-Either way the phase of a finished run comes from that run's own `Play` verdict
-(`phase_for_finished_run`), never from the plan's drift state: a failed `Recurring` run leaves every
-host on the hash an earlier run applied, so drift would report it as a success.
-
-### Retries (`spec.maxAttempts`)
-
-Tries per *execution*, counting the first run: the current hash for `OneShot` (default 3), one
-schedule tick for `Recurring` (default 1). Every try is a full run — own `Play`, own `runId`, own
-Job, own run number — and `status.retryCount` counts them within the execution, restarting on a hash
-change (`update_desired_hash`) and, for `Recurring`, at each tick (`next_attempt`).
-`status.retryCountSlot` identifies the schedule tick that a recurring count belongs to, so the count
-remains meaningful when `lastTriggeredRun` is stale or absent. Both are written from the run's
-record, never re-derived.
-
-Two gates, deliberately: `attempt_budget_available` at `may_start_new_run` is the whole answer for
-`OneShot` (nothing else ever stops it — its failed hosts stay outdated), while `Recurring` is
-answered by the schedule-window gate, which is the only one that can tell a retry of the current
-tick from the first run of the next.
-
-The operator appends a `__ansible_operator_completion_marker` play to every rendered playbook
-(`ansible::playbook_renderer`), and the recap callback reports per host whether it produced a result
-for that play's single task. This is the only way to tell "ran the whole playbook" from "was fine up
-to the point the play stopped": under an `any_errors_fatal`/`serial`/`max_fail_percentage` abort a
-surviving host reports `failed=0, unreachable=0`, identical to one that ran every task, and no
-callback hook announces the abort. An abort ends the whole playbook run so nobody reaches the marker,
-while a host that failed or went unreachable is dropped from later plays and so does not reach it
-either — which makes the answer per host. `HostOutcome::Incomplete` is that case, and it is
-deliberately not `Succeeded`, so `apply_terminal_play_status` does not stamp `lastAppliedHash` on a
-host that received part of a playbook. The task name is duplicated in `playbook_renderer.rs` and
-`ansible_operator_recap.py`; a test pins them together, because a drift there reads as "nothing
-converged" on every plan at once.
-
-A run gets its budget back, in either mode, when it made all the progress that was available to it,
-which is a `Succeeded` verdict *or* a failure confined to Nodes the run recorded as not `Ready` at
-its launch commit **and that still applied the playbook to at least one host**
-(`returns_its_attempt`, `classify_run_failure`, `PlayStatus::unreachable_hosts`). The mode must not
-come back into it: `Recurring`'s budget is scoped to the slot and defaults to one try, so without the
-refund `retry_budget_closes_window` would close every window on its first run, success or not, and
-a host arriving later in the window would never be asked about. That record holds every host
-the run excluded, each flagged with whether its Node was itself down — a host excluded because a
-`Ready` Node's proxy pod never came up is a configuration problem and is not refunded. It has to be
-captured at launch and persisted: the recap says nothing at all about a host the run excluded, and
-the Node may have recovered by the time the result is drained.
-
-That record and the run's `--limit` file are written from **one** variable in one tick, and must
-stay that way. A resumed run whose Job was never created re-reads its proxy pods, so the launch
-commit re-states the set rather than treating the replay as a pure no-op — the phase half stays
-idempotent, the data half does not. Left un-restated, the file and the record would describe
-different runs: a host excluded in one but not the other either loses its `unreachable` from the
-recap, or runs the playbook and is reported unreachable anyway, never stamped, and re-run forever.
-It is still "at launch", because a run whose Job exists is adopted rather than resumed, so the last
-write is always the one immediately before the Job that ran.
-
-An SSH key rotation is the one input that is *noticed* without being hashed. `StaticInventory`
-key material is deliberately outside the execution hash — that hash decides which hosts are outdated,
-so folding a key into it would re-apply the playbook to hosts that are already current. Instead
-`status.observedSshKeyRevision` fingerprints it (`execution_evaluator::hash_secret_data`), and a
-change restores the plan's attempt budget when its last run did not succeed
-(`sync_ssh_key_revision`) — in either mode: for `Recurring` that is the open slot's budget, so the
-plan acts on the new key inside that window rather than an interval later. The budget reset is the
-point: a plan whose hosts rejected the old key has spent every try by then — a `StaticInventory`
-host has no proxy grace window in front of it — so waking it alone would achieve nothing. `mappers::ssh_secret_to_playbookplans` supplies the wake-up,
-and both sides share `status::may_need_another_run` so the mapper can never wake a plan the reset
-would then decline. The first observation is recorded without acting: the first key a plan
-sees is the one it starts with, not a fix for an earlier failure.
-
-A human can hand the budget back too, without editing anything a Helm or GitOps source renders: a
-new value in the `ansible.cloudbending.dev/retry` annotation (`labels::RETRY_ANNOTATION`) restores
-the whole budget of a plan whose last run failed (`sync_retry_request`), and
-`status.observedRetryToken` records it so each value is honoured once — that dedupe is what keeps
-`maxAttempts` a bound. It looks like `sync_ssh_key_revision` and deliberately differs from it in
-two places. The **first observation acts**: an annotation that appears is a request, whereas a key
-that appears is just the key the plan starts with. And the gate is
-**`is_failure_verdict`**, not `may_need_another_run`, and it needs no mapper, since the primary plan
-watch has no predicate and an annotation change already reconciles.
-
-Both hand-backs are **judged by the finished run's verdict** (`last_run_verdict`) when a run of the
-current hash finished this tick, not by `status.phase`, which only receives that verdict later in the
-terminal branch: reading `phase` there sees `Applying`, which would silently spend a retry request
-made during the run and hand a budget back for a key rotated during a run that succeeded. While a run
-is in flight (`activeRun`, including one adopted behind a drained result) nothing is recorded, so a
-request or rotation waits for that run's result.
-
-Resetting `retryCount` alone cannot reopen a schedule window, because `window_taken_by_a_record`
-counts the slot's failed `Play`s precisely *because* status may lag them. So each honoured request
-— and each SSH key rotation that resets the budget, through the same `hand_back_retry_budget` —
-also bumps `status.retryGeneration`, every `Play` records the generation it was prepared under
-(passed through `PlayRef` from the tick's own status, never read from the reflector's plan), and the
-window gate counts only the current generation's failures. The same number keeps a *replayed* result
-(a terminal record whose acknowledgement failed after the status write) from taking the handed-back
-budget away again: `sync_desired_hash_after_finished_run` does not write the attempt of a run from an
-older generation, which is why `activeRun` mirrors the generation too. Do not replace it with the
-token on the record (values may repeat, `A → B → A`, which would count the first era's failures
-again), a timestamp cutoff (operator clock against apiserver clock) or a run-number cutoff (numbers
-restart below it once pruning frees them, so failures would stop counting at all).
-
-The "applied to at least one host" half is a bound, not a nicety: the gate reads the Node at tick
-time while `node_not_ready` is read a grace window later, so a Node that alternates across that
-window passes the gate *and* earns the refund, and the plan would run every grace window forever.
-A refund is credit for progress, so a run with none spends its attempt and `maxAttempts` bounds the
-flap. Hysteresis on the gate's release was considered and rejected — it damages the reboot workflow
-the gate exists for, and only filters flaps faster than the delay it adds. That relief
-and the `node_readiness` start gate are a matched pair — the relief is what stops a stranded Node
-burning the budget, the gate is what stops the plan re-running against it every grace window. Neither
-belongs without the other.
-
-### Run records and recovery (`Play`)
-
-Every run is written down **before** anything is created for it, as a `Play` in the plan's
-namespace whose spec is immutable (a CEL `self == oldSelf` rule). **The authoritative descriptions
-live in the code**: `play_history.rs`'s module doc for the `PlayPhase` protocol, `play.rs` for the
-spec and why every field is typed, `reconciler.rs`'s `resume_launching_run` for the Job-existence
-boundary. Keep those correct rather than restating them here. What belongs at this level is the
-handful of decisions that are easy to undo by accident:
-
-- **Do not reintroduce snapshots of the plan spec, resolved connection config or the Job blueprint**
-  "so a run can finish what it started". They are pure functions of the live plan and the live
-  resolved groups, which is exactly what `preparationFingerprint` covers; `create_job_blueprint` is
-  deterministic, so a resumed rebuild is byte-identical. An unlaunched run whose inputs changed is
-  deliberately *not* finished.
-- **A run is mirrored onto the plan's status before it acquires anything.** `try_start_run` writes
-  the record, then patches `activeRun`, and only then takes host Leases and creates proxy pods. The
-  record alone is not enough to hold that ordering open: it is a *dependent* of the plan, so a
-  `--cascade=foreground` delete has the garbage collector remove it while the run-cleanup finalizer
-  still holds the plan, and `release_deleted_plan` would then find no handle on resources in the
-  operator namespace that nothing else can collect. The mirror is a field of the plan and cannot be
-  collected separately. Do not move lock acquisition or proxy creation above that patch.
-- **Only `Prepared` is gated on the schedule window** and the rest of `has_work_to_start`.
-  `Starting`/`Launching` wait on proxy pods, which routinely outlasts `startingDeadlineSeconds`;
-  gating them would leave a scheduled plan unable to launch.
-- **The schedule window is gated on slot-scoped budget state and records, not only on
-  `lastTriggeredRun`.** That marker is a *derived* view of "a run for this slot got a Job", written
-  onto a status read from the reflector cache and re-stated from it by every merge patch — so a tick
-  running behind the write, or one whose write was lost to a conflict, cannot be trusted alone.
-  `schedule_window_already_taken`/`window_taken_by_a_record` re-ask the question of the plan's own
-  `Play`s (which book revision and slot before anything is created) before a new run is prepared.
-  The question is not "did a run take this slot" but "is there anything left for a run to do in
-  it": a record still `Running` closes the window, failures close it only
-  once they have spent the budget, and `Succeeded` records close it only once their recorded
-  inventories cover every host the tick would target (`hosts_to_trigger`) — one tick, one run *per
-  host*, so a host that joins after the slot's run succeeded still gets one inside the window. Do
-  not reduce it to "any `Succeeded` record closes the window", which strands a late host until the
-  next slot. A host whose
-  Node was re-created since a record was prepared is withdrawn from that record's coverage first
-  (`withdraw_replaced_machines`). A failure the budget refunded (`returns_its_attempt`) spent nothing
-  and is not counted — the refund and this count must answer from the same predicate, or the refund
-  is taken back here. `retryCountSlot` binds
-  `retryCount` to its recurring execution, so status can close an exhausted window after its records
-  have been pruned and `next_attempt` does not restart at one when `lastTriggeredRun` is stale.
-- **`spec.suspend` is decided before the inventory is read** (`resolve_unlaunched_before_inputs`),
-  for every phase — dropping an unlaunched run needs no inventory, and deferring it would leave a
-  suspended plan sitting on its host Leases behind a read that may never succeed. That is why
-  `has_work_to_start` excludes it and `decide_unlaunched_action` may assume it is not set; folding it
-  back in there looks like a simplification and is a second, later decision.
-- **The complete result reaches the plan first and the `Play` second.** The terminal phase, summary,
-  retry budget and schedule state are patched before the `Play` is acknowledged, so a crash or
-  input-read failure before that boundary replays idempotently. `plays_to_prune` therefore never
-  prunes an unacknowledged terminal record, nor an `Aborted` one.
-- **`recover_active_run` enforces one-run-at-a-time rather than assuming it.** More than one *in
-  flight* record fails the tick loudly (`sole_active_record`) instead of orphaning the loser's
-  node-root proxy pods — after `renew_contested_locks` has kept every candidate's hosts protected. It
-  deliberately does *not* second-guess a `Running` record's Job: only `advance_active_run` can tell an
-  unfinished foreign Job (wait) from a finished one (finalize with no recap), and deciding it in
-  recovery wedged the plan forever.
-- **A foreign Job at a run's name is waited on, but only up to the start timeout**, measured by
-  the foreign Job's own age (`foreign_job_outlasted`). Then a `Launching` run is `Displaced`
-  (abandoned, and `select_job` numbers its replacement past the name) and a `Running` one finishes
-  with no recap, in both cases only once no pod carrying the run's ID may still execute. Do not drop
-  that pod check to abandon at first sight: it is the only evidence left if the identity check ever
-  rejected a Job that was the run's own, and skipping it would release the Leases under a live run.
-  For the same reason an unfinished Job whose pod template carries the run's ID never outlasts the
-  wait: it may not have created its pod yet.
-- **`PlaybookPlanStatus.activeRun` is a thin mirror** of what *finishing* a run needs, so a run whose
-  `Play` was deleted can still be released (`finalize_lost_run`) instead of wedging in `Applying`. It
-  is read from the reflector cache, which lags this controller's own writes, so `finalize_lost_run`
-  re-reads the plan from the apiserver first and adopts a disagreeing live status wholesale
-  (`ActiveRunProgress::AlreadyFinalized`).
-- **Do not make the run ID a function of (plan, hash, runNumber)** to save recording it. An aborted
-  run frees its number again, so a derived ID would hand the retry that run's
-  still-terminating proxy pods — see `reconciler::run_id`.
-- **A contended lock is not automatically a lost one.** `locking::renew_locks` separates an observed
-  takeover (`Lost`) from a write race (`Unconfirmed`); only the first may abandon a run
-  (`resolve_contended_locks`). Collapsing them would let a transient 409 tear down node-root infra.
-
-### Job naming and idempotency
-
-Job name is `apply-{plan}-{shortid}-{runNumber}` (`job_builder::job_name`, which also names the
-`Play`), where `shortid` is **ten symbols of a hash over the plan's UID *and* the execution hash**
-(`run_short_id`) and `{plan}` is **truncated** to whatever `utils::MAX_DNS_LABEL_LEN` leaves after
-the rest — 44 characters at a single-digit run, one fewer per further digit. A Job name has to be
-a DNS *label* (it becomes the `job-name` label value on its pods) while a plan may carry a full
-subdomain, and the record is written under this name *before* the Job, so an unbounded name would be
-accepted for the `Play` and then refused for the Job. Keying the short id on the plan UID is what
-makes the lossy readable half safe. Both numbers are pinned by
-`the_plan_name_half_is_truncated_from_45_characters` — they are quoted to the user in
-`scheduling-and-modes.md`, so change them there too or not at all.
-
-The run number is in the name because the hash alone is unchanged between retries of an identical
-spec. `select_job` numbers a new run one past everything still claiming a name — *all* of this
-plan's Jobs *and* all of its retained `Play`s (including statusless ones, which occupy their name
-until recovery deletes them), across every revision and not just the one being named. That last part
-is load-bearing: `shortid` truncates a 64-bit hash to ten symbols, so two revisions *of one plan*
-(same UID) can still produce the same name, and per-hash numbering would let one claim a name a
-retained record of the other still holds — `record_prepared` then rejects it as another run's on
-every tick until pruning removes it.
-What it counts is only the plan's *own* objects, so it then reads the candidate name directly and
-steps past one held by a Job or `Play` it did not count (one created outside the operator, or
-another plan colliding on the truncated name), up to `MAX_TAKEN_RUN_NAMES`. Without that, a run
-given up because a foreign Job holds its name would hand its replacement the same number again.
-The number, not the hash, is what makes the name unique; a new revision therefore does not restart at
-1. It **never adopts an already-running Job**: every Job the operator creates has
-a `Play` recorded before it, so an active Job that `recover_active_run` didn't account for isn't this
-run's, and adopting it would pair it with a freshly minted `run_id` its own record contradicts.
-Resuming a genuinely in-flight run is recovery's job; same-run idempotency within a tick is
-`spawn_ansible_job`'s (`get_opt` + 409-tolerant create, both validated by `validate_selected_job`).
-
-`validate_selected_job` matches on **identity, not content**: the run's `Play` UID on both the Job
-and its pod template, the plan owner reference, the hash, the run ID and the run number. A Job's
-pod template is immutable once created, so identity already implies the blueprint — while a
-field-by-field comparison would have to model every server-side default and mutating webhook, and each
-field it mispredicted would disown a healthy run — the operator would sit out the whole run holding
-its host Leases, then write it off as `Unknown`.
-Per-node **Leases** give run mutual exclusion.
-
-### Secret / Node change triggers
-
-`.watches(secrets_api, …, mappers::secret_to_playbookplans(…))` re-triggers a plan when a
-referenced Secret changes — but Secret/Job watches are set up **per enrolled namespace**, not
-cluster-wide (the operator's `secrets`/`jobs` RBAC is scoped there; a cluster-wide `Api::all`
-watch would 403). The `ClusterInventory`/`StaticInventory` watches
-(`mappers::cluster_inventory_to_playbookplans` / `..._static_...`) are cluster-wide like the plan
-watch itself, since CRD reads are (R1). They exist because `resolve_inventory` reads both kinds
-**live on every tick**, so their contents were always fresh whenever a reconcile happened — nothing
-made one happen, and an inventory that gained a host reached its plans only on their next requeue.
-`clusterinventorycontroller` and `nodeaccesspolicycontroller` are the *set-valued* controllers: their
-whole status is a function of every Node (and, for policies, every Namespace), so there is no
-per-object targeting to do and both recompute everything on every trigger. What is narrow is the
-**trigger**, `selector_trigger::label_changes` + `Controller::reconcile_all_on`, which ticks only
-when a label moves or an object appears or disappears. A mapper cannot do this job: `watches`
-flattens `watcher::Event` through `touched_objects()` before the mapper runs, and a deleted Node
-still carries the labels it matched with, so a content-only predicate would miss every deletion and
-strand a departed machine in `resolvedHosts` until the hourly requeue. The filter hashes **labels**
-because labels are exactly what `nodeselector` reads — a selector term over taints, annotations or
-spec fields would be invisible to it, so the two must move together.
-
-The plan controller also watches **Nodes**, through one reflector serving two jobs: the mapper
-(`mappers::node_to_playbookplans`) and the readiness lookups the reconcile does
-(`node_readiness::unready_nodes`). The mapper is deliberately narrow — a Node that is `Ready` *and*
-in the plan's `eligibleHosts` *and* still owed a run (`OneShot`: not yet on the plan's
-`currentHash`; `Recurring`: owed the open slot, `execution_evaluator::host_owes_slot`) — because
-every kubelet reposts its Node status periodically, so an "all plans" mapping would reconcile every
-plan every few minutes forever, scaling with node count. A converged cluster matches no plans and the
-heartbeats fall on the floor. It asks the *plan* as well as the host, because a wake the plan cannot
-act on costs exactly as much as one it can: a suspended plan, a `OneShot` plan out of attempts, and a
-scheduled plan outside its window (`reconciler::open_schedule_slot`) are all refused. `Recurring`
-has no hash-scoped budget to bound the wakes (`attempt_budget_available` is always `true` for it), so
-its arm is bounded three ways, each asked the way the reconcile asks it: the window is open, the host
-owes that slot, and the slot's budget is not spent (`reconciler::retry_budget_closes_window`).
-Dropping any of the three lets one stuck host wake the plan per heartbeat. The
-replacement half of that predicate is asked **only of hosts `eligibleHosts` records as cluster
-Nodes** (`ResolvedHosts.connection`): a `StaticInventory` host may share a name with a Node the plan
-never targets, and `node_recreation` rightly refuses to act on it — so asking would leave a wake
-condition every heartbeat re-triggers and no reconcile can clear.
-
-The plan reflector's own task is driven **after** that wait, because it carries the two things
-`reconcile` never sees. A **deletion**: `Controller::new` decodes its primary watch with
-`applied_objects()`, which drops `Event::Delete`, and the object has left the store by then — so a
-deleted plan never reconciles, and the run-cleanup finalizer is no help either since an idle plan
-does not hold one. That is the path that withdraws a deleted provider's Node labels. And
-**`InitDone`**, the one moment "no such plan exists" is safe to ask: the reflector applies the event
-to the store *before* yielding it (`reflector/mod.rs`), so the store then holds a complete LIST.
-`node_labels::orphaned_labels` judged against a half-synced store would strip every dependency label
-in the cluster, which is why it is gated there and nowhere else — and why it runs on every resync,
-not only the first: a deletion during a watch disconnection produces no `Delete` event at all.
-
-**Neither is awaited on that stream.** The reflector applies events to the store as the stream is
-polled, so work done inline stops the plan cache updating for its whole duration — and both of these
-remove a label per Node, one PATCH at a time. Every mapper that decides which plans to wake reads
-that cache. So each spawns a task, unserialized: both only ever *remove* labels, removing an absent
-one is a no-op, and a late-starting sweep still reads a complete store because `Writer` buffers a
-re-LIST and only swaps it in on `InitDone`.
-
-`reconciler::new` is `async` because it waits for two initial LISTs before handing back a
-controller, and both waits exist because an unsynced `Store` does not fail — it answers wrongly.
-An unsynced **Node** cache reports every node `Ready`, which is precisely the answer that starts the
-runs the readiness gate exists to hold back: after a restart every held plan would launch one, take
-its hosts' Leases for the full proxy grace window and report everything unreachable. An unsynced
-**plan** cache reports every plan *deleted*, so `plan_still_exists` would withhold the Node labels
-the first tick after a restart is there to republish — the crash-between-status-and-labels case
-deriving them every tick exists for — and not retry until the plan's next requeue, an hour for an
-idle `OneShot`. The plan wait comes second because the task that drives that reflector is spawned
-between them. `main` drives this controller as a future of its own so neither wait delays the other
-two.
-
-Both waits are bounded (`CACHE_SYNC_TIMEOUT`, 2 min) and **fatal**: `await_node_cache` and
-`await_plan_cache` panic rather than carrying on, because `Store::wait_until_ready` resolves only on
-a populated cache or a dropped writer, and a `watcher` retries a failing watch forever — so an
-unbounded wait would leave the controller pending for the life of the process while the other two
-kept the operator looking healthy. `join!` in `main` is what turns that panic into a process exit;
-spawning the controllers instead would park it in a `JoinHandle` nobody reads and restore exactly
-the silent half-alive state.
-
-**It bounds the first sync only.** A watch that breaks after the cache is populated leaves the
-`Store` serving its last contents for the life of the process, so the gate keeps answering from a
-snapshot and degrades from there — a Node that goes down afterwards still reads `Ready`. That is
-deliberately not treated the same way: with no answer at all, refusing to start is strictly better
-than guessing, while with a stale one every response trades one failure for another (crashing turns
-an apiserver blip into a restart loop; holding every run stops a fleet on a watch error). Which
-trade is right is an open decision, so the reflector task (`NodeWatchFailures`) only escalates its
-log after `NODE_WATCH_FAILURES_BEFORE_ESCALATING`, repeats that line every
-`NODE_WATCH_ESCALATION_INTERVAL` and says when the watch recovers — making the state loud, which is
-the half that was missing. Only `Apply`, `Delete` and `InitDone` count as the cache updating: a
-watcher whose re-LIST keeps failing yields `Init` before every attempt, so counting that as success
-would never let a failing re-list escalate.
-
-That reflector is for **readiness only**. `node_access::enforce` keeps its own *live* Node read:
-the allow-set is a security gate and INV-5 says it is never served from a cache.
-
-## Enrolled namespaces (R1)
-
-The operator only reads/writes Secrets and creates Jobs in **enrolled** namespaces = its own
-namespace ∪ the chart's `watchNamespaces`, granted via a per-namespace `Role`/`RoleBinding`
-(the `ClusterRole` has no `secrets`/`jobs`/`pods`). Config is read once at startup from the
-mounted ConfigMap; a change rolls the pod via `checksum/config` (no hot-reload). A plan in a
-non-enrolled namespace is fail-closed to `UnauthorizedNamespace`. The operator can **read and
-delete** Secrets in every enrolled namespace, so operators should enroll only namespaces
-dedicated to Ansible ops (see `THREAT_MODEL.md` §6 / T-INFO-1).
-
-## Known rough edges / things to know before touching related code
-
-- **Raw cron strings cross one validation boundary.** `cron::Schedule::from_str` must only be called
-  by `triggers::Schedule::parse`, which enforces the public five-field contract before adapting it to
-  the cron crate's seconds field. `evaluate_schedule` and `forecast_next_run` must remain total: a
-  syntactically valid expression can have no future occurrence, and that must return `None` for the
-  reconciler to report, never panic and put the whole operator into CrashLoopBackOff on tenant input.
-- **Status writes on the reconciled primary object are JSON merge patches** in all three
-  controllers (`patch_status` → `Patch::Merge({"status": …})`), not `Api::replace_status` (a
-  version-checked PUT that would routinely 409 across a reconcile's many async steps). Only the
-  `.status` subresource is sent.
-- **`Play` records go the opposite way, deliberately.** Every step of the record protocol
-  (`play_history::record_prepared` … `acknowledge_finished`) reads the object fresh and writes it
-  back through `replace_status`, so each write carries a `resourceVersion` precondition. The 409 the
-  plan's status write must avoid is the whole point here: a record is a per-run receipt for a
-  privileged run, and losing a write race on one must be noticed, not merged over. `decide_transition`
-  makes replaying a step that already landed a no-op, and `transition_phase` re-reads and re-decides
-  once before surfacing a conflict. Don't "fix" this to a merge patch for consistency with the bullet
-  above — the two are answering different questions.
-- `examples/v1beta1/*.yaml` is the canonical CRD shape; use it when writing docs/examples.
-- Deliberate `.unwrap()`/`.expect()` style: preconditions the apiserver genuinely guarantees are
-  unwrapped; only things this operator must guarantee (namespace/name/generation/uid on the
-  primary object) go through `ReconcileError::PreconditionFailed`. Match this — don't blanket-add
-  error plumbing to apiserver-guaranteed invariants, and don't unwrap things the operator owns.
-- `FilesSource::Other` round-trips arbitrary JSON/YAML through a real
-  `k8s_openapi::…::Volume` via `serde_json` (any volume type without hand-modeling); errors
-  surface per-item as `Result`, not a panic.
-- `ansible/playbook_renderer.rs` re-parses+re-serializes the playbook mostly as validation.
-- The `NodeAccessPolicy` CRD is *cluster-scoped* — creating one requires cluster RBAC, which is
-  what makes it an admin (not tenant) control. Enforcement reads **every** policy in the cluster;
-  a namespace's allow-set is the union across all policies whose `namespaceSelector` matches it.
-- **`watcher` streams back off through `controllers::watch_backoff::WatchBackoff`, not
-  `.default_backoff()`.** kube's `StreamBackoff` resets its delay on every `Ok` item, and a watcher
-  whose re-LIST fails yields `Ok(Event::Init)` before every retry, so `.default_backoff()` retries a
-  refused LIST about once a second for as long as it is refused. `WatchBackoff` drops that reset and
-  keeps only the one after two quiet minutes; use it for any new `watcher` stream.
-
-## User & operator documentation (`docs/` mdBook) — keep in sync with the code
-
-End-user and cluster-operator docs are an **mdBook** under `docs/` (`docs/book.toml`, chapters in
-`docs/src/*.md`, TOC in `docs/src/SUMMARY.md`; `just docs` builds it to the git-ignored `docs/book/`).
-This is the narrative guide; rustdoc (`just apidoc`) is the separate API reference for the code. Two
-chapters: `docs/src/running-playbooks/` (users authoring PlaybookPlans/inventories) and
-`docs/src/cluster-operators/` (admins installing/securing the operator). The guide is **part of the
-change surface** — a behaviour/API/security change is not done until the matching page is updated. Map:
-
-- CRD field / default / enum change → the page for that resource under `running-playbooks/`:
-  `playbook-plans.md` (PlaybookPlan), `cluster-nodes.md` (ClusterInventory), `external-hosts.md`
-  (StaticInventory), `variables-and-files.md` (`template.variables`/`files`), `scheduling-and-modes.md`
-  (`schedule`/`mode`/hash), `results-and-troubleshooting.md` (status/phases/outcomes); or
-  `cluster-operators/node-access-policies.md` (NodeAccessPolicy).
-- Chart / deploy / RBAC / PSA / SELinux / proxy-image / `watchNamespaces` change → `cluster-operators/deployment.md`.
-- Threat-model / invariant change → `cluster-operators/security.md` (a **summary**; `THREAT_MODEL.md`
-  stays the source of truth — the page says so, so update both and keep them consistent).
-- Secret-key conventions the user must match (`variables.yaml`; StaticInventory `id_rsa`/`known_hosts`;
-  file mount paths under `/run/ansible-operator/files/<name>`) live in `variables-and-files.md` /
-  `external-hosts.md` — re-verify against `workspace.rs`/`job_builder.rs`/`inventory_renderer.rs`/`paths.rs`
-  if you touch those.
-
-Conventions: the guide is **prose** — refer to CRD types as inline code (`` `PlaybookPlan` ``) and
-defer exhaustive field lists to the API reference (`ansible-operator crds` / `just apidoc`), don't
-restate whole field tables. Cross-references between pages are **relative markdown links**
-(`./playbook-plans.md`, `../cluster-operators/deployment.md#enrolled-namespaces`); heading anchors are
-mdBook slugs (lowercase, punctuation stripped, spaces→`-`), so a link into `## The proxy image`
-becomes `#the-proxy-image`. Verify with `just docs`; adding/removing a page also needs a `SUMMARY.md`
-entry (a page missing from `SUMMARY.md` is not rendered). mdBook has no built-in broken-link check, so
-eyeball new cross-page links (or run the `mdbook-linkcheck` backend if installed).
-
-## Testing & workflow
-
-- `cargo test` — unit tests colocated in `#[cfg(test)] mod tests` at the bottom of each file
-  (no `tests/` dir for Rust); follow this convention. Prefer extracting a small pure function (as
-  `execution_evaluator`, `triggers`, `status`, `nodeselector`, `node_access::clamp_*`,
-  `job_builder::extract_file_volumes` do) over testing through the full `reconcile()`.
-- `just test-python` — the embedded Python scripts, which cargo does not compile and therefore
-  does not cover. `tests/python/`, stdlib `unittest`, no dependencies and nothing to install:
-  keep it that way, so the suite stays runnable wherever a `python3` is. The preflight gate's
-  tests dial a real listener rather than feeding a parser byte strings — what the gate exists to
-  judge is wire behaviour, and a fake would only test the half that was never in doubt.
-- `managed_ssh::container_tests` is an `#[ignore]`d testcontainers test that boots the real
-  proxy sshd image and asserts per-run cert isolation (INV-4). It needs a Docker/Podman socket
-  and an `ssh` client; it validates cert *logic*, not the on-cluster Secret-mount permissions
-  (that's what the `StrictModes no` unit assertion guards — see the test's doc comment).
-- `cargo clippy` is clean and there's no `clippy.toml`; keep it clean (a scoped
-  `#[allow(clippy::too_many_arguments)]` on `ensure_proxy_infra` is the only deliberate
-  exception). Run `cargo build` + `cargo test` + `cargo clippy` before proposing changes — and
-  the guide build (`just docs`) if you touched `docs/` or user-facing behaviour/CRDs/chart.
-  `just check` runs everything (build + both test suites + clippy + guide + apidoc); see the
-  `Justfile` for recipes.
-- `./ansible-operator crds` dumps all **five** CRDs (PlaybookPlan, Play, ClusterInventory,
-  StaticInventory, NodeAccessPolicy) — check this path after changing any `CustomResource` type.
-  **A doc comment on a CRD type becomes Helm template text.** `just generate-crds` copies the dump
-  into `chart/charts/crds/templates/` verbatim, escaping nothing, so a `{{ … }}` in a doc comment is
-  a live Helm action: an example of Helm syntax renders as its *result* in the shipped CRD (a
-  `{{ .Chart.Version | replace … }}` sample became `0.1.0`), and an expression Helm cannot evaluate
-  fails the install outright. Describe such syntax in prose, and check with
-  `helm template ./chart | grep` after regenerating.
-- The chart renders `managedSsh.proxyImage` and `watchNamespaces` into the operator ConfigMap;
-  `helm template ./chart -s templates/configmap.yaml` (and `templates/role.yaml`) is the quick
-  way to sanity-check chart wiring.
-- CI (`.github/workflows/build-test-push.yml`): `cargo test` and the Python suite as separate
-  parallel jobs, + `cargo build --release`, then a Containerfile distroless image (binary copied
-  in, no cargo build inside the image). A `docs` job builds the guide with a pinned, checksummed
-  mdBook release, and the `test` job builds the API docs with `RUSTDOCFLAGS=-D warnings`, the same
-  check as `just apidoc`. `book.toml` sets `create-missing = false`, so a `SUMMARY.md` entry
-  whose file is missing fails the build instead of rendering an empty page. On a release tag
-  without a pre-release suffix, `publish-docs` deploys that build to GitHub Pages after
-  `publish-chart`, replacing the whole site, so it always documents the latest release. That needs
-  two repository settings no workflow can make: Pages → Source "GitHub Actions", and a `v*` tag
-  rule on the `github-pages` environment, which otherwise admits only the default branch.
-  `publish-docs.yml` publishes any ref by hand (run it from `main`); the mdBook pin both workflows
-  install lives in `.github/actions/setup-mdbook`. The checks also run weekly on `main`, so a new
-  stable toolchain's lints surface without a PR.
-- `.agents/skills/` is a vendored skill pack (rust-skills), unrelated to this project's domain —
-  not something to modify as part of feature work.
-```
+- `just check` = build + Rust and Python tests + clippy + guide + apidoc; run it before proposing
+  changes. `just` lists the other recipes.
+- Rust unit tests live in `#[cfg(test)] mod tests` in each file; prefer extracting a small pure
+  function over testing through `reconcile()`.
+- `tests/python/` is stdlib `unittest` with no dependencies; keep it that way.
+- Clippy stays clean; the only allowed exception is `too_many_arguments` on `ensure_proxy_infra`.
+- After changing a `CustomResource` type: `just crds` (all five CRDs), then `just generate-crds`.
+  CRD doc comments are copied verbatim into Helm templates, so never write `{{ … }}` in one;
+  check with `helm template ./chart | grep`.
+- `managed_ssh::container_tests` is `#[ignore]`d and needs a container socket + `ssh`.
