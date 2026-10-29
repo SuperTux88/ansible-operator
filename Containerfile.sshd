@@ -21,8 +21,8 @@ FROM alpine:${ALPINE_VERSION} AS build
 
 RUN apk add --no-cache build-base linux-headers zlib-static zlib-dev curl tar busybox-static
 
-ARG OPENSSH_VERSION=10.4p1
-ARG OPENSSH_SHA256=ef6026dd2aea8d56059638d5d3262902c892ceba9f88395835e0d06d3fb63238
+ARG OPENSSH_VERSION=10.6p1
+ARG OPENSSH_SHA256=a9dc9565dffe8640f64d863cd29a32bc4a3dbdec0566a7fc44c5d6ee767d5f39
 RUN curl -fsSL "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-${OPENSSH_VERSION}.tar.gz" -o openssh.tar.gz \
  && echo "${OPENSSH_SHA256}  openssh.tar.gz" | sha256sum -c - \
  && tar -xzf openssh.tar.gz \

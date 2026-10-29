@@ -23,7 +23,7 @@ image:
 
 managedSsh:
   proxyImage:
-    repository: ghcr.io/webd97/ansible-operator-sshd@sha256:bd32bc1aaf89d110a5e5098977c5b41018c9134eef57d9ec14c42ac3fb959f38
+    repository: ghcr.io/webd97/ansible-operator-sshd@sha256:dfd9f3c2c1342ba30c99c60949a036b123aaa9c0ad1ed85b958c4a37feabd486
     # <openssh>-<revision>, e.g. 10.4p1-1; the release workflow repins this to a @sha256: digest.
     tag: ""
 

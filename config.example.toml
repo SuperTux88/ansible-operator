@@ -29,7 +29,7 @@ watch_namespaces = [
 # THREAT_MODEL T-ESC-5). REQUIRED — the operator will not start without it, and there is no built-in
 # default. Tag is <openssh>-<revision> (e.g. 10.4p1-1). Pin to a digest in production (repo@sha256:…);
 # the release workflow keeps this line pinned to the current signed image.
-proxy_image = "ghcr.io/webd97/ansible-operator-sshd@sha256:bd32bc1aaf89d110a5e5098977c5b41018c9134eef57d9ec14c42ac3fb959f38"
+proxy_image = "ghcr.io/webd97/ansible-operator-sshd@sha256:dfd9f3c2c1342ba30c99c60949a036b123aaa9c0ad1ed85b958c4a37feabd486"
 
 # Optional JSON-encoded NetworkPolicy egress rule arrays. Omit either setting to avoid creating an
 # egress policy for that workload. `[{}]` creates a policy while preserving unrestricted egress;
