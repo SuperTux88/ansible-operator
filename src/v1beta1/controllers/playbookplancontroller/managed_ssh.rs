@@ -27,6 +27,7 @@ use kube::{
 use super::{node_readiness, paths};
 use crate::utils;
 use crate::v1beta1::{
+    ansible,
     ca::CertificateAuthority,
     controllers::{
         playbookplancontroller::execution_evaluator::ExecutionHash,
@@ -934,7 +935,7 @@ fn render_client_cert_files(
     let client_key = crate::v1beta1::ca::generate_ephemeral_keypair()?;
     let client_cert = ca.sign_client_cert(
         client_key.public_key(),
-        &["root", run_id],
+        &[ansible::MANAGED_SSH_USER, run_id],
         certificate_validity,
     )?;
     let ca_pub = ca.public_key_openssh()?;
