@@ -18,6 +18,11 @@ pub const RESERVED_HOST_VARS: &[&str] = &[
     "ansible_ssh_common_args",
 ];
 
+/// The account every managed-ssh connection logs in as: the only one the proxy's sshd has
+/// (`PermitRootLogin yes`), and the login principal of the run's client cert. Rendered explicitly
+/// because ssh otherwise logs in as the local user, which is not root in a non-root image.
+pub const MANAGED_SSH_USER: &str = "root";
+
 /// SSH options that give up on a host that stopped answering, after about two minutes. A host that
 /// dies or drops off the network mid-task sends nothing to close the connection, and with no
 /// traffic only TCP keepalive would notice, after more than two hours. Ansible waits for every host
@@ -122,6 +127,10 @@ fn render_managed_ssh_host_vars(hostname: &str, ctx: &RenderContext) -> Mapping 
     }
 
     vars.insert(
+        Value::String("ansible_user".into()),
+        Value::String(MANAGED_SSH_USER.into()),
+    );
+    vars.insert(
         Value::String("ansible_ssh_private_key_file".into()),
         Value::String(ctx.managed_ssh_client_key_path.to_string()),
     );
@@ -208,6 +217,8 @@ mod tests {
 
         assert!(rendered.contains("ansible_host: 10.0.0.5"));
         assert!(rendered.contains("ansible_port: 22"));
+        // Explicit, so a non-root image does not log in as its own user, which the proxy lacks.
+        assert!(rendered.contains("ansible_user: root"));
         assert!(rendered.contains("client_key"));
         // The host cert's principal is the node name, not the proxy pod IP dialed via
         // ansible_host, so the SSH client needs HostKeyAlias to check the cert/known_hosts

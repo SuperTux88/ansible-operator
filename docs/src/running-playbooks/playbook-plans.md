@@ -114,7 +114,8 @@ requires of a key root reads. A non-root process then cannot read its key, and e
 unreachable. With either field set, the files are readable by every user in the pod. OpenSSH accepts
 that, because the files belong to root and not to the user running it. `runAsNonRoot: true` alone
 needs a numeric `USER` in the image, because the kubelet refuses to start a container whose
-non-numeric user it cannot check.
+non-numeric user it cannot check. The local user does not change who the playbook is on a cluster
+Node: managed SSH always logs in as `root`.
 
 The user must also exist in the image. OpenSSH refuses to start for a uid that has no `/etc/passwd`
 entry, and Ansible needs a writable home directory for its temporary files. So pick the uid of the
