@@ -169,7 +169,9 @@ spec:
                   5-field cron expression (`minute hour day-of-month month day-of-week`) that tells at which
                   time the playbook may execute.
                 nullable: true
-                pattern: ^[0-9*/,-]+[ \t]+[0-9*/,-]+[ \t]+[0-9?*/,-]+[ \t]+[0-9A-Za-z*/,-]+[ \t]+[0-9A-Za-z?*/,-]+$
+                pattern: >-
+                  ^[0-9*/,-]+[ \t]+[0-9*/,-]+[ \t]+[0-9?*/,-]+[ \t]+[0-9A-Za-z*/,-]+[
+                  \t]+[0-9A-Za-z?*/,-]+$
                 type: string
               securityContext:
                 description: |-
@@ -318,7 +320,9 @@ spec:
                   Defaults to false.
                 type: boolean
               template:
-                description: The playbook will be built from this, some fields will be set automatically (vars, hosts)
+                description: >-
+                  The playbook will be built from this, some fields will be set automatically
+                  (vars, hosts)
                 properties:
                   files:
                     description: |-
@@ -1015,7 +1019,9 @@ spec:
                     description: The execution hash used to create this run's Job and infrastructure.
                     type: string
                   hosts:
-                    description: Hosts targeted by this run, preserved even if the desired inventory changes while it runs.
+                    description: >-
+                      Hosts targeted by this run, preserved even if the desired inventory changes
+                      while it runs.
                     items:
                       type: string
                     type: array
@@ -1023,7 +1029,9 @@ spec:
                     description: The Job backing this run, which is also the name of its `Play`.
                     type: string
                   playUid:
-                    description: UID of the immutable `Play` recovery record correlated with the Job and its pod template.
+                    description: >-
+                      UID of the immutable `Play` recovery record correlated with the Job and its pod
+                      template.
                     type: string
                   retryGeneration:
                     default: 0
@@ -1034,7 +1042,9 @@ spec:
                     minimum: 0.0
                     type: integer
                   runId:
-                    description: Stable per-run resource/cleanup identity, distinct even across same-hash retries.
+                    description: >-
+                      Stable per-run resource/cleanup identity, distinct even across same-hash
+                      retries.
                     type: string
                   runNumber:
                     description: Run number represented by `jobName`.
@@ -1158,7 +1168,9 @@ spec:
                       nullable: true
                       type: string
                     lastAppliedHash:
-                      description: The execution hash last SUCCESSFULLY applied to this host. Only bumped on `HostOutcome::Succeeded`.
+                      description: >-
+                        The execution hash last SUCCESSFULLY applied to this host. Only bumped on
+                        `HostOutcome::Succeeded`.
                       type: string
                     lastOutcome:
                       enum:
@@ -1298,10 +1310,10 @@ spec:
         title: PlaybookPlan
         type: object
         x-kubernetes-validations:
-        - message: 'PlaybookPlan name must be at most 63 characters: it is used as a label value on the objects each run creates'
-          rule: '!has(self.metadata.name) || self.metadata.name.size() <= 63'
-        - message: 'a Recurring PlaybookPlan requires spec.schedule: nothing else starts a run for it'
-          rule: '!has(self.spec.mode) || self.spec.mode != ''Recurring'' || has(self.spec.schedule)'
+        - message: "PlaybookPlan name must be at most 63 characters: it is used as a label value on the objects each run creates"
+          rule: "!has(self.metadata.name) || self.metadata.name.size() <= 63"
+        - message: "a Recurring PlaybookPlan requires spec.schedule: nothing else starts a run for it"
+          rule: "!has(self.spec.mode) || self.spec.mode != 'Recurring' || has(self.spec.schedule)"
     served: true
     storage: true
     subresources:

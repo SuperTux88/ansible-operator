@@ -320,7 +320,9 @@ spec:
                   the status subresource so acknowledgement uses the operator's existing `plays/status` RBAC.
                 type: boolean
               recap:
-                description: The Ansible recap, summed across every targeted host — the recap columns read from here.
+                description: >-
+                  The Ansible recap, summed across every targeted host — the recap columns read
+                  from here.
                 properties:
                   changed:
                     maximum: 4294967295.0
@@ -409,7 +411,9 @@ spec:
                     host:
                       type: string
                     nodeNotReady:
-                      description: The `Node` backing this host was itself not reporting `Ready` when the run launched.
+                      description: >-
+                        The `Node` backing this host was itself not reporting `Ready` when the run
+                        launched.
                       type: boolean
                   required:
                   - host
