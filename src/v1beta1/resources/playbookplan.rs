@@ -1028,7 +1028,7 @@ mod tests {
             },
         );
 
-        let serialized = serde_yaml::to_string(&playbookplan).unwrap();
+        let serialized = serde_saphyr::to_string(&playbookplan).unwrap();
 
         println!("{serialized}");
     }
@@ -1069,7 +1069,7 @@ spec:
               command: echo Hello
         "#;
 
-        let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let pp = serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap();
 
         assert!(pp.spec.template.files.is_some());
 
