@@ -128,7 +128,7 @@ pub enum ReconcileError {
     JsonSerializationError(#[from] serde_json::Error),
 
     #[error(transparent)]
-    YamlSerializationError(#[from] serde_yaml::Error),
+    YamlSerializationError(#[from] serde_saphyr::SerializeError),
 }
 
 fn phase_suffix(phase: &Option<PlayPhase>) -> String {

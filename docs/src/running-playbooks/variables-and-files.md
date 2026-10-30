@@ -11,6 +11,11 @@ affected hosts.
 `--extra-vars`, so later entries win over earlier ones on key collisions, exactly as with
 `ansible-playbook`.
 
+A value reaches the playbook with the type it has in the plan. Ansible reads YAML 1.1, where a bare
+`yes`, `on`, `no` or `off` is a boolean, so the operator quotes such a string when it writes inline
+variables and inventory group variables for Ansible: `permit_root_login: "no"` stays the string
+`no` and does not become `False`.
+
 ### Inline
 
 Literal values written straight into the plan. Good for non-secret configuration.

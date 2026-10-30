@@ -68,7 +68,7 @@ spec:
             description: |-
               An immutable per-run recovery and history record. It is written before Job creation, advances
               from preparation through execution, and retains the terminal recap after the Job is reaped.
-
+              
               Owned (ownerReference) by its `PlaybookPlan`, so deleting the plan cascades to all its Plays;
               retention beyond that is bounded per-plan by `successfulPlaysHistoryLimit`/
               `failedPlaysHistoryLimit`. The Job and pod template carry this Play's UID for correlation.
@@ -80,7 +80,7 @@ spec:
                   for a `OneShot` plan and one schedule tick for a `Recurring` one, so this restarts at 1
                   whenever the plan is edited, after a successful `OneShot` execution, and — for `Recurring` —
                   at every tick.
-
+                  
                   Orthogonal to `runNumber`, which every try advances because every try *is* a run — with its
                   own record, its own `runId` and its own Job. This says which try of its execution that run
                   was, which the run number cannot: it is reserved plan-wide and continues across editions.
@@ -102,13 +102,13 @@ spec:
                         How a run reaches this group's hosts: `managedSsh` for a cluster Node, through a per-run
                         managed-ssh proxy pod, and `ssh` for an external machine, through its `StaticInventory`'s own
                         key. It follows from the kind of inventory the group came from and is never chosen.
-
+                        
                         Recorded because everything about a host — its `hostsStatus` row, its per-host Lease, its entry
                         in the rendered inventory — is keyed by host *name*, and a name alone cannot say whether a Node
                         object standing under it describes this host. For a `ClusterInventory` host it does; for a
                         `StaticInventory` host a Node of the same name is an unrelated machine, whose rebuilding says
                         nothing about the external one.
-
+                        
                         Absent on a `ClusterInventory`'s own `status.resolvedHosts`, where the kind of the resource
                         holding it is already the answer, and on any record not written by [`flatten_hosts`]. Absent
                         therefore reads as "not known to be a Node", which is the safe way round: every question it
@@ -140,7 +140,7 @@ spec:
               preparationFingerprint:
                 description: |-
                   Fingerprint of all plan and resolved-inventory inputs used while preparing this run.
-
+                  
                   This is the run's change detector, and it is why the record carries no copy of the plan spec,
                   resolved connection configuration or the Job. Everything an unlaunched run needs to be
                   resumed is a pure function of the live plan spec and the freshly resolved groups, so while
@@ -152,13 +152,13 @@ spec:
               providesVersion:
                 description: |-
                   The version this run's revision declared in the plan's `spec.provides`, if it declared one.
-
+                  
                   Recorded here rather than read from the live plan when a result is folded in, because the
                   two can legitimately differ: a plan edited while a run was in flight already advertises the
                   *next* version, and stamping that onto the hosts this run converged would label them for a
                   revision they never received. The run's own record is the only copy that still describes
                   what actually ran.
-
+                  
                   Absent for a plan that provides nothing — no Node is ever labelled from such a record.
                 nullable: true
                 type: string
@@ -184,7 +184,7 @@ spec:
                   past every Job and retained `Play` record still claiming a number. It therefore continues
                   across plan edits rather than restarting at 1 for a new revision. Mirrors the backing Job's
                   numbered name (`apply-{plan}-{shortid}-{runNumber}`).
-
+                  
                   Not a dense count of this plan's runs: a run abandoned before its Job exists leaves its
                   number unused whenever the plan's `lastRunNumber` already recorded it. Uniqueness of the
                   name is the whole contract.
@@ -320,7 +320,9 @@ spec:
                   the status subresource so acknowledgement uses the operator's existing `plays/status` RBAC.
                 type: boolean
               recap:
-                description: The Ansible recap, summed across every targeted host — the recap columns read from here.
+                description: >-
+                  The Ansible recap, summed across every targeted host — the recap columns read
+                  from here.
                 properties:
                   changed:
                     maximum: 4294967295.0
@@ -381,15 +383,15 @@ spec:
                   within the grace window, so there was no address to reach them at and the run passed
                   `--limit '!<host>'` rather than dialling one. They stay in the rendered inventory, so
                   `groups[]` still describes the full fleet.
-
+                  
                   Their outcome in `hosts` follows `nodeNotReady`: `Unreachable` when the Node itself was down,
                   `NotReached` when the Node was `Ready` and only its proxy pod failed. The two are recovered
                   from in different places, and only the first is something a Node returning to `Ready` fixes.
-
+                  
                   Written at the launch commit, because neither half is knowable later: the recap says nothing
                   about a host it never processed, and the Node's own state cannot be re-read afterwards
                   because by then it may have recovered.
-
+                  
                   A run whose Job creation did not complete is resumed, re-reads its proxy pods and re-states
                   this from what it finds, so that the record and the `--limit` file the same tick renders
                   always describe one run. That still makes it "at launch": a run whose Job exists is adopted
@@ -397,7 +399,7 @@ spec:
                 items:
                   description: |-
                     A host excluded from a run, and the one distinction the exclusion itself does not carry.
-
+                    
                     Both kinds are equally unreachable and are excluded identically, but they mean opposite things:
                     a Node that was down is something no attempt could have helped with and that its own return
                     resolves, while a `Ready` Node whose proxy pod never came up anyway — an untolerated taint, a
@@ -409,7 +411,9 @@ spec:
                     host:
                       type: string
                     nodeNotReady:
-                      description: The `Node` backing this host was itself not reporting `Ready` when the run launched.
+                      description: >-
+                        The `Node` backing this host was itself not reporting `Ready` when the run
+                        launched.
                       type: boolean
                   required:
                   - host

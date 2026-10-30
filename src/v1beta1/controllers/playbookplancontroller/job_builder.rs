@@ -1137,7 +1137,7 @@ spec:
     playbook: |
       - hosts: all
         "#;
-        let mut pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let mut pp = serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap();
         pp.metadata.uid = Some("plan-uid".into());
         let hash = crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash("- hosts: all", std::iter::empty());
 
@@ -1202,7 +1202,7 @@ spec:
     playbook: |
       - hosts: all
         "#;
-        let mut pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let mut pp = serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap();
         pp.metadata.uid = Some("plan-uid".into());
         let hash = crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash("- hosts: all", std::iter::empty());
 
@@ -1275,7 +1275,7 @@ spec:
               command: echo Hello
         "#;
 
-        let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let pp = serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap();
 
         let results = super::extract_file_volumes(&pp);
         let (oks, errs): (Vec<_>, Vec<_>) = results.partition(Result::is_ok);
@@ -1326,7 +1326,7 @@ spec:
       - hosts: all
         tasks: []
         "#;
-        let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let pp = serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap();
 
         let command = render_ansible_command(&pp, Vec::new());
 
@@ -1446,7 +1446,7 @@ spec:
       - hosts: all
         tasks: []
         "#;
-        let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let pp = serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap();
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
 
         let run_1 =
@@ -1576,7 +1576,7 @@ spec:
       - hosts: all
         tasks: []
         "#;
-        serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap()
+        serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap()
     }
 
     #[test]

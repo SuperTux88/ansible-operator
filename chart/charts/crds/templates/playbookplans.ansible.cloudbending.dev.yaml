@@ -98,7 +98,7 @@ spec:
                 description: |-
                   How many times a failed run may be tried again before the operator stops, counting the first
                   run — so `1` means no retry. Defaults to 3 for `OneShot` and 1 for `Recurring`.
-
+                  
                   The budget covers one *execution*: for `OneShot` the current playbook and inputs, which an
                   edit resets; for `Recurring` one schedule tick, since the next tick is going to re-apply the
                   playbook anyway. Every try is a run of its own, with its own `Play` record and its own Job.
@@ -116,13 +116,13 @@ spec:
               provides:
                 description: |-
                   What this plan makes true on the hosts it converges, for other plans to depend on.
-
+                  
                   Setting it opts the plan into Node labelling: every cluster Node this plan applied to
                   successfully is labelled `<namespace>.plan.ansible.cloudbending.dev/<plan-name>` with the
                   declared `version`, and another plan's `ClusterInventory` can select on that label to keep
                   its own runs off hosts that are not ready yet. A plan without `provides` is labelled
                   nowhere, so nothing unrelated appears on a Node.
-
+                  
                   Left an object rather than a bare version string so it can grow a field without a breaking
                   change.
                 nullable: true
@@ -130,16 +130,16 @@ spec:
                   version:
                     description: |-
                       What this plan is providing right now, and the value the Node label carries.
-
+                      
                       **Part of the execution hash**, which is what makes the label trustworthy: a Node carrying
                       version X has to have had a run of the revision that *declared* X succeed on it, so bumping
                       this re-applies the playbook everywhere before any label moves. Adding or removing
                       `provides` re-runs the plan once for the same reason. It is also the only way to roll out a
                       new binary that ships inside the plan's `image`, since the image is not hashed.
-
+                      
                       A plan whose playbook must not re-run on every release therefore wants a version of its own
                       rather than the chart's.
-
+                      
                       Any valid Kubernetes label value is accepted, but `Gt`/`Ge`/`Lt`/`Le` selectors read it as a
                       SemVer version, so a value that is not one only ever matches `Exists`, `In` and `NotIn`.
                       SemVer build metadata cannot be expressed — `+` is not a legal label value character — so
@@ -156,7 +156,9 @@ spec:
                   5-field cron expression (`minute hour day-of-month month day-of-week`) that tells at which
                   time the playbook may execute.
                 nullable: true
-                pattern: ^[0-9*/,-]+[ \t]+[0-9*/,-]+[ \t]+[0-9?*/,-]+[ \t]+[0-9A-Za-z*/,-]+[ \t]+[0-9A-Za-z?*/,-]+$
+                pattern: >-
+                  ^[0-9*/,-]+[ \t]+[0-9*/,-]+[ \t]+[0-9?*/,-]+[ \t]+[0-9A-Za-z*/,-]+[
+                  \t]+[0-9A-Za-z?*/,-]+$
                 type: string
               securityContext:
                 description: |-
@@ -301,7 +303,9 @@ spec:
                   Defaults to false.
                 type: boolean
               template:
-                description: The playbook will be built from this, some fields will be set automatically (vars, hosts)
+                description: >-
+                  The playbook will be built from this, some fields will be set automatically
+                  (vars, hosts)
                 properties:
                   files:
                     description: Files for the playbook
@@ -980,7 +984,7 @@ spec:
                   The run that is currently being applied, independent of the newly desired execution hash.
                   This remains stable while a spec change queues a replacement run, so the old Job, locks, and
                   managed-ssh resources continue to be reconciled until the run finishes.
-
+                  
                   Only what finishing that run needs: everything else about it lives in its immutable `Play`,
                   which is the record recovery reads. This copy is what lets the operator still release a run
                   whose `Play` was deleted out from under it.
@@ -995,7 +999,9 @@ spec:
                     description: The execution hash used to create this run's Job and infrastructure.
                     type: string
                   hosts:
-                    description: Hosts targeted by this run, preserved even if the desired inventory changes while it runs.
+                    description: >-
+                      Hosts targeted by this run, preserved even if the desired inventory changes
+                      while it runs.
                     items:
                       type: string
                     type: array
@@ -1003,7 +1009,9 @@ spec:
                     description: The Job backing this run, which is also the name of its `Play`.
                     type: string
                   playUid:
-                    description: UID of the immutable `Play` recovery record correlated with the Job and its pod template.
+                    description: >-
+                      UID of the immutable `Play` recovery record correlated with the Job and its pod
+                      template.
                     type: string
                   retryGeneration:
                     default: 0
@@ -1014,7 +1022,9 @@ spec:
                     minimum: 0.0
                     type: integer
                   runId:
-                    description: Stable per-run resource/cleanup identity, distinct even across same-hash retries.
+                    description: >-
+                      Stable per-run resource/cleanup identity, distinct even across same-hash
+                      retries.
                     type: string
                   runNumber:
                     description: Run number represented by `jobName`.
@@ -1065,13 +1075,13 @@ spec:
                         How a run reaches this group's hosts: `managedSsh` for a cluster Node, through a per-run
                         managed-ssh proxy pod, and `ssh` for an external machine, through its `StaticInventory`'s own
                         key. It follows from the kind of inventory the group came from and is never chosen.
-
+                        
                         Recorded because everything about a host — its `hostsStatus` row, its per-host Lease, its entry
                         in the rendered inventory — is keyed by host *name*, and a name alone cannot say whether a Node
                         object standing under it describes this host. For a `ClusterInventory` host it does; for a
                         `StaticInventory` host a Node of the same name is an unrelated machine, whose rebuilding says
                         nothing about the external one.
-
+                        
                         Absent on a `ClusterInventory`'s own `status.resolvedHosts`, where the kind of the resource
                         holding it is already the answer, and on any record not written by [`flatten_hosts`]. Absent
                         therefore reads as "not known to be a Node", which is the safe way round: every question it
@@ -1100,7 +1110,7 @@ spec:
                         When the run that stamped `lastAppliedHash` was **prepared** — moved by exactly the outcome
                         that moves that field, and by no other. This is what separates it from `lastTransitionTime`,
                         which records every outcome, successful or not.
-
+                        
                         It dates the claim, and it is also what tells a **replaced machine** from the one the record
                         describes: `hostsStatus` is keyed by host *name*, and the name is all a rebuilt machine
                         inherits, so without this a Node deleted and re-registered under the same name would keep the
@@ -1108,13 +1118,13 @@ spec:
                         Node whose `creationTimestamp` is later than this cannot be the machine the run was prepared
                         against — Node names are unique, so one standing there now that is *older* has been there
                         since before the run — and its recorded application is dropped (`node_recreation`).
-
+                        
                         The run's start rather than its finish, because the finish time is stamped by the operator
                         pod while a Node's `creationTimestamp` is stamped by the API server. Comparing those two
                         would measure clock skew as much as machine identity, and an operator running behind would
                         drop the claim it had just written for a freshly joined Node — a success that re-runs for
                         ever. Both sides of the comparison are now the API server's own clock.
-
+                        
                         Absent while the host has no recorded success. A claim without it cannot be dated, so it is
                         never treated as a replacement, which would re-run the host on no evidence, and never
                         published as a Node label, which would advertise software nothing shows the Node has; the
@@ -1127,18 +1137,20 @@ spec:
                         The `spec.provides` version of the revision that stamped `lastAppliedHash` — moved by exactly
                         the same outcome, and taken from that run's own `Play` rather than from the plan as it reads
                         now.
-
+                        
                         This is what a Node label is derived from, which is why it is recorded per host instead of
                         read from the spec: the plan converges one host at a time, so at any moment some hosts carry
                         the new revision and some still carry the old one, and each must be labelled with what it
                         actually has.
-
+                        
                         Absent for a plan that provides nothing, and while the host has no recorded success. A host
                         with no version here is never labelled — see `node_labels`.
                       nullable: true
                       type: string
                     lastAppliedHash:
-                      description: The execution hash last SUCCESSFULLY applied to this host. Only bumped on `HostOutcome::Succeeded`.
+                      description: >-
+                        The execution hash last SUCCESSFULLY applied to this host. Only bumped on
+                        `HostOutcome::Succeeded`.
                       type: string
                     lastOutcome:
                       enum:
@@ -1161,7 +1173,7 @@ spec:
               lastRenderedGeneration:
                 description: |-
                   The plan generation the workspace Secret was last rendered from — informational only.
-
+                  
                   It is deliberately *not* a "needs re-render" gate: the workspace embeds the live proxy pod
                   IPs, which are fresh every time a run's infrastructure is built, so it is rewritten whenever
                   a run reaches that point regardless of whether the spec changed. Reintroducing a gate here
@@ -1180,7 +1192,7 @@ spec:
                   are reserved plan-wide rather than per revision because the short id truncates a hash over
                   the plan and the revision, so two revisions of one plan can share one; see
                   `reconciler::select_job`.
-
+                  
                   A high-water mark, not a count of runs: a run abandoned before its Job existed is not
                   deducted, so its number stays reserved for as long as this field outlives its `Play`.
                 maximum: 4294967295.0
@@ -1210,7 +1222,7 @@ spec:
                 description: |-
                   Fingerprint of the SSH key material this plan's `StaticInventory` hosts are reached with,
                   as it was when the plan last looked. Absent for a plan that reaches no such hosts.
-
+                  
                   Deliberately *not* part of `currentHash`. That hash decides which hosts are outdated, so
                   folding a key into it would re-apply the playbook to every host that is already current —
                   rotating a key changes how the operator connects, not what it applies. Kept beside the hash
@@ -1239,7 +1251,7 @@ spec:
                   execution resets it to 0, in either mode, so hosts that become eligible afterwards can begin
                   a new one: for `Recurring` that is what leaves a schedule window open for a machine switched
                   on later in it.
-
+                  
                   Written from the run's own `Play` record, so a status that lags a run in flight cannot hand
                   the budget back by forgetting a try that was already made.
                 maximum: 4294967295.0
@@ -1278,10 +1290,10 @@ spec:
         title: PlaybookPlan
         type: object
         x-kubernetes-validations:
-        - message: 'PlaybookPlan name must be at most 63 characters: it is used as a label value on the objects each run creates'
-          rule: '!has(self.metadata.name) || self.metadata.name.size() <= 63'
-        - message: 'a Recurring PlaybookPlan requires spec.schedule: nothing else starts a run for it'
-          rule: '!has(self.spec.mode) || self.spec.mode != ''Recurring'' || has(self.spec.schedule)'
+        - message: "PlaybookPlan name must be at most 63 characters: it is used as a label value on the objects each run creates"
+          rule: "!has(self.metadata.name) || self.metadata.name.size() <= 63"
+        - message: "a Recurring PlaybookPlan requires spec.schedule: nothing else starts a run for it"
+          rule: "!has(self.spec.mode) || self.spec.mode != 'Recurring' || has(self.spec.schedule)"
     served: true
     storage: true
     subresources:

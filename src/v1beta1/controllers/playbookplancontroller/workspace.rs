@@ -115,7 +115,7 @@ pub fn render_secret(
                 crate::v1beta1::PlaybookVariableSource::SecretRef { secret_ref: _ } => None,
                 crate::v1beta1::PlaybookVariableSource::Inline { inline } => Some(inline),
             })
-            .map(serde_yaml::to_string)
+            .map(ansible::yaml_node::to_string)
             .collect(),
         None => Vec::new(),
     };
@@ -260,7 +260,7 @@ spec:
       - hosts: all
         tasks: []
         "#;
-        serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap()
+        serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap()
     }
 
     fn host(pod_ip: &str) -> ansible::ManagedSshHostInfo {

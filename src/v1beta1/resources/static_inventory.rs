@@ -69,6 +69,6 @@ mod tests {
     #[test]
     fn test_deserialize_example() {
         let inventory_str = include_str!("../../../examples/v1beta1/static-inventory.yaml");
-        let _: StaticInventory = serde_yaml::from_str(inventory_str).unwrap();
+        let _: StaticInventory = serde_saphyr::from_str(inventory_str).unwrap();
     }
 }
