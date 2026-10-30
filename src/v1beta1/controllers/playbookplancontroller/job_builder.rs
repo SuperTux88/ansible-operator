@@ -2021,7 +2021,7 @@ spec:
     }
 
     fn security_context(yaml: &str) -> crate::v1beta1::PlaybookSecurityContext {
-        serde_yaml::from_str(yaml).unwrap()
+        serde_saphyr::from_str(yaml).unwrap()
     }
 
     /// The field exists so an execution image can declare what it needs and a plan can satisfy the
@@ -2105,7 +2105,7 @@ spec:
 
     #[test]
     fn only_restricted_volume_types_and_image_volumes_are_mountable_as_files() {
-        let volume = |yaml: &str| -> super::Volume { serde_yaml::from_str(yaml).unwrap() };
+        let volume = |yaml: &str| -> super::Volume { serde_saphyr::from_str(yaml).unwrap() };
 
         for source in super::ALLOWED_FILE_VOLUME_SOURCES {
             let allowed = volume(&format!("name: files\n{source}: {{}}"));

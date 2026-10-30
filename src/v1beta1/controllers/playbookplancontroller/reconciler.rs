@@ -11868,7 +11868,7 @@ spec:
     fn a_file_entry_cannot_mount_a_host_path() {
         let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
         plan.spec.template.files = Some(vec![
-            serde_yaml::from_str("name: root\nhostPath:\n  path: /").unwrap(),
+            serde_saphyr::from_str("name: root\nhostPath:\n  path: /").unwrap(),
         ]);
 
         assert!(matches!(
