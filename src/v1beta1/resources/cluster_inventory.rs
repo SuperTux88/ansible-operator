@@ -239,11 +239,11 @@ mod tests {
     #[test]
     fn test_deserialize_example() {
         let inventory_str = include_str!("../../../examples/v1beta1/cluster-inventory.yaml");
-        let _: ClusterInventory = serde_yaml::from_str(inventory_str).unwrap();
+        let _: ClusterInventory = serde_saphyr::from_str(inventory_str).unwrap();
     }
 
     fn example() -> ClusterInventory {
-        serde_yaml::from_str(include_str!(
+        serde_saphyr::from_str(include_str!(
             "../../../examples/v1beta1/cluster-inventory.yaml"
         ))
         .unwrap()

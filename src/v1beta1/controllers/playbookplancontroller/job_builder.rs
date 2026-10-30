@@ -1307,7 +1307,7 @@ spec:
     playbook: |
       - hosts: all
         "#;
-        let mut pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let mut pp = serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap();
         pp.metadata.uid = Some("plan-uid".into());
         let hash = crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash("- hosts: all", std::iter::empty());
 
@@ -1372,7 +1372,7 @@ spec:
     playbook: |
       - hosts: all
         "#;
-        let mut pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let mut pp = serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap();
         pp.metadata.uid = Some("plan-uid".into());
         let hash = crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash("- hosts: all", std::iter::empty());
 
@@ -1445,7 +1445,7 @@ spec:
               command: echo Hello
         "#;
 
-        let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let pp = serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap();
 
         let results = super::extract_file_volumes(&pp);
         let (oks, errs): (Vec<_>, Vec<_>) = results.partition(Result::is_ok);
@@ -1496,7 +1496,7 @@ spec:
       - hosts: all
         tasks: []
         "#;
-        let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let pp = serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap();
 
         let command = render_ansible_command(&pp, Vec::new());
 
@@ -1616,7 +1616,7 @@ spec:
       - hosts: all
         tasks: []
         "#;
-        let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let pp = serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap();
         let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
 
         let run_1 =
@@ -1746,7 +1746,7 @@ spec:
       - hosts: all
         tasks: []
         "#;
-        serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap()
+        serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap()
     }
 
     #[test]
@@ -2119,7 +2119,7 @@ spec:
     }
 
     fn security_context(yaml: &str) -> crate::v1beta1::PlaybookSecurityContext {
-        serde_yaml::from_str(yaml).unwrap()
+        serde_saphyr::from_str(yaml).unwrap()
     }
 
     /// The field exists so an execution image can declare what it needs and a plan can satisfy the
@@ -2203,7 +2203,7 @@ spec:
 
     #[test]
     fn only_restricted_volume_types_and_image_volumes_are_mountable_as_files() {
-        let volume = |yaml: &str| -> super::Volume { serde_yaml::from_str(yaml).unwrap() };
+        let volume = |yaml: &str| -> super::Volume { serde_saphyr::from_str(yaml).unwrap() };
 
         for source in super::ALLOWED_FILE_VOLUME_SOURCES {
             let allowed = volume(&format!("name: files\n{source}: {{}}"));
