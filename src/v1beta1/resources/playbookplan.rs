@@ -81,7 +81,9 @@ pub struct PlaybookPlanSpec {
     /// collection-installer init container. Optional for compatibility with arbitrary execution
     /// images; cluster admission policies may require particular fields. Values the baseline Pod
     /// Security Standard forbids (privileged, added capabilities beyond the runtime defaults, other
-    /// SELinux types, unmasked procMount, Unconfined profiles, hostProcess) are refused.
+    /// SELinux types, unmasked procMount, Unconfined profiles, hostProcess) are refused. An image
+    /// that runs as a non-root user needs runAsUser or runAsNonRoot set here: without either, the
+    /// SSH keys and secret variables are mounted readable by root only.
     pub security_context: Option<PlaybookSecurityContext>,
 
     /// ServiceAccount the playbook pod runs as, letting tasks reach the Kubernetes API with that
