@@ -179,8 +179,12 @@ is by pod IP written into the rendered inventory.
 
 **T-TAMP-2 — Tampering with the workspace/client-cert Secret to alter what runs.**
 - *Mitigation:* Secrets are operator-owned (ownerReferences), rendered server-side; the
-  client-cert and var/file volumes mount `0400`, sshd config `0500`. Kubernetes RBAC
-  governs who can edit them.
+  client-cert, StaticInventory key and `vars` volumes mount `0400`, sshd config `0500`.
+  Kubernetes RBAC governs who can edit them. When the plan's `securityContext` guarantees a
+  non-root uid, those Job volumes mount `0444` instead (`job_builder::secret_file_mode`).
+  Kubelet makes the files root-owned, so a non-root uid could not read `0400`, and OpenSSH
+  refuses a wider key only when the caller owns it. Every uid that can read them runs in that
+  pod, from the plan's own image.
 - *Residual:* anyone with `secrets` write in the plan namespace can alter the playbook
   workspace (it lives there) → arbitrary root on the plan's *already-authorized* nodes.
   This is within the tenant's existing authority, not an escalation.

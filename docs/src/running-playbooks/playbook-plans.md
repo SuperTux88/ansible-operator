@@ -105,6 +105,34 @@ reports `securityContext … is not allowed` and starts no run. Everything that 
 stays available, and running as root inside the container remains allowed. A playbook that needs
 root on a cluster Node reaches it over managed SSH, through a [ClusterInventory](./cluster-nodes.md).
 
+### Running as a non-root user
+
+If the image runs Ansible as a non-root user, the plan has to say so. Set `runAsUser` to that user's
+uid, or `runAsNonRoot: true`. Unless one of the two guarantees a non-root user, the operator mounts
+the SSH keys, `known_hosts` and `secretRef` variables readable by root only, which is what OpenSSH
+requires of a key root reads. A non-root process then cannot read its key, and every host is reported
+unreachable. With either field set, the files are readable by every user in the pod. OpenSSH accepts
+that, because the files belong to root and not to the user running it. `runAsNonRoot: true` alone
+needs a numeric `USER` in the image, because the kubelet refuses to start a container whose
+non-numeric user it cannot check.
+
+The user must also exist in the image. OpenSSH refuses to start for a uid that has no `/etc/passwd`
+entry, and Ansible needs a writable home directory for its temporary files. So pick the uid of the
+image's own user, not an arbitrary one. This also satisfies the `restricted` Pod Security Standard:
+
+```yaml
+spec:
+  image: registry.example.com/ansible-core:2.20-user
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+    seccompProfile:
+      type: RuntimeDefault
+```
+
 ## The playbook
 
 `template.playbook` is an ordinary Ansible playbook as a YAML string. Two conventions matter:

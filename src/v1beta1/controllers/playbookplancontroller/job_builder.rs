@@ -172,13 +172,13 @@ pub fn create_job_blueprint(
 
     if has_managed_ssh_group(target_groups) {
         let secret_name = managed_ssh::client_cert_secret_name(run_id);
-        configure_job_for_managed_ssh_client_cert(&mut job, &secret_name);
+        configure_job_for_managed_ssh_client_cert(&mut job, object, &secret_name);
         configure_job_for_managed_ssh_preflight(&mut job, object);
     }
 
     let ssh_configs = distinct_static_inventory_ssh_configs(target_groups);
     if !ssh_configs.is_empty() {
-        configure_job_for_ssh(&mut job, &ssh_configs);
+        configure_job_for_ssh(&mut job, object, &ssh_configs);
     }
 
     configure_job_for_callback_plugin(&mut job);
@@ -424,6 +424,21 @@ pub(super) fn job_network_policy_name(plan_name: &str, run_id: &str) -> String {
 /// connection-specifics. This Job pod needs no node-level privilege at all —
 /// hostPID, the node-access capabilities and the pinning to one Node all live on the ephemeral
 /// managed-ssh proxy pods instead (see `managed_ssh.rs`).
+/// File mode for the Secrets the playbook process reads itself: SSH keys and certs, `known_hosts`
+/// and `variables.yaml`.
+///
+/// Kubelet creates secret files owned by root, so a non-root uid can read them only through the
+/// "other" bits. OpenSSH refuses a private key with group or other bits, but only one owned by the
+/// calling uid (`sshkey_perm_ok` in `authfile.c`): root needs `0400`, while `0444` works for any
+/// other uid. Non-root counts only when the plan guarantees it — the image's `USER` is not known
+/// here, so an image running as non-root without either field gets `0400` and cannot read these.
+fn secret_file_mode(plan: &v1beta1::PlaybookPlan) -> i32 {
+    let runs_as_non_root = plan.spec.security_context.as_ref().is_some_and(|context| {
+        context.run_as_non_root == Some(true) || context.run_as_user.is_some_and(|uid| uid > 0)
+    });
+    if runs_as_non_root { 0o0444 } else { 0o0400 }
+}
+
 fn create_job_skeleton(
     plan: &v1beta1::PlaybookPlan,
     with_requirements: bool,
@@ -479,7 +494,7 @@ fn create_job_skeleton(
             name: volume.clone(),
             secret: Some(SecretVolumeSource {
                 secret_name: Some(secret_name.to_string()),
-                default_mode: Some(0o0400),
+                default_mode: Some(secret_file_mode(plan)),
                 items: Some(vec![KeyToPath {
                     key: "variables.yaml".into(),
                     path: "variables.yaml".into(),
@@ -691,7 +706,11 @@ fn distinct_static_inventory_ssh_configs(
 /// Mounts one SSH secret per distinct `StaticInventory` referenced this run, each at its own
 /// resource-name-keyed path (`paths::static_inventory_ssh_dir`) so multiple StaticInventories
 /// with different credentials can coexist in the same Job pod without colliding.
-fn configure_job_for_ssh(job: &mut Job, ssh_configs: &[(String, SshConfig)]) {
+fn configure_job_for_ssh(
+    job: &mut Job,
+    plan: &v1beta1::PlaybookPlan,
+    ssh_configs: &[(String, SshConfig)],
+) {
     job.spec
         .as_mut()
         .and_then(|spec| {
@@ -708,7 +727,7 @@ fn configure_job_for_ssh(job: &mut Job, ssh_configs: &[(String, SshConfig)]) {
                         name: volume_name.clone(),
                         secret: Some(SecretVolumeSource {
                             secret_name: Some(config.secret_ref.name.clone()),
-                            default_mode: Some(0o0400),
+                            default_mode: Some(secret_file_mode(plan)),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -729,7 +748,11 @@ fn configure_job_for_ssh(job: &mut Job, ssh_configs: &[(String, SshConfig)]) {
 
 /// Mounts this run's managed-ssh client identity. The Secret is expected to already exist by the
 /// time the Job is created (`managed_ssh::ensure_proxy_infra`'s `ensure_client_cert` step).
-fn configure_job_for_managed_ssh_client_cert(job: &mut Job, secret_name: &str) {
+fn configure_job_for_managed_ssh_client_cert(
+    job: &mut Job,
+    plan: &v1beta1::PlaybookPlan,
+    secret_name: &str,
+) {
     job.spec
         .as_mut()
         .and_then(|spec| {
@@ -743,7 +766,7 @@ fn configure_job_for_managed_ssh_client_cert(job: &mut Job, secret_name: &str) {
                     name: "managed-ssh-client".into(),
                     secret: Some(SecretVolumeSource {
                         secret_name: Some(secret_name.to_string()),
-                        default_mode: Some(0o0400),
+                        default_mode: Some(secret_file_mode(plan)),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -2018,6 +2041,81 @@ spec:
                 .allow_privilege_escalation,
             Some(false)
         );
+    }
+
+    /// Root has to keep `0400` — OpenSSH refuses a wider key the caller owns — and a non-root uid
+    /// cannot read `0400` root-owned files at all, so the mode follows what the plan guarantees.
+    #[test]
+    fn secrets_read_by_the_playbook_are_readable_by_a_non_root_plan_only() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+        use crate::v1beta1::{
+            PlaybookVariableSource, ResolvedHosts, ResolvedInventoryGroup, SecretRef, SshConfig,
+        };
+
+        let groups = vec![
+            ResolvedInventoryGroup::ManagedSsh {
+                hosts: ResolvedHosts {
+                    name: "workers".into(),
+                    hosts: vec!["node-a".into()],
+                    ..Default::default()
+                },
+                tolerations: None,
+                variables: None,
+            },
+            ResolvedInventoryGroup::Ssh {
+                hosts: ResolvedHosts {
+                    name: "external".into(),
+                    hosts: vec!["ccu.fritz.box".into()],
+                    ..Default::default()
+                },
+                static_inventory_name: "ccu".into(),
+                config: SshConfig {
+                    user: "root".into(),
+                    secret_ref: SecretRef {
+                        name: "ssh-key".into(),
+                    },
+                },
+                variables: None,
+            },
+        ];
+        let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
+        let modes = |context: Option<&str>| {
+            let mut pp = minimal_plan();
+            pp.spec.template.variables = Some(vec![PlaybookVariableSource::SecretRef {
+                secret_ref: SecretRef {
+                    name: "vars".into(),
+                },
+            }]);
+            pp.spec.security_context = context.map(security_context);
+            let pod_spec =
+                super::create_job_blueprint(&hash, 1, "run-1", &groups, &pp, TEST_DEADLINES)
+                    .unwrap()
+                    .spec
+                    .unwrap()
+                    .template
+                    .spec
+                    .unwrap();
+            pod_spec
+                .volumes
+                .unwrap()
+                .into_iter()
+                .filter(|volume| volume.name != super::WORKSPACE_VOLUME_NAME)
+                .map(|volume| (volume.name, volume.secret.unwrap().default_mode))
+                .collect::<Vec<_>>()
+        };
+
+        let expect = |mode| {
+            vec![
+                (super::volume_name("vars", "vars"), Some(mode)),
+                ("managed-ssh-client".to_string(), Some(mode)),
+                (super::volume_name("ssh", "ccu"), Some(mode)),
+            ]
+        };
+        assert_eq!(modes(None), expect(0o0400), "the image's default user");
+        assert_eq!(modes(Some("runAsUser: 0")), expect(0o0400));
+        assert_eq!(modes(Some("runAsNonRoot: false")), expect(0o0400));
+        assert_eq!(modes(Some("runAsUser: 1000")), expect(0o0444));
+        assert_eq!(modes(Some("runAsNonRoot: true")), expect(0o0444));
     }
 
     fn security_context(yaml: &str) -> crate::v1beta1::PlaybookSecurityContext {

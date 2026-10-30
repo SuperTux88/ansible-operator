@@ -368,7 +368,9 @@ kubectl label namespace team-a pod-security.kubernetes.io/enforce=baseline
 
 Use `restricted` where every plan in the namespace sets a compliant `securityContext`
 (`runAsNonRoot`, `allowPrivilegeEscalation: false`, dropped capabilities, `RuntimeDefault`
-seccomp). The operator namespace stays `privileged` for the proxy pods; do not create plans there.
+seccomp). Each of those plans needs an image with a non-root user of its own (see [Running as a
+non-root user](../running-playbooks/playbook-plans.md#running-as-a-non-root-user)). The operator
+namespace stays `privileged` for the proxy pods; do not create plans there.
 
 ## Network policies
 

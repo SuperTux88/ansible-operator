@@ -141,6 +141,11 @@ capabilities beyond the runtime defaults, SELinux types such as `spc_t`, unmaske
 types the `restricted` standard allows plus image volumes. Settings that make the pod stricter stay
 available.
 
+The SSH keys, `known_hosts` and secret variables the playbook reads are mounted readable by root
+only. When the plan guarantees a non-root user (`runAsUser` or `runAsNonRoot`), they are readable by
+every user in the pod instead. Only the plan's own image runs there, and a non-root user could not
+read them otherwise.
+
 That check is the operator's own and does not depend on admission. Enforcing Pod Security
 `baseline` or `restricted` on every enrolled namespace as well (`pod-security.kubernetes.io/enforce`)
 is strongly recommended, so admission backs it independently and also covers Jobs created by
