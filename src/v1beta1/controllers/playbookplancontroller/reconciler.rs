@@ -4899,7 +4899,7 @@ fn spec_input_failure(plan: &PlaybookPlan, error: &ReconcileError) -> InputFailu
 }
 
 fn invalid_playbook_summary(playbook: &str) -> String {
-    match serde_yaml::from_str::<serde_yaml::Value>(playbook) {
+    match ansible::yaml_node::parse_document(playbook) {
         Err(syntax) => match syntax.location() {
             Some(at) => format!(
                 "playbook is not valid YAML at line {} column {}",
@@ -4908,7 +4908,7 @@ fn invalid_playbook_summary(playbook: &str) -> String {
             ),
             None => "playbook is not valid YAML".to_string(),
         },
-        Ok(serde_yaml::Value::Sequence(_)) => "playbook cannot be rendered".to_string(),
+        Ok(node) if node.is_sequence() => "playbook cannot be rendered".to_string(),
         Ok(_) => "playbook is not a list of plays".to_string(),
     }
 }
@@ -11609,7 +11609,7 @@ spec:
       - hosts: all
         tasks: []
         "#;
-        let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let pp = serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap();
 
         let secrets: Vec<&str> = get_related_secrets(&pp)
             .into_iter()
@@ -11655,7 +11655,7 @@ spec:
         tasks: []
         "#
             );
-            serde_yaml::from_str::<PlaybookPlan>(&yaml).unwrap()
+            serde_saphyr::from_str::<PlaybookPlan>(&yaml).unwrap()
         };
 
         let workspace_name = workspace::workspace_secret_name("an-example", "plan-uid");
@@ -11717,7 +11717,7 @@ spec:
       - hosts: all
         tasks: []
         "#;
-        let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let pp = serde_saphyr::from_str::<PlaybookPlan>(yaml).unwrap();
         let rendered = render_secret(&pp, &[], &BTreeMap::new()).unwrap();
 
         assert!(owner_references_plan(
@@ -11823,7 +11823,7 @@ spec:
     fn a_file_entry_requires_one_recognized_volume_source_without_ignored_fields() {
         let plan_with = |yaml: &str| {
             let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
-            plan.spec.template.files = Some(vec![serde_yaml::from_str(yaml).unwrap()]);
+            plan.spec.template.files = Some(vec![serde_saphyr::from_str(yaml).unwrap()]);
             plan
         };
 
@@ -11962,19 +11962,17 @@ spec:
             misindented.summary,
             "playbook is not valid YAML at line 5 column 6"
         );
-        assert!(
-            misindented
-                .detail
-                .starts_with("spec.template.playbook is not a valid playbook: did not find"),
-            "{}",
-            misindented.detail
+        assert_eq!(
+            misindented.detail,
+            "spec.template.playbook is not a valid playbook: while parsing a block collection, \
+             did not find expected '-' indicator at line 5, column 6"
         );
 
         let single_play = failure_for("hosts: all\ntasks: []\n");
         assert_eq!(single_play.summary, "playbook is not a list of plays");
         assert_eq!(
             single_play.detail,
-            "spec.template.playbook is not a valid playbook: invalid type: map, expected a sequence"
+            "spec.template.playbook is not a valid playbook: expected sequence start at line 1, column 1"
         );
     }
 
@@ -12096,7 +12094,7 @@ spec:
     fn an_invalid_playbook_supersedes_a_run_that_has_not_launched() {
         let parse_error = || {
             ansible::RenderError::from(
-                serde_yaml::from_str::<serde_yaml::Sequence>("hosts: all").unwrap_err(),
+                ansible::yaml_node::parse_playbook("hosts: all").unwrap_err(),
             )
         };
 

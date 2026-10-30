@@ -27,21 +27,21 @@ spec:
             description: |-
               Cluster-admin-authored, **cluster-scoped** policy that caps which cluster Nodes a namespace's
               `ClusterInventory` resources may resolve.
-
+              
               `ClusterInventory` confers node-root (its managed-ssh proxy pods run with hostPID + nsenter), so
               any namespace allowed to create one could otherwise target *any* node. A `NodeAccessPolicy` maps
               a set of namespaces to a *ceiling* set of nodes; a `ClusterInventory`'s resolved nodes are
               intersected with that ceiling before any proxy infra is created.
-
+              
               # Trust model
-
+              
               The policy is cluster-scoped, so authoring one requires cluster-level RBAC (the cluster admin) —
               a different principal than the tenant who authors the namespaced `ClusterInventory`. Enforcement
               is an intersection, so it can only ever *shrink* a tenant's node set: a forged or buggy request
               can never reach a node the policy didn't grant.
-
+              
               # Fail-closed
-
+              
               A namespace with no matching policy resolves to zero allowed nodes. An empty selector (`{}`)
               matches *nothing*, not everything — to grant all nodes, match a ubiquitous label explicitly,
               e.g. `matchExpressions: [{ key: kubernetes.io/hostname, operator: Exists }]`. The effective
@@ -62,9 +62,9 @@ spec:
                         operator:
                           description: |-
                             How a `matchExpressions` term compares a label against the values it lists.
-
+                            
                             `In`, `NotIn`, `Exists` and `DoesNotExist` behave exactly as Kubernetes' own label selectors do.
-
+                            
                             `Gt`, `Ge`, `Lt` and `Le` order the label value against the term's single value **as a version**,
                             which Kubernetes itself cannot do: its own `Gt`/`Lt` parse both sides as integers, so a dotted
                             version never matches, and plain string ordering would sort 1.10.0 before 1.9.0. An optional
@@ -115,9 +115,9 @@ spec:
                         operator:
                           description: |-
                             How a `matchExpressions` term compares a label against the values it lists.
-
+                            
                             `In`, `NotIn`, `Exists` and `DoesNotExist` behave exactly as Kubernetes' own label selectors do.
-
+                            
                             `Gt`, `Ge`, `Lt` and `Le` order the label value against the term's single value **as a version**,
                             which Kubernetes itself cannot do: its own `Gt`/`Lt` parse both sides as integers, so a dotted
                             version never matches, and plain string ordering would sort 1.10.0 before 1.9.0. An optional

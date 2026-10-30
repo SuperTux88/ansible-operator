@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use serde_yaml::{Mapping, Value};
+use serde::{Serialize, Serializer};
 
 use crate::v1beta1::ResolvedInventoryGroup;
 
@@ -63,108 +63,121 @@ pub fn render_inventory(
     groups: &[ResolvedInventoryGroup],
     ctx: &RenderContext,
 ) -> Result<String, super::RenderError> {
-    let mut yaml_inventory = Mapping::new();
+    let inventory = groups
+        .iter()
+        .map(|group| {
+            let hosts = group.hosts();
+            let host_entries = hosts
+                .hosts
+                .iter()
+                .map(|hostname| {
+                    let vars = match group {
+                        ResolvedInventoryGroup::ManagedSsh { .. } => {
+                            render_managed_ssh_host_vars(hostname, ctx)
+                        }
+                        ResolvedInventoryGroup::Ssh {
+                            static_inventory_name,
+                            config,
+                            ..
+                        } => render_ssh_host_vars(static_inventory_name, config, ctx),
+                    };
+                    (hostname.as_str(), vars)
+                })
+                .collect();
 
-    for group in groups.iter() {
-        let hosts = group.hosts();
-        let mut host_entries = Mapping::new();
+            // Author-supplied group variables become Ansible group `vars:`. They rank below the
+            // per-host connection vars above in Ansible precedence, so they can never override the
+            // managed-ssh/SSH wiring the operator renders — reserved keys are rejected at resolve
+            // time regardless (see `first_reserved_var`).
+            let vars = group
+                .variables()
+                .and_then(|variables| variables.0.as_object())
+                .filter(|vars| !vars.is_empty());
 
-        for hostname in &hosts.hosts {
-            let vars = match group {
-                ResolvedInventoryGroup::ManagedSsh { .. } => {
-                    render_managed_ssh_host_vars(hostname, ctx)
-                }
-                ResolvedInventoryGroup::Ssh {
-                    static_inventory_name,
-                    config,
-                    ..
-                } => render_ssh_host_vars(static_inventory_name, config, ctx),
-            };
+            (
+                hosts.name.as_str(),
+                InventoryGroup {
+                    hosts: OrderedMap(host_entries),
+                    vars,
+                },
+            )
+        })
+        .collect();
 
-            host_entries.insert(Value::String(hostname.into()), Value::Mapping(vars));
-        }
-
-        let mut yaml_group = Mapping::new();
-        yaml_group.insert(Value::String("hosts".into()), Value::Mapping(host_entries));
-
-        // Author-supplied group variables become Ansible group `vars:`. They rank below the
-        // per-host connection vars above in Ansible precedence, so they can never override the
-        // managed-ssh/SSH wiring the operator renders — reserved keys are rejected at resolve time
-        // regardless (see `first_reserved_var`).
-        if let Some(variables) = group.variables()
-            && let Value::Mapping(vars) = serde_yaml::to_value(&variables.0)?
-            && !vars.is_empty()
-        {
-            yaml_group.insert(Value::String("vars".into()), Value::Mapping(vars));
-        }
-
-        yaml_inventory.insert(
-            Value::String(hosts.name.to_owned()),
-            Value::Mapping(yaml_group),
-        );
-    }
-
-    Ok(serde_yaml::to_string(&yaml_inventory)?)
+    Ok(super::yaml_node::to_string(&OrderedMap(inventory))?)
 }
 
-fn render_managed_ssh_host_vars(hostname: &str, ctx: &RenderContext) -> Mapping {
-    let mut vars = Mapping::new();
+#[derive(Serialize)]
+struct InventoryGroup<'a> {
+    hosts: OrderedMap<'a, HostVars>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vars: Option<&'a serde_json::Map<String, serde_json::Value>>,
+}
 
-    if let Some(ManagedSshHostInfo::Proxy { pod_ip, port }) = ctx.managed_ssh_hosts.get(hostname) {
-        vars.insert(
-            Value::String("ansible_host".into()),
-            Value::String(pod_ip.clone()),
-        );
-        vars.insert(
-            Value::String("ansible_port".into()),
-            Value::Number((*port).into()),
-        );
+#[derive(Serialize, Default)]
+struct HostVars {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ansible_host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ansible_port: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ansible_user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ansible_ssh_private_key_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ansible_ssh_common_args: Option<String>,
+}
+
+/// A mapping that keeps its entries in the order given: Ansible lists hosts in inventory order,
+/// and that order decides which hosts share a `serial` batch.
+struct OrderedMap<'a, V>(Vec<(&'a str, V)>);
+
+impl<V: Serialize> Serialize for OrderedMap<'_, V> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().map(|(key, value)| (key, value)))
     }
+}
 
-    vars.insert(
-        Value::String("ansible_ssh_private_key_file".into()),
-        Value::String(ctx.managed_ssh_client_key_path.to_string()),
-    );
-    // ansible_host is the proxy pod's IP, but the host cert's principal (and the wildcard
-    // @cert-authority known_hosts line) is the node's name — without HostKeyAlias, the SSH
-    // client checks the cert/known_hosts entry against the dialed IP, not the node name, and
-    // rejects with "Certificate invalid: name is not a listed principal" even though everything
-    // else is correctly signed.
-    vars.insert(
-        Value::String("ansible_ssh_common_args".into()),
-        Value::String(format!(
+fn render_managed_ssh_host_vars(hostname: &str, ctx: &RenderContext) -> HostVars {
+    let (ansible_host, ansible_port) = match ctx.managed_ssh_hosts.get(hostname) {
+        Some(ManagedSshHostInfo::Proxy { pod_ip, port }) => (Some(pod_ip.clone()), Some(*port)),
+        _ => (None, None),
+    };
+
+    HostVars {
+        ansible_host,
+        ansible_port,
+        ansible_ssh_private_key_file: Some(ctx.managed_ssh_client_key_path.to_string()),
+        // ansible_host is the proxy pod's IP, but the host cert's principal (and the wildcard
+        // @cert-authority known_hosts line) is the node's name — without HostKeyAlias, the SSH
+        // client checks the cert/known_hosts entry against the dialed IP, not the node name, and
+        // rejects with "Certificate invalid: name is not a listed principal" even though
+        // everything else is correctly signed.
+        ansible_ssh_common_args: Some(format!(
             "-o UserKnownHostsFile={} -o HostKeyAlias={hostname} {DEAD_HOST_SSH_ARGS}",
             ctx.managed_ssh_known_hosts_path
         )),
-    );
-
-    vars
+        ..Default::default()
+    }
 }
 
 fn render_ssh_host_vars(
     static_inventory_name: &str,
     config: &crate::v1beta1::SshConfig,
     ctx: &RenderContext,
-) -> Mapping {
-    let mut vars = Mapping::new();
-    vars.insert(
-        Value::String("ansible_user".into()),
-        Value::String(config.user.clone()),
-    );
+) -> HostVars {
+    let mut vars = HostVars {
+        ansible_user: Some(config.user.clone()),
+        ..Default::default()
+    };
 
     if let Some((key_path, known_hosts_path)) =
         ctx.ssh_paths_by_static_inventory.get(static_inventory_name)
     {
-        vars.insert(
-            Value::String("ansible_ssh_private_key_file".into()),
-            Value::String(key_path.clone()),
-        );
-        vars.insert(
-            Value::String("ansible_ssh_common_args".into()),
-            Value::String(format!(
-                "-o UserKnownHostsFile={known_hosts_path} {DEAD_HOST_SSH_ARGS}"
-            )),
-        );
+        vars.ansible_ssh_private_key_file = Some(key_path.clone());
+        vars.ansible_ssh_common_args = Some(format!(
+            "-o UserKnownHostsFile={known_hosts_path} {DEAD_HOST_SSH_ARGS}"
+        ));
     }
 
     vars
@@ -206,7 +219,7 @@ mod tests {
 
         let rendered = render_inventory(&[group], &ctx).unwrap();
 
-        assert!(rendered.contains("ansible_host: 10.0.0.5"));
+        assert!(rendered.contains("ansible_host: \"10.0.0.5\""));
         assert!(rendered.contains("ansible_port: 22"));
         assert!(rendered.contains("client_key"));
         // The host cert's principal is the node name, not the proxy pod IP dialed via
@@ -256,7 +269,7 @@ mod tests {
         assert!(rendered.contains("-o HostKeyAlias=worker-9"));
         // The only address in the rendering belongs to the host that has one.
         assert_eq!(rendered.matches("ansible_host").count(), 1);
-        assert!(rendered.contains("ansible_host: 10.0.0.5"));
+        assert!(rendered.contains("ansible_host: \"10.0.0.5\""));
     }
 
     #[test]
@@ -388,6 +401,85 @@ mod tests {
         assert!(rendered.contains("ansible_python_interpreter: /usr/bin/python3.11"));
     }
 
+    /// Ansible reads the inventory as YAML 1.1, where a plain `yes`, `on`, `no` or `off` is a
+    /// boolean. A string the author set has to reach the playbook as that string — a template
+    /// writing `permit_root_login` into `sshd_config` must not see `False`.
+    #[test]
+    fn string_variables_stay_strings_for_a_yaml_1_1_reader() {
+        let group = ResolvedInventoryGroup::ManagedSsh {
+            hosts: ResolvedHosts {
+                name: "controlplanes".into(),
+                hosts: vec!["worker-1".into()],
+                ..Default::default()
+            },
+            tolerations: None,
+            variables: Some(GenericMap(serde_json::json!({
+                "a_yes": "yes",
+                "b_on": "on",
+                "c_no": "no",
+                "d_off": "off",
+                "e_bool": true,
+            }))),
+        };
+
+        let managed_ssh_hosts = BTreeMap::new();
+        let ssh_paths = BTreeMap::new();
+        let ctx = RenderContext {
+            managed_ssh_hosts: &managed_ssh_hosts,
+            managed_ssh_client_key_path: "/run/ansible-operator/managed-ssh/client_key",
+            managed_ssh_known_hosts_path: "/run/ansible-operator/managed-ssh/known_hosts",
+            ssh_paths_by_static_inventory: &ssh_paths,
+        };
+
+        let rendered = render_inventory(&[group], &ctx).unwrap();
+
+        assert!(
+            rendered.contains(
+                "a_yes: \"yes\"\n    b_on: \"on\"\n    c_no: \"no\"\n    d_off: \"off\"\n    e_bool: true\n"
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// Ansible lists a group's hosts in inventory order, which decides the `serial` batches, so
+    /// groups and hosts render in the order they were resolved rather than sorted.
+    #[test]
+    fn groups_and_hosts_keep_their_resolved_order() {
+        let group = |name: &str, hosts: &[&str]| ResolvedInventoryGroup::ManagedSsh {
+            hosts: ResolvedHosts {
+                name: name.into(),
+                hosts: hosts.iter().map(|host| host.to_string()).collect(),
+                ..Default::default()
+            },
+            tolerations: None,
+            variables: None,
+        };
+
+        let managed_ssh_hosts = BTreeMap::new();
+        let ssh_paths = BTreeMap::new();
+        let ctx = RenderContext {
+            managed_ssh_hosts: &managed_ssh_hosts,
+            managed_ssh_client_key_path: "/run/ansible-operator/managed-ssh/client_key",
+            managed_ssh_known_hosts_path: "/run/ansible-operator/managed-ssh/known_hosts",
+            ssh_paths_by_static_inventory: &ssh_paths,
+        };
+
+        let rendered = render_inventory(
+            &[
+                group("workers", &["worker-2", "worker-1"]),
+                group("controlplanes", &["cp-1"]),
+            ],
+            &ctx,
+        )
+        .unwrap();
+
+        let positions: Vec<usize> = ["workers:", "worker-2:", "worker-1:", "controlplanes:"]
+            .iter()
+            .map(|needle| rendered.find(needle).expect(needle))
+            .collect();
+        assert!(positions.is_sorted(), "{rendered}");
+    }
+
     /// The other half of the rule `execution_evaluator::renders_group_vars` mirrors: an empty
     /// `variables` map renders exactly what an absent one does. The hash skips such a group on the
     /// strength of that, so if this ever started emitting an empty `vars:` block the two would
@@ -480,21 +572,20 @@ mod tests {
         };
 
         let rendered = render_inventory(&[managed, ssh], &ctx).unwrap();
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+        let parsed: serde_json::Value = serde_saphyr::from_str(&rendered).unwrap();
 
-        for (_group, body) in parsed.as_mapping().expect("inventory is a mapping") {
-            let Some(hosts) = body.get("hosts").and_then(|h| h.as_mapping()) else {
+        for (_group, body) in parsed.as_object().expect("inventory is a mapping") {
+            let Some(hosts) = body.get("hosts").and_then(|h| h.as_object()) else {
                 continue;
             };
             for (_host, host_vars) in hosts {
-                let Some(host_vars) = host_vars.as_mapping() else {
+                let Some(host_vars) = host_vars.as_object() else {
                     continue;
                 };
-                for (key, _) in host_vars {
-                    let key = key.as_str().expect("var key is a string");
+                for key in host_vars.keys() {
                     if key.starts_with("ansible_") {
                         assert!(
-                            RESERVED_HOST_VARS.contains(&key),
+                            RESERVED_HOST_VARS.contains(&key.as_str()),
                             "operator emits `{key}` as a host var but it is missing from RESERVED_HOST_VARS"
                         );
                     }

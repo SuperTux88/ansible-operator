@@ -1,5 +1,6 @@
-use serde_yaml::{Mapping, Sequence, Value};
+use serde::Serialize;
 
+use super::yaml_node::{self, YamlNode};
 use crate::v1beta1;
 
 /// Name of the task whose per-host results tell the operator which hosts reached the end of the
@@ -25,9 +26,40 @@ pub const COMPLETION_MARKER_TASK: &str = "__ansible_operator_play_completed";
 const COMPLETION_MARKER_PLAY: &str = "__ansible_operator_completion_marker";
 
 pub fn render_playbook(spec: &v1beta1::PlaybookPlanSpec) -> Result<String, super::RenderError> {
-    let mut plays: Sequence = serde_yaml::from_str(&spec.template.playbook)?;
-    plays.push(completion_marker_play());
-    Ok(serde_yaml::to_string(&plays)?)
+    let authored = yaml_node::parse_playbook(&spec.template.playbook)?;
+    let plays: Vec<RenderedPlay> = authored
+        .into_iter()
+        .map(RenderedPlay::Authored)
+        .chain([RenderedPlay::CompletionMarker(completion_marker_play())])
+        .collect();
+    Ok(yaml_node::to_string(&plays)?)
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum RenderedPlay {
+    Authored(YamlNode),
+    CompletionMarker(CompletionMarkerPlay),
+}
+
+#[derive(Serialize)]
+struct CompletionMarkerPlay {
+    name: &'static str,
+    hosts: &'static str,
+    gather_facts: bool,
+    tasks: [CompletionMarkerTask; 1],
+}
+
+#[derive(Serialize)]
+struct CompletionMarkerTask {
+    name: &'static str,
+    #[serde(rename = "ansible.builtin.debug")]
+    debug: DebugArgs,
+}
+
+#[derive(Serialize)]
+struct DebugArgs {
+    msg: &'static str,
 }
 
 /// The appended play, targeting `all` so it reports on every host the run still has.
@@ -56,40 +88,29 @@ pub fn render_playbook(spec: &v1beta1::PlaybookPlanSpec) -> Result<String, super
 /// marker is the safer of two wrong answers, because it fails loudly and never claims convergence
 /// it does not have. (Note `--skip-tags always` would defeat the tag anyway, so it was never
 /// absolute protection.)
-fn completion_marker_play() -> Value {
-    let mut task = Mapping::new();
-    task.insert(
-        Value::String("name".into()),
-        Value::String(COMPLETION_MARKER_TASK.into()),
-    );
-    let mut debug_args = Mapping::new();
-    debug_args.insert(
-        Value::String("msg".into()),
-        Value::String("ansible-operator completion marker".into()),
-    );
-    task.insert(
-        Value::String("ansible.builtin.debug".into()),
-        Value::Mapping(debug_args),
-    );
-
-    let mut play = Mapping::new();
-    play.insert(
-        Value::String("name".into()),
-        Value::String(COMPLETION_MARKER_PLAY.into()),
-    );
-    play.insert(Value::String("hosts".into()), Value::String("all".into()));
-    play.insert(Value::String("gather_facts".into()), Value::Bool(false));
-    play.insert(
-        Value::String("tasks".into()),
-        Value::Sequence(vec![Value::Mapping(task)]),
-    );
-
-    Value::Mapping(play)
+fn completion_marker_play() -> CompletionMarkerPlay {
+    CompletionMarkerPlay {
+        name: COMPLETION_MARKER_PLAY,
+        hosts: "all",
+        gather_facts: false,
+        tasks: [CompletionMarkerTask {
+            name: COMPLETION_MARKER_TASK,
+            debug: DebugArgs {
+                msg: "ansible-operator completion marker",
+            },
+        }],
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
+
+    fn plays_of(rendered: &str) -> Vec<Value> {
+        serde_saphyr::from_str(rendered).unwrap()
+    }
 
     fn spec(playbook: &str) -> v1beta1::PlaybookPlanSpec {
         let mut spec = v1beta1::PlaybookPlanSpec {
@@ -106,17 +127,19 @@ mod tests {
             "- hosts: webservers\n  tasks: []\n- hosts: dbservers\n  tasks: []\n",
         ))
         .unwrap();
-        let plays: Sequence = serde_yaml::from_str(&rendered).unwrap();
+        let plays = plays_of(&rendered);
 
         assert_eq!(plays.len(), 3);
-        assert_eq!(plays[0]["hosts"], Value::String("webservers".into()));
-        assert_eq!(plays[1]["hosts"], Value::String("dbservers".into()));
+        assert_eq!(plays[0]["hosts"], json!("webservers"));
+        assert_eq!(plays[1]["hosts"], json!("dbservers"));
         // Last, so nothing the author wrote runs after it: reaching it has to mean the playbook is
         // done with that host.
-        assert_eq!(plays[2]["hosts"], Value::String("all".into()));
+        assert_eq!(plays[2]["hosts"], json!("all"));
+        assert_eq!(plays[2]["gather_facts"], json!(false));
+        assert_eq!(plays[2]["tasks"][0]["name"], json!(COMPLETION_MARKER_TASK));
         assert_eq!(
-            plays[2]["tasks"][0]["name"],
-            Value::String(COMPLETION_MARKER_TASK.into())
+            plays[2]["tasks"][0]["ansible.builtin.debug"]["msg"],
+            json!("ansible-operator completion marker")
         );
     }
 
@@ -139,9 +162,27 @@ mod tests {
     fn the_authors_plays_are_rendered_unchanged() {
         let playbook = "- hosts: all\n  any_errors_fatal: true\n  serial: 2\n  tasks:\n    - ansible.builtin.ping:\n";
         let rendered = render_playbook(&spec(playbook)).unwrap();
-        let plays: Sequence = serde_yaml::from_str(&rendered).unwrap();
-        let original: Sequence = serde_yaml::from_str(playbook).unwrap();
 
-        assert_eq!(plays[0], original[0]);
+        assert_eq!(plays_of(&rendered)[0], plays_of(playbook)[0]);
+    }
+
+    /// Passing the plays through untouched includes what only YAML says about them: a `!vault`
+    /// value is decrypted and an `!unsafe` one kept out of Jinja only while it carries its tag, and
+    /// a string Ansible reads as a string has to stay one.
+    #[test]
+    fn the_authors_tags_and_quoting_survive_rendering() {
+        let playbook = "- hosts: all\n  vars:\n    secret: !vault |\n      $ANSIBLE_VAULT;1.1;AES256\n      6231346531\n    raw: !unsafe '{{ not_a_template }}'\n    enabled: \"yes\"\n  tasks: []\n";
+        let rendered = render_playbook(&spec(playbook)).unwrap();
+
+        assert!(
+            rendered
+                .contains("secret: !vault |\n      $ANSIBLE_VAULT;1.1;AES256\n      6231346531\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("raw: !unsafe \"{{ not_a_template }}\"\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("enabled: \"yes\"\n"), "{rendered}");
     }
 }

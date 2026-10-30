@@ -120,6 +120,13 @@ root on a cluster Node reaches it over managed SSH, through a [ClusterInventory]
 The playbook text is parsed as YAML when the plan is reconciled, so a syntactically broken playbook
 surfaces as an error early rather than as a failed Job.
 
+The operator does not run your text verbatim: it appends a play of its own that tells it which hosts
+reached the end of the playbook, and writes the result out again. It reads the playbook the way
+Ansible does, as YAML 1.1, so values keep the meaning Ansible would have given them: tags such as
+`!unsafe` and `!vault` stay attached, `"yes"` stays a string and `yes` a boolean, an unquoted `0644`
+stays the octal number 420 and `2024-01-15` a date. That includes the YAML 1.1 surprises: an
+unquoted `1:30` is the number 90 to Ansible, and stays 90. Comments are not kept.
+
 ## Referencing inventories
 
 `inventoryRefs` is a list; each entry names **exactly one** inventory by kind:

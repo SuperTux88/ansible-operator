@@ -71,9 +71,7 @@ mod tests {
     fn test_deserialize_example() {
         let policy_str = include_str!("../../../examples/v1beta1/node-access-policy.yaml");
         // The example is a multi-document stream (tenant scope + admin allow-all), so parse each.
-        let policies: Vec<NodeAccessPolicy> = serde_yaml::Deserializer::from_str(policy_str)
-            .map(|doc| NodeAccessPolicy::deserialize(doc).unwrap())
-            .collect();
+        let policies: Vec<NodeAccessPolicy> = serde_saphyr::from_multiple(policy_str).unwrap();
         assert_eq!(policies.len(), 2);
     }
 }
