@@ -122,7 +122,8 @@ Numbered entry points where an actor injects data or makes a request:
 
 1. **PlaybookPlan spec** — playbook text (→ runs as root), inventory refs, variables,
    files (`FilesSource::Other` = a Volume of an allowed type, T-ESC-10), the Job containers'
-   security context (T-ESC-10), image, schedule, tolerations, TTL. Tenant-controlled.
+   security context (T-ESC-10), image and its pull policy, schedule, tolerations, TTL.
+   Tenant-controlled.
 2. **ClusterInventory spec** — node label selectors → requested nodes. Tenant-controlled.
 3. **StaticInventory spec** — literal hostnames/IPs + SSH `SecretRef`. Tenant-controlled.
 4. **Referenced Secrets** — variable/file/SSH-key Secrets in the plan namespace.

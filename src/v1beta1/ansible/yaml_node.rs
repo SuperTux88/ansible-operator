@@ -19,6 +19,7 @@
 //! takes each untagged plain scalar's spelling from the source and resolves it the way PyYAML's
 //! resolver and `SafeConstructor` do; serde-saphyr only supplies structure, tags and spans.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::LazyLock;
 
@@ -26,23 +27,36 @@ use regex::Regex;
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_saphyr::options::NonFiniteFloatPolicy;
+use serde_saphyr::budget::Budget;
+use serde_saphyr::options::{MergeKeyPolicy, NonFiniteFloatPolicy};
 use serde_saphyr::{Location, Spanned, Tagged};
 
 /// Parses a playbook, which has to be a sequence of plays, the way Ansible reads the same text.
 pub fn parse_playbook(input: &str) -> Result<Vec<YamlNode>, serde_saphyr::Error> {
-    let mut plays: Vec<YamlNode> = parse(input)?;
+    let input = with_final_line_break(input);
+    let mut plays: Vec<YamlNode> = parse(&input)?;
     for play in &mut plays {
-        play.resolve_plain_scalars(input);
+        play.resolve_plain_scalars(&input);
     }
     Ok(plays)
 }
 
 /// Parses any YAML document the way Ansible reads the same text.
 pub fn parse_document(input: &str) -> Result<YamlNode, serde_saphyr::Error> {
-    let mut document: YamlNode = parse(input)?;
-    document.resolve_plain_scalars(input);
+    let input = with_final_line_break(input);
+    let mut document: YamlNode = parse(&input)?;
+    document.resolve_plain_scalars(&input);
     Ok(document)
+}
+
+/// A block scalar's span ends in its final line break, which is what tells it from a plain scalar
+/// in [`plain_spelling`], so the last one needs a line break to end in.
+fn with_final_line_break(input: &str) -> Cow<'_, str> {
+    if input.ends_with('\n') {
+        Cow::Borrowed(input)
+    } else {
+        Cow::Owned(format!("{input}\n"))
+    }
 }
 
 /// Not public on its own: the plain scalars of a tree parsed here carry serde-saphyr's types until
@@ -52,15 +66,25 @@ fn parse<'de, T: Deserialize<'de>>(input: &'de str) -> Result<T, serde_saphyr::E
     // `.inf` and `.nan` are ordinary YAML 1.1 floats; the default rejects them for any target that
     // does not ask for a float by type, which a generic tree never does.
     options.non_finite_float_policy = NonFiniteFloatPolicy::PassThrough;
+    // PyYAML applies merge keys once every key is resolved and puts the merged ones first, which
+    // expanding them here would not match, so they are left for it: see `resolve_plain`.
+    options.merge_keys = MergeKeyPolicy::AsOrdinary;
+    // `!!binary` text is written back as it was read, so it has to stay base64.
+    options.ignore_binary_tag_for_string = true;
+    // One anchor used by a hundred tasks is an ordinary playbook. Alias bombs are stopped by the
+    // limits on nodes and replayed events, which this leaves in place.
+    let mut budget = Budget::default();
+    budget.enforce_alias_anchor_ratio = false;
+    options.budget = Some(budget);
     serde_saphyr::from_str_with_options(input, options)
 }
 
 /// What PyYAML reads from a plain scalar.
 enum Resolved {
     Value(Content),
-    /// A value [`Content`] cannot hold: a date or date-time, or a number beyond 64 bits. It is
-    /// written back as its spelling with this tag: serde-saphyr quotes such a string, and the tag
-    /// makes PyYAML construct the value from it all the same.
+    /// A value [`Content`] cannot hold: a date or date-time, a number beyond 64 bits or a merge key.
+    /// It is written back as its spelling with this tag: serde-saphyr quotes such a string, and the
+    /// tag makes PyYAML construct the value from it all the same.
     Tagged(&'static str),
     String,
 }
@@ -97,6 +121,8 @@ fn resolve_plain(spelling: &str) -> Resolved {
         })
     } else if INT.is_match(spelling) {
         yaml_1_1_int(spelling).map_or(Resolved::Tagged("tag:yaml.org,2002:int"), Resolved::Value)
+    } else if spelling == "<<" {
+        Resolved::Tagged("tag:yaml.org,2002:merge")
     } else if NULL.is_match(spelling) {
         Resolved::Value(Content::Null)
     } else if TIMESTAMP.is_match(spelling) {
@@ -170,47 +196,30 @@ fn yaml_1_1_float(spelling: &str) -> Option<f64> {
     Some(if negative { -magnitude } else { magnitude })
 }
 
-/// The text of a plain scalar as written in `source`, or `None` for a quoted or block scalar.
+/// The text of a scalar as written in `source`.
 ///
 /// The span of a quoted scalar includes its quotes, and that of a block scalar its final line break,
-/// so neither matches a bare spelling. The exception is a block scalar that ends the input without
-/// a line break, which is why a value directly under a `|` or `>` header is ruled out explicitly.
+/// so neither matches a bare spelling.
 fn plain_spelling(source: &str, at: Location) -> Option<&str> {
     let span = at.span();
     let start = usize::try_from(span.byte_offset()?).ok()?;
     let end = start + usize::try_from(span.byte_len()?).ok()?;
-    let spelling = source.get(start..end)?;
-
-    let before = source[..start].trim_end_matches([' ', '\t']);
-    if let Some(previous_lines) = before.strip_suffix('\n') {
-        let previous_line = previous_lines.trim_end_matches('\r');
-        let previous_line = previous_line.rsplit('\n').next().unwrap_or(previous_line);
-        let header = previous_line
-            .split(" #")
-            .next()
-            .unwrap_or_default()
-            .trim_end();
-        let indicator = header.rsplit([' ', '\t']).next().unwrap_or(header);
-        if let Some(modifiers) = indicator.strip_prefix(['|', '>'])
-            && modifiers
-                .chars()
-                .all(|c| matches!(c, '1'..='9' | '+' | '-'))
-        {
-            return None;
-        }
-    }
-
-    Some(spelling)
+    source.get(start..end)
 }
 
 /// Writes `value` as YAML for Ansible to read.
 ///
 /// A long single-line string stays on one line instead of being folded at 80 characters: folding
 /// does not change its value, but these files are what someone reads when a run misbehaves, and an
-/// SSH argument list wrapped mid-way is easy to misread and impossible to grep for.
+/// SSH argument list wrapped mid-way is easy to misread and impossible to grep for. A multi-line
+/// string is double-quoted.
 pub fn to_string<T: Serialize>(value: &T) -> Result<String, serde_saphyr::SerializeError> {
     let mut options = serde_saphyr::SerializerOptions::default();
     options.folded_wrap_chars = usize::MAX;
+    // Workaround: serde-saphyr writes no indentation indicator for a block scalar whose first line
+    // starts with a tab, and libyaml, which Ansible reads through, refuses that. Worth removing
+    // once serde-saphyr writes one: `|` blocks are easier to read in a rendered file.
+    options.prefer_block_scalars = false;
     serde_saphyr::to_string_with_options(value, options)
 }
 
@@ -224,7 +233,8 @@ impl YamlNode {
         matches!(self.0.0.value, Content::Sequence(_))
     }
 
-    /// Gives every untagged plain scalar the type and value PyYAML gives its spelling.
+    /// Gives every untagged plain scalar the type and value PyYAML gives its spelling, and every
+    /// tagged one its spelling, from which whatever the tag names builds its value.
     ///
     /// `defined` rather than `referenced`, so an alias reads the spelling of its anchor, not `*name`.
     fn resolve_plain_scalars(&mut self, source: &str) {
@@ -242,11 +252,20 @@ impl YamlNode {
                     value.resolve_plain_scalars(source);
                 }
             }
-            scalar if tag.is_none() => {
+            scalar => {
                 let Some(spelling) = plain_spelling(source, defined) else {
                     return;
                 };
-                match resolve_plain(spelling) {
+                // An empty block scalar has an empty span, like an empty plain scalar.
+                if spelling.is_empty() && matches!(scalar, Content::String(_)) {
+                    return;
+                }
+                let resolved = if tag.is_some() {
+                    Resolved::String
+                } else {
+                    resolve_plain(spelling)
+                };
+                match resolved {
                     Resolved::Value(value) => *scalar = value,
                     Resolved::Tagged(resolved_tag) => {
                         *tag = Some(resolved_tag.to_owned());
@@ -262,7 +281,6 @@ impl YamlNode {
                     Resolved::String => {}
                 }
             }
-            _ => {}
         }
     }
 }
@@ -390,7 +408,7 @@ mod tests {
         );
 
         assert!(
-            rendered.contains("secret: !vault |\n  $ANSIBLE_VAULT;1.1;AES256\n  6231346531\n"),
+            rendered.contains("secret: !vault \"$ANSIBLE_VAULT;1.1;AES256\\n6231346531\\n\"\n"),
             "{rendered}"
         );
         assert!(
@@ -405,15 +423,24 @@ mod tests {
     }
 
     #[test]
-    fn long_strings_stay_on_one_line_and_multi_line_ones_stay_literal() {
+    fn long_strings_stay_on_one_line_and_multi_line_ones_are_quoted() {
         let long = "x ".repeat(60);
         let rendered = to_string(&serde_json::json!({ "long": long, "multi": "a\nb\n" })).unwrap();
 
         assert_eq!(
             rendered,
-            format!("long: \"{long}\"\nmulti: |\n  a\n  b\n"),
+            format!("long: \"{long}\"\nmulti: \"a\\nb\\n\"\n"),
             "{rendered}"
         );
+    }
+
+    /// libyaml refuses a `|` block whose first line starts with a tab. serde-saphyr's own reader
+    /// accepts it, so only the rendered text can show this.
+    #[test]
+    fn a_multi_line_string_starting_with_a_tab_is_not_a_block_scalar() {
+        let rendered = to_string(&serde_json::json!({ "v": "\tfoo\nbar\n" })).unwrap();
+
+        assert_eq!(rendered, "v: \"\\tfoo\\nbar\\n\"\n");
     }
 
     /// Each pair is what Ansible reads from the left-hand text and the spelling that keeps that
@@ -523,8 +550,25 @@ mod tests {
         );
     }
 
-    /// A block scalar is never a boolean, even when it ends the input without a line break, which
-    /// leaves its source text indistinguishable from a bare `yes`.
+    /// A spelling is cut from the source by byte offset, so whatever comes before it has to count
+    /// in bytes, not characters: a wrong slice would quietly leave serde-saphyr's own reading.
+    #[test]
+    fn spellings_are_found_after_non_ascii_text_line_endings_and_a_bom() {
+        for yaml in [
+            "ä: ü\nb: yes\nc: 0644\n",
+            "b: yes\r\nc: 0644\r\n",
+            "\u{feff}b: yes\nc: 0644\n",
+        ] {
+            let rendered = round_trip(yaml);
+
+            assert!(
+                rendered.ends_with("b: true\nc: 420\n"),
+                "{yaml:?}: {rendered}"
+            );
+        }
+    }
+
+    /// A block scalar is never a boolean, even when it ends the input without a line break.
     #[test]
     fn a_block_scalar_stays_a_string() {
         for yaml in [
@@ -536,6 +580,67 @@ mod tests {
             assert_eq!(round_trip(yaml), "a: \"yes\"\n", "{yaml:?}");
         }
         assert_eq!(round_trip("a:\n  yes"), "a: true\n");
+    }
+
+    #[test]
+    fn a_tagged_plain_scalar_keeps_its_spelling() {
+        let rendered = round_trip(
+            "a: !unsafe 1.10\nb: !unsafe 0644\nc: !unsafe yes\nd: !unsafe ~\ne: !unsafe\n\
+             !unsafe y: f\n",
+        );
+
+        assert_eq!(
+            rendered,
+            "a: !unsafe \"1.10\"\nb: !unsafe \"0644\"\nc: !unsafe \"yes\"\nd: !unsafe \"~\"\n\
+             e: !unsafe \"\"\n? !unsafe \"y\"\n: f\n"
+        );
+    }
+
+    /// Only a real block scalar is exempt: these lines merely end in what looks like its header.
+    #[test]
+    fn a_line_ending_in_a_block_indicator_hides_nothing() {
+        assert_eq!(round_trip("# a |\ny: 1\n"), "\"y\": 1\n");
+        assert_eq!(round_trip("a: b >\nn: 1\n"), "a: b >\n\"n\": 1\n");
+    }
+
+    #[test]
+    fn an_empty_block_scalar_stays_a_string() {
+        assert_eq!(round_trip("a: |\nb: 1\n"), "a: \"\"\nb: 1\n");
+        assert!(!round_trip("a: |+\n\nb: 1\n").contains("null"));
+    }
+
+    /// Merging is left to PyYAML, which puts merged keys first and lets an explicit key win over
+    /// one that only equals it once both are resolved. A quoted `<<` is an ordinary key.
+    #[test]
+    fn a_merge_key_stays_a_merge_key_and_a_quoted_one_does_not() {
+        assert_eq!(
+            round_trip("d: &d {yes: 1}\nm:\n  <<: *d\n  true: 2\n"),
+            "d:\n  true: 1\nm:\n  ? !<tag:yaml.org,2002:merge> \"<<\"\n  : true: 1\n  true: 2\n"
+        );
+        assert_eq!(round_trip("'<<': 1\n"), "\"<<\": 1\n");
+    }
+
+    #[test]
+    fn binary_text_stays_as_it_was_written() {
+        assert_eq!(
+            round_trip("a: !!binary aGVsbG8=\n"),
+            "a: !<tag:yaml.org,2002:binary> aGVsbG8=\n"
+        );
+    }
+
+    #[test]
+    fn an_anchor_can_be_used_many_times_but_aliases_cannot_explode() {
+        let reused: String = std::iter::once("c: &c 1\n".to_owned())
+            .chain((0..150).map(|index| format!("k{index}: *c\n")))
+            .collect();
+        assert!(parse_document(&reused).is_ok());
+
+        let mut bomb = "a: &a [x, x, x, x, x, x, x, x, x]\n".to_owned();
+        for (previous, name) in "abcdefgh".chars().zip("bcdefghi".chars()) {
+            let aliases = vec![format!("*{previous}"); 9].join(", ");
+            bomb.push_str(&format!("{name}: &{name} [{aliases}]\n"));
+        }
+        assert!(parse_document(&bomb).is_err());
     }
 
     #[test]

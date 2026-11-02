@@ -175,8 +175,7 @@ mod tests {
         let rendered = render_playbook(&spec(playbook)).unwrap();
 
         assert!(
-            rendered
-                .contains("secret: !vault |\n      $ANSIBLE_VAULT;1.1;AES256\n      6231346531\n"),
+            rendered.contains("secret: !vault \"$ANSIBLE_VAULT;1.1;AES256\\n6231346531\\n\"\n"),
             "{rendered}"
         );
         assert!(
