@@ -77,6 +77,15 @@ pub struct PlaybookPlanSpec {
     /// An OCI image with Ansible and all required collections
     pub image: String,
 
+    /// When the kubelet pulls `image`: `Always`, `IfNotPresent` or `Never`, with the meaning they
+    /// have on any container. Applied to every container of the run. When unset, Kubernetes picks:
+    /// `Always` for a `:latest` or untagged image, otherwise `IfNotPresent`. Not part of the
+    /// execution hash, so changing it does not re-run the playbook on already-current hosts.
+    // Left out when unset: the spec is serialized into `preparationFingerprint`, and a `null` here
+    // would abandon every unlaunched run the moment an operator with this field starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_pull_policy: Option<ImagePullPolicy>,
+
     /// Container security context applied to both the Ansible playbook container and the optional
     /// collection-installer init container. Optional for compatibility with arbitrary execution
     /// images; cluster admission policies may require particular fields. Values the baseline Pod
@@ -336,6 +345,24 @@ pub enum ExecutionMode {
     #[default]
     OneShot,
     Recurring,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+pub enum ImagePullPolicy {
+    Always,
+    IfNotPresent,
+    Never,
+}
+
+impl From<&ImagePullPolicy> for String {
+    fn from(value: &ImagePullPolicy) -> Self {
+        match value {
+            ImagePullPolicy::Always => "Always",
+            ImagePullPolicy::IfNotPresent => "IfNotPresent",
+            ImagePullPolicy::Never => "Never",
+        }
+        .into()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
@@ -955,6 +982,7 @@ mod tests {
             "blubb",
             PlaybookPlanSpec {
                 image: "registry.tld/ansible:1.0.0".to_string(),
+                image_pull_policy: None,
                 security_context: None,
                 service_account_name: None,
                 verbosity: None,
