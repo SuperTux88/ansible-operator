@@ -63,11 +63,11 @@ where
 {
     let kind = M::kind(&M::DynamicType::default()).to_string();
 
-    // The delay `Controller::watches` would supply, and the restart that makes a failure cost one
-    // error instead of a dozen — both are `restarting_watcher`'s, and a bare `watcher` has neither:
-    // it re-lists on the very next poll after an error, and the retry that made that acceptable
-    // belongs to the controller (`Controller::run` wraps its trigger streams in `StreamBackoff`,
-    // which only ever sees the errors that reach it as stream items).
+    // The delay `Controller::watches` would supply, and the restart that drops a failed response
+    // and its stale `resourceVersion` — both are `restarting_watcher`'s, and a bare `watcher` has
+    // neither: it re-lists on the very next poll after an error, and the retry that made that
+    // acceptable belongs to the controller (`Controller::run` wraps its trigger streams in
+    // `StreamBackoff`, which only ever sees the errors that reach it as stream items).
     restarting_watcher(api, watcher::Config::default())
         .scan(TrackedLabels::default(), move |tracked, event| {
             let tick = match event {
