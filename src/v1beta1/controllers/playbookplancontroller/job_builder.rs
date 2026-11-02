@@ -545,6 +545,7 @@ fn create_job_skeleton(
         let collections_installer = kcore::v1::Container {
             name: "download-collections".into(),
             image: Some(plan.spec.image.clone()),
+            image_pull_policy: plan.spec.image_pull_policy.as_ref().map(Into::into),
             working_dir: Some(paths::WORKSPACE_MOUNT_PATH.into()),
             volume_mounts: Some(volume_mounts.clone()),
             command: Some(vec![
@@ -563,6 +564,7 @@ fn create_job_skeleton(
     let main_container = kcore::v1::Container {
         name: ANSIBLE_CONTAINER_NAME.into(),
         image: Some(plan.spec.image.clone()),
+        image_pull_policy: plan.spec.image_pull_policy.as_ref().map(Into::into),
         working_dir: Some(paths::WORKSPACE_MOUNT_PATH.into()),
         volume_mounts: Some(volume_mounts),
         command: Some(render_ansible_command(plan, variable_secrets)),
@@ -813,6 +815,7 @@ fn configure_job_for_managed_ssh_preflight(job: &mut Job, plan: &v1beta1::Playbo
                     .push(kcore::v1::Container {
                         name: MANAGED_SSH_PREFLIGHT_CONTAINER_NAME.into(),
                         image: Some(plan.spec.image.clone()),
+                        image_pull_policy: plan.spec.image_pull_policy.as_ref().map(Into::into),
                         working_dir: Some(paths::WORKSPACE_MOUNT_PATH.into()),
                         // The plan's own image is the one already being pulled for this run, and
                         // ansible-core *is* Python, so the gate needs no second image to mirror and no
@@ -1879,6 +1882,49 @@ spec:
                     .as_str()
             )
         );
+    }
+
+    /// The kubelet applies a pull policy per container, and an init container pulls first: one left
+    /// out here would still pull an image the plan said `Never` to, and `Always` would not refresh
+    /// the image that container runs.
+    #[test]
+    fn the_image_pull_policy_reaches_every_container_that_runs_the_plan_image() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+        use crate::v1beta1::{ResolvedHosts, ResolvedInventoryGroup};
+
+        let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
+        let groups = vec![ResolvedInventoryGroup::ManagedSsh {
+            hosts: ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["node-a".into()],
+                ..Default::default()
+            },
+            tolerations: None,
+            variables: None,
+        }];
+        let policies = |pp: &PlaybookPlan| {
+            let job = super::create_job_blueprint(&hash, 1, "run-1", &groups, pp, TEST_DEADLINES)
+                .unwrap();
+            let pod_spec = job.spec.unwrap().template.spec.unwrap();
+            pod_spec
+                .init_containers
+                .into_iter()
+                .flatten()
+                .chain(pod_spec.containers)
+                .map(|container| container.image_pull_policy)
+                .collect::<Vec<_>>()
+        };
+
+        let mut pp = minimal_plan();
+        pp.spec.template.requirements = Some("collections: []".into());
+        assert_eq!(
+            policies(&pp),
+            vec![None; 3],
+            "unset must leave the choice to Kubernetes"
+        );
+
+        pp.spec.image_pull_policy = Some(crate::v1beta1::ImagePullPolicy::Always);
+        assert_eq!(policies(&pp), vec![Some("Always".to_string()); 3]);
     }
 
     /// A run with no managed-ssh targets has no proxy pods to wait for, so it must not pay for the

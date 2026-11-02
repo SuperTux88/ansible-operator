@@ -16,6 +16,7 @@ validation rules, the operator refuses the plan instead and says so in `.status.
 | Field | Required | Meaning |
 |---|---|---|
 | `image` | yes | An OCI image that has `ansible-playbook` on `PATH`, `python3` on `PATH`, and every collection your playbook uses. The Job runs this image. |
+| `imagePullPolicy` | no | `Always`, `IfNotPresent` or `Never`, applied to every container of the run. Unset leaves the choice to Kubernetes — see [Pulling the image](#pulling-the-image). |
 | `securityContext` | no | Container security context applied to the playbook and collection-installer containers. Privileged settings are refused — see [Choosing the image](#choosing-the-image). |
 | `serviceAccountName` | no | ServiceAccount the run's pod uses, so tasks can reach the Kubernetes API. Unset means no API token is mounted — see [Managing Kubernetes resources](#managing-kubernetes-resources). |
 | `inventoryRefs` | yes | Which inventories to target — one entry per referenced `ClusterInventory` or `StaticInventory`. |
@@ -54,6 +55,24 @@ template:
 
 Baking collections into the image is faster and more reproducible than installing them on every run;
 use `requirements` for collections you cannot or do not want to pre-bake.
+
+### Pulling the image
+
+Without `imagePullPolicy`, Kubernetes decides when to pull: on every start for a `:latest` or untagged
+image, otherwise only when the node does not have the image yet. Set the field when that is not what
+you want, for instance when you keep pushing to a tag other than `latest`:
+
+```yaml
+spec:
+  image: registry.example.com/ansible-core:stable
+  imagePullPolicy: Always
+```
+
+The policy applies to every container of the run, because they all use this image. Changing it
+affects future Jobs but does not itself cause hosts that already succeeded to run again. With `Never`
+the image has to be on the node the Job's pod lands on already. If it is not, the pod waits with
+`ErrImageNeverPull` until the run counts as [never having
+started](../cluster-operators/deployment.md#runs-whose-job-never-starts).
 
 ### `python3` must be on `PATH`
 

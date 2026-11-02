@@ -80,6 +80,19 @@ spec:
               image:
                 description: An OCI image with Ansible and all required collections
                 type: string
+              imagePullPolicy:
+                description: |-
+                  When the kubelet pulls `image`: `Always`, `IfNotPresent` or `Never`, with the meaning they
+                  have on any container. Applied to every container of the run. When unset, Kubernetes picks:
+                  `Always` for a `:latest` or untagged image, otherwise `IfNotPresent`. Not part of the
+                  execution hash, so changing it does not re-run the playbook on already-current hosts.
+                enum:
+                - Always
+                - IfNotPresent
+                - Never
+                - null
+                nullable: true
+                type: string
               inventoryRefs:
                 description: These host groups will be available in our playbook
                 items:

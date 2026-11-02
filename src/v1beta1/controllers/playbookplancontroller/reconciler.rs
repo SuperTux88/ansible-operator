@@ -8845,7 +8845,8 @@ fn annotation_value<'a>(
 mod tests {
     use super::*;
     use crate::v1beta1::{
-        PlaySpec, PlaybookPlanSpec, ResolvedHosts, SecretRef, SshConfig, Toleration,
+        ImagePullPolicy, PlaySpec, PlaybookPlanSpec, ResolvedHosts, SecretRef, SshConfig,
+        Toleration,
     };
 
     /// A dropped writer means the reflector task is gone, so the Node cache will never populate and
@@ -9504,6 +9505,24 @@ mod tests {
             preparation_fingerprint(&plan, &relabelled).unwrap(),
             "a change in the resolved node set must move the fingerprint"
         );
+    }
+
+    /// A plan that does not use the field must serialize as it did before the field existed:
+    /// otherwise upgrading the operator moves every plan's fingerprint and abandons the runs that
+    /// were waiting on their locks or proxy pods.
+    #[test]
+    fn an_unset_image_pull_policy_leaves_the_fingerprinted_spec_unchanged() {
+        let mut plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+        assert!(
+            !serde_json::to_string(&plan.spec)
+                .unwrap()
+                .contains("imagePullPolicy")
+        );
+
+        let groups = vec![managed_ssh_group("nodes", &["a"], None)];
+        let baseline = preparation_fingerprint(&plan, &groups).unwrap();
+        plan.spec.image_pull_policy = Some(ImagePullPolicy::Always);
+        assert_ne!(baseline, preparation_fingerprint(&plan, &groups).unwrap());
     }
 
     /// The fingerprint is strict on purpose, but it must not be strict about something no host can
