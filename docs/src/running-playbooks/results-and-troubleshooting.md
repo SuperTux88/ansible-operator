@@ -417,9 +417,10 @@ running, and so could not decide anything this tick:
 - **"cannot read referenced Secrets: …"** — a Secret named by `spec.template.variables` or
   `spec.template.files` could not be read. `Referenced Secret "…" does not exist` means the reference
   is wrong or the Secret was deleted; anything else is an API error to retry.
-- **"playbook is not valid YAML at line … column …" / "playbook is not a list of plays"** — the
-  playbook does not parse as YAML, or it does but is not a YAML list (a single play written as a
-  mapping, without the leading `-`). The `Ready` condition carries the parser's full message,
+- **"playbook is not valid YAML at line … column …" / "playbook is not a list of plays" /
+  "playbook has no plays"** — the playbook does not parse as YAML, or it does but is not a YAML
+  list (a single play written as a mapping, without the leading `-`), or it has no plays at all
+  (empty, only comments, `null` or `[]`), which Ansible would refuse too. The `Ready` condition carries the parser's full message,
   prefixed with `spec.template.playbook is not a valid playbook:`. Correct the playbook; a new run
   does not acquire host Leases or create managed-SSH proxy pods for this invalid spec. Only the YAML
   shape is checked here: a list whose entries are not valid plays is accepted and fails when Ansible

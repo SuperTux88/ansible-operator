@@ -165,8 +165,8 @@ spec:
   settings — those are rendered from the inventories and, for cluster nodes, the managed-SSH
   machinery. Setting them yourself conflicts with the operator.
 
-The playbook text is parsed as YAML when the plan is reconciled, so a syntactically broken playbook
-surfaces as an error early rather than as a failed Job.
+The playbook text is parsed as YAML when the plan is reconciled, so a syntactically broken playbook,
+or one without a single play, surfaces as an error early rather than as a failed Job.
 
 The operator does not run your text verbatim: it appends a play of its own that tells it which hosts
 reached the end of the playbook, and writes the result out again. It reads the playbook the way
@@ -174,6 +174,19 @@ Ansible does, as YAML 1.1, so values keep the meaning Ansible would have given t
 `!unsafe` and `!vault` stay attached, `"yes"` stays a string and `yes` a boolean, an unquoted `0644`
 stays the octal number 420 and `2024-01-15` a date. That includes the YAML 1.1 surprises: an
 unquoted `1:30` is the number 90 to Ansible, and stays 90. Comments are not kept.
+
+The operator's YAML reader is stricter than Ansible's in a few places, and the plan reports these
+as an invalid playbook with line and column before any Job starts. A mapping may not repeat a key,
+which also counts `'true'` next to `true` and a second `<<` merge key; Ansible would warn and keep
+the last one. Some explicit core tags are refused, such as `!!timestamp`, `!!int 0644` and
+`!!float 1_000.5`: write the value without the tag, which Ansible reads the same way. An alias used
+as a key needs a space before its colon (`*name : value`), a comment needs a space after a quoted
+value, and a lone `-` in a flow sequence needs quotes (`["-"]`).
+
+One value can change on the way. If the playbook text does not end in a line break, as with
+`playbook: |-`, and its last value is a `|` or `>` block without the `-` indicator, that value gains
+a final line break that Ansible would not have seen. Writing the plan's playbook with `|` instead
+of `|-` avoids it.
 
 ## Referencing inventories
 

@@ -32,9 +32,13 @@ use serde_saphyr::options::{MergeKeyPolicy, NonFiniteFloatPolicy};
 use serde_saphyr::{Location, Spanned, Tagged};
 
 /// Parses a playbook, which has to be a sequence of plays, the way Ansible reads the same text.
+///
+/// An empty or null document has no plays. That is read through `Option` because serde-saphyr
+/// itself has changed its mind about null as a sequence: 2.0 took it for an empty one, 2.1 refuses
+/// it with an end-of-input error that points past the last line.
 pub fn parse_playbook(input: &str) -> Result<Vec<YamlNode>, serde_saphyr::Error> {
     let input = with_final_line_break(input);
-    let mut plays: Vec<YamlNode> = parse(&input)?;
+    let mut plays: Vec<YamlNode> = parse::<Option<_>>(&input)?.unwrap_or_default();
     for play in &mut plays {
         play.resolve_plain_scalars(&input);
     }
@@ -271,10 +275,13 @@ impl YamlNode {
                         *tag = Some(resolved_tag.to_owned());
                         *scalar = Content::String(spelling.to_owned());
                     }
-                    // A plain scalar over several lines is folded into one, so only a single-line
-                    // one is its own spelling.
+                    // A plain scalar over several lines is folded into one, and the span of a
+                    // quoted one includes its quotes, so only a single-line plain one is its own
+                    // spelling. A plain scalar cannot start with a quote.
                     Resolved::String
-                        if !matches!(scalar, Content::String(_)) && !spelling.contains('\n') =>
+                        if !matches!(scalar, Content::String(_))
+                            && !spelling.contains('\n')
+                            && !spelling.starts_with(['"', '\'']) =>
                     {
                         *scalar = Content::String(spelling.to_owned());
                     }
@@ -593,6 +600,17 @@ mod tests {
             rendered,
             "a: !unsafe \"1.10\"\nb: !unsafe \"0644\"\nc: !unsafe \"yes\"\nd: !unsafe \"~\"\n\
              e: !unsafe \"\"\n? !unsafe \"y\"\n: f\n"
+        );
+    }
+
+    #[test]
+    fn a_tagged_quoted_scalar_does_not_keep_its_quotes() {
+        let rendered = round_trip("a: !!int \"5\"\nb: !!float '1.5'\nc: !!bool \"true\"\n");
+
+        assert_eq!(
+            rendered,
+            "a: !<tag:yaml.org,2002:int> 5\nb: !<tag:yaml.org,2002:float> 1.5\n\
+             c: !<tag:yaml.org,2002:bool> true\n"
         );
     }
 
