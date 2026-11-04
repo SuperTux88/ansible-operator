@@ -27,6 +27,11 @@ const COMPLETION_MARKER_PLAY: &str = "__ansible_operator_completion_marker";
 
 pub fn render_playbook(spec: &v1beta1::PlaybookPlanSpec) -> Result<String, super::RenderError> {
     let authored = yaml_node::parse_playbook(&spec.template.playbook)?;
+    // Ansible refuses a playbook without plays. Rendered, it would be the marker play alone: a run
+    // that reports every host as having reached the end without doing anything.
+    if authored.is_empty() {
+        return Err(super::RenderError::NoPlays);
+    }
     let plays: Vec<RenderedPlay> = authored
         .into_iter()
         .map(RenderedPlay::Authored)
@@ -154,6 +159,19 @@ mod tests {
             callback.contains(&format!("\"{COMPLETION_MARKER_TASK}\"")),
             "the callback must match the marker task by the name the renderer emits"
         );
+    }
+
+    #[test]
+    fn a_playbook_without_plays_is_refused() {
+        for playbook in ["", "\n", "~", "null", "# only a comment\n", "---\n", "[]"] {
+            assert!(
+                matches!(
+                    render_playbook(&spec(playbook)),
+                    Err(crate::v1beta1::ansible::RenderError::NoPlays)
+                ),
+                "{playbook:?}"
+            );
+        }
     }
 
     /// The author's own plays are passed through untouched — the marker is an addition, never a

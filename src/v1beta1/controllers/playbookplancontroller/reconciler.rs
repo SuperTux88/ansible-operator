@@ -4878,6 +4878,9 @@ fn api_error_summary(status: &kube::core::Status) -> String {
 /// single play written as a mapping, the commonest form of it).
 fn spec_input_failure(plan: &PlaybookPlan, error: &ReconcileError) -> InputFailure {
     let summary = match error {
+        ReconcileError::InvalidPlaybook(ansible::RenderError::NoPlays) => {
+            "playbook has no plays".to_string()
+        }
         ReconcileError::InvalidPlaybook(_) => {
             invalid_playbook_summary(&plan.spec.template.playbook)
         }
@@ -11952,6 +11955,8 @@ spec:
             "- hosts: all\n  tasks: [\n",
             // Valid YAML, but a playbook is a list of plays.
             "hosts: all\ntasks: []\n",
+            // A list, but without a single play.
+            "[]\n",
         ] {
             assert!(
                 matches!(
@@ -11993,6 +11998,16 @@ spec:
             single_play.detail,
             "spec.template.playbook is not a valid playbook: expected sequence start at line 1, column 1"
         );
+
+        for empty in ["", "~\n", "[]\n"] {
+            let no_plays = failure_for(empty);
+            assert_eq!(no_plays.summary, "playbook has no plays", "{empty:?}");
+            assert_eq!(
+                no_plays.detail,
+                "spec.template.playbook is not a valid playbook: a playbook needs at least one play",
+                "{empty:?}"
+            );
+        }
     }
 
     fn forbidden_secret() -> ReconcileError {
