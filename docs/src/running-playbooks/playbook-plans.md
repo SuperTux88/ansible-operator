@@ -165,8 +165,8 @@ spec:
   settings — those are rendered from the inventories and, for cluster nodes, the managed-SSH
   machinery. Setting them yourself conflicts with the operator.
 
-The playbook text is parsed as YAML when the plan is reconciled, so a syntactically broken playbook
-surfaces as an error early rather than as a failed Job.
+The playbook text is parsed as YAML when the plan is reconciled, so a syntactically broken playbook,
+or one without a single play, surfaces as an error early rather than as a failed Job.
 
 The operator does not run your text verbatim: it appends a play of its own that tells it which hosts
 reached the end of the playbook, and writes the result out again. It reads the playbook the way

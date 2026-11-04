@@ -5,6 +5,10 @@ pub enum RenderError {
     #[error("{}", .0.without_snippet())]
     ParseError(#[from] serde_saphyr::Error),
 
+    /// An empty or null playbook, or `[]`.
+    #[error("a playbook needs at least one play")]
+    NoPlays,
+
     #[error(transparent)]
     SerializationError(#[from] serde_saphyr::SerializeError),
 }
