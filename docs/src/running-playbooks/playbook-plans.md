@@ -16,7 +16,8 @@ validation rules, the operator refuses the plan instead and says so in `.status.
 | Field | Required | Meaning |
 |---|---|---|
 | `image` | yes | An OCI image that has `ansible-playbook` on `PATH`, `python3` on `PATH`, and every collection your playbook uses. The Job runs this image. |
-| `securityContext` | no | Container security context applied to the playbook and collection-installer containers. |
+| `imagePullPolicy` | no | `Always`, `IfNotPresent` or `Never`, applied to every container of the run. Unset leaves the choice to Kubernetes — see [Pulling the image](#pulling-the-image). |
+| `securityContext` | no | Container security context applied to the playbook and collection-installer containers. Privileged settings are refused — see [Choosing the image](#choosing-the-image). |
 | `serviceAccountName` | no | ServiceAccount the run's pod uses, so tasks can reach the Kubernetes API. Unset means no API token is mounted — see [Managing Kubernetes resources](#managing-kubernetes-resources). |
 | `inventoryRefs` | yes | Which inventories to target — one entry per referenced `ClusterInventory` or `StaticInventory`. |
 | `provides` | no | Declares what this plan makes true on the hosts it converges, so other plans can depend on it — see [Declaring what a plan provides](#declaring-what-a-plan-provides). |
@@ -54,6 +55,24 @@ template:
 
 Baking collections into the image is faster and more reproducible than installing them on every run;
 use `requirements` for collections you cannot or do not want to pre-bake.
+
+### Pulling the image
+
+Without `imagePullPolicy`, Kubernetes decides when to pull: on every start for a `:latest` or untagged
+image, otherwise only when the node does not have the image yet. Set the field when that is not what
+you want, for instance when you keep pushing to a tag other than `latest`:
+
+```yaml
+spec:
+  image: registry.example.com/ansible-core:stable
+  imagePullPolicy: Always
+```
+
+The policy applies to every container of the run, because they all use this image. Changing it
+affects future Jobs but does not itself cause hosts that already succeeded to run again. With `Never`
+the image has to be on the node the Job's pod lands on already. If it is not, the pod waits with
+`ErrImageNeverPull` until the run counts as [never having
+started](../cluster-operators/deployment.md#runs-whose-job-never-starts).
 
 ### `python3` must be on `PATH`
 
@@ -95,6 +114,44 @@ The context is applied to every container of the run: the `ansible-playbook` con
 optional `download-collections` init container, and the `managed-ssh-preflight` init container that
 plans targeting cluster Nodes get. Changing the security context affects future Jobs but does not
 itself cause hosts that already succeeded to run again.
+
+The operator creates the Job for you, so it refuses settings that would make its containers
+privileged — anything the `baseline` Pod Security Standard forbids: `privileged: true`, adding
+capabilities beyond the container runtime's defaults (`SYS_ADMIN`, `NET_ADMIN`, `ALL`, …), SELinux
+types other than `container_t` and its siblings or any SELinux `user`/`role`, `procMount:
+Unmasked`, an `Unconfined` seccomp or AppArmor profile, and Windows `hostProcess`. Such a plan
+reports `securityContext … is not allowed` and starts no run. Everything that makes the pod stricter
+stays available, and running as root inside the container remains allowed. A playbook that needs
+root on a cluster Node reaches it over managed SSH, through a [ClusterInventory](./cluster-nodes.md).
+
+### Running as a non-root user
+
+If the image runs Ansible as a non-root user, the plan has to say so. Set `runAsUser` to that user's
+uid, or `runAsNonRoot: true`. Unless one of the two guarantees a non-root user, the operator mounts
+the SSH keys, `known_hosts` and `secretRef` variables readable by root only, which is what OpenSSH
+requires of a key root reads. A non-root process then cannot read its key, and every host is reported
+unreachable. With either field set, the files are readable by every user in the pod. OpenSSH accepts
+that, because the files belong to root and not to the user running it. `runAsNonRoot: true` alone
+needs a numeric `USER` in the image, because the kubelet refuses to start a container whose
+non-numeric user it cannot check. The local user does not change who the playbook is on a cluster
+Node: managed SSH always logs in as `root`.
+
+The user must also exist in the image. OpenSSH refuses to start for a uid that has no `/etc/passwd`
+entry, and Ansible needs a writable home directory for its temporary files. So pick the uid of the
+image's own user, not an arbitrary one. This also satisfies the `restricted` Pod Security Standard:
+
+```yaml
+spec:
+  image: registry.example.com/ansible-core:2.20-user
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+    seccompProfile:
+      type: RuntimeDefault
+```
 
 ## The playbook
 

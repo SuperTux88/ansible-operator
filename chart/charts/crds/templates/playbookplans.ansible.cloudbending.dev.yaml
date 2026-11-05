@@ -80,6 +80,19 @@ spec:
               image:
                 description: An OCI image with Ansible and all required collections
                 type: string
+              imagePullPolicy:
+                description: |-
+                  When the kubelet pulls `image`: `Always`, `IfNotPresent` or `Never`, with the meaning they
+                  have on any container. Applied to every container of the run. When unset, Kubernetes picks:
+                  `Always` for a `:latest` or untagged image, otherwise `IfNotPresent`. Not part of the
+                  execution hash, so changing it does not re-run the playbook on already-current hosts.
+                enum:
+                - Always
+                - IfNotPresent
+                - Never
+                - null
+                nullable: true
+                type: string
               inventoryRefs:
                 description: These host groups will be available in our playbook
                 items:
@@ -162,7 +175,11 @@ spec:
                 description: |-
                   Container security context applied to both the Ansible playbook container and the optional
                   collection-installer init container. Optional for compatibility with arbitrary execution
-                  images; cluster admission policies may require particular fields.
+                  images; cluster admission policies may require particular fields. Values the baseline Pod
+                  Security Standard forbids (privileged, added capabilities beyond the runtime defaults, other
+                  SELinux types, unmasked procMount, Unconfined profiles, hostProcess) are refused. An image
+                  that runs as a non-root user needs runAsUser or runAsNonRoot set here: without either, the
+                  SSH keys and secret variables are mounted readable by root only.
                 nullable: true
                 properties:
                   allowPrivilegeEscalation:
@@ -304,7 +321,10 @@ spec:
                 description: The playbook will be built from this, some fields will be set automatically (vars, hosts)
                 properties:
                   files:
-                    description: Files for the playbook
+                    description: |-
+                      Files for the playbook. Each entry is a `secretRef` or one Kubernetes volume source of a
+                      type the restricted Pod Security Standard allows, or `image`; `hostPath` and other types
+                      are refused.
                     items:
                       type: object
                       x-kubernetes-preserve-unknown-fields: true

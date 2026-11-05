@@ -63,6 +63,14 @@ operator's namespace needs that label, e.g.:
 kubectl label namespace ansible-system pod-security.kubernetes.io/enforce=privileged
 ```
 
+Enrolled tenant namespaces are the opposite case. The operator itself refuses plan settings that
+would make a playbook's Job pod privileged, but enforcing `baseline` (or `restricted`) there is
+strongly recommended as an independent second layer:
+
+```sh
+kubectl label namespace team-a pod-security.kubernetes.io/enforce=baseline
+```
+
 ### SELinux-enforcing nodes
 
 Proxy pods also set `securityContext.seLinuxOptions.type: spc_t` ("super-privileged

@@ -1124,6 +1124,7 @@ async fn reconcile(
     // Job creation, where no retry can clear it and the plan wedges holding those Leases.
     if let Err(error) = validate_playbook(&object)
         .and_then(|()| validate_file_entries(&object))
+        .and_then(|()| validate_security_context(&object))
         .and_then(|()| validate_workspace_not_referenced(&object))
     {
         let reported = report_desired_input_error(
@@ -2543,9 +2544,30 @@ fn validate_file_entries(plan: &PlaybookPlan) -> Result<(), ReconcileError> {
                 "it must contain exactly one recognized Kubernetes volume source with no unrecognized fields",
             ));
         }
+        let allowed = job_builder::file_volume_type_allowed(&volume)
+            .map_err(|_| invalid("its fields cannot be encoded as a Kubernetes volume"))?;
+        if !allowed {
+            return Err(invalid(
+                "its volume type is not allowed; use secret, configMap, image, emptyDir, persistentVolumeClaim, projected, downwardAPI, csi or ephemeral",
+            ));
+        }
     }
 
     Ok(())
+}
+
+/// Refuses a `spec.securityContext` that would make the Job's containers privileged; see
+/// `job_builder::privileged_security_context_setting` for why the operator, not admission, has to.
+fn validate_security_context(plan: &PlaybookPlan) -> Result<(), ReconcileError> {
+    match plan
+        .spec
+        .security_context
+        .as_ref()
+        .and_then(job_builder::privileged_security_context_setting)
+    {
+        Some(setting) => Err(ReconcileError::PrivilegedSecurityContext { setting }),
+        None => Ok(()),
+    }
 }
 
 /// Whether the plan has work a run could start this tick, from the mode, whether a schedule is set,
@@ -4862,6 +4884,9 @@ fn spec_input_failure(plan: &PlaybookPlan, error: &ReconcileError) -> InputFailu
         ReconcileError::InvalidFileEntry { name, .. } => {
             format!("files entry {name:?} is not usable")
         }
+        ReconcileError::PrivilegedSecurityContext { setting } => {
+            format!("securityContext {setting} is not allowed")
+        }
         ReconcileError::WorkspaceSecretReferenced { .. } => {
             "template references the plan's own workspace Secret".to_string()
         }
@@ -5214,6 +5239,7 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         // holding a run open against it would hold host Leases for as long as the plan stays wrong.
         ReconcileError::InvalidPlaybook(_)
         | ReconcileError::InvalidFileEntry { .. }
+        | ReconcileError::PrivilegedSecurityContext { .. }
         | ReconcileError::WorkspaceSecretReferenced { .. } => true,
         // Neither is an input read — both come from a run's own infrastructure — but the enum is
         // matched exhaustively so that a new failure has to be classified here deliberately.
@@ -7737,10 +7763,10 @@ fn filter_groups_to_hosts(
 /// a host silently dropped from the run, with no error anywhere that names the cause.
 ///
 /// A Node reached through several inventories gets the **union** of theirs, deduplicated. Union is
-/// the safe direction here, and deliberately so: a proxy pod is pinned to one Node by its
-/// `nodeSelector`, so a toleration it did not need cannot take it anywhere else — it can only fail
-/// to have one it did need. Intersecting, the instinct that usually passes for conservative, is what
-/// would reintroduce the bug.
+/// the safe direction here, and deliberately so: a proxy pod is pinned to one Node by a required
+/// node affinity on its name, so a toleration it did not need cannot take it anywhere else — it can
+/// only fail to have one it did need. Intersecting, the instinct that usually passes for
+/// conservative, is what would reintroduce the bug.
 ///
 /// Hosts are deduplicated too, in first-seen order, so a Node named by two inventories is one proxy
 /// with one set of API calls rather than the same pod reconciled twice.
@@ -8819,7 +8845,8 @@ fn annotation_value<'a>(
 mod tests {
     use super::*;
     use crate::v1beta1::{
-        PlaySpec, PlaybookPlanSpec, ResolvedHosts, SecretRef, SshConfig, Toleration,
+        ImagePullPolicy, PlaySpec, PlaybookPlanSpec, ResolvedHosts, SecretRef, SshConfig,
+        Toleration,
     };
 
     /// A dropped writer means the reflector task is gone, so the Node cache will never populate and
@@ -9478,6 +9505,24 @@ mod tests {
             preparation_fingerprint(&plan, &relabelled).unwrap(),
             "a change in the resolved node set must move the fingerprint"
         );
+    }
+
+    /// A plan that does not use the field must serialize as it did before the field existed:
+    /// otherwise upgrading the operator moves every plan's fingerprint and abandons the runs that
+    /// were waiting on their locks or proxy pods.
+    #[test]
+    fn an_unset_image_pull_policy_leaves_the_fingerprinted_spec_unchanged() {
+        let mut plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+        assert!(
+            !serde_json::to_string(&plan.spec)
+                .unwrap()
+                .contains("imagePullPolicy")
+        );
+
+        let groups = vec![managed_ssh_group("nodes", &["a"], None)];
+        let baseline = preparation_fingerprint(&plan, &groups).unwrap();
+        plan.spec.image_pull_policy = Some(ImagePullPolicy::Always);
+        assert_ne!(baseline, preparation_fingerprint(&plan, &groups).unwrap());
     }
 
     /// The fingerprint is strict on purpose, but it must not be strict about something no host can
@@ -11834,6 +11879,50 @@ spec:
                 "{source:?} must be rejected before a run starts"
             );
         }
+    }
+
+    /// A `hostPath` entry is root on whichever Node runs the Job pod, so it is refused before a run
+    /// starts, like any other unusable entry.
+    #[test]
+    fn a_file_entry_cannot_mount_a_host_path() {
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        plan.spec.template.files = Some(vec![
+            serde_yaml::from_str("name: root\nhostPath:\n  path: /").unwrap(),
+        ]);
+
+        assert!(matches!(
+            validate_file_entries(&plan),
+            Err(ReconcileError::InvalidFileEntry { name, reason })
+                if name == "root" && reason.contains("volume type is not allowed")
+        ));
+    }
+
+    #[test]
+    fn a_privileged_security_context_is_refused_before_a_run_starts() {
+        let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+        assert!(validate_security_context(&plan).is_ok());
+
+        plan.spec.security_context = Some(v1beta1::PlaybookSecurityContext {
+            run_as_non_root: Some(true),
+            ..Default::default()
+        });
+        assert!(validate_security_context(&plan).is_ok());
+
+        plan.spec.security_context = Some(v1beta1::PlaybookSecurityContext {
+            privileged: Some(true),
+            ..Default::default()
+        });
+        let error = validate_security_context(&plan).unwrap_err();
+        assert!(matches!(
+            &error,
+            ReconcileError::PrivilegedSecurityContext { setting } if setting == "privileged: true"
+        ));
+        // Only an edit fixes it, so it must not hold a prepared run's Leases open.
+        assert!(input_error_supersedes_unlaunched(&error));
+        assert_eq!(
+            spec_input_failure(&plan, &error).summary,
+            "securityContext privileged: true is not allowed"
+        );
     }
 
     /// A spec error no tick can clear: holding a run open against it would hold its host Leases for

@@ -113,7 +113,8 @@ pub(super) const TEST_DEADLINES: JobDeadlines = JobDeadlines {
 use crate::{
     utils,
     v1beta1::{
-        self, FilesSource, PlaybookPlan, PlaybookVariableSource, ResolvedInventoryGroup, SshConfig,
+        self, FilesSource, PlaybookPlan, PlaybookSecurityContext, PlaybookVariableSource,
+        ResolvedInventoryGroup, SshConfig,
         controllers::reconcile_error::ReconcileError,
         labels,
         playbookplancontroller::{
@@ -171,13 +172,13 @@ pub fn create_job_blueprint(
 
     if has_managed_ssh_group(target_groups) {
         let secret_name = managed_ssh::client_cert_secret_name(run_id);
-        configure_job_for_managed_ssh_client_cert(&mut job, &secret_name);
+        configure_job_for_managed_ssh_client_cert(&mut job, object, &secret_name);
         configure_job_for_managed_ssh_preflight(&mut job, object);
     }
 
     let ssh_configs = distinct_static_inventory_ssh_configs(target_groups);
     if !ssh_configs.is_empty() {
-        configure_job_for_ssh(&mut job, &ssh_configs);
+        configure_job_for_ssh(&mut job, object, &ssh_configs);
     }
 
     configure_job_for_callback_plugin(&mut job);
@@ -421,8 +422,23 @@ pub(super) fn job_network_policy_name(plan_name: &str, run_id: &str) -> String {
 
 /// Creates a Kubernetes Job with everything needed for basic Ansible execution, without any
 /// connection-specifics. This Job pod needs no node-level privilege at all —
-/// hostPID/hostIPC/hostNetwork/privileged/nodeSelector all live on the ephemeral managed-ssh proxy
-/// pods instead (see `managed_ssh.rs`).
+/// hostPID, the node-access capabilities and the pinning to one Node all live on the ephemeral
+/// managed-ssh proxy pods instead (see `managed_ssh.rs`).
+/// File mode for the Secrets the playbook process reads itself: SSH keys and certs, `known_hosts`
+/// and `variables.yaml`.
+///
+/// Kubelet creates secret files owned by root, so a non-root uid can read them only through the
+/// "other" bits. OpenSSH refuses a private key with group or other bits, but only one owned by the
+/// calling uid (`sshkey_perm_ok` in `authfile.c`): root needs `0400`, while `0444` works for any
+/// other uid. Non-root counts only when the plan guarantees it — the image's `USER` is not known
+/// here, so an image running as non-root without either field gets `0400` and cannot read these.
+fn secret_file_mode(plan: &v1beta1::PlaybookPlan) -> i32 {
+    let runs_as_non_root = plan.spec.security_context.as_ref().is_some_and(|context| {
+        context.run_as_non_root == Some(true) || context.run_as_user.is_some_and(|uid| uid > 0)
+    });
+    if runs_as_non_root { 0o0444 } else { 0o0400 }
+}
+
 fn create_job_skeleton(
     plan: &v1beta1::PlaybookPlan,
     with_requirements: bool,
@@ -478,7 +494,7 @@ fn create_job_skeleton(
             name: volume.clone(),
             secret: Some(SecretVolumeSource {
                 secret_name: Some(secret_name.to_string()),
-                default_mode: Some(0o0400),
+                default_mode: Some(secret_file_mode(plan)),
                 items: Some(vec![KeyToPath {
                     key: "variables.yaml".into(),
                     path: "variables.yaml".into(),
@@ -529,6 +545,7 @@ fn create_job_skeleton(
         let collections_installer = kcore::v1::Container {
             name: "download-collections".into(),
             image: Some(plan.spec.image.clone()),
+            image_pull_policy: plan.spec.image_pull_policy.as_ref().map(Into::into),
             working_dir: Some(paths::WORKSPACE_MOUNT_PATH.into()),
             volume_mounts: Some(volume_mounts.clone()),
             command: Some(vec![
@@ -547,6 +564,7 @@ fn create_job_skeleton(
     let main_container = kcore::v1::Container {
         name: ANSIBLE_CONTAINER_NAME.into(),
         image: Some(plan.spec.image.clone()),
+        image_pull_policy: plan.spec.image_pull_policy.as_ref().map(Into::into),
         working_dir: Some(paths::WORKSPACE_MOUNT_PATH.into()),
         volume_mounts: Some(volume_mounts),
         command: Some(render_ansible_command(plan, variable_secrets)),
@@ -572,7 +590,9 @@ fn create_job_skeleton(
     let pod_template = kcore::v1::PodTemplateSpec {
         metadata: None,
         spec: Some(kcore::v1::PodSpec {
-            restart_policy: Some("Never".into()), // todo: maybe configurable
+            // `OnFailure`, the only other value a Job allows, would apply the playbook a second
+            // time within one run and read the recap from the restarted container.
+            restart_policy: Some("Never".into()),
             service_account_name: plan.spec.service_account_name.clone(),
             automount_service_account_token: Some(plan.spec.service_account_name.is_some()),
             volumes: Some(volumes),
@@ -583,7 +603,9 @@ fn create_job_skeleton(
     };
 
     let job_spec = batch::v1::JobSpec {
-        backoff_limit: Some(0), // todo: maybe configurable
+        // Retries belong to the operator (`spec.maxAttempts`, one `Play` per run): a Job-level
+        // retry would apply the playbook again under the same run ID, outside that accounting.
+        backoff_limit: Some(0),
         // Reaping a finished run is Kubernetes' job (the TTL controller), not the operator's — see
         // `effective_job_ttl`.
         ttl_seconds_after_finished: Some(effective_job_ttl(plan)),
@@ -620,7 +642,10 @@ fn managed_ssh_node_names(groups: &[ResolvedInventoryGroup]) -> Vec<String> {
 /// that disrupts a node (reboot/drain) is less likely to kill its own controller pod mid-run.
 /// Uses `preferredDuringScheduling…` (never `required`): a run targeting every node still schedules
 /// normally — the `NotIn` term then matches no node and the preference is simply a no-op. Skipped
-/// entirely when the run targets no managed-ssh nodes (e.g. StaticInventory-only).
+/// entirely when the run targets no managed-ssh nodes (e.g. StaticInventory-only). Matches the Node
+/// name (`metadata.name`), which `avoid_nodes` holds, not the `kubernetes.io/hostname` label, which
+/// can differ from it. The apiserver allows only one value per `matchFields` `NotIn`, so each Node
+/// gets its own requirement; requirements within a term are ANDed.
 fn configure_job_for_node_affinity(job: &mut Job, avoid_nodes: &[String]) {
     if avoid_nodes.is_empty() {
         return;
@@ -632,11 +657,16 @@ fn configure_job_for_node_affinity(job: &mut Job, avoid_nodes: &[String]) {
                 kcore::v1::PreferredSchedulingTerm {
                     weight: 100,
                     preference: kcore::v1::NodeSelectorTerm {
-                        match_expressions: Some(vec![kcore::v1::NodeSelectorRequirement {
-                            key: "kubernetes.io/hostname".into(),
-                            operator: "NotIn".into(),
-                            values: Some(avoid_nodes.to_vec()),
-                        }]),
+                        match_fields: Some(
+                            avoid_nodes
+                                .iter()
+                                .map(|node| kcore::v1::NodeSelectorRequirement {
+                                    key: "metadata.name".into(),
+                                    operator: "NotIn".into(),
+                                    values: Some(vec![node.clone()]),
+                                })
+                                .collect(),
+                        ),
                         ..Default::default()
                     },
                 },
@@ -678,7 +708,11 @@ fn distinct_static_inventory_ssh_configs(
 /// Mounts one SSH secret per distinct `StaticInventory` referenced this run, each at its own
 /// resource-name-keyed path (`paths::static_inventory_ssh_dir`) so multiple StaticInventories
 /// with different credentials can coexist in the same Job pod without colliding.
-fn configure_job_for_ssh(job: &mut Job, ssh_configs: &[(String, SshConfig)]) {
+fn configure_job_for_ssh(
+    job: &mut Job,
+    plan: &v1beta1::PlaybookPlan,
+    ssh_configs: &[(String, SshConfig)],
+) {
     job.spec
         .as_mut()
         .and_then(|spec| {
@@ -695,7 +729,7 @@ fn configure_job_for_ssh(job: &mut Job, ssh_configs: &[(String, SshConfig)]) {
                         name: volume_name.clone(),
                         secret: Some(SecretVolumeSource {
                             secret_name: Some(config.secret_ref.name.clone()),
-                            default_mode: Some(0o0400),
+                            default_mode: Some(secret_file_mode(plan)),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -716,7 +750,11 @@ fn configure_job_for_ssh(job: &mut Job, ssh_configs: &[(String, SshConfig)]) {
 
 /// Mounts this run's managed-ssh client identity. The Secret is expected to already exist by the
 /// time the Job is created (`managed_ssh::ensure_proxy_infra`'s `ensure_client_cert` step).
-fn configure_job_for_managed_ssh_client_cert(job: &mut Job, secret_name: &str) {
+fn configure_job_for_managed_ssh_client_cert(
+    job: &mut Job,
+    plan: &v1beta1::PlaybookPlan,
+    secret_name: &str,
+) {
     job.spec
         .as_mut()
         .and_then(|spec| {
@@ -730,7 +768,7 @@ fn configure_job_for_managed_ssh_client_cert(job: &mut Job, secret_name: &str) {
                     name: "managed-ssh-client".into(),
                     secret: Some(SecretVolumeSource {
                         secret_name: Some(secret_name.to_string()),
-                        default_mode: Some(0o0400),
+                        default_mode: Some(secret_file_mode(plan)),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -777,6 +815,7 @@ fn configure_job_for_managed_ssh_preflight(job: &mut Job, plan: &v1beta1::Playbo
                     .push(kcore::v1::Container {
                         name: MANAGED_SSH_PREFLIGHT_CONTAINER_NAME.into(),
                         image: Some(plan.spec.image.clone()),
+                        image_pull_policy: plan.spec.image_pull_policy.as_ref().map(Into::into),
                         working_dir: Some(paths::WORKSPACE_MOUNT_PATH.into()),
                         // The plan's own image is the one already being pulled for this run, and
                         // ansible-core *is* Python, so the gate needs no second image to mirror and no
@@ -947,6 +986,140 @@ pub(super) fn file_volume_is_usable(
         .unwrap_or_default();
 
     Ok(source_count == 1 && requested == rendered)
+}
+
+/// Volume sources a `files` entry may use: those the `restricted` Pod Security Standard allows,
+/// plus `image`, which mounts an OCI image read-only.
+///
+/// An allowlist rather than a `hostPath` ban: `hostPath` is the obvious way out of the pod onto its
+/// Node, but in-tree types such as `gitRepo` (CVE-2024-10220) and `flexVolume` hand plan-supplied
+/// options to code running on the Node. The operator creates the Job, so the plan author needs no
+/// right to create pods, and no `NodeAccessPolicy` bounds which Node the pod lands on.
+pub(super) const ALLOWED_FILE_VOLUME_SOURCES: &[&str] = &[
+    "configMap",
+    "csi",
+    "downwardAPI",
+    "emptyDir",
+    "ephemeral",
+    "image",
+    "persistentVolumeClaim",
+    "projected",
+    "secret",
+];
+
+/// Whether every source in a file entry's volume is in [`ALLOWED_FILE_VOLUME_SOURCES`].
+pub(super) fn file_volume_type_allowed(volume: &Volume) -> Result<bool, serde_json::Error> {
+    Ok(serde_json::to_value(volume)?
+        .as_object()
+        .is_some_and(|fields| {
+            fields
+                .keys()
+                .filter(|field| field.as_str() != "name")
+                .all(|field| ALLOWED_FILE_VOLUME_SOURCES.contains(&field.as_str()))
+        }))
+}
+
+/// Capabilities the `baseline` Pod Security Standard lets a container add: the container runtimes'
+/// default set.
+const BASELINE_CAPABILITIES: &[&str] = &[
+    "AUDIT_WRITE",
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "FSETID",
+    "KILL",
+    "MKNOD",
+    "NET_BIND_SERVICE",
+    "SETFCAP",
+    "SETGID",
+    "SETPCAP",
+    "SETUID",
+    "SYS_CHROOT",
+];
+
+/// SELinux types the `baseline` Pod Security Standard allows a container to request.
+const BASELINE_SELINUX_TYPES: &[&str] = &[
+    "container_t",
+    "container_init_t",
+    "container_kvm_t",
+    "container_engine_t",
+];
+
+/// The first setting in a plan's `securityContext` that would give its Job containers more privilege
+/// than the `baseline` Pod Security Standard allows, if any.
+///
+/// The operator creates the Job, so a plan author needs no right to create pods, and no
+/// `NodeAccessPolicy` bounds which Node the pod lands on: a privileged playbook container would be
+/// root on whichever Node runs it. Pod Security admission refuses such a pod only in a namespace
+/// that enforces `baseline` or `restricted`, which is not the Kubernetes default, so the operator
+/// refuses it itself. Only the escalating values are refused; everything `restricted` asks for
+/// (`runAsNonRoot`, dropped capabilities, a `RuntimeDefault` seccomp profile) stays available,
+/// which is what the field exists for.
+pub(super) fn privileged_security_context_setting(
+    context: &PlaybookSecurityContext,
+) -> Option<String> {
+    if context.privileged == Some(true) {
+        return Some("privileged: true".into());
+    }
+
+    // Exact names, as Pod Security admission compares them: runtimes also accept `cap_sys_admin`,
+    // which an allowlist refuses without having to know every spelling.
+    let added = context
+        .capabilities
+        .as_ref()
+        .and_then(|capabilities| capabilities.add.as_deref())
+        .unwrap_or_default();
+    if let Some(capability) = added
+        .iter()
+        .find(|capability| !BASELINE_CAPABILITIES.contains(&capability.as_str()))
+    {
+        return Some(format!("capabilities.add {capability:?}"));
+    }
+
+    if let Some(options) = &context.se_linux_options {
+        let set = |value: &Option<String>| value.as_deref().is_some_and(|value| !value.is_empty());
+        if let Some(type_) = options.type_.as_deref().filter(|type_| !type_.is_empty())
+            && !BASELINE_SELINUX_TYPES.contains(&type_)
+        {
+            return Some(format!("seLinuxOptions.type {type_:?}"));
+        }
+        if set(&options.user) {
+            return Some("seLinuxOptions.user".into());
+        }
+        if set(&options.role) {
+            return Some("seLinuxOptions.role".into());
+        }
+    }
+
+    if let Some(proc_mount) = context
+        .proc_mount
+        .as_deref()
+        .filter(|proc_mount| *proc_mount != "Default")
+    {
+        return Some(format!("procMount {proc_mount:?}"));
+    }
+
+    let unconfined = |profile: &Option<v1beta1::SecurityProfile>| {
+        profile
+            .as_ref()
+            .is_some_and(|profile| profile.type_ == "Unconfined")
+    };
+    if unconfined(&context.seccomp_profile) {
+        return Some("seccompProfile.type: Unconfined".into());
+    }
+    if unconfined(&context.app_armor_profile) {
+        return Some("appArmorProfile.type: Unconfined".into());
+    }
+
+    if context
+        .windows_options
+        .as_ref()
+        .is_some_and(|options| options.host_process == Some(true))
+    {
+        return Some("windowsOptions.hostProcess: true".into());
+    }
+
+    None
 }
 
 /// Ten symbols matches the run-name discriminator: five has only about 14 million values, and a
@@ -1621,13 +1794,25 @@ spec:
             .unwrap()[0];
         assert_eq!(term.weight, 100);
 
-        let req = &term.preference.match_expressions.as_ref().unwrap()[0];
-        assert_eq!(req.key, "kubernetes.io/hostname");
-        assert_eq!(req.operator, "NotIn");
-        assert_eq!(
-            req.values.as_ref().unwrap(),
-            &vec!["node-a".to_string(), "node-b".to_string()]
-        );
+        assert_eq!(term.preference.match_expressions, None);
+        // One requirement per Node: the apiserver refuses a `matchFields` `NotIn` with more than
+        // one value, and refuses the whole Job with it.
+        let avoided: Vec<_> = term
+            .preference
+            .match_fields
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|req| {
+                assert_eq!(req.key, "metadata.name");
+                assert_eq!(req.operator, "NotIn");
+                let [node] = req.values.as_deref().unwrap() else {
+                    panic!("a node field selector takes exactly one value: {req:?}");
+                };
+                node.as_str()
+            })
+            .collect();
+        assert_eq!(avoided, ["node-a", "node-b"]);
     }
 
     /// The gate only earns its keep if it is the *last* thing before `ansible-playbook`: it has to
@@ -1697,6 +1882,49 @@ spec:
                     .as_str()
             )
         );
+    }
+
+    /// The kubelet applies a pull policy per container, and an init container pulls first: one left
+    /// out here would still pull an image the plan said `Never` to, and `Always` would not refresh
+    /// the image that container runs.
+    #[test]
+    fn the_image_pull_policy_reaches_every_container_that_runs_the_plan_image() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+        use crate::v1beta1::{ResolvedHosts, ResolvedInventoryGroup};
+
+        let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
+        let groups = vec![ResolvedInventoryGroup::ManagedSsh {
+            hosts: ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["node-a".into()],
+                ..Default::default()
+            },
+            tolerations: None,
+            variables: None,
+        }];
+        let policies = |pp: &PlaybookPlan| {
+            let job = super::create_job_blueprint(&hash, 1, "run-1", &groups, pp, TEST_DEADLINES)
+                .unwrap();
+            let pod_spec = job.spec.unwrap().template.spec.unwrap();
+            pod_spec
+                .init_containers
+                .into_iter()
+                .flatten()
+                .chain(pod_spec.containers)
+                .map(|container| container.image_pull_policy)
+                .collect::<Vec<_>>()
+        };
+
+        let mut pp = minimal_plan();
+        pp.spec.template.requirements = Some("collections: []".into());
+        assert_eq!(
+            policies(&pp),
+            vec![None; 3],
+            "unset must leave the choice to Kubernetes"
+        );
+
+        pp.spec.image_pull_policy = Some(crate::v1beta1::ImagePullPolicy::Always);
+        assert_eq!(policies(&pp), vec![Some("Always".to_string()); 3]);
     }
 
     /// A run with no managed-ssh targets has no proxy pods to wait for, so it must not pay for the
@@ -1859,6 +2087,189 @@ spec:
                 .allow_privilege_escalation,
             Some(false)
         );
+    }
+
+    /// Root has to keep `0400` — OpenSSH refuses a wider key the caller owns — and a non-root uid
+    /// cannot read `0400` root-owned files at all, so the mode follows what the plan guarantees.
+    #[test]
+    fn secrets_read_by_the_playbook_are_readable_by_a_non_root_plan_only() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+        use crate::v1beta1::{
+            PlaybookVariableSource, ResolvedHosts, ResolvedInventoryGroup, SecretRef, SshConfig,
+        };
+
+        let groups = vec![
+            ResolvedInventoryGroup::ManagedSsh {
+                hosts: ResolvedHosts {
+                    name: "workers".into(),
+                    hosts: vec!["node-a".into()],
+                    ..Default::default()
+                },
+                tolerations: None,
+                variables: None,
+            },
+            ResolvedInventoryGroup::Ssh {
+                hosts: ResolvedHosts {
+                    name: "external".into(),
+                    hosts: vec!["ccu.fritz.box".into()],
+                    ..Default::default()
+                },
+                static_inventory_name: "ccu".into(),
+                config: SshConfig {
+                    user: "root".into(),
+                    secret_ref: SecretRef {
+                        name: "ssh-key".into(),
+                    },
+                },
+                variables: None,
+            },
+        ];
+        let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
+        let modes = |context: Option<&str>| {
+            let mut pp = minimal_plan();
+            pp.spec.template.variables = Some(vec![PlaybookVariableSource::SecretRef {
+                secret_ref: SecretRef {
+                    name: "vars".into(),
+                },
+            }]);
+            pp.spec.security_context = context.map(security_context);
+            let pod_spec =
+                super::create_job_blueprint(&hash, 1, "run-1", &groups, &pp, TEST_DEADLINES)
+                    .unwrap()
+                    .spec
+                    .unwrap()
+                    .template
+                    .spec
+                    .unwrap();
+            pod_spec
+                .volumes
+                .unwrap()
+                .into_iter()
+                .filter(|volume| volume.name != super::WORKSPACE_VOLUME_NAME)
+                .map(|volume| (volume.name, volume.secret.unwrap().default_mode))
+                .collect::<Vec<_>>()
+        };
+
+        let expect = |mode| {
+            vec![
+                (super::volume_name("vars", "vars"), Some(mode)),
+                ("managed-ssh-client".to_string(), Some(mode)),
+                (super::volume_name("ssh", "ccu"), Some(mode)),
+            ]
+        };
+        assert_eq!(modes(None), expect(0o0400), "the image's default user");
+        assert_eq!(modes(Some("runAsUser: 0")), expect(0o0400));
+        assert_eq!(modes(Some("runAsNonRoot: false")), expect(0o0400));
+        assert_eq!(modes(Some("runAsUser: 1000")), expect(0o0444));
+        assert_eq!(modes(Some("runAsNonRoot: true")), expect(0o0444));
+    }
+
+    fn security_context(yaml: &str) -> crate::v1beta1::PlaybookSecurityContext {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    /// The field exists so an execution image can declare what it needs and a plan can satisfy the
+    /// `restricted` standard; none of that may be refused.
+    #[test]
+    fn hardening_security_context_settings_are_allowed() {
+        for yaml in [
+            "{}",
+            "allowPrivilegeEscalation: false\nrunAsNonRoot: true\nrunAsUser: 1000\nrunAsGroup: 1000\nreadOnlyRootFilesystem: true",
+            "capabilities:\n  drop: [ALL]\n  add: [NET_BIND_SERVICE]",
+            // Baseline allows running as root and adding the runtime's default capabilities.
+            "runAsUser: 0\ncapabilities:\n  add: [CHOWN, SETUID, KILL]",
+            "privileged: false\nprocMount: Default",
+            "seccompProfile:\n  type: RuntimeDefault\nappArmorProfile:\n  type: RuntimeDefault",
+            "seccompProfile:\n  type: Localhost\n  localhostProfile: profiles/ansible.json",
+            "seLinuxOptions:\n  type: container_t\n  level: s0:c123,c456",
+            "seLinuxOptions:\n  type: \"\"\n  user: \"\"",
+            "windowsOptions:\n  hostProcess: false\n  runAsUserName: ansible",
+        ] {
+            assert_eq!(
+                super::privileged_security_context_setting(&security_context(yaml)),
+                None,
+                "{yaml:?} must stay allowed"
+            );
+        }
+    }
+
+    /// Each of these makes the playbook container root on whichever Node runs it, which no
+    /// `NodeAccessPolicy` bounds.
+    #[test]
+    fn escalating_security_context_settings_are_refused() {
+        for (yaml, setting) in [
+            ("privileged: true", "privileged: true"),
+            (
+                "capabilities:\n  add: [SYS_ADMIN]",
+                r#"capabilities.add "SYS_ADMIN""#,
+            ),
+            // Runtimes accept these spellings for SYS_ADMIN too.
+            (
+                "capabilities:\n  add: [cap_sys_admin]",
+                r#"capabilities.add "cap_sys_admin""#,
+            ),
+            // Pod Security admission compares exact names, so only those pass here as well.
+            (
+                "capabilities:\n  add: [CAP_CHOWN]",
+                r#"capabilities.add "CAP_CHOWN""#,
+            ),
+            ("capabilities:\n  add: [kill]", r#"capabilities.add "kill""#),
+            ("capabilities:\n  add: [ALL]", r#"capabilities.add "ALL""#),
+            (
+                "capabilities:\n  add: [CHOWN, NET_ADMIN]",
+                r#"capabilities.add "NET_ADMIN""#,
+            ),
+            (
+                "seLinuxOptions:\n  type: spc_t",
+                r#"seLinuxOptions.type "spc_t""#,
+            ),
+            ("seLinuxOptions:\n  user: system_u", "seLinuxOptions.user"),
+            ("seLinuxOptions:\n  role: system_r", "seLinuxOptions.role"),
+            ("procMount: Unmasked", r#"procMount "Unmasked""#),
+            (
+                "seccompProfile:\n  type: Unconfined",
+                "seccompProfile.type: Unconfined",
+            ),
+            (
+                "appArmorProfile:\n  type: Unconfined",
+                "appArmorProfile.type: Unconfined",
+            ),
+            (
+                "windowsOptions:\n  hostProcess: true",
+                "windowsOptions.hostProcess: true",
+            ),
+        ] {
+            assert_eq!(
+                super::privileged_security_context_setting(&security_context(yaml)).as_deref(),
+                Some(setting),
+                "{yaml:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn only_restricted_volume_types_and_image_volumes_are_mountable_as_files() {
+        let volume = |yaml: &str| -> super::Volume { serde_yaml::from_str(yaml).unwrap() };
+
+        for source in super::ALLOWED_FILE_VOLUME_SOURCES {
+            let allowed = volume(&format!("name: files\n{source}: {{}}"));
+            assert!(
+                super::file_volume_type_allowed(&allowed).unwrap(),
+                "{source} must be mountable"
+            );
+        }
+
+        for yaml in [
+            "name: files\nhostPath:\n  path: /",
+            "name: files\ngitRepo:\n  repository: https://example.invalid/repo.git",
+            "name: files\nflexVolume:\n  driver: example/driver",
+            "name: files\nnfs:\n  server: nfs.example\n  path: /export",
+        ] {
+            assert!(
+                !super::file_volume_type_allowed(&volume(yaml)).unwrap(),
+                "{yaml:?} must not be mountable"
+            );
+        }
     }
 
     /// The budget this name has to fit: any plan name at all, against a run ID of the length the

@@ -94,6 +94,13 @@ pub enum ReconcileError {
     #[error("spec.template.files entry {name:?} is not usable: {reason}")]
     InvalidFileEntry { name: String, reason: &'static str },
 
+    /// A `spec.securityContext` value that would give the Job's containers more privilege than the
+    /// `baseline` Pod Security Standard allows (see `job_builder::privileged_security_context_setting`).
+    #[error(
+        "spec.securityContext {setting} is not allowed: the operator creates the Job for the plan, so it refuses anything the baseline Pod Security Standard forbids"
+    )]
+    PrivilegedSecurityContext { setting: String },
+
     /// The plan's own playbook does not parse. Kept apart from [`ReconcileError::RenderError`],
     /// which also covers the operator's own rendering, because only this one is the user's to fix.
     #[error("spec.template.playbook is not a valid playbook: {0}")]

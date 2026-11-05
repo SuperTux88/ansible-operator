@@ -77,9 +77,22 @@ pub struct PlaybookPlanSpec {
     /// An OCI image with Ansible and all required collections
     pub image: String,
 
+    /// When the kubelet pulls `image`: `Always`, `IfNotPresent` or `Never`, with the meaning they
+    /// have on any container. Applied to every container of the run. When unset, Kubernetes picks:
+    /// `Always` for a `:latest` or untagged image, otherwise `IfNotPresent`. Not part of the
+    /// execution hash, so changing it does not re-run the playbook on already-current hosts.
+    // Left out when unset: the spec is serialized into `preparationFingerprint`, and a `null` here
+    // would abandon every unlaunched run the moment an operator with this field starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_pull_policy: Option<ImagePullPolicy>,
+
     /// Container security context applied to both the Ansible playbook container and the optional
     /// collection-installer init container. Optional for compatibility with arbitrary execution
-    /// images; cluster admission policies may require particular fields.
+    /// images; cluster admission policies may require particular fields. Values the baseline Pod
+    /// Security Standard forbids (privileged, added capabilities beyond the runtime defaults, other
+    /// SELinux types, unmasked procMount, Unconfined profiles, hostProcess) are refused. An image
+    /// that runs as a non-root user needs runAsUser or runAsNonRoot set here: without either, the
+    /// SSH keys and secret variables are mounted readable by root only.
     pub security_context: Option<PlaybookSecurityContext>,
 
     /// ServiceAccount the playbook pod runs as, letting tasks reach the Kubernetes API with that
@@ -334,6 +347,24 @@ pub enum ExecutionMode {
     Recurring,
 }
 
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+pub enum ImagePullPolicy {
+    Always,
+    IfNotPresent,
+    Never,
+}
+
+impl From<&ImagePullPolicy> for String {
+    fn from(value: &ImagePullPolicy) -> Self {
+        match value {
+            ImagePullPolicy::Always => "Always",
+            ImagePullPolicy::IfNotPresent => "IfNotPresent",
+            ImagePullPolicy::Never => "Never",
+        }
+        .into()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
 pub struct PlaybookTemplate {
     /// The actual playbook contents
@@ -342,7 +373,9 @@ pub struct PlaybookTemplate {
     /// Variables for the playbook
     pub variables: Option<Vec<PlaybookVariableSource>>,
 
-    /// Files for the playbook
+    /// Files for the playbook. Each entry is a `secretRef` or one Kubernetes volume source of a
+    /// type the restricted Pod Security Standard allows, or `image`; `hostPath` and other types
+    /// are refused.
     #[schemars(with = "Option<Vec<GenericMap>>")]
     pub files: Option<Vec<FilesSource>>,
 
@@ -949,6 +982,7 @@ mod tests {
             "blubb",
             PlaybookPlanSpec {
                 image: "registry.tld/ansible:1.0.0".to_string(),
+                image_pull_policy: None,
                 security_context: None,
                 service_account_name: None,
                 verbosity: None,

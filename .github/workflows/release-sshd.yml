@@ -33,7 +33,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       image: ${{ steps.image.outputs.name }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The tag must reflect what the image actually builds: `sshd-v<openssh>-<rev>` where <openssh>
       # equals Containerfile.sshd's ARG OPENSSH_VERSION. Fail the release on a mismatch or bad shape.
@@ -97,7 +97,7 @@ jobs:
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+        run: echo "${TAGS}" | xargs -I {} cosign sign --yes "{}@${DIGEST}"
 
   # Open a PR that pins the chart + example config to the immutable digest just published. Kept as a PR
   # (not a direct push) so a human reviews the bump; it touches no Containerfile, so it does not
@@ -111,7 +111,7 @@ jobs:
       pull-requests: write
     steps:
       # Base the PR on main, not the pushed tag.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
 
@@ -133,7 +133,7 @@ jobs:
           sed -i -E "s|^proxy_image = .*|proxy_image = \"${REF}\"|" config.example.toml
 
       - name: Open pin PR
-        uses: peter-evans/create-pull-request@v8
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           branch: chore/pin-sshd-${{ needs.build.outputs.version }}
           title: "chore: pin managed-ssh proxy image to ${{ needs.build.outputs.version }}"
