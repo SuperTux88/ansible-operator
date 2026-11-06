@@ -8,6 +8,12 @@ pub enum ReconcileError {
     #[error(transparent)]
     KubeError(#[from] kube::Error),
 
+    /// The live re-read that tells a tick whether its cached copy of the plan status is still
+    /// current failed. Kept apart from [`ReconcileError::KubeError`] because that copy may describe
+    /// a run an earlier tick already finished, so the tick must not write it back to report this.
+    #[error("could not re-read the plan to confirm its cached status: {0}")]
+    PlanStatusUnconfirmed(#[source] kube::Error),
+
     #[error("Precondition failed: {0}")]
     PreconditionFailed(&'static str),
 

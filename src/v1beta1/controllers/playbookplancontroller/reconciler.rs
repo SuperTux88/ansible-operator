@@ -4328,7 +4328,8 @@ async fn adopt_live_status_if_finalized(
 
     let live_status = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace)
         .get(name)
-        .await?
+        .await
+        .map_err(ReconcileError::PlanStatusUnconfirmed)?
         .status;
     let still_active = live_status
         .as_ref()
@@ -4738,14 +4739,43 @@ async fn report_recovery_failure(
     resource_status: &mut PlaybookPlanStatus,
     error: ReconcileError,
 ) -> ReconcileError {
-    resource_status.summary = Some(format!("run recovery failed: {}", summary_error(&error)));
-    if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
+    let summary = format!("run recovery failed: {}", summary_error(&error));
+    resource_status.summary = Some(summary.clone());
+    let reported: Result<(), ReconcileError> = async {
+        match summary_only_status_patch(object, &summary) {
+            Some(patch) => {
+                let (_, name) = namespace_and_name(object)?;
+                api.patch_status(name, &PatchParams::default(), &Patch::Merge(patch))
+                    .await?;
+            }
+            None => {
+                patch_status(api, object, resource_status.clone()).await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(patch_error) = reported {
         warn!(
             "Could not report the recovery failure on {:?}/{:?}: {patch_error}",
             object.metadata.namespace, object.metadata.name
         );
     }
     error
+}
+
+/// The status patch that sets only `summary`, for a plan that already has a status.
+///
+/// A failed recovery has not checked this tick's status against the live plan. That status comes
+/// from the reflector cache, which can still name a run an earlier tick already finished, and
+/// writing it whole would put that run's `activeRun` back over the finished plan. A plan without a
+/// status gets `None`: the CRD requires `phase`, `currentHash` and more, so a patch carrying only
+/// the summary would be refused, and the caller writes the whole status instead.
+fn summary_only_status_patch(object: &PlaybookPlan, summary: &str) -> Option<serde_json::Value> {
+    object
+        .status
+        .as_ref()
+        .map(|_| serde_json::json!({ "status": { "summary": summary } }))
 }
 
 /// Records why a finished run could not be completed on the plan and hands the error straight back.
@@ -4773,6 +4803,9 @@ async fn report_failed_finalization(
     resource_status: &mut PlaybookPlanStatus,
     error: ReconcileError,
 ) -> ReconcileError {
+    if !finalization_failure_is_reported(&error) {
+        return error;
+    }
     resource_status.summary = Some(format!(
         "could not complete run {}: {}",
         run.mirror.job_name,
@@ -4785,6 +4818,17 @@ async fn report_failed_finalization(
         );
     }
     error
+}
+
+/// Whether [`report_failed_finalization`] may write this tick's status to report `error`.
+///
+/// Not when the live re-read itself failed: the tick's status comes from the reflector cache, which
+/// may still name a run an earlier tick already finished, and the merge patch would write that run's
+/// `activeRun`, `Applying` and `Running` condition back over the finished plan. Should the run's
+/// `Play` be pruned by then, the next tick would report it lost and every host `Unknown`. The error
+/// is still returned, so the controller logs it and retries.
+fn finalization_failure_is_reported(error: &ReconcileError) -> bool {
+    !matches!(error, ReconcileError::PlanStatusUnconfirmed(_))
 }
 
 /// Records a failed attempt to prepare or launch a run on the plan and hands the error straight
@@ -5345,7 +5389,7 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         | ReconcileError::AmbiguousHost { .. }
         | ReconcileError::AmbiguousHostCredentials { .. }
         | ReconcileError::SecretNotFound { .. } => true,
-        ReconcileError::KubeError(_) => false,
+        ReconcileError::KubeError(_) | ReconcileError::PlanStatusUnconfirmed(_) => false,
         // Transient by construction, and the shortest-lived of them all: the inventory's own
         // controller is on its way to publishing the hosts for this generation, and the status
         // write that does it wakes this plan. Giving up a prepared run over a wait measured in
@@ -9998,63 +10042,128 @@ mod tests {
     /// The state an apiserver restart left a plan in: a tick that started from a stale cache wrote
     /// the run's mirror back over the finished status, while the run's record is terminal and
     /// already acknowledged, so recovery no longer drains it. The record's result has to be applied
-    /// again and the mirror given up, or the plan reads `Applying` for good.
+    /// again and the mirror given up, or the plan reads `Applying` for good. A failed run must come
+    /// back as a failure that spent its attempt, without recording its host as up to date.
     #[test]
     fn a_plan_still_mirroring_a_finished_run_takes_the_result_from_its_record() {
         let hash = ExecutionHash::from_hex("1a").unwrap();
-        let run = finished_run(hash, 1, 1, Utc::now().fixed_offset());
-        let mut play = Play::new(
-            &run.mirror.job_name,
-            PlaySpec {
-                inventory: vec![ResolvedHosts {
-                    name: "all".into(),
-                    hosts: vec!["worker-1".into()],
-                    ..Default::default()
-                }],
-                ..PlaySpec::default()
-            },
-        );
-        play.metadata.uid = Some(run.mirror.play_uid.clone());
-        play.status = Some(v1beta1::PlayStatus {
-            host_count: 1,
-            plan_status_recorded: true,
-            ..terminal_play_status(
+        for (play_phase, host_outcome, expected_verdict, expected_failure, applied_hash) in [
+            (
                 v1beta1::PlayPhase::Succeeded,
-                &[("worker-1", v1beta1::HostOutcome::Succeeded)],
-                &[],
-            )
-        });
-        let mut resource_status = PlaybookPlanStatus {
-            phase: Phase::Applying,
-            active_run: Some(run.mirror.clone()),
-            ..Default::default()
-        };
-        status::set_running_condition(&mut resource_status);
-        let nodes = Writer::<Node>::default().as_reader();
+                v1beta1::HostOutcome::Succeeded,
+                Phase::Succeeded,
+                RunFailure::None,
+                hash.to_string(),
+            ),
+            (
+                v1beta1::PlayPhase::Failed,
+                v1beta1::HostOutcome::Failed,
+                Phase::Failed,
+                RunFailure::Real,
+                String::new(),
+            ),
+        ] {
+            let run = finished_run(hash, 1, 1, Utc::now().fixed_offset());
+            let mut play = Play::new(
+                &run.mirror.job_name,
+                PlaySpec {
+                    inventory: vec![ResolvedHosts {
+                        name: "all".into(),
+                        hosts: vec!["worker-1".into()],
+                        ..Default::default()
+                    }],
+                    ..PlaySpec::default()
+                },
+            );
+            play.metadata.uid = Some(run.mirror.play_uid.clone());
+            play.status = Some(v1beta1::PlayStatus {
+                host_count: 1,
+                plan_status_recorded: true,
+                ..terminal_play_status(
+                    play_phase.clone(),
+                    &[("worker-1", host_outcome.clone())],
+                    &[],
+                )
+            });
+            let mut resource_status = PlaybookPlanStatus {
+                phase: Phase::Applying,
+                active_run: Some(run.mirror.clone()),
+                ..Default::default()
+            };
+            status::set_running_condition(&mut resource_status);
+            let nodes = Writer::<Node>::default().as_reader();
 
-        let ActiveRunProgress::Finished {
-            verdict,
-            failure,
-            record,
-            ..
-        } = finished_from_record(&run, &play, &nodes, &mut resource_status).unwrap()
-        else {
-            panic!("a terminal record finishes the run it records");
+            let ActiveRunProgress::Finished {
+                verdict,
+                failure,
+                record,
+                ..
+            } = finished_from_record(&run, &play, &nodes, &mut resource_status).unwrap()
+            else {
+                panic!("a terminal record finishes the run it records");
+            };
+
+            assert_eq!(verdict, expected_verdict, "{play_phase:?}");
+            assert_eq!(failure, expected_failure, "{play_phase:?}");
+            assert_eq!(record, TerminalRecord::Present);
+            assert!(resource_status.active_run.is_none());
+            assert!(
+                !resource_status
+                    .conditions
+                    .iter()
+                    .any(|condition| condition.type_ == "Running" && condition.status == "True")
+            );
+            let host = &resource_status.hosts_status.unwrap()["worker-1"];
+            assert_eq!(host.last_applied_hash, applied_hash, "{play_phase:?}");
+            assert_eq!(host.last_outcome, host_outcome);
+        }
+    }
+
+    /// A tick that could not re-read the plan cannot tell whether its cached status still names a
+    /// live run, so it must not write that status back to report the failure. The same API error
+    /// from any other finalization step is still reported.
+    #[test]
+    fn a_failed_plan_reread_is_not_reported_on_the_plan() {
+        let unavailable = || {
+            kube::Error::Api(Box::new(
+                kube::core::Status::failure(
+                    "the server is currently unable to handle the request",
+                    "ServiceUnavailable",
+                )
+                .with_code(503),
+            ))
         };
 
-        assert_eq!(verdict, Phase::Succeeded);
-        assert_eq!(failure, RunFailure::None);
-        assert_eq!(record, TerminalRecord::Present);
-        assert!(resource_status.active_run.is_none());
-        assert!(
-            !resource_status
-                .conditions
-                .iter()
-                .any(|condition| condition.type_ == "Running" && condition.status == "True")
-        );
+        assert!(!finalization_failure_is_reported(
+            &ReconcileError::PlanStatusUnconfirmed(unavailable())
+        ));
+        assert!(finalization_failure_is_reported(
+            &ReconcileError::KubeError(unavailable())
+        ));
+        assert!(finalization_failure_is_reported(
+            &ReconcileError::PreconditionFailed("name not set")
+        ));
+    }
+
+    /// A failed recovery reports itself without writing back the cached `activeRun`, which may
+    /// name a run an earlier tick already finished. A plan without a status cannot take a patch
+    /// that carries only the summary, so it is left to the whole-status write.
+    #[test]
+    fn a_failed_recovery_writes_only_its_summary() {
+        let mut plan = PlaybookPlan::new("web", Default::default());
+        plan.status = Some(status_mirroring_a_run());
+
         assert_eq!(
-            resource_status.hosts_status.unwrap()["worker-1"].last_applied_hash,
-            hash.to_string()
+            summary_only_status_patch(&plan, "run recovery failed: boom"),
+            Some(serde_json::json!({
+                "status": { "summary": "run recovery failed: boom" }
+            }))
+        );
+
+        plan.status = None;
+        assert_eq!(
+            summary_only_status_patch(&plan, "run recovery failed: boom"),
+            None
         );
     }
 
