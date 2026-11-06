@@ -4739,14 +4739,43 @@ async fn report_recovery_failure(
     resource_status: &mut PlaybookPlanStatus,
     error: ReconcileError,
 ) -> ReconcileError {
-    resource_status.summary = Some(format!("run recovery failed: {}", summary_error(&error)));
-    if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
+    let summary = format!("run recovery failed: {}", summary_error(&error));
+    resource_status.summary = Some(summary.clone());
+    let reported: Result<(), ReconcileError> = async {
+        match summary_only_status_patch(object, &summary) {
+            Some(patch) => {
+                let (_, name) = namespace_and_name(object)?;
+                api.patch_status(name, &PatchParams::default(), &Patch::Merge(patch))
+                    .await?;
+            }
+            None => {
+                patch_status(api, object, resource_status.clone()).await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(patch_error) = reported {
         warn!(
             "Could not report the recovery failure on {:?}/{:?}: {patch_error}",
             object.metadata.namespace, object.metadata.name
         );
     }
     error
+}
+
+/// The status patch that sets only `summary`, for a plan that already has a status.
+///
+/// A failed recovery has not checked this tick's status against the live plan. That status comes
+/// from the reflector cache, which can still name a run an earlier tick already finished, and
+/// writing it whole would put that run's `activeRun` back over the finished plan. A plan without a
+/// status gets `None`: the CRD requires `phase`, `currentHash` and more, so a patch carrying only
+/// the summary would be refused, and the caller writes the whole status instead.
+fn summary_only_status_patch(object: &PlaybookPlan, summary: &str) -> Option<serde_json::Value> {
+    object
+        .status
+        .as_ref()
+        .map(|_| serde_json::json!({ "status": { "summary": summary } }))
 }
 
 /// Records why a finished run could not be completed on the plan and hands the error straight back.
@@ -10114,6 +10143,28 @@ mod tests {
         assert!(finalization_failure_is_reported(
             &ReconcileError::PreconditionFailed("name not set")
         ));
+    }
+
+    /// A failed recovery reports itself without writing back the cached `activeRun`, which may
+    /// name a run an earlier tick already finished. A plan without a status cannot take a patch
+    /// that carries only the summary, so it is left to the whole-status write.
+    #[test]
+    fn a_failed_recovery_writes_only_its_summary() {
+        let mut plan = PlaybookPlan::new("web", Default::default());
+        plan.status = Some(status_mirroring_a_run());
+
+        assert_eq!(
+            summary_only_status_patch(&plan, "run recovery failed: boom"),
+            Some(serde_json::json!({
+                "status": { "summary": "run recovery failed: boom" }
+            }))
+        );
+
+        plan.status = None;
+        assert_eq!(
+            summary_only_status_patch(&plan, "run recovery failed: boom"),
+            None
+        );
     }
 
     /// A replacement `Play` at the same name is not this run's record, and has to be indistinguishable
