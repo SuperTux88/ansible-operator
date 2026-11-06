@@ -11,26 +11,16 @@ use serde::de::DeserializeOwned;
 /// is **thrown away and rebuilt from a fresh LIST after any error**, rather than resumed.
 ///
 /// `watcher` resumes. On an error it hands the error up and keeps the state it had — including, in
-/// `State::Watching`, the very HTTP response body that produced the error. The next poll does not
-/// re-request anything; it reads the next line out of that same response. That is only a subtlety
-/// until the response is an error body, because `kube_client`'s watch path never checks the HTTP
-/// status (`Client::request_events`, unlike `Client::request_text`, does not call
-/// `handle_api_errors`) and instead frames the body by lines and parses each one as a `WatchEvent`.
-/// A compact single-line `Status` is recovered by a fallback and reported as one API error; a
-/// **pretty-printed** one is not, and becomes one `SerdeError` per line.
+/// `State::Watching`, the response body that failed, whose next line the next poll reads, and the
+/// `resourceVersion` it had reached. Restarting discards both, so one bad response costs exactly
+/// one error.
 ///
-/// That is not hypothetical: a k3s apiserver that restarts answers the metadata watches
-/// (`selector_trigger::label_changes`, which asks for `PartialObjectMetadata`) with a pretty-printed
-/// `403` while its RBAC is still loading. Resuming turned that single 403 into a dozen stream
-/// errors, each one paying a full backoff delay, so the operator spent five and a half minutes
-/// reading an error message it had already received — four of them after the apiserver was healthy
-/// again. Restarting discards the body with the watcher, so one bad response costs exactly one
-/// error.
-///
-/// Restarting also settles the other half of that incident. A resumed watch re-asks from the
-/// `resourceVersion` it last saw, which after an apiserver restart is far enough behind to be
-/// refused with `410 Expired` — another error, another delay, before the re-LIST that was always
-/// going to be needed. A rebuilt watcher LISTs first, so there is no stale version to be refused.
+/// The version is what an apiserver restart comes down to. A resumed watch re-asks from the
+/// `resourceVersion` it last saw, which by then is far enough behind to be refused with
+/// `410 Expired` — another error, another delay, before the re-LIST that was always going to be
+/// needed. A rebuilt watcher LISTs first, so there is no stale version to be refused. `watcher`
+/// itself re-lists only on a `410` delivered as a watch event: one that answers the watch request
+/// is a `WatchStartFailed`, and it asks again from the same version for as long as it is refused.
 ///
 /// The cost is a full re-LIST per error, which is what `client-go`'s reflector has always done. It
 /// is bounded by the backoff below, and it is not paid on the routine path: the apiserver closing a

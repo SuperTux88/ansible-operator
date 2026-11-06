@@ -175,7 +175,9 @@ spec:
                         its own.
                       type: boolean
                     providerName:
-                      description: The name of the `PlaybookPlan` that publishes `key`, decoded from the key itself.
+                      description: >-
+                        The name of the `PlaybookPlan` that publishes `key`, decoded from the key
+                        itself.
                       type: string
                     providerNamespace:
                       description: |-
@@ -186,7 +188,7 @@ spec:
                         like — and naming it is what lets a human spot the typo.
                       type: string
                     requirement:
-                      description: 'The requirement as written, rendered back for a reader: `Ge 1.4.0`, `Exists`, `= 1.4.2`.'
+                      description: "The requirement as written, rendered back for a reader: `Ge 1.4.0`, `Exists`, `= 1.4.2`."
                       type: string
                     satisfied:
                       description: |-
