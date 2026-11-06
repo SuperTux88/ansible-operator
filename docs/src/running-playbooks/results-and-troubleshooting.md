@@ -694,6 +694,9 @@ instead, and `.status.activeRun` names the run it is waiting on:
   own once the underlying problem does. Until then the run's proxy pods may still be up — worth
   looking at if the message persists, since these are node-root pods. The run's `Play` is deliberately
   kept meanwhile: it is the handle the retry works from, so do not delete it to unstick the plan.
+  The one failure this summary never shows is the operator failing to re-read the plan itself: its
+  own copy may still describe a run that has already finished, so it writes nothing to the plan
+  and the error appears only in the operator's log.
 - **"run recovery failed: …"** — the operator could not resume the run after a restart. The rest of
   the message is the underlying error; the operator retries every tick. An error about a run record
   starts with `Play <ns>/<name> (phase <phase>)`, naming the record and the phase it was in. If the

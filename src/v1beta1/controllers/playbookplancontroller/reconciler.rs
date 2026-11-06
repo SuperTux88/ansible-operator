@@ -4328,7 +4328,8 @@ async fn adopt_live_status_if_finalized(
 
     let live_status = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace)
         .get(name)
-        .await?
+        .await
+        .map_err(ReconcileError::PlanStatusUnconfirmed)?
         .status;
     let still_active = live_status
         .as_ref()
@@ -4773,6 +4774,9 @@ async fn report_failed_finalization(
     resource_status: &mut PlaybookPlanStatus,
     error: ReconcileError,
 ) -> ReconcileError {
+    if !finalization_failure_is_reported(&error) {
+        return error;
+    }
     resource_status.summary = Some(format!(
         "could not complete run {}: {}",
         run.mirror.job_name,
@@ -4785,6 +4789,17 @@ async fn report_failed_finalization(
         );
     }
     error
+}
+
+/// Whether [`report_failed_finalization`] may write this tick's status to report `error`.
+///
+/// Not when the live re-read itself failed: the tick's status comes from the reflector cache, which
+/// may still name a run an earlier tick already finished, and the merge patch would write that run's
+/// `activeRun`, `Applying` and `Running` condition back over the finished plan. Should the run's
+/// `Play` be pruned by then, the next tick would report it lost and every host `Unknown`. The error
+/// is still returned, so the controller logs it and retries.
+fn finalization_failure_is_reported(error: &ReconcileError) -> bool {
+    !matches!(error, ReconcileError::PlanStatusUnconfirmed(_))
 }
 
 /// Records a failed attempt to prepare or launch a run on the plan and hands the error straight
@@ -5345,7 +5360,7 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         | ReconcileError::AmbiguousHost { .. }
         | ReconcileError::AmbiguousHostCredentials { .. }
         | ReconcileError::SecretNotFound { .. } => true,
-        ReconcileError::KubeError(_) => false,
+        ReconcileError::KubeError(_) | ReconcileError::PlanStatusUnconfirmed(_) => false,
         // Transient by construction, and the shortest-lived of them all: the inventory's own
         // controller is on its way to publishing the hosts for this generation, and the status
         // write that does it wakes this plan. Giving up a prepared run over a wait measured in
@@ -10073,6 +10088,32 @@ mod tests {
             assert_eq!(host.last_applied_hash, applied_hash, "{play_phase:?}");
             assert_eq!(host.last_outcome, host_outcome);
         }
+    }
+
+    /// A tick that could not re-read the plan cannot tell whether its cached status still names a
+    /// live run, so it must not write that status back to report the failure. The same API error
+    /// from any other finalization step is still reported.
+    #[test]
+    fn a_failed_plan_reread_is_not_reported_on_the_plan() {
+        let unavailable = || {
+            kube::Error::Api(Box::new(
+                kube::core::Status::failure(
+                    "the server is currently unable to handle the request",
+                    "ServiceUnavailable",
+                )
+                .with_code(503),
+            ))
+        };
+
+        assert!(!finalization_failure_is_reported(
+            &ReconcileError::PlanStatusUnconfirmed(unavailable())
+        ));
+        assert!(finalization_failure_is_reported(
+            &ReconcileError::KubeError(unavailable())
+        ));
+        assert!(finalization_failure_is_reported(
+            &ReconcileError::PreconditionFailed("name not set")
+        ));
     }
 
     /// A replacement `Play` at the same name is not this run's record, and has to be indistinguishable
