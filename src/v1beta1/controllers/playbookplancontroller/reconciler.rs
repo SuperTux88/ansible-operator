@@ -53,7 +53,10 @@
 //!    termination message (`callback_output`), clean up proxy infra, release Leases,
 //!    `record_finished`, fold it into the plan (`status::apply_terminal_play_status`) and set the
 //!    terminal phase or reschedule. A run whose `Play` is gone is released here by
-//!    `finalize_lost_run`, brought in by the `activeRun` mirror. The early exits that may follow a
+//!    `finalize_lost_run`, brought in by the `activeRun` mirror; one whose `Play` is already
+//!    terminal goes to `refinish_from_record`. Both re-read the live plan first, because a tick
+//!    started from a lagging cache would otherwise write a finished run's mirror back, and only
+//!    then finish the run from what is left of it. The early exits that may follow a
 //!    finished run (input outage, invalid schedule) write that run's verdict, not `Pending`
 //!    (`phase_under_overlay_after_run`) — for a lost run that is the only write its verdict gets. A
 //!    Job that never started (`job_start_stall`, judged by time against `runs.startTimeoutSeconds`)
@@ -3969,19 +3972,37 @@ fn apply_abandoned_run_status(status: &mut PlaybookPlanStatus, run: &RecordedRun
     status.next_run = None;
 }
 
-/// Whether this run's record has reached `Running`, the only phase that may enter Job finalization.
-/// Earlier phases belong to absent-Job recovery, including when a tick just drained another run's
-/// terminal result while the plan status mirrors this one.
-///
-/// The UID is checked by the caller rather than here, because a record that no longer carries it is
-/// not a wrong *phase* — it is a different object at the same name, which says the recorded run is
-/// gone.
-fn play_is_running(play: &Play) -> Result<bool, ReconcileError> {
+/// How far the run the plan's status mirrors has got, according to its own record.
+#[derive(Debug, PartialEq, Eq)]
+enum RecordStage {
+    /// Before its Job, or given up before one: absent-Job recovery owns it, including when a tick
+    /// just drained another run's terminal result while the plan status mirrors this one.
+    Unlaunched,
+    /// The only stage that may enter Job finalization.
+    Running,
+    /// Already finished: its infrastructure was released before the record turned terminal, so all
+    /// that can be left is folding its result into the plan (see [`refinish_from_record`]).
+    Finished,
+}
+
+/// Where this run's record stands. The UID is checked by the caller rather than here, because a
+/// record that no longer carries it is not a wrong *phase* — it is a different object at the same
+/// name, which says the recorded run is gone.
+fn record_stage(play: &Play) -> Result<RecordStage, ReconcileError> {
     let status = play
         .status
         .as_ref()
         .ok_or_else(|| ReconcileError::record_mismatch(play, "is active but has no status"))?;
-    Ok(status.phase == v1beta1::PlayPhase::Running)
+    Ok(match status.phase {
+        v1beta1::PlayPhase::Prepared
+        | v1beta1::PlayPhase::Starting
+        | v1beta1::PlayPhase::Launching
+        | v1beta1::PlayPhase::Aborted => RecordStage::Unlaunched,
+        v1beta1::PlayPhase::Running => RecordStage::Running,
+        v1beta1::PlayPhase::Succeeded
+        | v1beta1::PlayPhase::Failed
+        | v1beta1::PlayPhase::Unknown => RecordStage::Finished,
+    })
 }
 
 /// Steps 6-7: once this run's Job is `Complete`/`Failed`, reads the per-host recap from its pod's
@@ -4010,8 +4031,8 @@ async fn advance_active_run(
     let Some(play) = own_record(plays_api.get_opt(&job_name).await?, &run.mirror.play_uid) else {
         return finalize_lost_run(context, object, run, resource_status).await;
     };
-    // Deliberately silent on the plan, and deliberately the slow interval. Two ticks reach here,
-    // and neither wants a message or a prompt return of its own:
+    // An unlaunched record is deliberately silent on the plan, and deliberately the slow interval.
+    // Two ticks find one, and neither wants a message or a prompt return of its own:
     //
     //   - one that drained a queued terminal result while the mirror still named a run that
     //     has not reached `Running`. That tick describes the situation itself, in terms this could
@@ -4029,10 +4050,16 @@ async fn advance_active_run(
     //
     // Fifteen seconds serves both: the first overrides it, and the second is exactly the cadence
     // the contested path asked for.
-    if !play_is_running(&play)? {
-        return Ok(ActiveRunProgress::Running(std::time::Duration::from_secs(
-            15,
-        )));
+    match record_stage(&play)? {
+        RecordStage::Unlaunched => {
+            return Ok(ActiveRunProgress::Running(std::time::Duration::from_secs(
+                15,
+            )));
+        }
+        RecordStage::Finished => {
+            return refinish_from_record(context, object, run, &play, resource_status).await;
+        }
+        RecordStage::Running => {}
     }
 
     // An earlier tick found this run's Job stalled and wrote down why. The cancellation is carried
@@ -4284,25 +4311,19 @@ fn report_stalled_run_cancelling(
     ActiveRunProgress::Running(std::time::Duration::from_secs(5))
 }
 
-/// Finalizes a run whose `Play` is gone: its Job is stopped first, then its infrastructure is
-/// released and every targeted host is reported `Unknown`, because without the record nothing about
-/// the run can be recovered. Wedging in `Applying` on a record that is never coming back would hold
-/// this plan's host locks indefinitely.
+/// Re-reads the plan from the apiserver and, when its status no longer names `run` as active,
+/// replaces this tick's cached status with it and answers `true`: an earlier tick already finished
+/// the run and the cache had not caught up. The live status is adopted wholesale because it is
+/// strictly newer than the copy this tick started from.
 ///
-/// First, though, it re-reads the plan **from the apiserver**. The run this is called for comes from
-/// the reflector-cached status, which lags this controller's own writes, so a tick that raced ahead
-/// of that cache can arrive here for a run a previous tick already finished, acknowledged and pruned
-/// (a `historyLimit` of 0 prunes it immediately). Reporting that run lost would overwrite a
-/// perfectly good recap with `Unknown` for every host. When the live status disagrees, it is adopted
-/// wholesale — it is strictly newer than the copy this tick started from — and nothing is finalized.
 /// The full-object GET is intentional: the operator has `get` on `playbookplans` but only `patch` on
 /// `playbookplans/status`, so using `get_status` would require an additional RBAC grant.
-async fn finalize_lost_run(
+async fn adopt_live_status_if_finalized(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
     run: &RecordedRun,
     resource_status: &mut PlaybookPlanStatus,
-) -> Result<ActiveRunProgress, ReconcileError> {
+) -> Result<bool, ReconcileError> {
     let (namespace, name) = namespace_and_name(object)?;
 
     let live_status = Api::<PlaybookPlan>::namespaced(context.client.clone(), namespace)
@@ -4313,12 +4334,104 @@ async fn finalize_lost_run(
         .as_ref()
         .and_then(|status| status.active_run.as_ref())
         .is_some_and(|mirrored| mirrored.play_uid == run.mirror.play_uid);
-    if !still_active {
-        debug!(
-            "PlaybookPlan {namespace}/{name}: run {} was already finalized by an earlier tick; refreshing the cached status",
-            run.mirror.job_name
-        );
-        *resource_status = live_status.unwrap_or_default();
+    if still_active {
+        return Ok(false);
+    }
+    debug!(
+        "PlaybookPlan {namespace}/{name}: run {} was already finalized by an earlier tick; refreshing the cached status",
+        run.mirror.job_name
+    );
+    *resource_status = live_status.unwrap_or_default();
+    Ok(true)
+}
+
+/// Finishes a run whose own record is already terminal while the plan still names it as active.
+///
+/// A tick gets here by starting from a cached plan older than the write that finished the run: after
+/// an apiserver restart the controller's plan watch can lag for seconds while a Job event still
+/// triggers ticks. Waiting would not be harmless there, because the tick's final status patch merges
+/// its whole cached status back over the finished one, `activeRun` included. From then on nothing
+/// clears it: the record is acknowledged, so recovery no longer drains it, and every later tick
+/// lands here again.
+///
+/// So the live plan is read first, as [`finalize_lost_run`] does. When it has moved on, it is adopted
+/// and nothing is finished twice. When it still names the run, the plan has lost the result its
+/// record holds, and that result is applied again from the record, the way recovery applies one that
+/// was never acknowledged ([`finished_from_record`]).
+async fn refinish_from_record(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    run: &RecordedRun,
+    play: &Play,
+    resource_status: &mut PlaybookPlanStatus,
+) -> Result<ActiveRunProgress, ReconcileError> {
+    if adopt_live_status_if_finalized(context, object, run, resource_status).await? {
+        return Ok(ActiveRunProgress::AlreadyFinalized);
+    }
+    let (namespace, name) = namespace_and_name(object)?;
+    warn!(
+        "PlaybookPlan {namespace}/{name}: run {} has already finished, but the plan still names it as its active run; applying its recorded result again",
+        run.mirror.job_name
+    );
+    finished_from_record(run, play, &context.nodes, resource_status)
+}
+
+/// Folds a terminal record's result into the plan status and gives up the plan's mirror of it.
+///
+/// Nothing is torn down: a run's infrastructure is released before its record turns terminal. The
+/// record stays `Present`, so it is acknowledged again after the status patch, which is a no-op for
+/// a record that already is. The diagnostic is not logged again; the tick that first applied this
+/// result already did.
+fn finished_from_record(
+    run: &RecordedRun,
+    play: &Play,
+    nodes: &Store<Node>,
+    resource_status: &mut PlaybookPlanStatus,
+) -> Result<ActiveRunProgress, ReconcileError> {
+    let play_status = play
+        .status
+        .as_ref()
+        .ok_or_else(|| ReconcileError::record_mismatch(play, "finished but has no status"))?;
+    status::apply_terminal_play_status(
+        &status::RunRecord {
+            execution_hash: &run.execution_hash,
+            provides_version: play.spec.provides_version.as_deref(),
+            started_at: play_prepared_at(play),
+            inventory: &play.spec.inventory,
+        },
+        play_status,
+        nodes,
+        resource_status,
+    );
+    resource_status.active_run = None;
+    Ok(ActiveRunProgress::Finished {
+        run: run.clone(),
+        verdict: phase_for_finished_run(play_status),
+        failure: classify_run_failure(play_status),
+        diagnostic: RunDiagnostic::from_play_status(play_status),
+        record: TerminalRecord::Present,
+    })
+}
+
+/// Finalizes a run whose `Play` is gone: its Job is stopped first, then its infrastructure is
+/// released and every targeted host is reported `Unknown`, because without the record nothing about
+/// the run can be recovered. Wedging in `Applying` on a record that is never coming back would hold
+/// this plan's host locks indefinitely.
+///
+/// First, though, it re-reads the plan **from the apiserver** ([`adopt_live_status_if_finalized`]).
+/// The run this is called for comes from the reflector-cached status, which lags this controller's
+/// own writes, so a tick that raced ahead of that cache can arrive here for a run a previous tick
+/// already finished, acknowledged and pruned (a `historyLimit` of 0 prunes it immediately).
+/// Reporting that run lost would overwrite a perfectly good recap with `Unknown` for every host.
+async fn finalize_lost_run(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+    run: &RecordedRun,
+    resource_status: &mut PlaybookPlanStatus,
+) -> Result<ActiveRunProgress, ReconcileError> {
+    let (namespace, name) = namespace_and_name(object)?;
+
+    if adopt_live_status_if_finalized(context, object, run, resource_status).await? {
         return Ok(ActiveRunProgress::AlreadyFinalized);
     }
 
@@ -9854,15 +9967,24 @@ mod tests {
             play
         };
 
-        assert!(play_is_running(&play(v1beta1::PlayPhase::Running)).unwrap());
+        assert_eq!(
+            record_stage(&play(v1beta1::PlayPhase::Running)).unwrap(),
+            RecordStage::Running
+        );
         for phase in [
             v1beta1::PlayPhase::Prepared,
             v1beta1::PlayPhase::Starting,
             v1beta1::PlayPhase::Launching,
             v1beta1::PlayPhase::Aborted,
-            v1beta1::PlayPhase::Succeeded,
         ] {
-            assert!(!play_is_running(&play(phase)).unwrap());
+            assert_eq!(record_stage(&play(phase)).unwrap(), RecordStage::Unlaunched);
+        }
+        for phase in [
+            v1beta1::PlayPhase::Succeeded,
+            v1beta1::PlayPhase::Failed,
+            v1beta1::PlayPhase::Unknown,
+        ] {
+            assert_eq!(record_stage(&play(phase)).unwrap(), RecordStage::Finished);
         }
 
         // A statusless record never crossed the operator-owned boundary, so it describes no phase to
@@ -9870,7 +9992,87 @@ mod tests {
         // filters out before ever getting here.
         let mut statusless = play(v1beta1::PlayPhase::Running);
         statusless.status = None;
-        assert!(play_is_running(&statusless).is_err());
+        assert!(record_stage(&statusless).is_err());
+    }
+
+    /// The state an apiserver restart left a plan in: a tick that started from a stale cache wrote
+    /// the run's mirror back over the finished status, while the run's record is terminal and
+    /// already acknowledged, so recovery no longer drains it. The record's result has to be applied
+    /// again and the mirror given up, or the plan reads `Applying` for good. A failed run must come
+    /// back as a failure that spent its attempt, without recording its host as up to date.
+    #[test]
+    fn a_plan_still_mirroring_a_finished_run_takes_the_result_from_its_record() {
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+        for (play_phase, host_outcome, expected_verdict, expected_failure, applied_hash) in [
+            (
+                v1beta1::PlayPhase::Succeeded,
+                v1beta1::HostOutcome::Succeeded,
+                Phase::Succeeded,
+                RunFailure::None,
+                hash.to_string(),
+            ),
+            (
+                v1beta1::PlayPhase::Failed,
+                v1beta1::HostOutcome::Failed,
+                Phase::Failed,
+                RunFailure::Real,
+                String::new(),
+            ),
+        ] {
+            let run = finished_run(hash, 1, 1, Utc::now().fixed_offset());
+            let mut play = Play::new(
+                &run.mirror.job_name,
+                PlaySpec {
+                    inventory: vec![ResolvedHosts {
+                        name: "all".into(),
+                        hosts: vec!["worker-1".into()],
+                        ..Default::default()
+                    }],
+                    ..PlaySpec::default()
+                },
+            );
+            play.metadata.uid = Some(run.mirror.play_uid.clone());
+            play.status = Some(v1beta1::PlayStatus {
+                host_count: 1,
+                plan_status_recorded: true,
+                ..terminal_play_status(
+                    play_phase.clone(),
+                    &[("worker-1", host_outcome.clone())],
+                    &[],
+                )
+            });
+            let mut resource_status = PlaybookPlanStatus {
+                phase: Phase::Applying,
+                active_run: Some(run.mirror.clone()),
+                ..Default::default()
+            };
+            status::set_running_condition(&mut resource_status);
+            let nodes = Writer::<Node>::default().as_reader();
+
+            let ActiveRunProgress::Finished {
+                verdict,
+                failure,
+                record,
+                ..
+            } = finished_from_record(&run, &play, &nodes, &mut resource_status).unwrap()
+            else {
+                panic!("a terminal record finishes the run it records");
+            };
+
+            assert_eq!(verdict, expected_verdict, "{play_phase:?}");
+            assert_eq!(failure, expected_failure, "{play_phase:?}");
+            assert_eq!(record, TerminalRecord::Present);
+            assert!(resource_status.active_run.is_none());
+            assert!(
+                !resource_status
+                    .conditions
+                    .iter()
+                    .any(|condition| condition.type_ == "Running" && condition.status == "True")
+            );
+            let host = &resource_status.hosts_status.unwrap()["worker-1"];
+            assert_eq!(host.last_applied_hash, applied_hash, "{play_phase:?}");
+            assert_eq!(host.last_outcome, host_outcome);
+        }
     }
 
     /// A replacement `Play` at the same name is not this run's record, and has to be indistinguishable
