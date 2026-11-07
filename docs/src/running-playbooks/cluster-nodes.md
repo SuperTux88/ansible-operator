@@ -230,9 +230,11 @@ spec:
 
 Group variables are part of the execution hash of every plan that references the inventory, so
 changing one re-applies that plan's playbook to all of its Nodes on its next run, not only to that
-group's Nodes. The connection variables the operator manages itself — `ansible_host`, `ansible_port`,
-`ansible_user`, and the `ansible_ssh_*` options — are rejected: they are wired from
-managed SSH, and a plan that references an inventory setting one does not run until you remove it.
+group's Nodes. The connection variables the operator manages itself — `ansible_host`, `ansible_port`
+and `ansible_user`, also under their older `ansible_ssh_host`, `ansible_ssh_port` and
+`ansible_ssh_user` spellings, `ansible_ssh_private_key_file` and `ansible_ssh_common_args` — are
+rejected: they are wired from managed SSH, and a plan that references an inventory setting one does
+not run until you remove it.
 
 Which group a Node is in is not part of the hash. A Node that has already been applied and then moves
 to another group, for example after a relabel, is not re-run, even when the new group sets different

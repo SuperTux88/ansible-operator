@@ -726,9 +726,10 @@ instead, and `.status.activeRun` names the run it is waiting on:
   just this one. If its Job had already been created it is adopted and allowed to finish instead,
   reported as **"adopted the started run; the desired inputs cannot be resolved: …"**.
 - **"aborted the run: host '…' is now locked by …"** — while the run was still being set up,
-  another run was *observed* holding one of its host locks (its own lease lapsed during an operator
-  outage and the other run took it over). Rather than run two playbooks against the same host, it was
-  released and deleted; it starts again once the host is free.
+  another run was *observed* holding one of its host locks. The operator does not take over a lapsed
+  lock while the run holding it is still in flight, so this means something outside the operator
+  changed the Lease, or deleted it and another run took the host. Rather than run two playbooks
+  against the same host, it was released and deleted; it starts again once the host is free.
 - **"could not confirm the lock on host '…'; retrying"** — the same check, but inconclusive: the
   operator raced another writer on that Lease and cannot say who holds it. Nothing was seen taking
   the lock over, so the run is deliberately *kept* and the question is asked again a second
@@ -761,8 +762,9 @@ instead, and `.status.activeRun` names the run it is waiting on:
   NetworkPolicy or Lease would not delete, or its run record could not be removed afterwards. The
   rest of the message is the underlying error. The run's record is deliberately kept as the
   handle for retrying that cleanup, and the operator retries every tick, so this clears on its own
-  once the underlying problem does. Until then the run's proxy pods may still be up — worth looking
-  at if the message persists, since these are node-root pods. This is the one message here that can
+  once the underlying problem does. Until then the run's proxy pods may still be up and its hosts
+  may stay locked against other plans — worth looking at if the message persists, since these are
+  node-root pods. This is the one message here that can
   also appear while the phase reads `Pending`, if the teardown got as far as clearing the run before
   failing.
 
@@ -802,9 +804,10 @@ instead, and `.status.activeRun` names the run it is waiting on:
 
   Re-read the holder identity of each Lease immediately before deleting it, and delete it only while
   it still names this run. A host lock is the one thing another plan can take over between the two
-  commands: a lapsed Lease is acquired by whichever run wants that host next, and it keeps the same
-  Lease name. If the holder no longer matches, **stop** — the host now belongs to a live run, and
-  deleting its Lease hands the same host to a third run while Ansible is on it.
+  commands: a lapsed Lease is acquired by whichever run wants that host next once its plan no longer
+  records this run as active, and it keeps the same Lease name. If the holder no longer matches,
+  **stop** — the host now belongs to a live run, and deleting its Lease hands the same host to a
+  third run while Ansible is on it.
 
   Once those resources are gone, the operator can delete the `Aborted` Play itself on its next
   retry. Delete the Play by hand only after verifying the cleanup; deleting the recovery handle

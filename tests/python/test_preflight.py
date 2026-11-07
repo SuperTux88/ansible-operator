@@ -231,7 +231,8 @@ class WaitForTest(unittest.TestCase):
 
         self.assertEqual(pending, endpoint)
         self.assertLessEqual(
-            len(calls), int(1.0 / preflight.POLL_INTERVAL_SECONDS) + 1,
+            len(calls),
+            int(1.0 / preflight.POLL_INTERVAL_SECONDS) + 1,
             "a refused connection must not make the polling loop free-run",
         )
 
@@ -240,9 +241,8 @@ class ReadEndpointsTest(unittest.TestCase):
     def write(self, contents):
         import tempfile
 
-        handle = tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False)
-        self.addCleanup(lambda: Path(handle.name).unlink(missing_ok=True))
-        with handle:
+        with tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False) as handle:
+            self.addCleanup(Path(handle.name).unlink, missing_ok=True)
             handle.write(contents)
         return handle.name
 
@@ -265,9 +265,7 @@ class ReadEndpointsTest(unittest.TestCase):
 
     def test_a_malformed_port_is_reported_without_discarding_other_endpoints(self):
         path = self.write(
-            "node-a\t10.42.1.7\t22\n"
-            "node-b\t10.42.2.8\tnot-a-port\n"
-            "node-c\t10.42.3.9\t2222\n"
+            "node-a\t10.42.1.7\t22\nnode-b\t10.42.2.8\tnot-a-port\nnode-c\t10.42.3.9\t2222\n"
         )
 
         with mock.patch.object(preflight, "log") as log:
@@ -278,8 +276,7 @@ class ReadEndpointsTest(unittest.TestCase):
             [("node-a", "10.42.1.7", 22), ("node-c", "10.42.3.9", 2222)],
         )
         log.assert_called_once_with(
-            "ignoring malformed endpoint on line 2: "
-            "'node-b\\t10.42.2.8\\tnot-a-port'"
+            "ignoring malformed endpoint on line 2: 'node-b\\t10.42.2.8\\tnot-a-port'"
         )
 
 

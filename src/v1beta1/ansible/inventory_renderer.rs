@@ -10,10 +10,17 @@ use crate::v1beta1::ResolvedInventoryGroup;
 /// them at resolve time turns a silently-ignored setting into a clear error. The
 /// `reserved_vars_cover_every_rendered_host_var` test keeps this list in step with what is actually
 /// emitted below.
+///
+/// Host-var precedence only covers the same name, though. The ssh connection plugin also reads the
+/// older `ansible_ssh_host`/`_port`/`_user` spellings and prefers them when both are set, so a group
+/// var under one of those would win over what the operator renders; they are reserved too.
 pub const RESERVED_HOST_VARS: &[&str] = &[
     "ansible_host",
+    "ansible_ssh_host",
     "ansible_port",
+    "ansible_ssh_port",
     "ansible_user",
+    "ansible_ssh_user",
     "ansible_ssh_private_key_file",
     "ansible_ssh_common_args",
 ];
@@ -172,6 +179,7 @@ fn render_ssh_host_vars(
     ctx: &RenderContext,
 ) -> HostVars {
     let mut vars = HostVars {
+        ansible_port: config.port.map(i32::from),
         ansible_user: Some(config.user.clone()),
         ..Default::default()
     };
@@ -293,6 +301,7 @@ mod tests {
                 secret_ref: SecretRef {
                     name: "ssh-key".into(),
                 },
+                port: None,
             },
             variables: None,
         };
@@ -313,11 +322,20 @@ mod tests {
             ssh_paths_by_static_inventory: &ssh_paths,
         };
 
-        let rendered = render_inventory(&[group], &ctx).unwrap();
+        let rendered = render_inventory(std::slice::from_ref(&group), &ctx).unwrap();
 
         assert!(rendered.contains("ansible_user: root"));
         assert!(rendered.contains("/run/ansible-operator/ssh/ccu/id_rsa"));
         assert!(rendered.contains(DEAD_HOST_SSH_ARGS));
+        // No port set, so SSH's own default applies.
+        assert!(!rendered.contains("ansible_port"), "{rendered}");
+
+        let mut on_port = group;
+        if let ResolvedInventoryGroup::Ssh { config, .. } = &mut on_port {
+            config.port = Some(2222);
+        }
+        let rendered = render_inventory(&[on_port], &ctx).unwrap();
+        assert!(rendered.contains("ansible_port: 2222"), "{rendered}");
     }
 
     #[test]
@@ -343,6 +361,7 @@ mod tests {
                 secret_ref: SecretRef {
                     name: "ssh-key".into(),
                 },
+                port: None,
             },
             variables: None,
         };
@@ -554,6 +573,7 @@ mod tests {
                 secret_ref: SecretRef {
                     name: "ssh-key".into(),
                 },
+                port: None,
             },
             variables: None,
         };
@@ -611,5 +631,15 @@ mod tests {
 
         // A non-object has no top-level keys, so it never conflicts here.
         assert_eq!(first_reserved_var(&serde_json::json!("scalar")), None);
+    }
+
+    /// Ansible's ssh plugin prefers these older spellings over the names the operator renders, so
+    /// a group var using one would override the host-level connection vars despite precedence.
+    #[test]
+    fn older_spellings_of_rendered_connection_vars_are_reserved() {
+        for alias in ["ansible_ssh_host", "ansible_ssh_port", "ansible_ssh_user"] {
+            let variables = serde_json::json!({ alias: "value" });
+            assert_eq!(first_reserved_var(&variables), Some(alias));
+        }
     }
 }

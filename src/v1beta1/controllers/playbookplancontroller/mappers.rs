@@ -1015,6 +1015,7 @@ mod tests {
                     secret_ref: v1beta1::SecretRef {
                         name: secret.into(),
                     },
+                    port: None,
                 },
             },
         );

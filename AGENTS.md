@@ -68,8 +68,9 @@ both. Prose, not field tables; relative links with mdBook slug anchors; new page
 
 ## Workflow
 
-- `just check` = build + Rust and Python tests + clippy + guide + apidoc; run it before proposing
-  changes. `just` lists the other recipes.
+- `just check` = build + Rust and Python tests + clippy + ruff (skipped with a warning when not
+  installed; CI pins and always runs it) + guide + apidoc; run it before proposing changes. `just`
+  lists the other recipes.
 - Rust unit tests live in `#[cfg(test)] mod tests` in each file; prefer extracting a small pure
   function over testing through `reconcile()`.
 - `tests/python/` is stdlib `unittest` with no dependencies; keep it that way.
