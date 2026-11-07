@@ -122,15 +122,25 @@ jobs:
   # above. Deliberately a job of its own rather than a step in it: it needs no Rust toolchain and
   # no cache, it runs in seconds, and keeping it separate means a broken gate script is reported as
   # itself rather than as "tests failed". Stdlib `unittest` only, so the runner's python3 is the
-  # whole dependency.
+  # whole dependency of the tests; ruff comes from the runner's pipx.
   test-python:
     runs-on: ubuntu-latest
+
+    # Pinned because ruff's default rule set changes between releases: an unpinned run would start
+    # failing on a new release with no change in this repository.
+    env:
+      RUFF_VERSION: "0.17.3"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Run Python tests
         run: python3 -m unittest discover --start-directory tests/python --verbose
+
+      - name: Lint Python
+        run: |
+          pipx run "ruff==${RUFF_VERSION}" check
+          pipx run "ruff==${RUFF_VERSION}" format --check
 
   # The mdBook guide under docs/. A prebuilt mdBook release, so this job needs no Rust toolchain.
   docs:
