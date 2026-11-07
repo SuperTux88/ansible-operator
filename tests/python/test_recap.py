@@ -95,9 +95,9 @@ def result_for(host, task):
 def decode(message):
     """The reader's half of the wire format — mirrors `callback_output::parse_callback_output`."""
     if message.startswith(recap.COMPRESSED_PREFIX):
-        payload = zlib.decompress(
-            base64.b64decode(message[len(recap.COMPRESSED_PREFIX) :])
-        ).decode("utf-8")
+        payload = zlib.decompress(base64.b64decode(message[len(recap.COMPRESSED_PREFIX) :])).decode(
+            "utf-8"
+        )
     else:
         payload = message
     return json.loads(payload)
@@ -146,7 +146,7 @@ class RecapTest(unittest.TestCase):
             },
         )
 
-        self.assertEqual(written["cut-short"][:IGNORED + 1], written["finished"][:IGNORED + 1])
+        self.assertEqual(written["cut-short"][: IGNORED + 1], written["finished"][: IGNORED + 1])
         self.assertEqual(written["cut-short"][COMPLETED], 0)
         self.assertEqual(written["finished"][COMPLETED], 1)
 
@@ -155,7 +155,9 @@ class RecapTest(unittest.TestCase):
 
         self.assertEqual(written["bad-c"][FAILED], 1)
         self.assertEqual(written["bad-c"][COMPLETED], 0)
-        self.assertEqual(written["bad-c"][OK], 1, "nothing is subtracted from a host with no marker")
+        self.assertEqual(
+            written["bad-c"][OK], 1, "nothing is subtracted from a host with no marker"
+        )
 
     def test_a_host_no_play_targeted_reports_completion_with_no_counters(self):
         """It reaches the marker (which targets `all`) and nothing else. Empty counters plus
