@@ -24,6 +24,7 @@ pub struct ClusterInventorySpec {
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct Toleration {
     pub effect: Option<String>,
     pub key: Option<String>,
@@ -234,6 +235,31 @@ mod tests {
         assert!(item["properties"]["matchExpressions"].is_object());
         assert!(item["properties"]["matchLabels"].is_object());
         assert_eq!(item.get("x-kubernetes-preserve-unknown-fields"), None);
+    }
+
+    /// Tolerations are written as on any pod. A field the CRD spells differently is refused by
+    /// `kubectl`, but a client that does not ask for strict validation only gets a warning and the
+    /// field is pruned: a `tolerationSeconds` lost that way tolerates its taint for ever.
+    #[test]
+    fn a_toleration_is_spelled_as_kubernetes_spells_it() {
+        let kubernetes = k8s_openapi::api::core::v1::Toleration {
+            effect: Some("NoExecute".into()),
+            key: Some("node.kubernetes.io/unreachable".into()),
+            operator: Some("Equal".into()),
+            toleration_seconds: Some(300),
+            value: Some("x".into()),
+        };
+        let written = serde_json::to_value(&kubernetes).unwrap();
+
+        let crd = serde_json::to_value(ClusterInventory::crd()).unwrap();
+        let item = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+            ["tolerations"]["items"];
+        let admitted: Vec<&String> = item["properties"].as_object().unwrap().keys().collect();
+        let spelled: Vec<&String> = written.as_object().unwrap().keys().collect();
+        assert_eq!(admitted, spelled);
+
+        let decoded: Toleration = serde_json::from_value(written).unwrap();
+        assert_eq!(decoded, Toleration::from(kubernetes));
     }
 
     #[test]

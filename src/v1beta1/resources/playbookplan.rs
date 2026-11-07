@@ -376,7 +376,7 @@ pub struct PlaybookTemplate {
     /// Files for the playbook. Each entry is a `secretRef` or one Kubernetes volume source of a
     /// type the restricted Pod Security Standard allows, or `image`; `hostPath` and other types
     /// are refused.
-    #[schemars(with = "Option<Vec<GenericMap>>")]
+    #[schemars(with = "Option<Vec<FilesSourceSchema>>")]
     pub files: Option<Vec<FilesSource>>,
 
     /// Runtime requirements (e.g. Ansible collections)
@@ -398,6 +398,34 @@ pub enum FilesSource {
         #[serde(flatten)]
         extra: BTreeMap<String, serde_json::Value>,
     },
+}
+
+/// Admission schema of one [`FilesSource`]: free-form, except for what deserializing it requires.
+///
+/// It has to be at least as strict as the Rust type. The operator decodes every PlaybookPlan list
+/// as a whole, so one stored entry that does not deserialize fails the PlaybookPlan reflector for
+/// all plans, and the operator panics at start-up while such a plan exists (`await_plan_cache`).
+struct FilesSourceSchema;
+
+impl JsonSchema for FilesSourceSchema {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("FilesSource")
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": { "type": "string" }
+            },
+            "x-kubernetes-preserve-unknown-fields": true
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -868,6 +896,39 @@ mod tests {
                     "the {bound} the CRD admits for {field} does not decode"
                 );
             }
+        }
+    }
+
+    /// A `files` entry the CRD admits has to decode, or that one plan fails the PlaybookPlan list
+    /// for every plan. The schema leaves everything but `name` open, so it must require `name` as a
+    /// string, and the type must take whatever else an admitted entry carries.
+    #[test]
+    fn crd_admits_only_files_entries_that_decode() {
+        use kube::CustomResourceExt as _;
+
+        let crd = serde_json::to_value(PlaybookPlan::crd()).unwrap();
+        let item = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+            ["template"]["properties"]["files"]["items"];
+        assert_eq!(item["required"], serde_json::json!(["name"]));
+        assert_eq!(item["properties"]["name"]["type"], "string");
+        assert_eq!(item["x-kubernetes-preserve-unknown-fields"], true);
+
+        let mut plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
+        plan.metadata.namespace = Some("team".into());
+        let plan = serde_json::to_value(plan).unwrap();
+        for entry in [
+            serde_json::json!({"name": "certs", "secretRef": {"name": "tls"}}),
+            serde_json::json!({"name": "certs", "secretRef": {}}),
+            serde_json::json!({"name": "certs", "secretRef": "tls"}),
+            serde_json::json!({"name": "assets", "image": {"reference": "assets:1"}}),
+            serde_json::json!({"name": ""}),
+        ] {
+            let mut admitted = plan.clone();
+            admitted["spec"]["template"]["files"] = serde_json::json!([entry]);
+            assert!(
+                serde_json::from_value::<PlaybookPlan>(admitted).is_ok(),
+                "the CRD admits the files entry {entry}, but it does not decode"
+            );
         }
     }
 
