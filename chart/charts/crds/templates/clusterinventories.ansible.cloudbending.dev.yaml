@@ -106,7 +106,7 @@ spec:
                     operator:
                       nullable: true
                       type: string
-                    toleration_seconds:
+                    tolerationSeconds:
                       format: int64
                       nullable: true
                       type: integer

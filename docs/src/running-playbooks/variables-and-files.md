@@ -73,7 +73,9 @@ The `name` is that one directory, so it has to be a single path component: not e
 the plan and no run is started — a name that is a *path* would mount your Secret somewhere else in
 the run's pod entirely. Two entries may not share a name either: they would claim one directory, and
 the operator will not pick between them for you. Letters, digits, dots, dashes and underscores are
-all fine, in any case: `TLS_certs` and `assets.v2` are valid names.
+all fine, in any case: `TLS_certs` and `assets.v2` are valid names. An entry without a `name`, or
+with one that YAML does not read as a string, is refused already by `kubectl apply`: quote names
+such as `"2024"` or `"yes"`.
 
 ### From a Secret
 

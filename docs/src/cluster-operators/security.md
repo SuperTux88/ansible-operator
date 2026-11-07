@@ -84,6 +84,12 @@ plan's inventory groups expanded to. It carries no Secret material and no plan c
 that host list is enough that `get plays` should be treated as equivalent to `get playbookplans` for
 the namespace.
 
+One tenant's broken plan does not stop the others' runs either. The operator reads all plans in one
+list, and a plan it could not decode would fail that list for every namespace. The CRD therefore
+refuses such a plan at `kubectl apply` already; anything admission cannot check is reported on the
+plan itself. This holds for the plan's `spec`, not its `status`: grant `playbookplans/status` to the
+operator alone. `T-DOS-3` in the threat model has the details.
+
 ## The Job trust boundary
 
 The operator validates the identity of an existing Job before adopting it during recovery. That

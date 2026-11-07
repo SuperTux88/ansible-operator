@@ -330,6 +330,11 @@ spec:
                       type the restricted Pod Security Standard allows, or `image`; `hostPath` and other types
                       are refused.
                     items:
+                      properties:
+                        name:
+                          type: string
+                      required:
+                      - name
                       type: object
                       x-kubernetes-preserve-unknown-fields: true
                     nullable: true
