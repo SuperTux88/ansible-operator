@@ -205,15 +205,42 @@ Ansible group vars. An author could try to set `ansible_ssh_common_args` (weaken
 checking), `ansible_host`/`ansible_port` (redirecting the dial), or `ansible_user` to subvert the
 managed-SSH/SSH wiring.
 - *Mitigation:* the operator rejects the connection variables it renders itself
-  (`ansible::RESERVED_HOST_VARS` — `ansible_host`, `ansible_port`, `ansible_user`,
+  (`ansible::RESERVED_HOST_VARS` — `ansible_host`, `ansible_port`, `ansible_user`, their older
+  `ansible_ssh_host`/`ansible_ssh_port`/`ansible_ssh_user` spellings,
   `ansible_ssh_private_key_file`, `ansible_ssh_common_args`) at inventory-resolve time
   (`reject_reserved_variables`, before any proxy infra), failing the reconcile with
   `ReservedInventoryVariable`. Independently, those vars are rendered per-**host**, which outranks
-  group vars in Ansible precedence, so an accepted group var can never shadow them. A test
-  (`reserved_vars_cover_every_rendered_host_var`) keeps the reserved list in step with what the
-  renderer emits.
+  group vars in Ansible precedence — but only for the same name: the ssh connection plugin prefers
+  the older spellings when both are set, which is why they are reserved rather than left to
+  precedence. A test (`reserved_vars_cover_every_rendered_host_var`) keeps the reserved list in step
+  with what the renderer emits.
 - *Residual:* the inventory author already runs arbitrary playbook code as root on their
   already-authorized nodes (T-TAMP-2, T-ESC-4); group vars grant no reach beyond that.
+- *Deliberately allowed:* every other connection variable, notably `ansible_ssh_args`,
+  `ansible_ssh_extra_args` and `ansible_host_key_checking`/`ansible_ssh_host_key_checking`. What
+  they can do, checked with ansible-core 2.20 and OpenSSH: Ansible puts `ansible_ssh_args`, and the
+  `-o StrictHostKeyChecking=no` a false `host_key_checking` adds, *before* the operator's
+  `ansible_ssh_common_args`, and OpenSSH keeps the first value of each option. So `ansible_ssh_args`
+  can replace the operator's `UserKnownHostsFile` and `HostKeyAlias`, and a false
+  `host_key_checking` accepts a host key the CA did not sign. `ansible_ssh_extra_args` comes after
+  them and can only add options the operator does not set, such as `ProxyJump` or `HostName`. Why
+  that is accepted, each point to be re-checked if its premise changes:
+  1. The reserved list is not a boundary against the plan's authors, and cannot be one: a play's
+     `vars:` outrank inventory variables, so the playbook can set every connection variable,
+     reserved ones included (checked: play `vars:` replaced the operator's host-level
+     `ansible_host` and `ansible_user`), and so can an `ansible.cfg` in the plan's image. Rejecting
+     the rendered ones in inventories turns a common copy-paste mistake into a clear error; that is
+     its whole job.
+  2. The effect stays inside the run. A weakened or redirected connection still authenticates with
+     the run's client cert, which only this run's proxies accept (INV-4), or with the
+     `StaticInventory`'s own key. What it exposes is this run's own traffic to an impersonator on
+     the network path, and only the namespace's own authors can set it: a plan reads inventories
+     from its own namespace only.
+  3. `ansible_ssh_extra_args` has legitimate uses, such as `ProxyJump` for external hosts behind a
+     jump host, that reserving it would take away.
+
+  Revisit this if group variables can ever come from outside the plan's namespace (a shared or
+  cluster-scoped inventory), or if the reserved list is ever relied on as a security control.
 - *Severity:* Low.
 
 ### Repudiation

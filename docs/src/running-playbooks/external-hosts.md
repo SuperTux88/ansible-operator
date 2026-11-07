@@ -48,9 +48,11 @@ spec:
 
 Group variables are part of the execution hash of every plan that references the inventory, so
 changing one re-applies that plan's playbook to all of its hosts on its next run, not only to that
-group's hosts. The connection variables the operator manages — `ansible_user`, the `ansible_ssh_*`
-options, `ansible_host`, and `ansible_port` — are rejected: they come from the `ssh` block below, and
-a plan that references an inventory setting one does not run until you remove it.
+group's hosts. The connection variables the operator manages — `ansible_host`, `ansible_port` and
+`ansible_user`, also under their older `ansible_ssh_host`, `ansible_ssh_port` and `ansible_ssh_user`
+spellings, `ansible_ssh_private_key_file` and `ansible_ssh_common_args` — are rejected: they come
+from the `ssh` block below, and a plan that references an inventory setting one does not run until
+you remove it.
 
 Which group a host is in is not part of the hash. A host that has already been applied and then moves
 to another group or inventory is not re-run, even when the new group sets different variables — see
