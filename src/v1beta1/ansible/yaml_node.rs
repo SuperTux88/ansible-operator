@@ -34,8 +34,8 @@ use serde_saphyr::{Location, Spanned, Tagged};
 /// Parses a playbook, which has to be a sequence of plays, the way Ansible reads the same text.
 ///
 /// An empty or null document has no plays. That is read through `Option` because serde-saphyr
-/// itself has changed its mind about null as a sequence: 2.0 took it for an empty one, 2.1 refuses
-/// it with an end-of-input error that points past the last line.
+/// refuses an explicit null (`~`, `null`, a bare `---`) as a sequence, and has changed its mind
+/// between releases about an empty document (2.1.0 refused it too, 2.1.1 reads it as empty).
 pub fn parse_playbook(input: &str) -> Result<Vec<YamlNode>, serde_saphyr::Error> {
     let input = with_final_line_break(input);
     let mut plays: Vec<YamlNode> = parse::<Option<_>>(&input)?.unwrap_or_default();
