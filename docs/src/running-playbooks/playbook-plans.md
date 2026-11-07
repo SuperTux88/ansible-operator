@@ -335,7 +335,10 @@ Each run is a single Kubernetes Job (named `apply-<plan>-<id>-<n>`) that applies
 all of that run's hosts together, not one Job per host. This lets a playbook use Ansible features
 that span hosts (`serial`, `run_once`, delegation) normally. The operator adds per-host **Leases** so
 two runs never touch the same host at once, and it steers the Job's own pod away from the Nodes the
-run targets, so a disruptive playbook is less likely to evict its own runner mid-run.
+run targets, so a disruptive playbook is less likely to evict its own runner mid-run. A Lease the
+operator could not renew, because it was down or could not reach the API server while a Job kept
+running, is not handed to another run on its expiry alone: it is taken over only once the plan
+holding it no longer records that run as its active one.
 
 Before the Job starts, the operator renders everything the run needs to read — the playbook, the
 inventory it resolved, any inline variables — into a **workspace Secret** in the plan's namespace,

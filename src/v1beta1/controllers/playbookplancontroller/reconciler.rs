@@ -3537,8 +3537,13 @@ async fn try_start_run(
         {
             return Ok(Some(requeue));
         }
-    } else if let Some(blocked) =
-        locking::ensure_locks(&leases_api, &active_run.mirror.hosts, &holder_identity).await?
+    } else if let Some(blocked) = locking::ensure_locks(
+        &context.client,
+        &leases_api,
+        &active_run.mirror.hosts,
+        &holder_identity,
+    )
+    .await?
     {
         // Acquisition is all-or-nothing and took nothing this tick, so there is nothing to give up:
         // the run waits its turn and stays supersedable meanwhile.
