@@ -335,6 +335,29 @@ resolve to **zero** nodes and silently do nothing.
   node until an admin writes one. This is an operational requirement, not a vuln — see §6.
 - *Severity:* Operational, not security.
 
+**T-DOS-3 — One undecodable plan stops every tenant's plans.**
+The operator lists PlaybookPlans in every namespace, non-enrolled ones too (so it can report
+`UnauthorizedNamespace`), and kube-rs decodes a list as a whole. A single stored plan the Rust types
+cannot decode fails that list: the plan cache goes stale for every tenant, and an operator starting
+while such a plan exists panics in `await_plan_cache` and crash-loops until the plan is deleted.
+Anyone who may create a PlaybookPlan in any namespace could otherwise halt the operator for all
+tenants.
+- *Mitigation:* the CRD's `spec` schema is at least as strict as the Rust types, so such a plan is
+  refused at admission and never stored. Unit tests pin the two places where the generated schema
+  would be looser: free-form `files` entries must carry a string `name`
+  (`crd_admits_only_files_entries_that_decode`), and every integer is bounded to what its Rust type
+  holds (`every_integer_the_crd_admits_decodes`). What admission cannot express is reported on the
+  plan by the reconciler instead.
+- *Residual:* a newly added free-form or hand-written schema is not covered by those tests; it has
+  to keep the same property. The same holds for the `ClusterInventory` and `StaticInventory`
+  specs: tenants write them too, and the operator watches both kinds in every namespace, so an
+  undecodable one would stall that kind's cache for every tenant (without the start-up panic). The
+  `status` schema does not have the property: its RFC 3339 timestamps (`nextRun`,
+  `retryCountSlot`, `lastTransitionTime`, …) admit any string but decode only as RFC 3339. Whoever
+  may write `playbookplans/status` is therefore trusted like the operator; the chart grants it to no
+  one else.
+- *Severity:* Medium — cross-tenant, availability only.
+
 ### Elevation of privilege (the core of this model)
 
 **T-ESC-1 — Tenant targets nodes outside its remit ("business-team reaches admin nodes").**
