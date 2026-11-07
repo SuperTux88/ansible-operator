@@ -3537,8 +3537,13 @@ async fn try_start_run(
         {
             return Ok(Some(requeue));
         }
-    } else if let Some(blocked) =
-        locking::ensure_locks(&leases_api, &active_run.mirror.hosts, &holder_identity).await?
+    } else if let Some(blocked) = locking::ensure_locks(
+        &context.client,
+        &leases_api,
+        &active_run.mirror.hosts,
+        &holder_identity,
+    )
+    .await?
     {
         // Acquisition is all-or-nothing and took nothing this tick, so there is nothing to give up:
         // the run waits its turn and stays supersedable meanwhile.
@@ -5488,10 +5493,12 @@ async fn release_run_infrastructure(
 /// `status.activeRun`: that mirror is the only handle on the run left here, and on re-enrolment it
 /// lets recovery finish the run the usual way.
 ///
-/// Not waiting for the Job is what separates this from [`release_deleted_plan`], and it costs no
-/// mutual exclusion that was still there: nothing renews these Leases any more, so they would lapse
-/// within [`locking::LEASE_DURATION_SECONDS`] either way. Deleting the proxy pods also cuts the Job's
-/// access to every managed-ssh host. Idempotent, so it runs on every pass through the guard.
+/// Not waiting for the Job is what separates this from [`release_deleted_plan`]. Releasing is also
+/// the only thing that frees the hosts before re-enrolment: the plan keeps `activeRun`, and
+/// [`locking::ensure_locks`] does not take over a lapsed Lease while that still names the run.
+/// Deleting the proxy pods first cuts the Job's access to every managed-ssh host. A
+/// `StaticInventory` host is the exception: the Job reaches it with its own key, so it may still be
+/// on that host when another plan takes it. Idempotent, so it runs on every pass through the guard.
 async fn release_unenrolled_run(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -5840,10 +5847,11 @@ fn run_pod_selector(run_id: &str) -> String {
 /// usual shape of it is a partitioned runner whose container is still SSHed into perfectly healthy
 /// hosts. Releasing their Leases on that evidence is what lets a second playbook onto them.
 ///
-/// Waiting instead cannot hold a host forever: the Leases are only held while this operator keeps
-/// renewing them, so they expire and become takeable within `locking::LEASE_DURATION_SECONDS` of it
-/// stopping — and the plan waiting in `Terminating` is visible in the log, with a documented manual
-/// release for a node that never comes back.
+/// Waiting instead holds the run's hosts for as long as that Node stays unreachable: their Leases
+/// are renewed meanwhile, and outlast an operator outage too, since [`locking::ensure_locks`] does
+/// not take over a lapsed Lease while the plan still names the run. The Node recovering ends it, and
+/// so does removing its `Node` object, after which Kubernetes deletes the pods bound to it; the wait
+/// is visible in the log, and the troubleshooting guide documents both.
 fn pod_may_be_executing(pod: &Pod) -> bool {
     !matches!(
         pod.status
@@ -6172,7 +6180,9 @@ fn holder_identity(namespace: &str, name: &str, run: &RecordedRun) -> String {
 /// renewing for it would acquire locks on a tick that is about to bail. `Aborted` is excluded for
 /// the same reason from the other end: it has no Job, so nothing is executing behind it, and an
 /// run aborted straight out of `Prepared` never held a lock to renew — while the refusal that
-/// brought us here can persist for a long time, pinning hosts against every other plan. Best effort
+/// brought us here can persist for a long time, and renewing would pin its hosts against every
+/// other plan for all of it. Left alone, its Leases lapse, and [`locking::ensure_locks`] takes
+/// them over unless the plan's `activeRun` still names that run. Best effort
 /// by design: the caller is already returning an error, and a failure to renew here must not replace
 /// the diagnosis that explains why.
 async fn renew_contested_locks(

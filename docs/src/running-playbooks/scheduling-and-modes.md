@@ -479,8 +479,12 @@ that observes it unfinished. A plan waiting on the lock has no Job yet, so it re
 `Running=True` until the lock is free. Being blocked is a temporary wait, not a failure, and the run
 proceeds on its own as soon as the lock is free.
 
-A crashed operator's locks expire on their own after a short period, so a host is never left locked
-indefinitely.
+A lock also outlives an operator that crashed or lost the API server: it lapses after a short period,
+but passes to another plan only once the run holding it has finished or been given up, so a playbook
+that kept running through the outage is never joined by a second one on the same host. A plan that
+waits on a host for long names the plan and run holding it in its `Blocked` condition; see [The plan
+is stuck in `Applying`](./results-and-troubleshooting.md#the-plan-is-stuck-in-applying) for why that
+run may not be finishing.
 
 ## Cleaning up finished Jobs
 
