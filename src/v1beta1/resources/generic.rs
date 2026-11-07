@@ -37,6 +37,25 @@ impl JsonSchema for PositiveInt {
     }
 }
 
+/// Marker type for `#[schemars(with = "PortNumber")]` on `u16` TCP port fields: an integer from 1 to
+/// 65535, without the `format: uint16` a bare `u16` renders and Kubernetes does not recognise.
+pub struct PortNumber;
+
+impl JsonSchema for PortNumber {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("PortNumber")
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "integer",
+            "minimum": 1,
+            "maximum": u16::MAX
+        }))
+        .unwrap()
+    }
+}
+
 impl JsonSchema for UnsignedInt {
     fn schema_name() -> Cow<'static, str> {
         Cow::Borrowed("UnsignedInt")

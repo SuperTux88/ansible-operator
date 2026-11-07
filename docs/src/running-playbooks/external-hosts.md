@@ -64,13 +64,18 @@ to another group or inventory is not re-run, even when the new group sets differ
 
 - `ssh.user` — the SSH login user (`ansible_user`).
 - `ssh.secretRef.name` — a Kubernetes Secret **in the same namespace** holding the private key.
+- `ssh.port` — optional, the port the hosts' SSH server listens on (`ansible_port`). Omit it for
+  SSH's default, 22. It applies to every host of the inventory; hosts on different ports go into
+  `StaticInventory`s of their own.
 
 The referenced Secret is mounted read-only into the run and its keys are used as files:
 
 - **`id_rsa`** (required) — the SSH **private key** to authenticate with. Despite the name it may be
   any key type OpenSSH accepts, e.g. Ed25519.
 - **`known_hosts`** (optional) — an OpenSSH `known_hosts` file used to verify the hosts. Provide it
-  to pin host keys; without it, host-key verification follows your image's SSH defaults.
+  to pin host keys; without it, host-key verification follows your image's SSH defaults. With
+  `ssh.port` set to anything but 22, OpenSSH looks a host up as `[host]:port`, so write its
+  entries that way (`ssh-keyscan -p <port> <host>` prints them in that form).
 
 Create the key Secret before the run, for example:
 
@@ -105,7 +110,8 @@ own, though: the operator renders no `ansible_host` for a `StaticInventory` host
 instead, until the plan no longer reaches both.
 
 **One name, one set of credentials.** For the same reason, two `StaticInventory`s referenced by one
-plan may not name the same host with a different `ssh.user` or `ssh.secretRef`. That name is one
+plan may not name the same host with a different `ssh.user`, `ssh.secretRef` or `ssh.port` (an
+unset port and an explicit 22 agree). That name is one
 machine, so it gets one lock and one outcome, but the rendered inventory would carry two connection
 configurations for it and Ansible would keep whichever its group ordering happens to prefer — so the
 run would connect as somebody the manifests do not agree on. Naming the same host in two
@@ -126,6 +132,7 @@ single playbook instead, or across plans by hand.
 
 ## What you do not set
 
-As with cluster nodes, the operator renders `ansible_user`, `ansible_ssh_private_key_file`, and the
-host-key options into the inventory for you from the `ssh` block. Do not set these in your playbook —
+As with cluster nodes, the operator renders `ansible_user`, `ansible_ssh_private_key_file`, the
+host-key options and, when `ssh.port` is set, `ansible_port` into the inventory for you from the
+`ssh` block. Do not set these in your playbook —
 target `hosts: <group>` (or `all`) and let the operator wire up the connection.

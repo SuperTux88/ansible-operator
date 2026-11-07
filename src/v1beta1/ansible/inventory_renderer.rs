@@ -179,6 +179,7 @@ fn render_ssh_host_vars(
     ctx: &RenderContext,
 ) -> HostVars {
     let mut vars = HostVars {
+        ansible_port: config.port.map(i32::from),
         ansible_user: Some(config.user.clone()),
         ..Default::default()
     };
@@ -300,6 +301,7 @@ mod tests {
                 secret_ref: SecretRef {
                     name: "ssh-key".into(),
                 },
+                port: None,
             },
             variables: None,
         };
@@ -320,11 +322,20 @@ mod tests {
             ssh_paths_by_static_inventory: &ssh_paths,
         };
 
-        let rendered = render_inventory(&[group], &ctx).unwrap();
+        let rendered = render_inventory(std::slice::from_ref(&group), &ctx).unwrap();
 
         assert!(rendered.contains("ansible_user: root"));
         assert!(rendered.contains("/run/ansible-operator/ssh/ccu/id_rsa"));
         assert!(rendered.contains(DEAD_HOST_SSH_ARGS));
+        // No port set, so SSH's own default applies.
+        assert!(!rendered.contains("ansible_port"), "{rendered}");
+
+        let mut on_port = group;
+        if let ResolvedInventoryGroup::Ssh { config, .. } = &mut on_port {
+            config.port = Some(2222);
+        }
+        let rendered = render_inventory(&[on_port], &ctx).unwrap();
+        assert!(rendered.contains("ansible_port: 2222"), "{rendered}");
     }
 
     #[test]
@@ -350,6 +361,7 @@ mod tests {
                 secret_ref: SecretRef {
                     name: "ssh-key".into(),
                 },
+                port: None,
             },
             variables: None,
         };
@@ -561,6 +573,7 @@ mod tests {
                 secret_ref: SecretRef {
                     name: "ssh-key".into(),
                 },
+                port: None,
             },
             variables: None,
         };

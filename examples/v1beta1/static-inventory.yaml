@@ -15,3 +15,5 @@ spec:
     user: root
     secretRef:
       name: ssh-key
+    # Optional; SSH's default 22 when omitted.
+    port: 22

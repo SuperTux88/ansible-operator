@@ -8489,17 +8489,24 @@ fn describe_ssh_source(static_inventory_name: &str, group: &str) -> String {
     format!("StaticInventory {static_inventory_name:?} group {group:?}")
 }
 
-/// Whether two `StaticInventory`s reach a host as the same user with the same key.
+/// Whether two `StaticInventory`s reach a host as the same user with the same key, on the same port.
 ///
 /// Destructured rather than compared by a derived `PartialEq`, so that adding a field to
 /// [`SshConfig`] does not compile until someone has decided here whether it changes who the run
 /// connects as. A new connection field silently left out would reopen exactly the ambiguity this
 /// refusal exists to catch. Both Secrets are resolved in the plan's own namespace, so the name
-/// alone identifies the key.
+/// alone identifies the key. The port counts because one address may forward different ports to
+/// different machines; an unset port is the same as an explicit 22, the port SSH then dials.
 fn same_ssh_config(left: &SshConfig, right: &SshConfig) -> bool {
-    let SshConfig { user, secret_ref } = left;
+    let SshConfig {
+        user,
+        secret_ref,
+        port,
+    } = left;
 
-    *user == right.user && secret_ref.name == right.secret_ref.name
+    *user == right.user
+        && secret_ref.name == right.secret_ref.name
+        && port.unwrap_or(22) == right.port.unwrap_or(22)
 }
 
 /// Fails the reconcile if an inventory group sets a variable the operator manages for
@@ -9209,6 +9216,7 @@ mod tests {
                 secret_ref: SecretRef {
                     name: secret_name.into(),
                 },
+                port: None,
             },
             variables: None,
         }
@@ -9280,6 +9288,7 @@ mod tests {
                     secret_ref: SecretRef {
                         name: "ssh-key".into(),
                     },
+                    port: None,
                 },
                 variables: None,
             },
@@ -9303,6 +9312,28 @@ mod tests {
                 ssh_group_with_key("backup", &["ccu.fritz.box"], "spare", "ssh-key"),
             ])
             .is_ok()
+        );
+    }
+
+    /// One address can forward two ports to two machines, so a port is as much part of how a host
+    /// is reached as its user. An unset port is SSH's 22, so spelling it out agrees with leaving it
+    /// unset.
+    #[test]
+    fn an_external_host_is_reached_on_one_port() {
+        let on_port = |inventory: &str, port: Option<u16>| {
+            let mut group = ssh_group_with_key("edge", &["ccu.fritz.box"], inventory, "ssh-key");
+            if let ResolvedInventoryGroup::Ssh { config, .. } = &mut group {
+                config.port = port;
+            }
+            group
+        };
+
+        assert!(matches!(
+            reject_ambiguous_hosts(&[on_port("ccu", Some(2222)), on_port("spare", None)]),
+            Err(ReconcileError::AmbiguousHostCredentials { .. })
+        ));
+        assert!(
+            reject_ambiguous_hosts(&[on_port("ccu", Some(22)), on_port("spare", None)]).is_ok()
         );
     }
 
