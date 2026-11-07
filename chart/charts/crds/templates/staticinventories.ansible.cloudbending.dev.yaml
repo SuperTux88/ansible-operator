@@ -53,6 +53,12 @@ spec:
                   How to reach these hosts over SSH. Mandatory: a StaticInventory with no reachability
                   info isn't usable by any PlaybookPlan.
                 properties:
+                  port:
+                    description: The TCP port the hosts' SSH server listens on. Omit it for SSH's default, 22.
+                    maximum: 65535.0
+                    minimum: 1.0
+                    nullable: true
+                    type: integer
                   secretRef:
                     properties:
                       name:
