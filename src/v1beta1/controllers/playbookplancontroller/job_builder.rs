@@ -1997,6 +1997,7 @@ spec:
                 secret_ref: SecretRef {
                     name: "ssh-key".into(),
                 },
+                port: None,
             },
             variables: None,
         }];
@@ -2120,6 +2121,7 @@ spec:
                     secret_ref: SecretRef {
                         name: "ssh-key".into(),
                     },
+                    port: None,
                 },
                 variables: None,
             },

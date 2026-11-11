@@ -178,11 +178,20 @@ assume in an enrolled namespace.
 
 A `ClusterInventory` or `StaticInventory` group may set `variables`, rendered as Ansible group vars
 for its hosts. The operator **rejects** the connection variables it manages itself — `ansible_host`,
-`ansible_port`, `ansible_user`, and the `ansible_ssh_*` options — so an inventory
-author cannot use group vars to redirect a dial or weaken host-key checking; a plan that references
-such an inventory fails to reconcile until the variable is removed. Everything else an author sets is
-data the playbook they already control would receive anyway, so this adds no reach beyond authoring
-the playbook itself.
+`ansible_port` and `ansible_user`, under their older `ansible_ssh_host`, `ansible_ssh_port` and
+`ansible_ssh_user` spellings too, `ansible_ssh_private_key_file` and `ansible_ssh_common_args` — so
+a group var copied from another inventory cannot silently replace the address, port, user or key
+the operator renders; a plan that references such an inventory fails to reconcile until the variable
+is removed. This guards against mistakes, not against the namespace's own authors: a playbook's
+`vars:` outrank inventory variables and can set every connection variable anyway.
+
+Other SSH settings are deliberately accepted, including `ansible_ssh_args` (which can replace the
+operator's known-hosts options), `ansible_ssh_extra_args` and turning host-key checking off. Each
+affects only the run's own connections, which still authenticate with that run's certificate or the
+inventory's own key, and `ansible_ssh_extra_args` is what reaches an external host behind a jump
+host. Everything else an author sets is data the playbook they already control would receive anyway,
+so this adds no reach beyond authoring the playbook itself. `T-TAMP-4` in the threat model records
+the reasoning and when to revisit it.
 
 ## Writing labels on Nodes
 

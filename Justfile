@@ -34,8 +34,22 @@ test-python:
 clippy:
     cargo clippy
 
-# The full pre-change gate: build + tests (Rust and Python) + clippy + guide + API docs.
-check: build test test-python clippy docs apidoc
+# Lint and format-check the Python with ruff (settings in ruff.toml). Skipped with a warning when
+# ruff is not installed, so `check` needs nothing beyond python3 for the Python side; CI always
+# runs it, with the ruff version pinned there.
+lint-python:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v ruff > /dev/null; then
+        echo "warning: ruff is not installed, skipping the Python lint (CI runs it)" >&2
+        exit 0
+    fi
+    ruff check
+    ruff format --check
+
+# The full pre-change gate: build + tests (Rust and Python) + clippy + Python lint + guide + API
+# docs.
+check: build test test-python clippy lint-python docs apidoc
 
 # Dump all CRDs (PlaybookPlan, Play, ClusterInventory, StaticInventory, NodeAccessPolicy) to stdout.
 crds:

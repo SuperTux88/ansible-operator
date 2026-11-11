@@ -36,8 +36,10 @@ spec:
                     variables:
                       description: |-
                         Group variables applied to every host in this group, rendered as Ansible group `vars:`,
-                        e.g. `ansible_python_interpreter`. Operator-managed connection variables (`ansible_user`,
-                        `ansible_ssh_*`, `ansible_host`, `ansible_port`) are rejected — the operator owns those.
+                        e.g. `ansible_python_interpreter`. The connection variables the operator manages are
+                        rejected: `ansible_host`, `ansible_port` and `ansible_user`, also as `ansible_ssh_host`,
+                        `ansible_ssh_port` and `ansible_ssh_user`, `ansible_ssh_private_key_file` and
+                        `ansible_ssh_common_args`.
                       nullable: true
                       type: object
                       x-kubernetes-preserve-unknown-fields: true
@@ -51,6 +53,12 @@ spec:
                   How to reach these hosts over SSH. Mandatory: a StaticInventory with no reachability
                   info isn't usable by any PlaybookPlan.
                 properties:
+                  port:
+                    description: The TCP port the hosts' SSH server listens on. Omit it for SSH's default, 22.
+                    maximum: 65535.0
+                    minimum: 1.0
+                    nullable: true
+                    type: integer
                   secretRef:
                     properties:
                       name:

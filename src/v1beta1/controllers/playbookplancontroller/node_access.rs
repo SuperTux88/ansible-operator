@@ -149,6 +149,7 @@ mod tests {
             config: SshConfig {
                 user: "root".into(),
                 secret_ref: SecretRef { name: "k".into() },
+                port: None,
             },
             variables: None,
         }

@@ -183,8 +183,10 @@ pub struct InventoryHosts {
 
     /// Group variables applied to every node this group resolves to, rendered as Ansible group
     /// `vars:`. Use it to set node facts the playbook author should not have to know, e.g.
-    /// `ansible_python_interpreter`. Operator-managed connection variables (`ansible_host`,
-    /// `ansible_user`, `ansible_port`, `ansible_ssh_*`) are rejected — the operator owns those.
+    /// `ansible_python_interpreter`. The connection variables the operator manages are rejected:
+    /// `ansible_host`, `ansible_port` and `ansible_user`, also as `ansible_ssh_host`,
+    /// `ansible_ssh_port` and `ansible_ssh_user`, `ansible_ssh_private_key_file` and
+    /// `ansible_ssh_common_args`.
     pub variables: Option<GenericMap>,
 }
 

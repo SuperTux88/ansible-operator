@@ -12,6 +12,7 @@ use kube::{
 };
 use tracing::{debug, warn};
 
+use crate::v1beta1::PlaybookPlan;
 use crate::v1beta1::controllers::reconcile_error::{ReconcileError, is_conflict, is_not_found};
 
 /// How long a Lease is considered valid without being renewed. Deliberately short and renewed
@@ -33,7 +34,8 @@ pub struct BlockedBy {
 pub enum LeaseDecision {
     /// No Lease exists yet for this host.
     Create,
-    /// A Lease exists, is held by someone else, and has expired — safe to take over.
+    /// A Lease exists, is held by someone else, and has expired. Not yet safe to take over: an
+    /// expired Lease may belong to a run that is still executing, see [`ensure_locks`].
     Replace { resource_version: String },
     /// A Lease exists and is already held by us — needs its renewTime bumped, nothing else.
     Renew { resource_version: String },
@@ -144,7 +146,14 @@ fn acquisition_order(hosts: &[String]) -> Vec<&String> {
 /// fixed global order (`acquisition_order`), turns contention into clean serialization: one plan
 /// takes the whole set and runs while the others wait their turn. Safe to call every reconcile tick
 /// — locks we already hold just get their renewTime bumped.
+///
+/// An expired Lease is taken over only once its holder's run is no longer in flight
+/// ([`holder_run_in_flight`]). Expiry alone only says that nothing renewed the Lease for a while,
+/// and the operator is the only thing that renews: while it was down, or cut off from the
+/// apiserver, every Lease of a run whose Job kept executing lapsed. Taking those over on the first
+/// tick back would start a second playbook on a host the first is still applying.
 pub async fn ensure_locks(
+    client: &kube::Client,
     api: &Api<Lease>,
     target_hosts: &[String],
     holder_identity: &str,
@@ -155,7 +164,21 @@ pub async fn ensure_locks(
     for host in acquisition_order(target_hosts) {
         let name = lease_name(host);
         let existing = api.get_opt(&name).await?;
-        let decision = decide(existing.as_ref(), holder_identity, now);
+        let mut decision = decide(existing.as_ref(), holder_identity, now);
+        let current_holder = existing
+            .as_ref()
+            .and_then(|lease| lease.spec.as_ref())
+            .and_then(|spec| spec.holder_identity.as_deref());
+
+        if matches!(decision, LeaseDecision::Replace { .. })
+            && let Some(current_holder) = current_holder
+            && holder_run_in_flight(client, current_holder).await?
+        {
+            debug!(
+                "Lease for host {host} expired, but {current_holder} is still in flight; not taking it over"
+            );
+            decision = LeaseDecision::HeldByOther;
+        }
 
         let result = match decision {
             LeaseDecision::Create => {
@@ -170,17 +193,13 @@ pub async fn ensure_locks(
                     .await
                     .map(drop)
             }
-            // Held by another plan and not expired. Because we acquire in a fixed global order,
+            // Held by another run that is still live. Because we acquire in a fixed global order,
             // nothing after this can complete the set either — stop, record what (and who) blocked
             // us, and fall through to release whatever we already took this tick.
             LeaseDecision::HeldByOther => {
-                let holder = existing
-                    .as_ref()
-                    .and_then(|lease| lease.spec.as_ref())
-                    .and_then(|spec| spec.holder_identity.clone());
                 blocked = Some(BlockedBy {
                     host: host.clone(),
-                    holder,
+                    holder: current_holder.map(str::to_string),
                 });
                 break;
             }
@@ -211,6 +230,46 @@ pub async fn ensure_locks(
     }
 
     Ok(blocked)
+}
+
+/// Whether the run a Lease's holder identity names is still in flight, judged from its plan's
+/// `status.activeRun`, read live.
+///
+/// The mirror is the authority because of when it is written: before a run takes its first Lease,
+/// and cleared only after its Leases are released. A plan has at most one run in flight, so a
+/// mirror naming another run, or no plan at all, means the holder's run is over. A holder this
+/// operator did not write (not `namespace/name/run-id`) names no run to wait for.
+async fn holder_run_in_flight(
+    client: &kube::Client,
+    holder_identity: &str,
+) -> Result<bool, ReconcileError> {
+    let Some((namespace, name, run_id)) = parse_holder_identity(holder_identity) else {
+        return Ok(false);
+    };
+    let plans = Api::<PlaybookPlan>::namespaced(client.clone(), namespace);
+    let plan = plans.get_opt(name).await?;
+    Ok(run_in_flight(plan.as_ref(), run_id))
+}
+
+/// Splits a holder identity as `reconciler::holder_identity` writes it into namespace, plan name
+/// and run ID. None of the three can contain a `/`.
+fn parse_holder_identity(holder_identity: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = holder_identity.split('/');
+    let (Some(namespace), Some(name), Some(run_id), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    [namespace, name, run_id]
+        .iter()
+        .all(|part| !part.is_empty())
+        .then_some((namespace, name, run_id))
+}
+
+fn run_in_flight(plan: Option<&PlaybookPlan>, run_id: &str) -> bool {
+    plan.and_then(|plan| plan.status.as_ref())
+        .and_then(|status| status.active_run.as_ref())
+        .is_some_and(|active_run| active_run.run_id == run_id)
 }
 
 /// What `renew_locks` should do with one host's Lease while a run is in progress. Pure so the
@@ -598,6 +657,57 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert!(a.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-'));
+    }
+
+    #[test]
+    fn a_holder_identity_names_namespace_plan_and_run() {
+        assert_eq!(
+            parse_holder_identity("team-a/web/run-1"),
+            Some(("team-a", "web", "run-1"))
+        );
+        for foreign in [
+            "",
+            "web/run-1",
+            "team-a/web/run-1/extra",
+            "team-a//run-1",
+            "a/b/",
+        ] {
+            assert_eq!(parse_holder_identity(foreign), None, "{foreign:?}");
+        }
+    }
+
+    fn plan_running(run_id: Option<&str>) -> PlaybookPlan {
+        let mut plan = PlaybookPlan::new("web", Default::default());
+        plan.status = Some(crate::v1beta1::PlaybookPlanStatus {
+            active_run: run_id.map(|run_id| crate::v1beta1::ActiveRun {
+                execution_hash: "abc".into(),
+                run_id: run_id.into(),
+                job_name: "apply-web-abc-1".into(),
+                play_uid: "uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: None,
+                retry_generation: 0,
+            }),
+            ..Default::default()
+        });
+        plan
+    }
+
+    /// The Lease of a run whose Job kept executing through an operator outage has expired by the
+    /// time the operator is back; only the plan's own record of the run can say it is not over.
+    #[test]
+    fn a_run_is_in_flight_only_while_its_plan_still_names_it() {
+        assert!(run_in_flight(Some(&plan_running(Some("run-1"))), "run-1"));
+
+        assert!(!run_in_flight(Some(&plan_running(Some("run-2"))), "run-1"));
+        assert!(!run_in_flight(Some(&plan_running(None)), "run-1"));
+        assert!(!run_in_flight(
+            Some(&PlaybookPlan::new("web", Default::default())),
+            "run-1"
+        ));
+        assert!(!run_in_flight(None, "run-1"));
     }
 
     #[test]

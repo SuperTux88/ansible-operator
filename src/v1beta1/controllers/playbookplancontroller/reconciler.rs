@@ -3537,8 +3537,13 @@ async fn try_start_run(
         {
             return Ok(Some(requeue));
         }
-    } else if let Some(blocked) =
-        locking::ensure_locks(&leases_api, &active_run.mirror.hosts, &holder_identity).await?
+    } else if let Some(blocked) = locking::ensure_locks(
+        &context.client,
+        &leases_api,
+        &active_run.mirror.hosts,
+        &holder_identity,
+    )
+    .await?
     {
         // Acquisition is all-or-nothing and took nothing this tick, so there is nothing to give up:
         // the run waits its turn and stays supersedable meanwhile.
@@ -5488,10 +5493,12 @@ async fn release_run_infrastructure(
 /// `status.activeRun`: that mirror is the only handle on the run left here, and on re-enrolment it
 /// lets recovery finish the run the usual way.
 ///
-/// Not waiting for the Job is what separates this from [`release_deleted_plan`], and it costs no
-/// mutual exclusion that was still there: nothing renews these Leases any more, so they would lapse
-/// within [`locking::LEASE_DURATION_SECONDS`] either way. Deleting the proxy pods also cuts the Job's
-/// access to every managed-ssh host. Idempotent, so it runs on every pass through the guard.
+/// Not waiting for the Job is what separates this from [`release_deleted_plan`]. Releasing is also
+/// the only thing that frees the hosts before re-enrolment: the plan keeps `activeRun`, and
+/// [`locking::ensure_locks`] does not take over a lapsed Lease while that still names the run.
+/// Deleting the proxy pods first cuts the Job's access to every managed-ssh host. A
+/// `StaticInventory` host is the exception: the Job reaches it with its own key, so it may still be
+/// on that host when another plan takes it. Idempotent, so it runs on every pass through the guard.
 async fn release_unenrolled_run(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -5840,10 +5847,11 @@ fn run_pod_selector(run_id: &str) -> String {
 /// usual shape of it is a partitioned runner whose container is still SSHed into perfectly healthy
 /// hosts. Releasing their Leases on that evidence is what lets a second playbook onto them.
 ///
-/// Waiting instead cannot hold a host forever: the Leases are only held while this operator keeps
-/// renewing them, so they expire and become takeable within `locking::LEASE_DURATION_SECONDS` of it
-/// stopping — and the plan waiting in `Terminating` is visible in the log, with a documented manual
-/// release for a node that never comes back.
+/// Waiting instead holds the run's hosts for as long as that Node stays unreachable: their Leases
+/// are renewed meanwhile, and outlast an operator outage too, since [`locking::ensure_locks`] does
+/// not take over a lapsed Lease while the plan still names the run. The Node recovering ends it, and
+/// so does removing its `Node` object, after which Kubernetes deletes the pods bound to it; the wait
+/// is visible in the log, and the troubleshooting guide documents both.
 fn pod_may_be_executing(pod: &Pod) -> bool {
     !matches!(
         pod.status
@@ -6172,7 +6180,9 @@ fn holder_identity(namespace: &str, name: &str, run: &RecordedRun) -> String {
 /// renewing for it would acquire locks on a tick that is about to bail. `Aborted` is excluded for
 /// the same reason from the other end: it has no Job, so nothing is executing behind it, and an
 /// run aborted straight out of `Prepared` never held a lock to renew — while the refusal that
-/// brought us here can persist for a long time, pinning hosts against every other plan. Best effort
+/// brought us here can persist for a long time, and renewing would pin its hosts against every
+/// other plan for all of it. Left alone, its Leases lapse, and [`locking::ensure_locks`] takes
+/// them over unless the plan's `activeRun` still names that run. Best effort
 /// by design: the caller is already returning an error, and a failure to renew here must not replace
 /// the diagnosis that explains why.
 async fn renew_contested_locks(
@@ -8484,17 +8494,24 @@ fn describe_ssh_source(static_inventory_name: &str, group: &str) -> String {
     format!("StaticInventory {static_inventory_name:?} group {group:?}")
 }
 
-/// Whether two `StaticInventory`s reach a host as the same user with the same key.
+/// Whether two `StaticInventory`s reach a host as the same user with the same key, on the same port.
 ///
 /// Destructured rather than compared by a derived `PartialEq`, so that adding a field to
 /// [`SshConfig`] does not compile until someone has decided here whether it changes who the run
 /// connects as. A new connection field silently left out would reopen exactly the ambiguity this
 /// refusal exists to catch. Both Secrets are resolved in the plan's own namespace, so the name
-/// alone identifies the key.
+/// alone identifies the key. The port counts because one address may forward different ports to
+/// different machines; an unset port is the same as an explicit 22, the port SSH then dials.
 fn same_ssh_config(left: &SshConfig, right: &SshConfig) -> bool {
-    let SshConfig { user, secret_ref } = left;
+    let SshConfig {
+        user,
+        secret_ref,
+        port,
+    } = left;
 
-    *user == right.user && secret_ref.name == right.secret_ref.name
+    *user == right.user
+        && secret_ref.name == right.secret_ref.name
+        && port.unwrap_or(22) == right.port.unwrap_or(22)
 }
 
 /// Fails the reconcile if an inventory group sets a variable the operator manages for
@@ -9204,6 +9221,7 @@ mod tests {
                 secret_ref: SecretRef {
                     name: secret_name.into(),
                 },
+                port: None,
             },
             variables: None,
         }
@@ -9275,6 +9293,7 @@ mod tests {
                     secret_ref: SecretRef {
                         name: "ssh-key".into(),
                     },
+                    port: None,
                 },
                 variables: None,
             },
@@ -9298,6 +9317,28 @@ mod tests {
                 ssh_group_with_key("backup", &["ccu.fritz.box"], "spare", "ssh-key"),
             ])
             .is_ok()
+        );
+    }
+
+    /// One address can forward two ports to two machines, so a port is as much part of how a host
+    /// is reached as its user. An unset port is SSH's 22, so spelling it out agrees with leaving it
+    /// unset.
+    #[test]
+    fn an_external_host_is_reached_on_one_port() {
+        let on_port = |inventory: &str, port: Option<u16>| {
+            let mut group = ssh_group_with_key("edge", &["ccu.fritz.box"], inventory, "ssh-key");
+            if let ResolvedInventoryGroup::Ssh { config, .. } = &mut group {
+                config.port = port;
+            }
+            group
+        };
+
+        assert!(matches!(
+            reject_ambiguous_hosts(&[on_port("ccu", Some(2222)), on_port("spare", None)]),
+            Err(ReconcileError::AmbiguousHostCredentials { .. })
+        ));
+        assert!(
+            reject_ambiguous_hosts(&[on_port("ccu", Some(22)), on_port("spare", None)]).is_ok()
         );
     }
 

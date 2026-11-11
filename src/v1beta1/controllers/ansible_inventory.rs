@@ -255,6 +255,7 @@ mod tests {
                 config: SshConfig {
                     user: "root".into(),
                     secret_ref: crate::v1beta1::SecretRef { name: "key".into() },
+                    port: None,
                 },
                 variables: None,
             },

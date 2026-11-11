@@ -1,0 +1,9 @@
+# Lint and format settings for the Python the operator embeds into every run's workspace
+# (src/v1beta1/ansible/*.py) and its tests (tests/python/).
+
+# The same width as the Rust code.
+line-length = 100
+
+# The embedded scripts run on whatever python3 the plan's image ships, not on a version this
+# repository controls, so the pyupgrade rules must not suggest syntax an older image cannot run.
+target-version = "py39"
