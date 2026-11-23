@@ -270,7 +270,7 @@ For a run targeting Nodes, the operator:
 
 1. Schedules a short-lived **proxy pod** onto each targeted Node. The pod runs a real `sshd` and is
    granted just enough privilege (`hostPID`, a host `/proc` mount, `CAP_SYS_ADMIN` +
-   `CAP_SYS_PTRACE`) that each SSH session can `nsenter` into the Node's host namespaces, making the
+   `CAP_SYS_PTRACE`, and on AppArmor nodes an `Unconfined` profile) that each SSH session can `nsenter` into the Node's host namespaces, making the
    session `root` on the Node. The pod does not use `privileged: true`, `hostNetwork`, or `hostIPC`.
 2. Mints a fresh SSH **host certificate** for that run from the operator's in-memory certificate
    authority, and a matching **client certificate** for the Job. Certificates are per-run and
