@@ -23,7 +23,8 @@ The proxy pod is, by design, a **node-root primitive**:
 - `hostPID: true` ([`managed_ssh.rs` `build_pod`](src/v1beta1/controllers/playbookplancontroller/managed_ssh.rs))
 - `/proc` bind-mounted from the host (`HostPathVolumeSource` → `/host/proc`)
 - `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE`, plus SELinux `spc_t` (the label `oc debug node/…`
-  and `privileged: true` pods get)
+  and `privileged: true` pods get) and an `Unconfined` AppArmor profile (the runtime
+  default denies ptrace-read of host PID 1, which `nsenter` needs)
 - every SSH session is wrapped in `nsenter -m/-n/-i/-u` into the host's mount / net /
   ipc / uts namespaces via `/host/proc/1/ns/*`, then `exec sh -c "$SSH_ORIGINAL_COMMAND"`
 

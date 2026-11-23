@@ -127,7 +127,9 @@ holds the run until it finishes or is deleted.
 ## Privileges the proxy pods hold
 
 Proxy pods take the **minimum** that makes `nsenter`-to-host work: `hostPID: true`, a host `/proc`
-bind-mount, `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE`, and (on SELinux nodes) the `spc_t` label. They do
+bind-mount, `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE`, (on SELinux nodes) the `spc_t` label, and (on
+AppArmor nodes) an `Unconfined` profile, since the runtime default denies `nsenter` access to the
+host's PID 1. They do
 **not** set `privileged: true`, `hostNetwork`, or `hostIPC`. Each is pinned to exactly one Node by
 its name, not by the `kubernetes.io/hostname` label, which a Node's own kubelet may change. The
 proxy does not mount a ServiceAccount token. It cannot set `allowPrivilegeEscalation: false` because

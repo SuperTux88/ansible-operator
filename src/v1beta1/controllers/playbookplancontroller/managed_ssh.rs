@@ -5,9 +5,9 @@ use std::time::Duration;
 use k8s_openapi::{
     api::{
         core::v1::{
-            Affinity, Capabilities, Container, HostPathVolumeSource, Node, NodeAffinity,
-            NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, Pod, PodSpec, Probe, Secret,
-            SecurityContext, TCPSocketAction, Volume, VolumeMount,
+            Affinity, AppArmorProfile, Capabilities, Container, HostPathVolumeSource, Node,
+            NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, Pod, PodSpec,
+            Probe, Secret, SecurityContext, TCPSocketAction, Volume, VolumeMount,
         },
         networking::v1::{
             NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -797,6 +797,13 @@ fn build_pod(
             // host filesystem access. No-op on non-SELinux nodes.
             se_linux_options: Some(k8s_openapi::api::core::v1::SELinuxOptions {
                 type_: Some("spc_t".into()),
+                ..Default::default()
+            }),
+            // The runtime's default AppArmor profile (`cri-containerd.apparmor.d`) only allows
+            // ptrace within its own profile, so opening the unconfined PID 1's `/proc/1/ns/*` is
+            // denied and nsenter fails despite SYS_PTRACE. No-op on non-AppArmor nodes.
+            app_armor_profile: Some(AppArmorProfile {
+                type_: "Unconfined".into(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1748,6 +1755,14 @@ mod tests {
         let added = security.capabilities.as_ref().unwrap().add.clone().unwrap();
         assert!(added.contains(&"SYS_ADMIN".to_string()));
         assert!(added.contains(&"SYS_PTRACE".to_string()));
+        assert_eq!(
+            security
+                .app_armor_profile
+                .as_ref()
+                .map(|p| p.type_.as_str()),
+            Some("Unconfined"),
+            "the runtime-default AppArmor profile denies nsenter's ptrace-read of host PID 1"
+        );
 
         // Bounded even when the operator never deletes it.
         assert_eq!(
