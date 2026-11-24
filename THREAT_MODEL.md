@@ -296,7 +296,11 @@ resolved to — so the recap can be reported per host after the Job is gone.
 - *Residual:* it discloses which nodes a namespace resolved to, including nodes a later
   `NodeAccessPolicy` change has since revoked. A principal granted `get plays` in an enrolled
   namespace can read that even without `get playbookplans`, so treat `plays` read access as
-  equivalent to `playbookplans` read access for that namespace.
+  equivalent to `playbookplans` read access for that namespace. The plan's `status.summary` in turn
+  names one refused node when `NodeAccessPolicy` enforcement removed every selected node — never
+  more than the namespace's `ClusterInventory` status already lists before clamping, so treat
+  `playbookplans` read access as equivalent to `clusterinventories` read access for that namespace
+  too.
 - *Severity:* **Low** — same namespace, no Secret material, no inline plan configuration, and
   enrolled namespaces are already expected to be dedicated to Ansible ops (R1).
 

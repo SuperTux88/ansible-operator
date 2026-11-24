@@ -8,7 +8,9 @@ otherwise target *any* Node — the policy is what stops that.
 > **Fail-closed, always on.** A namespace with **no** matching policy resolves to **zero** allowed
 > Nodes. There is no default-allow and no way to disable the check — until you author a policy,
 > managed-SSH plans target nothing. This is the most common reason a `ClusterInventory` resolves to no
-> hosts.
+> hosts. A plan refused this way does not report `Succeeded` unless a run already succeeded on its
+> current playbook and inputs; its summary names one of the Nodes no
+> policy grants and counts the rest, and the operator log lists them all (see [a `ClusterInventory` resolves to zero hosts](../running-playbooks/results-and-troubleshooting.md#a-clusterinventory-resolves-to-zero-hosts)).
 
 ## Who can author them
 
