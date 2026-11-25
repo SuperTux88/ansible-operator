@@ -38,9 +38,9 @@
 //!    flight; a running run keeps its own hash, which lives in its `Play`.
 //! 6. **Step 1 — schedule and hosts to trigger.** `evaluate_schedule` in the plan's timezone; the
 //!    outdated hosts for `OneShot`, or for `Recurring` inside an open slot the hosts that slot still
-//!    owes (`find_hosts_owing_slot`). A fully served slot goes through
-//!    `update_idle_recurring_status`, which must requeue at the next slot or sub-hourly schedules
-//!    skip slots.
+//!    owes (`find_hosts_owing_slot`). A fully served slot, or a plan resolving to no hosts, goes
+//!    through `update_idle_status`, which must requeue a `Recurring` plan at the next slot or
+//!    sub-hourly schedules skip slots.
 //! 7. **Steps 2–5 — `try_start_run`** when eligible and nothing is active: `select_job` numbers the
 //!    run, `play_history::record_prepared` writes the record, the plan's `activeRun` mirror is
 //!    patched, then host Leases are taken and `commit_starting`. `ensure_infra_and_launch` does the
@@ -1771,12 +1771,12 @@ async fn reconcile(
         };
     }
 
-    if let Some(until_next_run) = update_idle_recurring_status(
+    if let Some(until_next_run) = update_idle_status(
         &object.spec.mode,
         scheduling_configuration.schedule.as_ref(),
         object.spec.suspend,
         !hosts_to_trigger.is_empty(),
-        !all_hosts.is_empty(),
+        HostResolution::of(&all_hosts, &excluded_nodes, &dependencies),
         now(),
         &mut resource_status,
     ) {
@@ -2873,54 +2873,173 @@ fn phase_while_waiting_for_schedule(current: &Phase) -> Phase {
     Phase::Delayed
 }
 
+/// The phase of an idle plan whose inventories resolve to no hosts.
+///
+/// No hosts selected is nothing to do, so the plan is done: `Succeeded`, as after a run that
+/// reached every host. One plan deployed to several clusters selects no Node in some of them, and
+/// `Pending` (`OneShot`) or a `Delayed` that never ends (`Recurring`) read there like a plan stuck
+/// on something.
+///
+/// No hosts because `NodeAccessPolicy` granted none of the selected nodes is a refusal instead, and
+/// no hosts because they wait for another plan's dependency label is a wait. Reporting either
+/// `Succeeded` would make a missing grant, or a provider that has not got there yet, look like a
+/// converged plan. Both keep the phase of a plan that has not run: `Pending` for `OneShot`,
+/// `Delayed` for `Recurring`, whose next slot is still ahead.
+///
+/// Either way a verdict stands, as in [`phase_while_waiting_for_schedule`]: it records a run that
+/// did happen, and losing the hosts does not undo it. A failure is only ever written by a run, but
+/// `Succeeded` is also written without one — by the "nothing to do" case here, and by
+/// `restore_idle_oneshot_status` for a revision with no outdated hosts — so under a refusal or a
+/// wait it counts only once a host has succeeded on the current revision.
+fn phase_without_hosts(
+    status: &PlaybookPlanStatus,
+    mode: &ExecutionMode,
+    resolution: HostResolution,
+) -> Phase {
+    let current = &status.phase;
+    let nothing_to_do = matches!(resolution, HostResolution::Hosts | HostResolution::Nothing);
+    if is_failure_verdict(current)
+        || (current == &Phase::Succeeded
+            && (nothing_to_do || succeeded_on_current_revision(status)))
+    {
+        return current.clone();
+    }
+    match (resolution, mode) {
+        (
+            HostResolution::ExcludedByPolicy(_) | HostResolution::WaitingForDependencies,
+            ExecutionMode::OneShot,
+        ) => Phase::Pending,
+        (
+            HostResolution::ExcludedByPolicy(_) | HostResolution::WaitingForDependencies,
+            ExecutionMode::Recurring,
+        ) => Phase::Delayed,
+        (HostResolution::Hosts | HostResolution::Nothing, _) => Phase::Succeeded,
+    }
+}
+
+/// Whether some host carries a success for the plan's current revision.
+fn succeeded_on_current_revision(status: &PlaybookPlanStatus) -> bool {
+    !status.current_hash.is_empty()
+        && status.hosts_status.as_ref().is_some_and(|hosts| {
+            hosts
+                .values()
+                .any(|host| host.last_applied_hash == status.current_hash)
+        })
+}
+
 fn duration_until<Tz: TimeZone>(until: &DateTime<Tz>, now: DateTime<Tz>) -> std::time::Duration {
     (until.clone() - now).to_std().unwrap_or_default()
 }
 
-/// Keeps a `Recurring` plan ticking through the states where it has no run to start.
+/// What the plan's inventories resolved to this tick, as far as an idle plan's status is concerned.
+#[derive(Clone, Copy, Debug)]
+enum HostResolution<'a> {
+    /// At least one host.
+    Hosts,
+    /// No host: the inventories select none.
+    Nothing,
+    /// No host, because `NodeAccessPolicy` enforcement removed every node the inventories selected.
+    ExcludedByPolicy(&'a [String]),
+    /// No host, because the selected Nodes wait for another plan's `provides` label: a
+    /// `ClusterInventory` leaves those out of `resolvedHosts` until the provider reaches them.
+    WaitingForDependencies,
+}
+
+impl<'a> HostResolution<'a> {
+    fn of(
+        all_hosts: &[String],
+        excluded_nodes: &'a [String],
+        dependencies: &[status::InventoryDependency],
+    ) -> Self {
+        if !all_hosts.is_empty() {
+            Self::Hosts
+        } else if !excluded_nodes.is_empty() {
+            Self::ExcludedByPolicy(excluded_nodes)
+        } else if dependencies
+            .iter()
+            .any(|entry| entry.dependency.waiting > 0)
+        {
+            Self::WaitingForDependencies
+        } else {
+            Self::Nothing
+        }
+    }
+}
+
+/// Describes an idle plan that has no run to start, and keeps a `Recurring` one ticking.
 ///
 /// Nothing to trigger is not work a run can start: [`has_work_to_start`] must keep rejecting it so
 /// the operator neither creates an empty Job nor resumes a `Prepared` run whose hosts disappeared.
-/// The plan still has to be woken for its next slot, though, and this is the only thing that does
-/// it on these paths — the start gate that would otherwise requeue is closed, so without this the
-/// tick leaves the hour-long default requeue standing and the plan sleeps through the slots in
-/// between.
+/// A `Recurring` plan still has to be woken for its next slot, though, and this is the only thing
+/// that does it on these paths — the start gate that would otherwise requeue is closed, so without
+/// this the tick leaves the hour-long default requeue standing and the plan sleeps through the
+/// slots in between.
 ///
 /// Two states reach here, and they differ in what is worth *saying*:
 ///
-///   - **The plan resolves to no hosts at all**, after a selector or `NodeAccessPolicy` change
-///     removed every one of them. That is a state of the plan, and reporting it is the only thing
-///     that stops the last run's summary and `nextRun` from standing indefinitely over a plan that
-///     can no longer do anything.
-///   - **Every host has already had its run in the open schedule window.** The slot is served, not
-///     empty, so the status is left exactly as the run that served it wrote it: the verdict, and
-///     the summary saying what that run did, are the truth about this plan until the next slot.
-///     Overwriting them here would also clobber the finished run's own report, because the run's
-///     per-host results are applied (`status::apply_terminal_play_status`) long before the owed set
-///     is computed — so the tick that finishes a run is itself one of these ticks.
+///   - **The plan resolves to no hosts at all** — its selector matches no Node in this cluster, or a
+///     selector or `NodeAccessPolicy` change removed every host. That is a state of the plan, and
+///     reporting it is the only thing that stops the last run's summary and `nextRun` from standing
+///     indefinitely over a plan that can no longer do anything. The phase follows
+///     [`phase_without_hosts`] in both modes; a `OneShot` plan advertises no `nextRun`, since no
+///     run is coming.
+///   - **Every host has already had its run in the open schedule window** (`Recurring`), or is on
+///     the current revision (`OneShot`). The work is done, not absent, so the status is left
+///     exactly as the run that did it wrote it: the verdict, and the summary saying what that run
+///     did, are the truth about this plan. Overwriting them here would also clobber the finished
+///     run's own report, because the run's per-host results are applied
+///     (`status::apply_terminal_play_status`) long before the owed set is computed — so the tick
+///     that finishes a run is itself one of these ticks.
 ///
 /// The next *future* occurrence is advertised rather than a slot whose grace window is currently
 /// open: there is nothing left to run in that slot. Another reconcile can still start the current
-/// slot if hosts return, or become owed, before its grace window closes. A previous verdict remains
-/// the phase, following [`phase_while_waiting_for_schedule`].
-fn update_idle_recurring_status<Tz: TimeZone>(
+/// slot if hosts return, or become owed, before its grace window closes.
+///
+/// A suspended plan keeps its phase, as it does with hosts.
+fn update_idle_status<Tz: TimeZone>(
     mode: &ExecutionMode,
     schedule: Option<&Schedule>,
     suspend: bool,
     has_hosts_to_trigger: bool,
-    resolves_to_hosts: bool,
+    resolution: HostResolution<'_>,
     now: DateTime<Tz>,
     status: &mut PlaybookPlanStatus,
 ) -> Option<std::time::Duration> {
-    if !matches!(mode, ExecutionMode::Recurring)
-        || has_hosts_to_trigger
-        || status.active_run.is_some()
-    {
+    if has_hosts_to_trigger || status.active_run.is_some() {
         return None;
     }
 
-    if !resolves_to_hosts {
-        status.summary = Some("plan currently resolves to no hosts".to_string());
+    let resolves_to_hosts = match resolution {
+        HostResolution::Hosts => true,
+        // `status::append_dependency_summary_clause`, later in the tick, adds how many wait.
+        HostResolution::Nothing | HostResolution::WaitingForDependencies => {
+            status.summary = Some("plan currently resolves to no hosts".to_string());
+            false
+        }
+        HostResolution::ExcludedByPolicy(nodes) => {
+            // One name: the summary is a printer column, and a namespace no policy governs is
+            // refused every selected Node. The full list is in the operator log.
+            let mut summary = format!(
+                "plan currently resolves to no hosts: no NodeAccessPolicy grants this namespace \
+                 node(s) {}",
+                nodes.first().map_or("", String::as_str)
+            );
+            if nodes.len() > 1 {
+                summary.push_str(&format!(" and {} more", nodes.len() - 1));
+            }
+            status.summary = Some(summary);
+            false
+        }
+    };
+
+    if matches!(mode, ExecutionMode::OneShot) {
+        if !resolves_to_hosts {
+            status.next_run = None;
+            if !suspend {
+                status.phase = phase_without_hosts(status, mode, resolution);
+            }
+        }
+        return None;
     }
 
     let Some(schedule) = schedule else {
@@ -2933,7 +3052,7 @@ fn update_idle_recurring_status<Tz: TimeZone>(
     }
 
     if !resolves_to_hosts {
-        status.phase = phase_while_waiting_for_schedule(&status.phase);
+        status.phase = phase_without_hosts(status, mode, resolution);
     }
     let next = forecast_next_run(schedule, now.clone(), None)?;
     status.next_run = Some(next.fixed_offset());
@@ -12576,12 +12695,12 @@ spec:
             ..Default::default()
         };
 
-        let requeue = update_idle_recurring_status(
+        let requeue = update_idle_status(
             &ExecutionMode::Recurring,
             Some(&Schedule::parse("0 20 * * *").unwrap()),
             false,
             false,
-            false,
+            HostResolution::Nothing,
             now,
             &mut status,
         );
@@ -12594,17 +12713,333 @@ spec:
         );
         assert_eq!(requeue, Some(std::time::Duration::from_secs(86_390)));
 
+        // Nothing to apply is done, not waiting: the plan reads the way it would after a run that
+        // reached every host, so a cluster with no matching Node does not read `Delayed` forever.
         let mut never_run = PlaybookPlanStatus::default();
-        update_idle_recurring_status(
+        update_idle_status(
             &ExecutionMode::Recurring,
             Some(&Schedule::parse("0 20 * * *").unwrap()),
             false,
             false,
-            false,
+            HostResolution::Nothing,
             now,
             &mut never_run,
         );
-        assert_eq!(never_run.phase, Phase::Delayed);
+        assert_eq!(never_run.phase, Phase::Succeeded);
+        assert_eq!(never_run.next_run, Some(next));
+    }
+
+    /// A `OneShot` plan with no hosts has nothing to apply and will never start a run for that, so
+    /// it is done. Left alone, it read `Pending` indefinitely — the phase of a plan that has not
+    /// been evaluated — with no `nextRun` saying when that would change, even with a schedule.
+    #[test]
+    fn a_oneshot_plan_without_hosts_has_nothing_to_do_and_succeeds() {
+        let now = "2025-08-12T19:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let stale_next = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        for (schedule, phase) in [
+            (None, Phase::Pending),
+            (Some(Schedule::parse("0 20 * * *").unwrap()), Phase::Pending),
+            (Some(Schedule::parse("0 20 * * *").unwrap()), Phase::Delayed),
+        ] {
+            let mut status = PlaybookPlanStatus {
+                phase,
+                next_run: Some(stale_next),
+                ..Default::default()
+            };
+
+            let requeue = update_idle_status(
+                &ExecutionMode::OneShot,
+                schedule.as_ref(),
+                false,
+                false,
+                HostResolution::Nothing,
+                now,
+                &mut status,
+            );
+
+            assert_eq!(status.phase, Phase::Succeeded, "{schedule:?}");
+            assert_eq!(status.next_run, None, "{schedule:?}");
+            assert_eq!(
+                status.summary.as_deref(),
+                Some("plan currently resolves to no hosts")
+            );
+            assert_eq!(requeue, None);
+        }
+    }
+
+    /// A verdict is a run that happened, so losing every host does not rewrite it — in either mode,
+    /// the same rule `phase_while_waiting_for_schedule` applies.
+    #[test]
+    fn a_plan_without_hosts_keeps_the_verdict_of_a_run_that_happened() {
+        let now = "2025-08-12T19:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for mode in [ExecutionMode::OneShot, ExecutionMode::Recurring] {
+            for verdict in [Phase::Failed, Phase::HostsUnreachable] {
+                let mut status = PlaybookPlanStatus {
+                    phase: verdict.clone(),
+                    ..Default::default()
+                };
+
+                update_idle_status(
+                    &mode,
+                    Some(&Schedule::parse("0 20 * * *").unwrap()),
+                    false,
+                    false,
+                    HostResolution::Nothing,
+                    now,
+                    &mut status,
+                );
+
+                assert_eq!(status.phase, verdict, "{mode:?}");
+            }
+        }
+    }
+
+    /// No hosts because `NodeAccessPolicy` granted none of the selected nodes is a refusal, not
+    /// "nothing to do": reporting it `Succeeded` would make a missing grant look like a converged
+    /// plan. The phase stays what it was, and the summary names the nodes, which was otherwise only
+    /// in the operator log.
+    #[test]
+    fn a_plan_whose_nodes_a_policy_excluded_is_not_reported_succeeded() {
+        let now = "2025-08-12T19:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let excluded = ["node-a".to_string(), "node-b".to_string()];
+        let expected_summary = "plan currently resolves to no hosts: no NodeAccessPolicy grants \
+                                this namespace node(s) node-a and 1 more";
+
+        let mut oneshot = PlaybookPlanStatus::default();
+        update_idle_status(
+            &ExecutionMode::OneShot,
+            None,
+            false,
+            false,
+            HostResolution::ExcludedByPolicy(&excluded),
+            now,
+            &mut oneshot,
+        );
+        assert_eq!(oneshot.phase, Phase::Pending);
+        assert_eq!(oneshot.summary.as_deref(), Some(expected_summary));
+
+        let mut recurring = PlaybookPlanStatus::default();
+        update_idle_status(
+            &ExecutionMode::Recurring,
+            Some(&Schedule::parse("0 20 * * *").unwrap()),
+            false,
+            false,
+            HostResolution::ExcludedByPolicy(&excluded),
+            now,
+            &mut recurring,
+        );
+        assert_eq!(recurring.phase, Phase::Delayed);
+        assert_eq!(
+            recurring.next_run,
+            Some(
+                "2025-08-12T20:00:00Z"
+                    .parse::<DateTime<FixedOffset>>()
+                    .unwrap()
+            )
+        );
+        assert_eq!(recurring.summary.as_deref(), Some(expected_summary));
+    }
+
+    /// The summary is the `Summary` printer column. The common refusal — a namespace no policy
+    /// governs at all — excludes every selected Node, which in a large cluster would put hundreds of
+    /// names into one column; one name says what kind of problem it is, and the operator log has
+    /// the rest.
+    #[test]
+    fn a_policy_refusal_summary_names_one_node_and_counts_the_rest() {
+        let now = "2025-08-12T19:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let summary = |excluded: &[String]| {
+            let mut status = PlaybookPlanStatus::default();
+            update_idle_status(
+                &ExecutionMode::OneShot,
+                None,
+                false,
+                false,
+                HostResolution::ExcludedByPolicy(excluded),
+                now,
+                &mut status,
+            );
+            status.summary.unwrap()
+        };
+
+        assert_eq!(
+            summary(&["node-a".to_string()]),
+            "plan currently resolves to no hosts: no NodeAccessPolicy grants this namespace \
+             node(s) node-a"
+        );
+        let many: Vec<String> = (0..300).map(|n| format!("node-{n:03}")).collect();
+        assert_eq!(
+            summary(&many),
+            "plan currently resolves to no hosts: no NodeAccessPolicy grants this namespace \
+             node(s) node-000 and 299 more"
+        );
+    }
+
+    /// `Succeeded` is only a verdict once a run has produced it. A plan that read `Succeeded` because
+    /// nothing matched must not keep reading it when a Node it is refused, or must wait for, joins;
+    /// nor may a revision nothing has received inherit it from a restored idle status. Both are
+    /// `Succeeded` on a plan whose hosts carry no result for the current revision.
+    #[test]
+    fn a_success_no_run_produced_does_not_outlast_a_refusal_or_a_wait() {
+        let now = "2025-08-12T19:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let excluded = ["node-a".to_string()];
+        let host_at = |hash: &str| {
+            Some(BTreeMap::from([(
+                "node-a".to_string(),
+                v1beta1::HostStatus {
+                    last_applied_hash: hash.into(),
+                    ..Default::default()
+                },
+            )]))
+        };
+
+        for resolution in [
+            HostResolution::ExcludedByPolicy(&excluded),
+            HostResolution::WaitingForDependencies,
+        ] {
+            for (mode, unrun) in [
+                (ExecutionMode::OneShot, Phase::Pending),
+                (ExecutionMode::Recurring, Phase::Delayed),
+            ] {
+                for (hosts_status, expected) in [
+                    // Nothing matched before, so nothing ever ran.
+                    (None, unrun.clone()),
+                    // Ran under an earlier revision; the current one reached nothing.
+                    (host_at("old"), unrun.clone()),
+                    // Ran under this revision and succeeded: a real verdict, which stands.
+                    (host_at("current"), Phase::Succeeded),
+                ] {
+                    let mut status = PlaybookPlanStatus {
+                        phase: Phase::Succeeded,
+                        current_hash: "current".into(),
+                        hosts_status,
+                        ..Default::default()
+                    };
+
+                    update_idle_status(
+                        &mode,
+                        Some(&Schedule::parse("0 20 * * *").unwrap()),
+                        false,
+                        false,
+                        resolution,
+                        now,
+                        &mut status,
+                    );
+
+                    assert_eq!(status.phase, expected, "{mode:?} {resolution:?}");
+                }
+            }
+        }
+    }
+
+    /// No hosts because every selected Node waits for another plan's `provides` label is a wait,
+    /// not "nothing to do": the `ClusterInventory` leaves such Nodes out of `resolvedHosts` until the
+    /// provider reaches them. Reporting it `Succeeded` would pass a dependent plan created alongside
+    /// its provider as converged, and keep one with a mistyped dependency key there for good.
+    #[test]
+    fn a_plan_whose_nodes_wait_for_dependencies_is_not_reported_succeeded() {
+        let now = "2025-08-12T19:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        let mut oneshot = PlaybookPlanStatus::default();
+        update_idle_status(
+            &ExecutionMode::OneShot,
+            None,
+            false,
+            false,
+            HostResolution::WaitingForDependencies,
+            now,
+            &mut oneshot,
+        );
+        assert_eq!(oneshot.phase, Phase::Pending);
+        assert_eq!(
+            oneshot.summary.as_deref(),
+            Some("plan currently resolves to no hosts")
+        );
+
+        let mut recurring = PlaybookPlanStatus::default();
+        update_idle_status(
+            &ExecutionMode::Recurring,
+            Some(&Schedule::parse("0 20 * * *").unwrap()),
+            false,
+            false,
+            HostResolution::WaitingForDependencies,
+            now,
+            &mut recurring,
+        );
+        assert_eq!(recurring.phase, Phase::Delayed);
+        assert!(recurring.next_run.is_some());
+    }
+
+    #[test]
+    fn host_resolution_tells_nothing_selected_from_a_refusal_and_a_wait() {
+        let hosts = ["node-a".to_string()];
+        let excluded = ["node-b".to_string()];
+        let waiting = |waiting| status::InventoryDependency {
+            inventory: "workers".into(),
+            dependency: v1beta1::DependencyStatus {
+                waiting,
+                ..Default::default()
+            },
+        };
+
+        assert!(matches!(
+            HostResolution::of(&hosts, &excluded, &[waiting(1)]),
+            HostResolution::Hosts
+        ));
+        assert!(matches!(
+            HostResolution::of(&[], &[], &[waiting(0)]),
+            HostResolution::Nothing
+        ));
+        assert!(matches!(
+            HostResolution::of(&[], &[], &[waiting(0), waiting(2)]),
+            HostResolution::WaitingForDependencies
+        ));
+        // The refusal is the one to name: waiting does not help a Node no policy grants.
+        assert!(matches!(
+            HostResolution::of(&[], &excluded, &[waiting(2)]),
+            HostResolution::ExcludedByPolicy(nodes) if nodes == excluded
+        ));
+    }
+
+    /// Suspension leaves the phase alone here as it does for a plan with hosts; and a converged
+    /// `OneShot` plan, which does resolve to hosts, is not this function's to describe.
+    #[test]
+    fn an_idle_oneshot_plan_is_left_alone_when_suspended_or_resolving_to_hosts() {
+        let now = "2025-08-12T19:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        let mut suspended = PlaybookPlanStatus::default();
+        update_idle_status(
+            &ExecutionMode::OneShot,
+            None,
+            true,
+            false,
+            HostResolution::Nothing,
+            now,
+            &mut suspended,
+        );
+        assert_eq!(suspended.phase, Phase::Pending);
+        assert_eq!(
+            suspended.summary.as_deref(),
+            Some("plan currently resolves to no hosts")
+        );
+
+        let mut converged = PlaybookPlanStatus {
+            phase: Phase::Succeeded,
+            summary: Some("3/3 up-to-date".into()),
+            ..Default::default()
+        };
+        update_idle_status(
+            &ExecutionMode::OneShot,
+            None,
+            false,
+            false,
+            HostResolution::Hosts,
+            now,
+            &mut converged,
+        );
+        assert_eq!(converged.phase, Phase::Succeeded);
+        assert_eq!(converged.summary.as_deref(), Some("3/3 up-to-date"));
     }
 
     /// The state per-slot targeting introduces: the window is still open, but every host has had its
@@ -12631,12 +13066,12 @@ spec:
             ..Default::default()
         };
 
-        let requeue = update_idle_recurring_status(
+        let requeue = update_idle_status(
             &ExecutionMode::Recurring,
             Some(&Schedule::parse("0 20 * * *").unwrap()),
             false,
             false,
-            true,
+            HostResolution::Hosts,
             now,
             &mut status,
         );
@@ -12663,12 +13098,12 @@ spec:
             ..Default::default()
         };
 
-        update_idle_recurring_status(
+        update_idle_status(
             &ExecutionMode::Recurring,
             Some(&Schedule::parse("0 20 * * *").unwrap()),
             false,
             false,
-            false,
+            HostResolution::Nothing,
             now,
             &mut status,
         );
@@ -12758,12 +13193,12 @@ spec:
         };
 
         assert_eq!(
-            update_idle_recurring_status(
+            update_idle_status(
                 &ExecutionMode::Recurring,
                 Some(&Schedule::parse("0 20 * * *").unwrap()),
                 true,
                 false,
-                false,
+                HostResolution::Nothing,
                 now,
                 &mut suspended,
             ),
@@ -12794,12 +13229,12 @@ spec:
         };
 
         assert_eq!(
-            update_idle_recurring_status(
+            update_idle_status(
                 &ExecutionMode::Recurring,
                 Some(&Schedule::parse("0 20 * * *").unwrap()),
                 false,
                 false,
-                false,
+                HostResolution::Nothing,
                 now,
                 &mut active,
             ),

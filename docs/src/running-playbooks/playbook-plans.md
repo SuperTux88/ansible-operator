@@ -397,7 +397,9 @@ whose Job never starts](../cluster-operators/deployment.md#runs-whose-job-never-
 
 A plan moves through phases: `Pending` → `Delayed` while it waits for a scheduled start →
 `Applying` → `Succeeded`/`Failed`/`HostsUnreachable`, in both modes, from the recap of the run that
-just finished. `HostsUnreachable` is a failure that is not the playbook's fault: everything reachable
+just finished. A plan without a verdict whose inventories select no hosts has nothing to do and
+reports `Succeeded` unless it is suspended; no hosts because of a `NodeAccessPolicy` or a dependency
+is not that case ([details](./results-and-troubleshooting.md#a-clusterinventory-resolves-to-zero-hosts)). `HostsUnreachable` is a failure that is not the playbook's fault: everything reachable
 was applied, and what is left is a machine that is down. A `Recurring` plan keeps that result between ticks and
 advertises the next one through `.status.nextRun`. Drift detection decides *which* hosts actually run: an
 execution hash over the plan's inputs ([which ones](./scheduling-and-modes.md#drift-detection))

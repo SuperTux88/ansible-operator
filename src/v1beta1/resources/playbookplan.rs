@@ -456,13 +456,17 @@ pub struct SecretRef {
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
 pub enum Phase {
-    /// Triggers have not yet been evaluated
+    /// Triggers have not yet been evaluated. Also a `OneShot` plan that has not run and whose
+    /// selected Nodes no `NodeAccessPolicy` grants its namespace (the summary names one), or all
+    /// wait for another plan's dependency label.
     #[default]
     Pending,
 
     /// The plan is waiting for its scheduled time, and the current playbook and inputs have not
     /// produced a result yet. Once a run has finished, its `Succeeded`/`Failed` verdict is what the
-    /// plan reports between runs, with `nextRun` naming the next one.
+    /// plan reports between runs, with `nextRun` naming the next one. Also a `Recurring` plan that
+    /// has not run and whose selected Nodes no `NodeAccessPolicy` grants its namespace, or all wait
+    /// for another plan's dependency label.
     Delayed,
 
     /// Playbook has not yet been applied to all hosts.
@@ -474,7 +478,8 @@ pub enum Phase {
     Failed,
 
     /// Every host the latest run targeted succeeded. A `Recurring` plan keeps this result between
-    /// schedule ticks, with `nextRun` naming the next one.
+    /// schedule ticks, with `nextRun` naming the next one. Also a plan without a run verdict whose
+    /// inventories select no hosts at all: it has nothing to apply.
     Succeeded,
 
     /// The latest run reached and applied the playbook to every host it *could* reach, and the only

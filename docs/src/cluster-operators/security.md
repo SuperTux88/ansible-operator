@@ -82,7 +82,10 @@ kubectl patch play <name> -n my-team --type merge -p '{"spec":{"runNumber":99}}'
 A `Play` does disclose the **resolved inventory** of the run it records — the host names each of the
 plan's inventory groups expanded to. It carries no Secret material and no plan configuration, but
 that host list is enough that `get plays` should be treated as equivalent to `get playbookplans` for
-the namespace.
+the namespace. A plan's own status names one Node a `NodeAccessPolicy` refused it when every
+selected Node was refused — a Node its `ClusterInventory`'s status already lists in the same
+namespace, so `get playbookplans` should likewise be treated as equivalent to
+`get clusterinventories` there.
 
 One tenant's broken plan does not stop the others' runs either. The operator reads all plans in one
 list, and a plan it could not decode would fail that list for every namespace. The CRD therefore
