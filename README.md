@@ -120,8 +120,7 @@ helm install --create-namespace -n ansible-system ansible-operator \
 ```
 
 It must be installed into its own dedicated namespace, which also needs the `privileged` Pod
-Security Admission label because the managed-SSH proxy pods use `hostPID` and elevated
-capabilities. See [`chart/README.md`](chart/README.md) for install instructions, the Pod Security
+Security Admission label because the managed-SSH proxy pods are privileged and use `hostPID`. See [`chart/README.md`](chart/README.md) for install instructions, the Pod Security
 Admission and SELinux notes, and how to regenerate the bundled CRDs.
 
 ## Example use cases

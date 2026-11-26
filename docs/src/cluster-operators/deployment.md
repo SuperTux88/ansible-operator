@@ -77,24 +77,25 @@ nothing to restart.
 ## Pod Security Admission
 
 Managed-SSH proxy pods (created dynamically by the operator at runtime, not by the chart) run with
-`hostPID: true` and added `SYS_ADMIN`/`SYS_PTRACE` capabilities so each SSH session can `nsenter` into
-the target Node's namespaces. That combination is only permitted under the **`privileged`** Pod
-Security Standard, so the operator's namespace must carry the label:
+`hostPID: true` and `privileged: true`, so each SSH session can `nsenter` into the target Node's
+namespaces and use the Node's devices like any other `root` process (see
+[Security → privileges the proxy pods hold](./security.md#privileges-the-proxy-pods-hold)). That
+combination is only permitted under the **`privileged`** Pod Security Standard, so the operator's
+namespace must carry the label:
 
 ```sh
 kubectl label namespace ansible-system pod-security.kubernetes.io/enforce=privileged
 ```
 
-The proxy pods do not use `privileged: true`, `hostNetwork`, or `hostIPC` — only `hostPID` plus the
-two capabilities. Because this exception is scoped to the single operator namespace, tenant
-namespaces need no Pod-Security relaxation.
+The proxy pods do not use `hostNetwork` or `hostIPC`. Because this exception is scoped to the single
+operator namespace, tenant namespaces need no Pod-Security relaxation.
 
 ## SELinux-enforcing nodes
 
-On SELinux-enforcing Nodes the proxy pods additionally set
-`securityContext.seLinuxOptions.type: spc_t` ("super-privileged container"), the label that lets the
-`nsenter`'d process touch the host filesystem. This is applied automatically, is a no-op on
-non-SELinux nodes, and needs no action from you.
+The proxy pods set `securityContext.seLinuxOptions.type: spc_t` ("super-privileged container"), the
+label that lets the `nsenter`'d process touch the host filesystem. containerd ignores a requested
+label for privileged containers and runs them in its own domain instead, so the setting only takes
+effect on runtimes that apply it. It is a no-op on non-SELinux nodes and needs no action from you.
 
 ## The managed-SSH proxy image
 
@@ -344,9 +345,8 @@ non-root user (65532), with a read-only root filesystem, every capability droppe
 authority's private key in memory, so it should not run as root even inside its container. If you
 override the operator image, keep a numeric non-root user in it or set `runAsUser` to match.
 
-Managed-SSH proxy containers cannot use `allowPrivilegeEscalation: false` because Kubernetes treats
-their required `SYS_ADMIN` capability as privilege escalation. The proxy receives only the
-capabilities and SELinux type required for node access. Admission policies should scope any required
+Managed-SSH proxy containers are privileged, which Kubernetes does not allow together with
+`allowPrivilegeEscalation: false`. Admission policies should scope any required
 exception to pods labelled `ansible.cloudbending.dev/component=managed-ssh-proxy` instead of
 excluding the whole namespace. The full list of exceptions to configure is [Admission
 policies](./admission-policies.md).

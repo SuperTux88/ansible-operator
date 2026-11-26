@@ -8,8 +8,8 @@ enforced by unit tests — is `THREAT_MODEL.md` in the repository. **If this pag
 ## Managed SSH is node-root
 
 Reaching a cluster Node via a `ClusterInventory` means a managed-SSH session that is **`root` on that
-Node** — it `nsenter`s into the host namespaces of a proxy pod running with `hostPID` and
-`SYS_ADMIN`/`SYS_PTRACE`. This is the intended capability (you cannot patch a Node's OS without it),
+Node** — it `nsenter`s into the host namespaces of a privileged proxy pod running with `hostPID`.
+This is the intended capability (you cannot patch a Node's OS without it),
 and the rest of the security model governs *who* may obtain it, over *which* Nodes, and for *how
 long*. External hosts reached via a `StaticInventory` are a different, lower-privilege path: there the
 operator is just an SSH client using a key you provided.
@@ -129,14 +129,18 @@ holds the run until it finishes or is deleted.
 
 ## Privileges the proxy pods hold
 
-Proxy pods take the **minimum** that makes `nsenter`-to-host work: `hostPID: true`, a host `/proc`
-bind-mount, `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE`, (on SELinux nodes) the `spc_t` label, and (on
-AppArmor nodes) an `Unconfined` profile, since the runtime default denies `nsenter` access to the
-host's PID 1. They do
-**not** set `privileged: true`, `hostNetwork`, or `hostIPC`. Each is pinned to exactly one Node by
+Proxy pods take what makes a session behave like `root` on the Node: `hostPID: true`, a host `/proc`
+bind-mount, `privileged: true`, (on SELinux nodes) the `spc_t` label, and (on AppArmor nodes) an
+`Unconfined` profile, since the runtime default denies `nsenter` access to the host's PID 1.
+`privileged` provides the `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE` that `nsenter` needs, and lifts the
+container's device restrictions: a session stays in the pod's cgroup after `nsenter`, and without
+`privileged` it could not open host block devices, so package scripts such as `grub-install` would
+fail. This adds no reach a session did not already have — as `root` in the host namespaces it could
+always start processes outside the pod, for example with `systemd-run`. They do **not** set
+`hostNetwork` or `hostIPC`. Each is pinned to exactly one Node by
 its name, not by the `kubernetes.io/hostname` label, which a Node's own kubelet may change. The
-proxy does not mount a ServiceAccount token. It cannot set `allowPrivilegeEscalation: false` because
-Kubernetes treats the required `SYS_ADMIN` capability as privilege escalation. The
+proxy does not mount a ServiceAccount token. It cannot set `allowPrivilegeEscalation: false`, which
+Kubernetes rejects for privileged containers. The
 image they run is the node-root supply-chain surface you must own — the default is the first-party
 image published with the operator; in production pin it to a trusted digest (see
 [Deployment → the proxy image](./deployment.md#the-managed-ssh-proxy-image)).
