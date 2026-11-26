@@ -22,9 +22,16 @@ The proxy pod is, by design, a **node-root primitive**:
 
 - `hostPID: true` ([`managed_ssh.rs` `build_pod`](src/v1beta1/controllers/playbookplancontroller/managed_ssh.rs))
 - `/proc` bind-mounted from the host (`HostPathVolumeSource` → `/host/proc`)
-- `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE`, plus SELinux `spc_t` (the label `oc debug node/…`
-  and `privileged: true` pods get) and an `Unconfined` AppArmor profile (the runtime
-  default denies ptrace-read of host PID 1, which `nsenter` needs)
+- `privileged: true`, plus an explicit `Unconfined` AppArmor profile (the runtime default
+  denies ptrace-read of host PID 1, which `nsenter` needs) and SELinux `spc_t` (the label
+  `oc debug node/…` gets; containerd ignores a requested label for privileged containers and
+  runs them in its own domain, so it only takes effect on runtimes that apply it).
+  `privileged` grants the `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE` that
+  `nsenter` needs, and it lifts the container's device cgroup: `nsenter` does not leave the
+  pod's cgroup, so without it a session could not open host block devices (`grub-install`,
+  `mkfs`, …) even though it is root on the node. It is not a privilege a session lacked
+  before — a session could always reach host-root processes outside the pod, e.g. through
+  `systemd-run` — so it does not change the boundary described below.
 - every SSH session is wrapped in `nsenter -m/-n/-i/-u` into the host's mount / net /
   ipc / uts namespaces via `/host/proc/1/ns/*`, then `exec sh -c "$SSH_ORIGINAL_COMMAND"`
 

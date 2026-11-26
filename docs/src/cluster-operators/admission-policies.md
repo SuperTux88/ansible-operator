@@ -14,23 +14,23 @@ the operator namespace must be labelled `privileged`.
 | --- | --- | --- |
 | Disallow host namespaces | yes, permanent | proxy pods, by label and namespace |
 | Disallow privilege escalation | yes, permanent | proxy pods, by label and namespace |
-| Disallow privileged containers | no | — |
+| Disallow privileged containers | yes, permanent | proxy pods, by label and namespace |
 | Restrict ServiceAccount token automount | no | — |
 | Require NetworkPolicies | no | — |
 
 ## Where the workloads run
 
-Both exceptions apply to the managed-SSH proxy pods, and only to them. Knowing where each workload
-lives is what makes that possible:
+All three exceptions apply to the managed-SSH proxy pods, and only to them. Knowing where each
+workload lives is what makes that possible:
 
 - **Proxy pods** are created by the operator in the **operator's own namespace**, never in the
   namespace of the `PlaybookPlan` that triggered the run. They carry the label
   `ansible.cloudbending.dev/component: managed-ssh-proxy`.
-- **The operator Deployment** lives in the same namespace and is compliant with both policies.
+- **The operator Deployment** lives in the same namespace and is compliant with all three policies.
 - **Ansible Jobs** run in the namespace of their `PlaybookPlan` — a tenant namespace, which needs no
   exception at all. They are labelled `ansible.cloudbending.dev/component: playbook`.
 
-Scope both exceptions to that pod label, and to the operator's namespace. That is the narrowest
+Scope all three exceptions to that pod label, and to the operator's namespace. That is the narrowest
 scope that grants what the proxies need: the policies stay enforced for the operator Deployment and
 for anything else running in the same namespace, and the label grants nothing to a pod that carries
 it in another namespace. In Kyverno both conditions go into one rule, where they are ANDed:
@@ -57,9 +57,8 @@ sufficient if your policy engine can express that.
 
 ## Privilege escalation
 
-Kubernetes treats the proxy's required `SYS_ADMIN` capability as privilege escalation, so proxy
-containers cannot set `allowPrivilegeEscalation: false`. Setting it anyway would be misleading and
-is rejected on some runtimes.
+Proxy containers are privileged (see [Privileged containers](#privileged-containers)), and
+Kubernetes rejects `allowPrivilegeEscalation: false` on a privileged container.
 
 Everything else stays enforced:
 
@@ -78,10 +77,23 @@ Everything else stays enforced:
   the execution image the plan uses. See
   [Playbook plans](../running-playbooks/playbook-plans.md).
 
-## Controls that need no exception
+## Privileged containers
 
-**Privileged containers.** The proxy pods request individual capabilities and an SELinux type. They
-never set `securityContext.privileged: true`.
+Managed-SSH proxy containers set `securityContext.privileged: true`. A session `nsenter`s into the
+Node's namespaces but stays in the proxy pod's cgroup, and for an unprivileged container that cgroup
+refuses access to the Node's block devices. Without `privileged`, anything that opens a disk —
+`grub-install` in a bootloader package update, `mkfs`, firmware tools — fails with `Operation not
+permitted`, even though the session is otherwise `root` on the Node. The exception grants no reach a
+session does not already have; see [Security](./security.md#privileges-the-proxy-pods-hold).
+
+Releases up to v1.0.2 did not need this exception. Add it **before** upgrading from one of them:
+otherwise the policy engine rejects every proxy pod. Runs against cluster Nodes do not fail but stall
+with the summary **"could not prepare run …"** naming the admission error, and retry every tick
+while holding their host Leases, so other plans targeting the same Nodes wait as well (see
+[Results and troubleshooting](../running-playbooks/results-and-troubleshooting.md)). Once the
+exception is in place, the next attempt creates the proxy pods and the runs continue on their own.
+
+## Controls that need no exception
 
 **ServiceAccount token automount.** The operator ServiceAccount sets
 `automountServiceAccountToken: false` and the operator Deployment requests its token explicitly;

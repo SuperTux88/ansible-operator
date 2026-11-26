@@ -269,9 +269,9 @@ You do not configure any of this; it is background for the security model and fo
 For a run targeting Nodes, the operator:
 
 1. Schedules a short-lived **proxy pod** onto each targeted Node. The pod runs a real `sshd` and is
-   granted just enough privilege (`hostPID`, a host `/proc` mount, `CAP_SYS_ADMIN` +
-   `CAP_SYS_PTRACE`, and on AppArmor nodes an `Unconfined` profile) that each SSH session can `nsenter` into the Node's host namespaces, making the
-   session `root` on the Node. The pod does not use `privileged: true`, `hostNetwork`, or `hostIPC`.
+   privileged, with `hostPID`, a host `/proc` mount, and on AppArmor nodes an `Unconfined` profile,
+   so that each SSH session can `nsenter` into the Node's host namespaces and act as `root` on the
+   Node, including access to its disks. The pod does not use `hostNetwork` or `hostIPC`.
 2. Mints a fresh SSH **host certificate** for that run from the operator's in-memory certificate
    authority, and a matching **client certificate** for the Job. Certificates are per-run and
    short-lived, so a run can authenticate only to *its own* proxy pods — even a re-run of the

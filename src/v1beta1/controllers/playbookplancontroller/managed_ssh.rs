@@ -5,9 +5,9 @@ use std::time::Duration;
 use k8s_openapi::{
     api::{
         core::v1::{
-            Affinity, AppArmorProfile, Capabilities, Container, HostPathVolumeSource, Node,
-            NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, Pod, PodSpec,
-            Probe, Secret, SecurityContext, TCPSocketAction, Volume, VolumeMount,
+            Affinity, AppArmorProfile, Container, HostPathVolumeSource, Node, NodeAffinity,
+            NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, Pod, PodSpec, Probe, Secret,
+            SecurityContext, TCPSocketAction, Volume, VolumeMount,
         },
         networking::v1::{
             NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -58,7 +58,7 @@ const AUTHORIZED_PRINCIPALS_FILENAME: &str = "authorized_principals";
 const SFTP_SUBSYSTEM_MARKER: &str = "ansible-operator-sftp";
 
 /// Where the host's real `/proc` is bind-mounted inside the proxy pod. The pod runs with ordinary
-/// pod networking (no `hostNetwork`/`hostIPC`/`privileged`), so sshd binds port 22 in its own
+/// pod networking (no `hostNetwork`/`hostIPC`), so sshd binds port 22 in its own
 /// namespace rather than colliding with the node's real sshd; each *session* instead nsenters into
 /// the host's mount/net/ipc/uts namespaces via `/host/proc/1/ns/*` — see
 /// `render_enter_host_script`. This also keeps the NetworkPolicy in `build_network_policy`
@@ -643,8 +643,9 @@ fn render_sshd_config() -> String {
 }
 
 /// Wraps every SSH session in an `nsenter` into the host's mount/net/ipc/uts namespaces via the
-/// bind-mounted `/host/proc/1/ns/*`. Requires `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` on the container
-/// (see `build_pod`'s `SecurityContext`), not `privileged: true`.
+/// bind-mounted `/host/proc/1/ns/*`. Requires `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE`, which the
+/// container gets from `privileged: true` (see `build_pod`'s `SecurityContext`). The session stays
+/// in the pod's cgroup, so `privileged` is also what lets it open host devices.
 ///
 /// No `-p`/pid join: `setns(CLONE_NEWPID)` can only move to a descendant PID namespace, never the
 /// host's (an ancestor); `build_pod` sets `hostPID: true` instead.
@@ -786,15 +787,16 @@ fn build_pod(
             },
         ]),
         security_context: Some(SecurityContext {
-            // Not `privileged: true` — only the two capabilities nsenter needs.
-            capabilities: Some(Capabilities {
-                add: Some(vec!["SYS_ADMIN".into(), "SYS_PTRACE".into()]),
-                ..Default::default()
-            }),
-            // nsenter-ing the host's mount namespace doesn't change the process's SELinux label
-            // (stays `container_t`, denied host filesystem access). `spc_t` is the same label
-            // `privileged: true` pods and `oc debug node/...` get, and is what actually allows
-            // host filesystem access. No-op on non-SELinux nodes.
+            // nsenter does not leave the pod's cgroup, so without `privileged` the container's
+            // device cgroup refuses opening host block devices (grub-install, mkfs, ...) even
+            // though the session is already root on the node. Also grants the capabilities
+            // nsenter needs (SYS_ADMIN, SYS_PTRACE).
+            privileged: Some(true),
+            // nsenter-ing the host's mount namespace doesn't change the process's SELinux label, and
+            // `container_t` is denied host filesystem access; `spc_t` is not. containerd ignores
+            // the requested label for privileged containers (they run in the runtime's own
+            // domain), so this only takes effect on a runtime that applies it. No-op on
+            // non-SELinux nodes.
             se_linux_options: Some(k8s_openapi::api::core::v1::SELinuxOptions {
                 type_: Some("spc_t".into()),
                 ..Default::default()
@@ -1747,14 +1749,24 @@ mod tests {
         let container = &spec.containers[0];
         assert_eq!(container.image.as_deref(), Some("proxy:latest"));
         let security = container.security_context.as_ref().unwrap();
-        assert_ne!(
+        assert_eq!(
             security.privileged,
             Some(true),
-            "capabilities are granted explicitly, never via blanket privileged"
+            "sessions stay in the pod's device cgroup after nsenter; without privileged they \
+             cannot open host block devices (grub-install, mkfs, ...)"
         );
-        let added = security.capabilities.as_ref().unwrap().add.clone().unwrap();
-        assert!(added.contains(&"SYS_ADMIN".to_string()));
-        assert!(added.contains(&"SYS_PTRACE".to_string()));
+        assert_ne!(
+            security.allow_privilege_escalation,
+            Some(false),
+            "the apiserver rejects allowPrivilegeEscalation: false on a privileged container"
+        );
+        assert_eq!(
+            security
+                .se_linux_options
+                .as_ref()
+                .and_then(|o| o.type_.as_deref()),
+            Some("spc_t")
+        );
         assert_eq!(
             security
                 .app_armor_profile

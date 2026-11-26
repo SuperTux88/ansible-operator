@@ -49,13 +49,14 @@ other workload using it in the release namespace is held to the operator's label
 ### Pod Security Admission
 
 Managed-ssh proxy pods (created dynamically by the operator at runtime, not by this chart) run
-with added `SYS_ADMIN`/`SYS_PTRACE` capabilities so each SSH session can `nsenter` into the
-target node's real mount/net/ipc/uts namespaces — they deliberately do *not* use
-`hostIPC`/`hostNetwork`/`privileged: true` (see `managed_ssh.rs`'s module docs for why). They
-*do* use `hostPID: true`, unlike the other three host-namespace flags: `setns(CLONE_NEWPID)` can
+with `privileged: true` so each SSH session can `nsenter` into the target node's real
+mount/net/ipc/uts namespaces and open the node's devices: the session stays in the pod's cgroup,
+whose device restrictions would otherwise refuse block devices (e.g. for `grub-install`). They
+deliberately do *not* use `hostIPC`/`hostNetwork` (see `managed_ssh.rs`'s module docs for why).
+They *do* use `hostPID: true`, unlike the other two host-namespace flags: `setns(CLONE_NEWPID)` can
 only move to a descendant PID namespace, never an ancestor like the host's, so per-session
 `nsenter --pid` is fundamentally impossible from a pod whose own PID namespace isn't already the
-host's — there's no capability-scoped workaround for this one. `SYS_ADMIN`/`hostPID` still aren't
+host's — there's no capability-scoped workaround for this one. `privileged`/`hostPID` aren't
 permitted under the `restricted` or `baseline` Pod Security Standards, only `privileged`, so the
 operator's namespace needs that label, e.g.:
 
@@ -75,11 +76,11 @@ kubectl label namespace team-a pod-security.kubernetes.io/enforce=baseline
 
 Proxy pods also set `securityContext.seLinuxOptions.type: spc_t` ("super-privileged
 container"). Joining the host's mount namespace via nsenter does not change a process's own
-SELinux label — it stays whatever the container runtime assigned (typically `container_t`),
-which is denied write access to almost all host filesystem paths regardless of Unix
-permissions or capabilities. `spc_t` is the same label `privileged: true` pods and
-node-debugging tools (e.g. `oc debug node/...`) get, and is what actually allows nsenter'd
-processes to touch the host filesystem. This is a no-op on non-SELinux nodes.
+SELinux label — it stays whatever the container runtime assigned. `container_t` is denied write
+access to almost all host filesystem paths regardless of Unix permissions or capabilities;
+`spc_t`, the label node-debugging tools (e.g. `oc debug node/...`) get, is not. containerd
+ignores a requested label for privileged containers and runs them in its own domain, so the
+setting only takes effect on runtimes that apply it. This is a no-op on non-SELinux nodes.
 
 ## Custom resource definitions
 
